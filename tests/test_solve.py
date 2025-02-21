@@ -28,7 +28,7 @@ def test_solve(seed, plot_root):
   q = 2 * jax.random.randint(key_q, shape=(n, ), minval=0, maxval=2) - 1
   m = jax.random.lognormal(key_m, shape=(n, ), sigma=1.0)
 
-  trajectory = detopt.detectors.straw.solve(x0, v0, q=q, m=m, J=0.2, K=0.2, L=3.0, B0=B0, dt=1.0e-2, steps=2000)
+  trajectory = detopt.detectors.straw.solve(x0, v0, q=q, m=m, J=0.0, K=0.2, L=3.0, B0=B0, dt=1.0e-2, steps=2000)
 
   print(trajectory.shape)
 

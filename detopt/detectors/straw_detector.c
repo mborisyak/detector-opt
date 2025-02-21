@@ -175,6 +175,9 @@ static PyObject * straw_solve(PyObject *self, PyObject *args) {
       const npy_double ty = c * By;
 
       const npy_double t_norm_sqr = tx * tx + ty * ty;
+
+      // placeholder
+      output_data[i + j] = 1.0;
     }
   }
 

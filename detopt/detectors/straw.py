@@ -21,6 +21,8 @@ def solve(x0, v0, q, m, J, K, L, *, B0: jax.Array | None=None, dt: float, steps:
     [K, -J, 0],
     [0, 0, 0]
   ], dtype=x0.dtype)
+  # Bx = (J * x + K * y) exp(-z^2 / L^2)
+  # By = (-K * x - J * y) exp(-z^2 / L^2)
 
   def step(state, _):
     x, v = state
@@ -31,7 +33,7 @@ def solve(x0, v0, q, m, J, K, L, *, B0: jax.Array | None=None, dt: float, steps:
 
     state_updated = (x_updated, v_updated)
     return state_updated, x_updated
-
+  # (n, n_t, 3)
   _, trajectory = jax.lax.scan(
     step,
     init=(x0, v0),
@@ -40,6 +42,8 @@ def solve(x0, v0, q, m, J, K, L, *, B0: jax.Array | None=None, dt: float, steps:
   )
 
   return trajectory
+
+  # (n, n_layers, n_tubes) 0.0 if no hit, 1.0 if hit
 
 def project(
   trajectory: jax.Array,
@@ -60,7 +64,7 @@ def project(
   delta = jnp.sqrt(jnp.square(delta_x) + jnp.square(delta_y))
 
   index = delta / (2 * straw_r)
-
+  return
 
 
 class StrawDetector(object):
