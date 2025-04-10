@@ -48,6 +48,13 @@ const PyArrayObject * check_scalar_array(const PyObject * object, int batch) {
   }
 }
 
+const npy_double hit(
+  const npy_double x, const npy_double y,
+  const npy_double angle, const npy_double r, const npy_double w, const npy_intp n
+) {
+  return 1.0;
+}
+
 // see documentation for the python method
 static PyObject * straw_solve(PyObject *self, PyObject *args) {
   PyObject *py_dt= NULL;
@@ -61,61 +68,105 @@ static PyObject * straw_solve(PyObject *self, PyObject *args) {
   PyObject *py_charges = NULL;
   PyObject *py_masses = NULL;
 
-  PyObject *py_output = NULL;
+  PyObject *py_layers = NULL;
+  PyObject *py_width = NULL;
+  PyObject *py_heights = NULL;
+  PyObject *py_angles = NULL;
+
+  PyObject *py_trajectories = NULL;
+  PyObject *py_response = NULL;
 
   if (!PyArg_UnpackTuple(
-    args, "straw_solve", 8, 8,
-    &py_initial_positions,
-    &py_initial_velocities,
-    &py_masses, &py_charges,
+    args, "straw_solve", 13, 13,
+    &py_initial_positions, &py_initial_velocities, &py_masses, &py_charges,
     &py_B, &py_L,
-    &py_dt, &py_output
+    &py_dt,
+    &py_layers, &py_width, &py_heights, &py_angles,
+    &py_trajectories, &py_response
   )) {
     return NULL;
   }
 
-  if (!PyArray_Check(py_output)) {
-    PyErr_SetString(PyExc_TypeError, "The output buffer must be an float64 array.");
+  if (!PyArray_Check(py_trajectories)) {
+    PyErr_SetString(PyExc_TypeError, "The trajectories buffer must be an float64 array.");
     return NULL;
   }
 
-  const PyArrayObject * output_array = (PyArrayObject *) py_output;
+  if (!PyArray_Check(py_response)) {
+    PyErr_SetString(PyExc_TypeError, "The response buffer must be an float64 array.");
+    return NULL;
+  }
+
+  const PyArrayObject * trajectories_array = (PyArrayObject *) py_trajectories;
+  const PyArrayObject * response_array = (PyArrayObject *) py_response;
 
   if (!(
-    PyArray_TYPE(output_array) == NPY_FLOAT64 &&
-    PyArray_NDIM(output_array) == 3 &&
-    PyArray_DIM(output_array, 2) == SPACE_DIM
+    PyArray_TYPE(trajectories_array) == NPY_FLOAT64 &&
+    PyArray_NDIM(trajectories_array) == 3 &&
+    PyArray_DIM(trajectories_array, 2) == SPACE_DIM
   )) {
-    PyErr_SetString(PyExc_TypeError, "The output buffer must be a (n, n_t, 3) float64 array.");
+    PyErr_SetString(PyExc_TypeError, "The trajectories buffer must be a (n, n_t, 3) float64 array.");
     return NULL;
   }
-  const npy_intp batch_size = PyArray_DIM(output_array, 0);
-  const npy_intp n_steps = PyArray_DIM(output_array, 1);
+  const npy_intp n_batch = PyArray_DIM(trajectories_array, 0);
+  const npy_intp n_steps = PyArray_DIM(trajectories_array, 1);
 
-  const PyArrayObject * initial_positions_array = check_vector_array(py_initial_positions, batch_size);
+  if (!(
+    PyArray_TYPE(response_array) == NPY_FLOAT64 &&
+    PyArray_NDIM(response_array) == 3 &&
+    PyArray_DIM(response_array, 0) == n_batch
+  )) {
+    PyErr_SetString(PyExc_TypeError, "The response buffer must be a (n, n_layers, n_straws) float64 array.");
+    return NULL;
+  }
+  const npy_intp n_layers = PyArray_DIM(response_array, 1);
+  const npy_intp n_straws = PyArray_DIM(response_array, 2);
+
+  const PyArrayObject * initial_positions_array = check_vector_array(py_initial_positions, n_batch);
   if (initial_positions_array == NULL) {
-    PyErr_SetString(
-      PyExc_TypeError,
-      "Invalid value for initial positions provided. Must be a (n, 3) float64 array."
-    );
+    PyErr_SetString(PyExc_TypeError, "initial_positions must be a (n, 3) float64 array.");
     return NULL;
   }
 
-  const PyArrayObject * initial_velocities_array = check_vector_array(py_initial_velocities, batch_size);
+  const PyArrayObject * initial_velocities_array = check_vector_array(py_initial_velocities, n_batch);
   if (initial_velocities_array == NULL) {
     PyErr_SetString(PyExc_TypeError, "Invalid value for initial velocities provided. Must be a (n, 3) float64 array.");
     return NULL;
   }
 
-  const PyArrayObject * masses_array = check_scalar_array(py_masses, batch_size);
+  const PyArrayObject * masses_array = check_scalar_array(py_masses, n_batch);
   if (masses_array == NULL) {
     PyErr_SetString(PyExc_TypeError, "Invalid value for masses provided. Must be a (n, ) float64 array.");
     return NULL;
   }
 
-  const PyArrayObject * charges_array = check_scalar_array(py_charges, batch_size);
+  const PyArrayObject * charges_array = check_scalar_array(py_charges, n_batch);
   if (charges_array == NULL) {
     PyErr_SetString(PyExc_TypeError, "Invalid value for charges provided. Must be a (n, ) float64 array.");
+    return NULL;
+  }
+
+  const PyArrayObject * layers_array = check_scalar_array(py_layers, n_layers);
+  if (layers_array == NULL) {
+    PyErr_SetString(PyExc_TypeError, "Invalid value for layers' z-positions provided. Must be a (n_layers, ) float64 array.");
+    return NULL;
+  }
+
+  const PyArrayObject * width_array = check_scalar_array(py_width, n_layers);
+  if (width_array == NULL) {
+    PyErr_SetString(PyExc_TypeError, "Invalid value for widths provided. Must be a (n_layers, ) float64 array.");
+    return NULL;
+  }
+
+  const PyArrayObject * angles_array = check_scalar_array(py_angles, n_layers);
+  if (angles_array == NULL) {
+    PyErr_SetString(PyExc_TypeError, "Invalid value for angles provided. Must be a (n_layers, ) float64 array.");
+    return NULL;
+  }
+
+  const PyArrayObject * heights_array = check_scalar_array(py_heights, n_layers);
+  if (heights_array == NULL) {
+    PyErr_SetString(PyExc_TypeError, "Invalid value for heights provided. Must be a (n_layers, ) float64 array.");
     return NULL;
   }
 
@@ -140,9 +191,16 @@ static PyObject * straw_solve(PyObject *self, PyObject *args) {
   const npy_double * initial_velocities = PyArray_DATA(initial_velocities_array);
   const npy_double * charges = PyArray_DATA(charges_array);
   const npy_double * masses = PyArray_DATA(masses_array);
-  npy_double * output = PyArray_DATA(output_array);
 
-  for (int i = 0; i < batch_size; ++i) {
+  const npy_double * layers = PyArray_DATA(layers_array);
+  const npy_double * widths = PyArray_DATA(width_array);
+  const npy_double * angles = PyArray_DATA(angles_array);
+  const npy_double * heights = PyArray_DATA(heights_array);
+
+  npy_double * response = PyArray_DATA(response_array);
+  npy_double * trajectories = PyArray_DATA(trajectories_array);
+
+  for (int i = 0; i < n_batch; ++i) {
     npy_double x = initial_positions[i * SPACE_DIM];
     npy_double y = initial_positions[i * SPACE_DIM + 1];
     npy_double z = initial_positions[i * SPACE_DIM + 2];
@@ -185,14 +243,62 @@ static PyObject * straw_solve(PyObject *self, PyObject *args) {
 //      const npy_double cy = az * bx - ax * bz;
 //      const npy_double cz = ax * by - ay * bx;
 
-      x = x + dt * vx;
-      y = y + dt * vy;
-      z = z + dt * vz;
+      const npy_double x_ = x + dt * vx;
+      const npy_double y_ = y + dt * vy;
+      const npy_double z_ = z + dt * vz;
+
+      for (int k = 0; k < n_layers; ++k) {
+        const npy_double layer = layers[k];
+        const npy_double height = heights[i];
+        const npy_double r = height / n_straws;
+
+        if ((z < layer - r && z_ < layer - r) || (z > layer + r && z_ > layer + r)) {
+          continue;
+        }
+        // potential hit
+        npy_double t;
+        if (z_ - z > 1.0e-6) {
+          t = (z_ - layer) / (z_ - z);
+        } else {
+          t = 0.5;
+        }
+        const npy_double xi = x + t * (x_ - x);
+        const npy_double yi = y + t * (y_ - y);
+
+        const npy_double angle = angles[i];
+        const npy_double width = widths[i];
+
+        const npy_double nx = cos(angle);
+        const npy_double ny = sin(angle);
+
+        const npy_double hx = nx * xi + ny * yi;
+        const npy_double hy = -ny * xi + nx * yi;
+
+        if (hx > width || hx < -width) {
+          continue;
+        }
+
+        if (hy > height || hy < -height) {
+          continue;
+        }
+
+        const npy_intp straw_i = floor(0.5 * (hy + height) / r);
+
+        if (straw_i < 0 || straw_i >= n_straws) {
+          printf("Warning: invalid straw %d\n", straw_i);
+        }
+
+        response[i * n_layers * n_straws + k * n_straws + straw_i] += dt;
+      }
+
+      x = x_;
+      y = y_;
+      z = z_;
 
       // placeholder
-      output[i * n_steps * SPACE_DIM + j * SPACE_DIM] = x;
-      output[i * n_steps * SPACE_DIM + j * SPACE_DIM + 1] = y;
-      output[i * n_steps * SPACE_DIM + j * SPACE_DIM + 2] = z;
+      trajectories[i * n_steps * SPACE_DIM + j * SPACE_DIM] = x;
+      trajectories[i * n_steps * SPACE_DIM + j * SPACE_DIM + 1] = y;
+      trajectories[i * n_steps * SPACE_DIM + j * SPACE_DIM + 2] = z;
     }
   }
 
@@ -234,7 +340,7 @@ static PyObject * straw_detect(PyObject *self, PyObject *args) {
     PyErr_SetString(PyExc_TypeError, "trajectories must be a (n, n_t, 3) float64 array.");
     return NULL;
   }
-  const npy_intp batch_size = PyArray_DIM(trajectories_array, 0);
+  const npy_intp n_batch = PyArray_DIM(trajectories_array, 0);
   const npy_intp n_steps = PyArray_DIM(trajectories_array, 1);
 
   if (!PyArray_Check(py_layers)) {
@@ -271,7 +377,7 @@ static PyObject * straw_detect(PyObject *self, PyObject *args) {
   if (!(
     PyArray_TYPE(response_array) == NPY_FLOAT64 &&
     PyArray_NDIM(response_array) == 3 &&
-    PyArray_DIM(response_array, 0) == batch_size &&
+    PyArray_DIM(response_array, 0) == n_batch &&
     PyArray_DIM(response_array, 1) ==  n_layers
   )) {
     PyErr_SetString(PyExc_TypeError, "response must be a (n, n_layers, n_straws) float64 array.");
@@ -284,7 +390,7 @@ static PyObject * straw_detect(PyObject *self, PyObject *args) {
   const npy_double * const layers = PyArray_DATA(layers_array);
   npy_double * const response = PyArray_DATA(response_array);
 
-  for (int i = 0; i < batch_size; ++i) {
+  for (int i = 0; i < n_batch; ++i) {
     npy_double z_prev = trajectories[i * n_steps * SPACE_DIM + 2];
 
     for (int j = 1; j < n_steps; ++j) {

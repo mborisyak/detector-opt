@@ -50,6 +50,7 @@ def test_solve(seed, plot_root):
 if __name__ == '__main__':
   n, n_t = 11, 2 * 1024
   dt = 1.0e-2
+  n_layers, n_straws = 7, 23
   x0 = np.zeros(shape=(n, 3)) + np.array([0.0, 0.0, -5.0])
   v0 = np.array([0.0, 0.0, 1.0])[None, :] + 0.05 * np.random.normal(size=(n, 3))
   v0 = 0.99 * v0 / np.sqrt(np.sum(np.square(v0), axis=-1))[..., None]
@@ -57,46 +58,55 @@ if __name__ == '__main__':
   m = np.ones(shape=(n, ))
   B, L = 1.0, 2.0
 
-  output = np.zeros(shape=(n, n_t, 3))
+  trajectories = np.zeros(shape=(n, n_t, 3))
+  responses = np.zeros(shape=(n, n_layers, n_straws))
+
+  layers = np.linspace(-5, 5, num=n_layers, dtype=np.float64)
+  width = 5 * np.ones(shape=(n_layers, ), dtype=np.float64)
+  heights = 5 * np.ones(shape=(n_layers,), dtype=np.float64)
+  angles = np.ones(shape=(n_layers,), dtype=np.float64)
 
   import time
   n_trials = 1024
   start_time = time.perf_counter()
   for i in range(n_trials):
-    _ = detopt.detectors.straw_detector.solve(x0, v0, m, q, B, L, dt, output)
+    _ = detopt.detectors.straw_detector.solve(
+      x0, v0, m, q, B, L, dt,
+      layers, width, heights, angles,
+      trajectories, responses
+    )
   runtime = time.perf_counter() - start_time
   print(f'iterations per second: {n_trials * n / runtime}')
 
-  _ = detopt.detectors.straw_detector.solve(x0, v0, m, q, B, L, dt, output)
+  responses[:] = 0.0
+  _ = detopt.detectors.straw_detector.solve(
+    x0, v0, m, q, B, L, dt,
+    layers, width, heights, angles,
+    trajectories, responses
+  )
 
-  n_l, n_s = 5, 23
-  layers = np.linspace(-5, 5, num=n_l + 2)[1:-1]
-  response = np.zeros(shape=(n, n_l, n_s))
+  print(trajectories[:, 0, :])
+  print(trajectories[:, -1, :])
 
-  _ = detopt.detectors.straw_detector.detect(output, layers, response, 1.0, 2.0)
-
-  print(output[:, 0, :])
-  print(output[:, -1, :])
-
-  print(response[..., 0])
+  print(responses[0])
 
   ax = plt.figure(figsize=(9, 9)).add_subplot(projection='3d')
 
-  xs_ = np.array([np.min(output[..., 0]), np.max(output[..., 0])])
-  ys_ = np.array([np.min(output[..., 1]), np.max(output[..., 1])])
+  xs_ = np.array([np.min(trajectories[..., 0]), np.max(trajectories[..., 0])])
+  ys_ = np.array([np.min(trajectories[..., 1]), np.max(trajectories[..., 1])])
   xs_grid, ys_grid = np.meshgrid(xs_, ys_, indexing='ij')
   for l_z in layers:
     ax.plot_surface(xs_grid, ys_grid, np.ones_like(xs_grid) * l_z, alpha=0.1, color=plt.cm.tab10(3))
 
   for i in range(n):
     ax.plot(
-      output[i, :, 0], output[i, :, 1], output[i, :, 2],
+      trajectories[i, :, 0], trajectories[i, :, 1], trajectories[i, :, 2],
       color=plt.cm.tab10(0) if q[i] < 0.0 else plt.cm.tab10(1)
     )
 
-  zs = np.linspace(np.min(output[..., 2]), np.max(output[..., 2]), num=128)
+  zs = np.linspace(np.min(trajectories[..., 2]), np.max(trajectories[..., 2]), num=128)
 
-  ax.plot(B * np.exp(-np.square(zs / L)), zs, zs=np.max(output[..., 1]), zdir='y', color='black', label='$B_y$')
+  ax.plot(B * np.exp(-np.square(zs / L)), zs, zs=np.max(trajectories[..., 1]), zdir='y', color='black', label='$B_y$')
   ax.legend()
   ax.set_xlabel('x')
   ax.set_ylabel('y')
