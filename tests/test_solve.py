@@ -48,23 +48,27 @@ def test_solve(seed, plot_root):
   plt.close(fig)
 
 if __name__ == '__main__':
-  n, n_t = 11, 2 * 1024
+  rng = np.random.RandomState(123)
+
+  n, n_t = 7, 1500
   dt = 1.0e-2
-  n_layers, n_straws = 7, 23
-  x0 = np.zeros(shape=(n, 3)) + np.array([0.0, 0.0, -5.0])
-  v0 = np.array([0.0, 0.0, 1.0])[None, :] + 0.05 * np.random.normal(size=(n, 3))
+  n_layers, n_straws = 7, 40
+  x0 = rng.normal(size=(n, 3))
+  x0[..., -1] = -5
+  v0 = np.array([0.0, 0.0, 1.0])[None, :] + 0.1 * rng.normal(size=(n, 3))
   v0 = 0.99 * v0 / np.sqrt(np.sum(np.square(v0), axis=-1))[..., None]
-  q = 2 * np.random.binomial(p=0.5, n=1, size=(n, )).astype(np.double) - 1
+  q = 2 * rng.binomial(p=0.5, n=1, size=(n, )).astype(np.double) - 1
+  print(q)
   m = np.ones(shape=(n, ))
   B, L = 1.0, 2.0
 
   trajectories = np.zeros(shape=(n, n_t, 3))
   responses = np.zeros(shape=(n, n_layers, n_straws))
 
-  layers = np.linspace(-5, 5, num=n_layers, dtype=np.float64)
+  layers = np.linspace(-4, 4, num=n_layers, dtype=np.float64)
   width = 5 * np.ones(shape=(n_layers, ), dtype=np.float64)
   heights = 5 * np.ones(shape=(n_layers,), dtype=np.float64)
-  angles = np.ones(shape=(n_layers,), dtype=np.float64)
+  angles = np.linspace(0, np.pi, num=n_layers, dtype=np.float64)
 
   import time
   n_trials = 1024
@@ -89,28 +93,46 @@ if __name__ == '__main__':
   print(trajectories[:, -1, :])
 
   print(responses[0])
+  combined_response = np.sum(responses, axis=0)
 
-  ax = plt.figure(figsize=(9, 9)).add_subplot(projection='3d')
+  import pyvista as pv
+
+  plotter = pv.Plotter()
 
   xs_ = np.array([np.min(trajectories[..., 0]), np.max(trajectories[..., 0])])
   ys_ = np.array([np.min(trajectories[..., 1]), np.max(trajectories[..., 1])])
   xs_grid, ys_grid = np.meshgrid(xs_, ys_, indexing='ij')
-  for l_z in layers:
-    ax.plot_surface(xs_grid, ys_grid, np.ones_like(xs_grid) * l_z, alpha=0.1, color=plt.cm.tab10(3))
+  for i, l_z in enumerate(layers):
+    for k in range(n_straws):
+      A = np.array([
+        [np.cos(angles[i]), np.sin(angles[i])],
+        [-np.sin(angles[i]), np.cos(angles[i])]
+      ])
+
+      h, w = heights[i], width[i]
+      r = heights[i] / n_straws
+      verts = np.array([
+        [-w, 2 * r * k - h], [-w, 2 * r * k - h + 2 * r], [w, 2 * r * k - h + 2 * r], [w, 2 * r * k - h]
+      ])
+      verts = np.concatenate([np.dot(verts, A), l_z * np.ones(shape=(4, 1))], axis=-1)
+      faces = np.array([[4, 0, 1, 2, 3]])
+      mesh = pv.PolyData(verts, faces=faces)
+      plotter.add_mesh(
+        mesh, color=(1.0, 0.0, 0.0), show_edges=False,
+        opacity=0.5 if combined_response[i, k] > 0.0 else 0.0
+      )
+
+      plotter.add_mesh(mesh, color='black', style='wireframe', opacity=0.25, line_width=0.1)
 
   for i in range(n):
-    ax.plot(
-      trajectories[i, :, 0], trajectories[i, :, 1], trajectories[i, :, 2],
-      color=plt.cm.tab10(0) if q[i] < 0.0 else plt.cm.tab10(1)
-    )
+    traj = pv.Spline(trajectories[i])#.tube(radius=0.05, )
+    plotter.add_mesh(traj, color='red' if q[i] > 0 else 'blue', line_width=4, opacity=0.5)
+    # ax.plot(
+    #   trajectories[i, :, 0], trajectories[i, :, 1], trajectories[i, :, 2],
+    #   color=plt.cm.tab10(0) if q[i] < 0.0 else plt.cm.tab10(1), zorder=10
+    # )
 
   zs = np.linspace(np.min(trajectories[..., 2]), np.max(trajectories[..., 2]), num=128)
-
-  ax.plot(B * np.exp(-np.square(zs / L)), zs, zs=np.max(trajectories[..., 1]), zdir='y', color='black', label='$B_y$')
-  ax.legend()
-  ax.set_xlabel('x')
-  ax.set_ylabel('y')
-  ax.set_zlabel('z')
-  plt.tight_layout()
-  plt.savefig('boris.png')
-  plt.close()
+  plotter.show_grid()
+  # plotter.enable_depth_peeling()
+  plotter.show()
