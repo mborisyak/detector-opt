@@ -50,89 +50,72 @@ def test_solve(seed, plot_root):
 if __name__ == '__main__':
   rng = np.random.RandomState(123)
 
-  n, n_t = 7, 1500
-  dt = 1.0e-2
-  n_layers, n_straws = 7, 40
-  x0 = rng.normal(size=(n, 3))
-  x0[..., -1] = -5
-  v0 = np.array([0.0, 0.0, 1.0])[None, :] + 0.1 * rng.normal(size=(n, 3))
-  v0 = 0.99 * v0 / np.sqrt(np.sum(np.square(v0), axis=-1))[..., None]
-  q = 2 * rng.binomial(p=0.5, n=1, size=(n, )).astype(np.double) - 1
-  print(q)
-  m = np.ones(shape=(n, ))
-  B, L = 1.0, 2.0
+  n_batch = 3
+  n_layers = 16
+  generator = detopt.detectors.StrawDetector(n_layers=n_layers)
 
-  trajectories = np.zeros(shape=(n, n_t, 3))
-  responses = np.zeros(shape=(n, n_layers, n_straws))
+  configs = np.ndarray(shape=(n_batch, 2 * n_layers + 1))
 
-  layers = np.linspace(-4, 4, num=n_layers, dtype=np.float64)
-  width = 5 * np.ones(shape=(n_layers, ), dtype=np.float64)
-  heights = 5 * np.ones(shape=(n_layers,), dtype=np.float64)
-  angles = np.linspace(0, np.pi, num=n_layers, dtype=np.float64)
+  configs[:, :n_layers] = np.linspace(-3, 3, num=n_layers)[None, :]
+  configs[:, n_layers:-1] = np.linspace(-3, 3, num=n_layers)[None, :]
+  configs[:, -1] = 5.0
 
   import time
   n_trials = 1024
   start_time = time.perf_counter()
   for i in range(n_trials):
-    _ = detopt.detectors.straw_detector.solve(
-      x0, v0, m, q, B, L, dt,
-      layers, width, heights, angles,
-      trajectories, responses
-    )
+    _ = generator(seed=1, configurations=configs)
   runtime = time.perf_counter() - start_time
-  print(f'iterations per second: {n_trials * n / runtime}')
+  events_per_second_single_core = n_trials * n_batch / runtime
+  print(f'events per second: {events_per_second_single_core}')
 
-  responses[:] = 0.0
-  _ = detopt.detectors.straw_detector.solve(
-    x0, v0, m, q, B, L, dt,
-    layers, width, heights, angles,
-    trajectories, responses
+  import cProfile
+  def generate():
+    for _ in range(n_trials):
+      generator(seed=1, configurations=configs)
+
+  cProfile.run('generate()', 'generate.profile')
+
+  from concurrent.futures import ThreadPoolExecutor
+  import os
+
+  n_cores = 5 # os.cpu_count()
+  start_time = time.perf_counter()
+  with ThreadPoolExecutor(max_workers=n_cores) as executor:
+    futures = [
+      executor.submit(generator, seed=1, configurations=configs)
+      for _ in range(n_trials)
+    ]
+
+    for future in futures:
+      _ = future.result()
+
+  runtime = time.perf_counter() - start_time
+  events_per_second_multi_core = n_trials * n_batch / runtime
+  print(
+    f'events per second: {events_per_second_multi_core} '
+    f'(eff. {events_per_second_multi_core / events_per_second_single_core / n_cores})'
   )
 
-  print(trajectories[:, 0, :])
-  print(trajectories[:, -1, :])
+  v0s = list()
+  ys = list()
+  for i in range(1000):
+    _, _, _, v0, trajectories, response, signal = generator.sample(seed=i, design=configs)
+    v0s.append(v0)
+    ys.append(signal)
 
-  print(responses[0])
-  combined_response = np.sum(responses, axis=0)
+  v0s = np.concatenate(v0s, axis=0)
+  ys = np.concatenate(ys, axis=0)
 
-  import pyvista as pv
+  ns = np.sum(np.sum(np.square(v0s), axis=-1) > 1.0e-3, axis=-1)
 
-  plotter = pv.Plotter()
+  plt.hist([ns[ys > 0.5], ns[ys < 0.5]], bins=7, label=['signal', 'noise'], histtype='step')
+  plt.title('Number of trajectories per event')
+  plt.legend()
+  plt.savefig('straw-events.png')
+  plt.close()
 
-  xs_ = np.array([np.min(trajectories[..., 0]), np.max(trajectories[..., 0])])
-  ys_ = np.array([np.min(trajectories[..., 1]), np.max(trajectories[..., 1])])
-  xs_grid, ys_grid = np.meshgrid(xs_, ys_, indexing='ij')
-  for i, l_z in enumerate(layers):
-    for k in range(n_straws):
-      A = np.array([
-        [np.cos(angles[i]), np.sin(angles[i])],
-        [-np.sin(angles[i]), np.cos(angles[i])]
-      ])
+  _, _, _, _, trajectories, response, signal = generator.sample(seed=15, design=configs)
+  layers, angles, widths, heights, Bs, Ls = generator.get_design(design=configs)
 
-      h, w = heights[i], width[i]
-      r = heights[i] / n_straws
-      verts = np.array([
-        [-w, 2 * r * k - h], [-w, 2 * r * k - h + 2 * r], [w, 2 * r * k - h + 2 * r], [w, 2 * r * k - h]
-      ])
-      verts = np.concatenate([np.dot(verts, A), l_z * np.ones(shape=(4, 1))], axis=-1)
-      faces = np.array([[4, 0, 1, 2, 3]])
-      mesh = pv.PolyData(verts, faces=faces)
-      plotter.add_mesh(
-        mesh, color=(1.0, 0.0, 0.0), show_edges=False,
-        opacity=0.5 if combined_response[i, k] > 0.0 else 0.0
-      )
-
-      plotter.add_mesh(mesh, color='black', style='wireframe', opacity=0.25, line_width=0.1)
-
-  for i in range(n):
-    traj = pv.Spline(trajectories[i])#.tube(radius=0.05, )
-    plotter.add_mesh(traj, color='red' if q[i] > 0 else 'blue', line_width=4, opacity=0.5)
-    # ax.plot(
-    #   trajectories[i, :, 0], trajectories[i, :, 1], trajectories[i, :, 2],
-    #   color=plt.cm.tab10(0) if q[i] < 0.0 else plt.cm.tab10(1), zorder=10
-    # )
-
-  zs = np.linspace(np.min(trajectories[..., 2]), np.max(trajectories[..., 2]), num=128)
-  plotter.show_grid()
-  # plotter.enable_depth_peeling()
-  plotter.show()
+  detopt.utils.viz.straw.show(layers[0], angles[0], widths[0], heights[0], response[0], trajectories[0], signal[0])

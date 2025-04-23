@@ -1,127 +1,193 @@
+import math
+
 import jax
 import jax.numpy as jnp
 
+import numpy as np
+import scipy as sp
+
+from . import straw_detector
+
 __all__ = [
-  'solve'
+  'StrawDetector'
 ]
 
-def boris_step(x, v, q_inv_m_B, dt):
-  # Magnetic field rotation
-  t = 0.5 * dt * q_inv_m_B
-  t_norm_sqr = jnp.sum(jnp.square(t), axis=-1)
-  v_ = v + jnp.cross(v, t)
-  v_updated = v + 2 * jnp.cross(v_, t) / (1 + t_norm_sqr)[..., None]
-  x_updated = x + v_updated * dt
+INV_SQRT_2 = math.sqrt(0.5)
+SQRT_2 = math.sqrt(2.0)
+LOG_2 = math.log(2.0)
 
-  return x_updated, v_updated
+def uniform_to_normal(xs, low, high):
+  """
+  A transformation that converts a uniformly distributed variable U[low, high] into N(0, 1).
+  """
+  ### uniform = 1 - exp(-x / 2)
+  ### normal = erfinv(2 * uniform - 1) * sqrt(2)
+  if hasattr(xs, 'dtype'):
+    eps = np.finfo(xs.dtype).eps
+  else:
+    eps = np.finfo(np.float64).eps
 
-def solve(x0, v0, q, m, J, K, L, *, B0: jax.Array | None=None, dt: float, steps: int):
-  A = jnp.array([
-    [J, -K, 0],
-    [K, -J, 0],
-    [0, 0, 0]
-  ], dtype=x0.dtype)
-  # Bx = (J * x + K * y) exp(-z^2 / L^2)
-  # By = (-K * x - J * y) exp(-z^2 / L^2)
+  c = (low + high) / 2
+  d = (high - low) / 2
 
-  def step(state, _):
-    x, v = state
-    B_ = jnp.exp(-jnp.square(x[..., -1] / L))[..., None] * jnp.matmul(x, A)
-    B = B_ if B0 is None else (B_ + B0)
-    q_inv_m_B = B * (0.5 * q[..., None] / m[..., None])
-    x_updated, v_updated = boris_step(x, v, q_inv_m_B, dt)
+  us = np.clip((xs - c) / d, eps - 1, 1 - eps)
 
-    state_updated = (x_updated, v_updated)
-    return state_updated, x_updated
-  # (n, n_t, 3)
-  _, trajectory = jax.lax.scan(
-    step,
-    init=(x0, v0),
-    xs=None,
-    length=steps
-  )
+  return sp.special.erfinv(us) * SQRT_2
 
-  return trajectory
-
-  # (n, n_layers, n_tubes) 0.0 if no hit, 1.0 if hit
-
-def project(
-  trajectory: jax.Array,
-  z0s: jax.Array, angles: jax.Array, lengths: jax.Array, straw_r: jax.Array,
-  n_straws: int
-):
-  # trajectory: (n_t, n, 3)
-  # z0s: (n_layers, )
-  x, y, z = trajectory[..., 0], trajectory[..., 1], trajectory[..., 2]
-  alpha = (z0s - z[:-1]) / (z[1:] - z[:-1])
-  intersections = alpha * (trajectory[1:] - trajectory[:-1]) + trajectory[:-1]
-
-  n_x, n_y = jnp.cos(angles), jnp.sin(angles)
-
-  a = x * n_x + y * n_y
-  delta_x = x - a * n_x
-  delta_y = y - a * n_y
-  delta = jnp.sqrt(jnp.square(delta_x) + jnp.square(delta_y))
-
-  index = delta / (2 * straw_r)
-  return
-
+def normal_to_uniform(xs, low, high):
+  """
+  A transformation that converts a normally distributed variable N(0, 1) into U[low, high].
+  """
+  us = sp.special.erf(xs * INV_SQRT_2,)
+  c = (low + high) / 2
+  d = (high - low) / 2
+  return us * d + c
 
 class StrawDetector(object):
   def __init__(
-    self, layers, origin, momentum,
-    J, K, L, dt,
-    sigma_x0: float=1.0e-1, sigma_v0: float=1.0e-1,
-    lambda_m: float=1.0
+    self,
+    max_B: float=0.5, L=1.0,
+    layer_bounds: tuple[float | int, float | int]=(-5.0, 5.0),
+    layer_width: float=5, layer_height: float=5,
+    dt: float=1.0e-2,
+    n_layers: int=16, n_straws: int=32,
+    max_particles=8,
+    origin=(0.0, 0.0, -10.0), origin_sigma=(0.2, 0.2, 1.0),
+    momentum=(0.0, 0.0, 5.0), momentum_sigma=(0.25, 0.25, 0.5),
+    noise_origin=(0.0, 0.0, -10.0), noise_origin_sigma=(1.0, 1.0, 1.0),
+    noise_momentum=(0.0, 0.0, 5.0), noise_momentum_sigma=(0.2, 0.2, 1.0),
+    straw_signal_rate=200.0,
+    straw_noise_rate=10.0,
   ):
     """
-    :param layers: layers in form [(z_0, angle_0, length_0, height_0), ...]
-    :param origin:
-    :param momentum:
-    :param J:
-    :param K:
-    :param L:
-    :param dt:
-    :param sigma_x0:
-    :param sigma_v0:
+    :param max_B: maximal strength of the magnetic field;
+    :param L: length parameter of the magnetic field;
+    :param origin: the mean point of particles' origin;
+    :param layer_bounds: restrictions on the layers' positions;
+    :param dt: time increment for the ODE solver;
     """
-    self.layers = layers
 
-    self.origin = origin
-    self.momentum = momentum
-
-    self.sigma_x0 = sigma_x0
-    self.sigma_v0 = sigma_v0
-    self.lambda_m = lambda_m
-
-    self.J = J
-    self.K = K
+    self.max_B = max_B
     self.L = L
+
+    self.origin = np.array(origin, dtype=np.float32)
+    self.origin_sigma = np.array(origin_sigma, np.float32)
+    self.momentum = np.array(momentum, dtype=np.float32)
+    self.momentum_sigma = np.array(momentum_sigma, dtype=np.float32)
+
+    self.noise_origin = np.array(noise_origin, dtype=np.float32)
+    self.noise_origin_sigma = np.array(noise_origin_sigma, np.float32)
+    self.noise_momentum = np.array(noise_momentum, dtype=np.float32)
+    self.noise_momentum_sigma = np.array(noise_momentum_sigma, dtype=np.float32)
+
+    self.layer_bounds = layer_bounds
     self.dt = dt
 
-    self.layers = layers
-    self.max_L = max(z for z, _ in layers)
+    self.layer_width = layer_width
+    self.layer_height = layer_height
 
-    min_v_z = self.momentum[-1] - 3 * self.sigma_v0
+    self.n_layers = n_layers
+    self.n_straws = n_straws
+    assert max_particles > 1, 'signal events produce at least 2 particles'
+    self.max_particles = max_particles
 
-    self.steps = 2 * L / min_v_z / dt
+    flight_distance = max(5 * L, layer_bounds[1]) - origin[2] - 3 * origin_sigma[2]
 
-  def __call__(self, rng: jax.Array, n: int):
-    key_x0, key_v0, key_q, key_m = jax.random.split(rng, num=4)
+    self.n_t = int(2 * flight_distance / dt)
+    self.straw_signal_rate = straw_signal_rate
+    self.straw_noise_rate = straw_noise_rate
 
-    x0 = self.sigma_x0 * jax.random.normal(key_x0, shape=(n, 3)) + self.origin
-    v0 = self.sigma_v0 * jax.random.normal(key_v0, shape=(n, 3)) + self.momentum
+  def design_shape(self):
+    ### positions + angles + magnetic field strength
+    return (self.n_layers + self.n_layers + 1, )
 
-    q = 2.0 * jax.random.bernoulli(key_q, p=0.5, shape=(n, )) - 1.0
-    m = self.lambda_m * jax.random.exponential(key_m, shape=(n, ))
+  def design_dim(self):
+    return math.prod(self.design_shape())
 
-    trajectory = solve(
-      x0, v0, q=q, m=m,
-      J=self.J, K=self.K, L=self.L,
-      B0=None, dt=self.dt, steps=self.steps
+  def output_shape(self):
+    ### positions + angles + magnetic field strength
+    return (self.n_layers, self.n_straws)
+
+  def output_dim(self):
+    return math.prod(self.output_shape())
+
+  def get_design(self, design: np.ndarray[tuple[int, int], np.dtype[np.float32]]):
+    n, _ = design.shape
+    m = self.n_layers
+
+    positions_normalized = design[:, :m]
+    angles_normalized = design[:, m:-1]
+    magnetic_strength_normalized = design[:, -1]
+
+    layers = normal_to_uniform(positions_normalized, *self.layer_bounds).astype(np.float32)
+    ### overlapping angles for easier optimization
+    angles = normal_to_uniform(angles_normalized, -np.pi, np.pi).astype(np.float32)
+
+    widths = self.layer_width + np.zeros(shape=(n, m), dtype=np.float32)
+    heights = self.layer_height + np.zeros(shape=(n, m), dtype=np.float32)
+
+    Bs = normal_to_uniform(magnetic_strength_normalized, 0.0, self.max_B).astype(np.float32)
+    Ls = self.L + np.zeros(shape=(n,), dtype=np.float32)
+
+    return layers, angles, widths, heights, Bs, Ls
+
+  def sample(self, seed: int, design: np.ndarray):
+    ### the first two particles reserve for signal
+    ### the rest is sampled as noise
+    rng = np.random.RandomState(seed)
+
+    n, _ = design.shape
+
+    layers, angles, widths, heights, Bs, Ls = self.get_design(design)
+
+    masses = np.ones(shape=(n ,self.max_particles, ), dtype=np.float32)
+    charges = (2 * rng.binomial(n=1, p=0.5, size=(n, self.max_particles)) - 1).astype(np.float32)
+
+    initial_positions = np.ndarray(shape=(n, self.max_particles, 3), dtype=np.float32)
+    initial_momentum = np.ndarray(shape=(n, self.max_particles, 3), dtype=np.float32)
+
+    u = rng.uniform(low=0.0, high=1.0, size=(n, ))
+    included = (rng.uniform(low=0.0, high=1.0, size=(n, self.max_particles - 2)) < u[:, None]).astype(dtype=np.float32)
+
+    noise_positions = self.noise_origin_sigma * rng.normal(size=(n, self.max_particles, 3)) + self.noise_origin
+    ### the total momentum would be ~ N(m, sigma^2)
+    noise_momentum = self.noise_momentum_sigma * rng.normal(size=(n, self.max_particles, 3)) + self.noise_momentum
+
+    initial_positions[:, 2:, :] = included[:, :, None] * noise_positions[:, 2:]
+    initial_momentum[:, 2:, :] = included[:, :, None] * noise_momentum[:, 2:]
+
+    signal_positions = self.origin_sigma * rng.normal(size=(n, 3)) + self.origin
+    ### the total momentum would be ~ N(m, sigma^2)
+    signal_momentum = INV_SQRT_2 * self.momentum_sigma * rng.normal(size=(n, 2, 3)) + 0.5 * self.momentum
+
+    signal = rng.binomial(n=1, p=0.5, size=(n,)).astype(dtype=np.float32)
+    initial_positions[:, :2, :] = signal[:, None, None] * signal_positions[:, None, :] + \
+                                  (1 - signal)[:, None, None] * noise_positions[:, :2, :]
+    initial_momentum[:, :2, :] = signal[:, None, None] * signal_momentum + \
+                                 (1 - signal)[:, None, None] * noise_momentum[:, :2, :]
+    charges[:, 0] = -signal * charges[:, 1] + (1 - signal) * charges[:, 0]
+
+    momentum_norm_sqr = np.sum(np.square(initial_momentum), axis=-1)
+    initial_velocities = initial_momentum / np.sqrt(np.square(masses) + momentum_norm_sqr)[..., None]
+
+    trajectories = np.zeros(shape=(n, self.max_particles, self.n_t, 3), dtype=np.float32)
+    response = np.zeros(shape=(n, self.max_particles, self.n_layers, self.n_straws), dtype=np.float32)
+
+    straw_detector.solve(
+      initial_positions, initial_velocities,
+      masses, charges, Bs, Ls,
+      self.n_t, self.dt, layers, widths, heights,
+      angles, trajectories, response
     )
 
-    return trajectory
+    combined_response = np.sum(response, axis=1) * self.straw_signal_rate + self.straw_noise_rate
+    measurements = rng.poisson(combined_response, size=combined_response.shape) / self.straw_signal_rate
+
+    return masses, charges, initial_positions, initial_momentum, trajectories, measurements, signal
+
+  def __call__(self, seed: int, configurations: np.ndarray):
+    _, _, _, _, _, measurements, signal = self.sample(seed, configurations)
+    return measurements, signal
 
 
 
