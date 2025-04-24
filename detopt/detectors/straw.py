@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 import scipy as sp
 
+from .common import Detector
 from . import straw_detector
 
 __all__ = [
@@ -43,7 +44,7 @@ def normal_to_uniform(xs, low, high):
   d = (high - low) / 2
   return us * d + c
 
-class StrawDetector(object):
+class StrawDetector(Detector):
   def __init__(
     self,
     max_B: float=0.5, L=1.0,
@@ -101,15 +102,9 @@ class StrawDetector(object):
     ### positions + angles + magnetic field strength
     return (self.n_layers + self.n_layers + 1, )
 
-  def design_dim(self):
-    return math.prod(self.design_shape())
-
   def output_shape(self):
     ### positions + angles + magnetic field strength
     return (self.n_layers, self.n_straws)
-
-  def output_dim(self):
-    return math.prod(self.output_shape())
 
   def get_design(self, design: np.ndarray[tuple[int, int], np.dtype[np.float32]]):
     n, _ = design.shape
@@ -188,6 +183,10 @@ class StrawDetector(object):
   def __call__(self, seed: int, configurations: np.ndarray):
     _, _, _, _, _, measurements, signal = self.sample(seed, configurations)
     return measurements, signal
+
+  def loss(self, target, predicted):
+    import optax
+    return optax.sigmoid_binary_cross_entropy(predicted, target)
 
 
 
