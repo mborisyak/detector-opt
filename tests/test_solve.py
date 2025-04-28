@@ -28,7 +28,7 @@ def test_solve(seed, plot_root):
   q = 2 * jax.random.randint(key_q, shape=(n, ), minval=0, maxval=2) - 1
   m = jax.random.lognormal(key_m, shape=(n, ), sigma=1.0)
 
-  trajectory = detopt.detectors.straw.solve(x0, v0, q=q, m=m, J=0.0, K=0.2, L=3.0, B0=B0, dt=1.0e-2, steps=2000)
+  trajectory = detopt.detector.straw.solve(x0, v0, q=q, m=m, J=0.0, K=0.2, L=3.0, B0=B0, dt=1.0e-2, steps=2000)
 
   print(trajectory.shape)
 
@@ -52,7 +52,7 @@ if __name__ == '__main__':
 
   n_batch = 3
   n_layers = 16
-  generator = detopt.detectors.StrawDetector(n_layers=n_layers)
+  generator = detopt.detector.StrawDetector(n_layers=n_layers)
 
   configs = np.ndarray(shape=(n_batch, 2 * n_layers + 1))
 
@@ -115,7 +115,7 @@ if __name__ == '__main__':
   plt.savefig('straw-events.png')
   plt.close()
 
-  _, _, _, _, trajectories, response, signal = generator.sample(seed=15, design=configs)
+  _, _, _, _, trajectories, response, signal = generator.sample(seed=1234567899, design=configs)
   layers, angles, widths, heights, Bs, Ls = generator.get_design(design=configs)
 
   detopt.utils.viz.straw.show(layers[0], angles[0], widths[0], heights[0], response[0], trajectories[0], signal[0])

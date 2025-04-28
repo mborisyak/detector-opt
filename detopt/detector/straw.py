@@ -52,7 +52,7 @@ class StrawDetector(Detector):
     layer_width: float=5, layer_height: float=5,
     dt: float=1.0e-2,
     n_layers: int=16, n_straws: int=32,
-    max_particles=8,
+    max_particles=3,
     origin=(0.0, 0.0, -10.0), origin_sigma=(0.2, 0.2, 1.0),
     momentum=(0.0, 0.0, 5.0), momentum_sigma=(0.25, 0.25, 0.5),
     noise_origin=(0.0, 0.0, -10.0), noise_origin_sigma=(1.0, 1.0, 1.0),
@@ -106,6 +106,9 @@ class StrawDetector(Detector):
     ### positions + angles + magnetic field strength
     return (self.n_layers, self.n_straws)
 
+  def target_shape(self):
+    return ()
+
   def get_design(self, design: np.ndarray[tuple[int, int], np.dtype[np.float32]]):
     n, _ = design.shape
     m = self.n_layers
@@ -129,7 +132,7 @@ class StrawDetector(Detector):
   def sample(self, seed: int, design: np.ndarray):
     ### the first two particles reserve for signal
     ### the rest is sampled as noise
-    rng = np.random.RandomState(seed)
+    rng = np.random.default_rng(seed)
 
     n, _ = design.shape
 

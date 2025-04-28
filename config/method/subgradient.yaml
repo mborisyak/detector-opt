@@ -1,0 +1,17 @@
+subgradient:
+  batch_size: 32
+  n_steps_regressor: 8
+  design_eps: 0.05
+
+  regressor:
+    resnet:
+      n_hidden: 128
+      depth: 5
+
+  optimizer_regressor:
+    adabelief:
+      learning_rate: 2.5e-4
+
+  optimizer_design:
+    nadam:
+      learning_rate: 1.0e-3

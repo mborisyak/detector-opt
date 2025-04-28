@@ -1,0 +1,11 @@
+detector: straw
+
+model: resnet-128
+optimizer:
+  adabelief:
+    learning_rate: 2.0e-4
+
+batch: 32
+epochs: 256
+steps: 1024
+validation_batches: 1024

@@ -1,0 +1,10 @@
+detector: straw
+method: subgradient
+
+### for direct training
+model: resnet-128
+optimizer: adam
+
+epochs: 128
+steps: 1024
+validation_batches: 4096
