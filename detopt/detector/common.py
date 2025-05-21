@@ -36,8 +36,14 @@ class Detector(object):
   def loss(self, target, predicted):
     raise NotImplementedError()
 
+  def loss_name(self):
+    raise NotImplementedError()
+
   def metric(self, target, predicted):
     return self.loss(target, predicted)
+
+  def metric_name(self):
+    return self.loss_name()
 
 
 

@@ -1,6 +1,6 @@
 detector: straw
 
-model: resnet-128
+regressor: resnet-128
 optimizer:
   adabelief:
     learning_rate: 2.0e-4

@@ -191,5 +191,14 @@ class StrawDetector(Detector):
     import optax
     return optax.sigmoid_binary_cross_entropy(predicted, target)
 
+  def loss_name(self):
+    return 'cross-entropy'
+
+  def metric(self, target, predicted):
+    return (predicted > 0.0) != (target > 0.5)
+
+  def metric_name(self):
+    return 'classification error'
+
 
 
