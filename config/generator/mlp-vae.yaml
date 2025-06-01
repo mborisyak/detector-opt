@@ -1,0 +1,9 @@
+model:
+  mlp-vae:
+    units: [512, 256, 128, 64]
+
+optimizer:
+  adam:
+    learning_rate: 1.0e-3
+
+steps: 8

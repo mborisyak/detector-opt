@@ -1,0 +1,7 @@
+model:
+  deep-set-vae:
+    features: [[128, 96], [64, 48], [32, 24]]
+
+optimizer:
+  adam:
+    learning_rate: 1.0e-3

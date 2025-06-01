@@ -1,0 +1,9 @@
+model:
+  cnn:
+    features: [24, 32, 48, 64]
+
+optimizer:
+  adam:
+    learning_rate: 1.0e-3
+
+steps: 8

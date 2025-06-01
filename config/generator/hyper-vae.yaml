@@ -1,0 +1,10 @@
+model:
+  hyper-vae:
+    units: [512, 256, 128, 64]
+    design_embedding: [96, 64]
+
+optimizer:
+  adabelief:
+    learning_rate: 2.0e-4
+
+steps: 8

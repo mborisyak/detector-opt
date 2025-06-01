@@ -1,0 +1,11 @@
+model:
+  resnet:
+    n_hidden: 128
+    depth: 5
+    p_dropout: 0.1
+
+optimizer:
+  adabelief:
+    learning_rate: 1.0e-3
+
+steps: 8

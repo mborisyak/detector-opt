@@ -1,0 +1,23 @@
+detector: straw
+
+regressor: deep-set-24
+discriminator: deep-set-24
+generator: deep-set-vae-64
+
+initial_design: data/design/default.json
+trace: data/design/vae/
+
+eps: 1.0e-2
+likelihood_sigma: 1.0e-1
+
+optimizer:
+  adam:
+    learning_rate: 1.0e-3
+    b1: 0.99
+    b2: 0.998
+
+epochs: 32
+steps: 128
+substeps: 2
+batch: 16
+validation_batches: 128

@@ -128,3 +128,5 @@ release/
 *.mp4
 *.webm
 *.html
+
+data/

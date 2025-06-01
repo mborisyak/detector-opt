@@ -1,0 +1,11 @@
+model:
+  hyper-resnet:
+    n_hidden: 32
+    depth: 8
+    p_dropout: 0.1
+
+optimizer:
+  adabelief:
+    learning_rate: 1.0e-3
+
+steps: 8
