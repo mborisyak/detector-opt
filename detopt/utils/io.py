@@ -1,6 +1,7 @@
 import os
 
 import flax
+import jax.tree
 from flax import nnx
 
 import orbax.checkpoint as ocp
@@ -55,10 +56,7 @@ def save_model(parameters, state, optimizer_state):
   if parameters is None:
     return dict(parameters=None, state=None, optimizer_state=None)
 
-  parameters = nnx.to_pure_dict(parameters)
-  state = nnx.to_pure_dict(state)
-  optimizer_state = flax.serialization.to_state_dict(optimizer_state)
-
+  optimizer_state = jax.tree.leaves(optimizer_state)
   return dict(parameters=parameters, state=state, optimizer_state=optimizer_state)
 
 def save_state(
@@ -69,12 +67,9 @@ def save_state(
   discriminator_parameters=None, discriminator_state=None, discriminator_optimizer_state=None,
   *, aux
 ):
-  if design_optimizer_state is not None:
-    design_optimizer_state = flax.serialization.to_state_dict(design_optimizer_state)
-
   manager.save(step, args=ocp.args.Composite(
     ### because saving a standalone array is difficult
-    design=ocp.args.PyTreeSave({'design' : design, 'optimizer_state': design_optimizer_state}),
+    design=ocp.args.PyTreeSave({'design' : design, 'optimizer_state': jax.tree.leaves(design_optimizer_state)}),
 
     regressor=ocp.args.PyTreeSave(
       save_model(regressor_parameters, regressor_state, regressor_optimizer_state)
@@ -89,7 +84,7 @@ def save_state(
     aux=ocp.args.PyTreeSave(aux)
   ))
 
-def restore_model(config, input_shape, design_shape, target_shape, restored, rngs):
+def restore_model(config, detector, restored, rngs):
   from .. import nn
   if config is None:
     return dict(
@@ -98,21 +93,22 @@ def restore_model(config, input_shape, design_shape, target_shape, restored, rng
     )
 
   model = nn.from_config(
-    input_shape, design_shape, target_shape, config=config['model'], rngs=rngs
+    detector, config=config['model'], rngs=rngs
   )
   model_def, initial_model_parameters, initial_model_state = nnx.split(model, nnx.Param, nnx.Variable)
   optimizer = config_utils.optimizer(config['optimizer'])
 
   if restored is None:
-    parameters = initial_model_parameters
-    model_state = initial_model_state
+    parameters = nnx.to_pure_dict(initial_model_parameters)
+    model_state = nnx.to_pure_dict(initial_model_state)
     optimizer_state = optimizer.init(parameters)
   else:
     parameters = restored['parameters']
     model_state = restored['state']
-    optimizer_state = restored['optimizer_state']
-    if optimizer_state is not None:
-      optimizer_state = flax.serialization.from_state_dict(optimizer.init(parameters), restored['optimizer_state'])
+    optimizer_state = jax.tree.unflatten(
+      jax.tree.structure(optimizer.init(parameters)),
+      restored['optimizer_state']
+    )
 
   return dict(
     model=model_def, optimizer=optimizer,
@@ -124,8 +120,6 @@ def restore_state(manager, detector, config, *, rngs: nnx.Rngs, restore=True):
     design_optimizer = config_utils.optimizer(config['optimizer'])
   else:
     design_optimizer = None
-
-  input_shape, design_shape, target_shape = detector.output_shape(), detector.design_shape(), detector.target_shape()
 
   last_epoch = manager.latest_step()
   if last_epoch is not None and restore:
@@ -143,10 +137,10 @@ def restore_state(manager, detector, config, *, rngs: nnx.Rngs, restore=True):
     )
     ### design -> design because it is a standalone array
     design, design_optimizer_state = data['design']['design'], data['design']['optimizer_state']
-    if design_optimizer_state is not None:
-      design_optimizer_state = flax.serialization.from_state_dict(
-        design_optimizer.init(design), design_optimizer_state
-      )
+    design_optimizer_state = jax.tree.unflatten(
+      jax.tree.structure(design_optimizer.init(design)),
+      design_optimizer_state
+    )
 
   else:
     starting_epoch = 0
@@ -160,15 +154,15 @@ def restore_state(manager, detector, config, *, rngs: nnx.Rngs, restore=True):
       design_optimizer_state = design_optimizer.init(design)
 
   regressor = restore_model(
-    config.get('regressor', None), input_shape, design_shape, target_shape, data.get('regressor', None), rngs=rngs
+    config.get('regressor', None), detector, data.get('regressor', None), rngs=rngs
   )
 
   generator = restore_model(
-    config.get('generator', None), input_shape, design_shape, (), data.get('generator', None), rngs=rngs
+    config.get('generator', None), detector, data.get('generator', None), rngs=rngs
   )
 
   discriminator = restore_model(
-    config.get('discriminator', None), input_shape, design_shape, (), data.get('discriminator', None), rngs=rngs
+    config.get('discriminator', None), detector, data.get('discriminator', None), rngs=rngs
   )
 
   return dict(

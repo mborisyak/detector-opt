@@ -9,11 +9,13 @@ from flax import nnx
 import optax
 
 import detopt
+from detopt.nn import cross_entropy_elbo
 
 MAX_INT = 9223372036854775807
 
 def optimize(seed, output, progress=True, restore=True, trace=None, **config):
   print(f'using {config.get("regressor")} as regressor')
+  print(f'using {config.get("discriminator")} as discriminator')
 
   np_rng = np.random.default_rng(seed=seed)
   get_seed = lambda: np_rng.integers(low=0, high=MAX_INT)
@@ -41,12 +43,17 @@ def optimize(seed, output, progress=True, restore=True, trace=None, **config):
   regressor_parameters, regressor_state =  restored['regressor']['parameters'],  restored['regressor']['state']
   regressor_optimizer_state = restored['regressor']['optimizer_state']
 
+  discriminator_def, discriminator_optimizer = restored['discriminator']['model'], restored['discriminator']['optimizer']
+  discriminator_parameters, discriminator_state = restored['discriminator']['parameters'], restored['discriminator']['state']
+  discriminator_optimizer_state = restored['discriminator']['optimizer_state']
+
   design_eps = float(config['design_eps'])
 
   epochs, steps, substeps = config['epochs'], config['steps'], config['substeps']
   batch, validation_batches = config['batch'], config['validation_batches']
 
-  reg_coef = config.get('regularization', 1.0e-2)
+  reg_coef = config.get('regularization', 1.0e-3)
+  discr_reg_coef = config.get('discriminator_regularization', 1.0e-3)
 
   @jax.jit
   def loss_f(x, c, t, r_params, r_state):
@@ -73,6 +80,46 @@ def optimize(seed, output, progress=True, restore=True, trace=None, **config):
     updates, opt_state = regressor_optimizer.update(grad, opt_state)
     r_params = optax.apply_updates(r_params, updates)
     return loss, r_params, r_state, opt_state
+
+  @jax.jit
+  def combine(x_real, c_real, gt_real, x_gen, c_gen, gt_gen):
+    n_real, *_ = x_real.shape
+    n_gen, *_ = x_gen.shape
+
+    x = jnp.concatenate([x_real, x_gen], axis=0)
+    c = jnp.concatenate([c_real, c_gen], axis=0)
+    gt = jnp.concatenate([gt_real, gt_gen], axis=0)
+
+    y = jnp.concatenate([
+      jnp.ones(shape=(n_real,), dtype=x_real.dtype),
+      jnp.zeros(shape=(n_gen,), dtype=x_gen.dtype),
+    ], axis=0)
+
+    return x, c, gt, y
+
+  @jax.jit
+  def loss_discriminator_f(x_true, c_true, gt_true, x_gen, c_gen, gt_gen, d_params, d_state):
+    x, c, gt, y = combine(x_true, c_true, gt_true, x_gen, c_gen, gt_gen)
+
+    discriminator = nnx.merge(discriminator_def, d_params, d_state)
+
+    p = discriminator(x, c, gt)
+
+    cross_entropy = jnp.mean(y * jax.nn.softplus(-p) + (1 - y) * jax.nn.softplus(p))
+    loss = cross_entropy + reg_coef * discriminator.regularization() + discr_reg_coef * jnp.mean(jnp.square(p))
+
+    _, _, d_state = nnx.split(discriminator, nnx.Param, nnx.Variable)
+
+    return loss, d_state
+
+  @jax.jit
+  def step_discriminator(x_true, c_true, gt_true, x_gen, c_gen, gt_gen, d_params, d_state, opt_state):
+    (loss, d_state), grad = jax.value_and_grad(loss_discriminator_f, argnums=6, has_aux=True)(
+      x_true, c_true, gt_true, x_gen, c_gen, gt_gen, d_params, d_state
+    )
+    updates, opt_state = discriminator_optimizer.update(grad, opt_state)
+    d_params = optax.apply_updates(d_params, updates)
+    return loss, d_params, d_state, opt_state
 
   @jax.jit
   def step_design(design, x, c, t, r_params, r_state, opt_state):
@@ -107,7 +154,7 @@ def optimize(seed, output, progress=True, restore=True, trace=None, **config):
       for k in range(substeps):
         design_batch = design[None, :] + \
                             design_eps * np_rng.normal(size=(batch, *detector.design_shape())).astype(np.float32)
-        _, measurements, target = detector(seed=get_seed(), configurations=design_batch)
+        measurements, target = detector(seed=get_seed(), configurations=design_batch)
 
         regressor_losses[i, j, k], regressor_parameters, regressor_state, regressor_optimizer_state = \
           step_regressor(
@@ -119,7 +166,7 @@ def optimize(seed, output, progress=True, restore=True, trace=None, **config):
           raise ValueError()
 
       design_batch = np.broadcast_to(design[None], shape=(batch, *detector.design_shape()))
-      _, measurements, target = detector(seed=get_seed(), configurations=design_batch)
+      measurements, target = detector(seed=get_seed(), configurations=design_batch)
 
       _, design_updated, design_optimizer_state = step_design(
         design,
@@ -140,7 +187,7 @@ def optimize(seed, output, progress=True, restore=True, trace=None, **config):
     for j in status.validation(validation_batches):
       design_batch = design[None, :] + \
                      design_eps * np_rng.normal(size=(batch, *detector.design_shape())).astype(np.float32)
-      _, measurements, target = detector(seed=get_seed(), configurations=design_batch)
+      measurements, target = detector(seed=get_seed(), configurations=design_batch)
 
       regressor_validation[i, j] = metric_f(measurements, design_batch, target, regressor_parameters, regressor_state)
 

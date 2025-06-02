@@ -5,7 +5,7 @@ __all__ = [
   'show'
 ]
 
-def show(layers, angles, width, height, response, trajectories=None, signal=None, threshold=0.2):
+def show(layers, angles, width, height, response, trajectories=None, signal=None, threshold=1.0):
   plotter = pv.Plotter(off_screen=False)
   plotter.camera_position = [
     (-55, 0, 11),
@@ -50,7 +50,7 @@ def show(layers, angles, width, height, response, trajectories=None, signal=None
       activation = float(combined_response[i, k] / np.max(combined_response))
       plotter.add_mesh(
         mesh, color=(1.0, 0.0, 0.0), show_edges=False,
-        opacity=activation if activation > threshold else 0.0
+        opacity=activation if combined_response[i, k] > threshold else 0.0
       )
 
   if trajectories is not None:

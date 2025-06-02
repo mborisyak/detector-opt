@@ -46,7 +46,9 @@ def test_deep_set_vae(seed):
 
   vae = detopt.nn.DeepSetVAE(
     input_shape, (n_design, ), (n_output, ),
-    features=[(7, 11), (13, 17), (23, n_z)], rngs=rngs
+    encoder_features=[(7, 11), (13, 17), (23, n_z)],
+    decoder_features=[24, 14, 12],
+    rngs=rngs
   )
 
   mean, log_sigma = vae.encode(X, design)

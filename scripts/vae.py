@@ -10,9 +10,16 @@ import optax
 
 import detopt
 
+MAX_INT = 9223372036854775807
+
 def generate(seed, output, progress=True, restore=True, **config):
-  rng = jax.random.PRNGKey(seed)
-  np_rng = np.random.default_rng(seed=(seed, 0))
+  print(f'using {config.get("regressor")} as regressor')
+  print(f'using {config.get("generator")} as generator')
+  print(f'using {config.get("discriminator")} as discriminator')
+
+  np_rng = np.random.default_rng(seed=seed)
+  get_seed = lambda: np_rng.integers(low=0, high=MAX_INT)
+  rng = jax.random.PRNGKey(get_seed())
 
   checkpointer = detopt.utils.io.get_checkpointer(output)
   if checkpointer.latest_step() is not None and checkpointer.latest_step() >= config['epochs']:
@@ -28,6 +35,8 @@ def generate(seed, output, progress=True, restore=True, **config):
   starting_epoch = restored['starting_epoch']
 
   design = restored['design']['design']
+  print(f'using {design} as initial design')
+  print(f'using {detector.decode_design(design)} as initial design')
   design_optimizer, design_optimizer_state = restored['design']['optimizer'], restored['design']['optimizer_state']
 
   regressor_def, regressor_optimizer = restored['regressor']['model'], restored['regressor']['optimizer']
@@ -70,7 +79,7 @@ def generate(seed, output, progress=True, restore=True, **config):
     p = discriminator(x, c, deterministic=False)
     loss = jnp.mean(y * jax.nn.softplus(-p) + (1 - y) * jax.nn.softplus(p))
     loss += 1.0e-4 * discriminator.regularization()
-    loss += 1.0e-2 * jnp.mean(jnp.square(p))
+    loss += 1.0e-1 * jnp.mean(jnp.square(p))
 
     _, _, d_state = nnx.split(discriminator, nnx.Param, nnx.Variable)
 
@@ -103,17 +112,20 @@ def generate(seed, output, progress=True, restore=True, **config):
     mean, sigma = vae.encode(x, c)
     latent = mean + sigma * jax.random.normal(key_elbo, shape=sigma.shape, dtype=sigma.dtype)
     x_reco = vae.decode(latent, c)
-    elbo = detopt.nn.elbo(x, x_reco, mean, sigma, likelihood_sigma, exact=True)
+    loss = detopt.nn.elbo(x, x_reco, mean, sigma, sigma_reconstructed=likelihood_sigma)
 
-    latent = jax.random.normal(key_elbo, shape=sigma.shape, dtype=sigma.dtype)
-    x_gen = vae.decode(latent, c)
-    p = discriminator(x_gen, c, deterministic=False)
+    # mean, sigma = vae.encode(x, c)
+    # x_reco = vae.decode(mean, c)
+    # loss = jnp.mean(x * jax.nn.softplus(-x_reco) + (1 - x) * jax.nn.softplus(x_reco))
 
-    loss_gan = jnp.mean(jax.nn.softplus(-p))
+    # n_b, *_ = x.shape
+    # latent = jax.random.normal(key_elbo, shape=(n_b, vae.latent_dim), dtype=x.dtype)
+    # x_gen = vae.decode(latent, c)
+    # p = discriminator(x_gen, c, deterministic=False)
+    # loss = -jnp.mean(jax.nn.softplus(p))
 
     _, _, g_state = nnx.split(vae, nnx.Param, nnx.Variable)
 
-    loss = elbo + loss_gan
 
     return jnp.mean(loss), g_state
 
@@ -133,7 +145,7 @@ def generate(seed, output, progress=True, restore=True, **config):
     clean_sample = vae.sample(key, design)
     eps = jax.random.normal(key_noise, shape=clean_sample.shape, dtype=clean_sample.dtype)
     sample = clean_sample + likelihood_sigma * eps
-    return clean_sample
+    return jax.nn.sigmoid(clean_sample)
 
   generator_losses = np.ndarray(shape=(epochs, steps))
   discriminator_losses = np.ndarray(shape=(epochs, steps, substeps))
@@ -154,7 +166,7 @@ def generate(seed, output, progress=True, restore=True, **config):
       for k in range(substeps):
         design_batch_real = design[None, :] + \
                             design_eps * np_rng.normal(size=(batch, *detector.design_shape())).astype(np.float32)
-        measurements, target = detector(seed=(seed, i, j, k, 0), configurations=design_batch_real)
+        measurements, target = detector(seed=get_seed(), configurations=design_batch_real)
 
         design_batch_gen = design[None, :] + \
                            design_eps * np_rng.normal(size=(batch, *detector.design_shape())).astype(np.float32)
@@ -167,8 +179,9 @@ def generate(seed, output, progress=True, restore=True, **config):
             discriminator_parameters, discriminator_state, discriminator_optimizer_state
           )
 
-      design_batch = np.broadcast_to(design[None], (batch, *design.shape))
-      measurements, target = detector(seed=(seed, i, 2), configurations=design_batch)
+      design_batch = design[None, :] + \
+                         design_eps * np_rng.normal(size=(batch, *detector.design_shape())).astype(np.float32)
+      measurements, target = detector(seed=get_seed(), configurations=design_batch)
       rng, key_step = jax.random.split(rng, num=2)
 
       generator_losses[i, j], generator_parameters, generator_state, generator_optimizer_state = step_generator(
@@ -180,7 +193,7 @@ def generate(seed, output, progress=True, restore=True, **config):
     for j in status.validation(validation_batches):
       design_batch_real = design[None, :] + \
                           design_eps * np_rng.normal(size=(batch, *detector.design_shape())).astype(np.float32)
-      measurements, target = detector(seed=(seed, i, j, 0), configurations=design_batch_real)
+      measurements, target = detector(seed=get_seed(), configurations=design_batch_real)
 
       design_batch_gen = design[None, :] + \
                          design_eps * np_rng.normal(size=(batch, *detector.design_shape())).astype(np.float32)

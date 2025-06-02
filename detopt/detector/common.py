@@ -30,6 +30,12 @@ class Detector(object):
   def target_dim(self):
     return math.prod(self.target_shape())
 
+  def ground_truth_shape(self):
+    raise NotImplementedError()
+
+  def ground_truth_dim(self):
+    return math.prod(self.ground_truth_shape())
+
   def __call__(self, seed: int, configurations: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     raise NotImplementedError()
 
@@ -38,6 +44,12 @@ class Detector(object):
 
   def metric(self, target, predicted):
     return self.loss(target, predicted)
+
+  def encode_design(self, design):
+    raise NotImplementedError()
+
+  def decode_design(self, encoded_design):
+    raise NotImplementedError()
 
 
 

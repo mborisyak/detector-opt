@@ -409,6 +409,7 @@ static PyObject * solve(PyObject *self, PyObject *args) {
 
           if (straw_i >= 0 && straw_i < n_straws) {
             response[l * rs0 + i * rs1 + k * rs2 + straw_i * rs3] += dt;
+//            response[l * rs0 + i * rs1 + k * rs2 + straw_i * rs3] = 1;
           } else {
             printf(
               "Warning: invalid straw %d: y'=%lf (x=%lf, y=%lf, theta=%lf), H=%lf, r=%lf\n",

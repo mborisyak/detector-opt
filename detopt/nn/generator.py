@@ -9,7 +9,7 @@ import jax.nn as jnn
 
 from flax import nnx
 
-from .common import Model, Block, SiLU, LeakyTanh, Softplus, gated_leaky_tanh, bayes_aggregate
+from .common import Model, Block, SiLU, LeakyTanh, Softplus, LeakyReLU, gated_leaky_tanh, bayes_aggregate
 
 __all__ = [
   'VAE',
@@ -18,7 +18,8 @@ __all__ = [
   'CVAE',
   'DeepSetVAE',
 
-  'elbo'
+  'elbo',
+  'cross_entropy_elbo'
 ]
 
 def elbo(
@@ -47,16 +48,52 @@ def elbo(
   :return: Evidence Lower Bound (renormalized, if `exact=False`).
   """
 
-  if beta is None:
-    ### posterior_penalty below is missing 1/2 coefficient.
-    beta = 0.5
+  if axes is None:
+    sample_axes = range(1, X_original.ndim)
+    latent_axes = range(1, latent_mean.ndim)
   else:
-    beta = beta / 2
+    sample_axes = axes
+    sample_batch_axes = tuple(i for i in range(X_original.ndim) if i not in sample_axes)
+    latent_axes = tuple(i for i in range(latent_mean.ndim) if i not in sample_batch_axes)
 
-  if exact:
-    normalization = jnp.array(0.5 / jnp.square(sigma_reconstructed), dtype=jnp.float32)
-  else:
-    normalization = jnp.array(2 * beta * jnp.square(sigma_reconstructed), dtype=jnp.float32)
+  n = max(
+    math.prod(X_original.shape[i] for i in sample_axes),
+    math.prod(latent_mean.shape[i] for i in latent_axes),
+  )
+
+  reconstruction_loss = 0.5 * jnp.sum(jnp.square(X_reconstructed - X_original), axis=sample_axes)
+
+  posterior_penalty = 0.5 * jnp.sum(
+    jnp.square(latent_sigma) + jnp.square(latent_mean) - 2 * jnp.log(latent_sigma),
+    axis=latent_axes
+  )
+
+  return (reconstruction_loss + jnp.square(sigma_reconstructed) * posterior_penalty) / n
+
+def cross_entropy_elbo(
+  X_original: jax.Array, logits: jax.Array, latent_mean: jax.Array, latent_sigma: jax.Array,
+  axes: tuple[int, ...] | int | None=None
+):
+  """
+  Returns Evidence Lower Bound for normally distributed (z | X), (X | z) and z:
+    P(z | X) = N(`latent_mean`, `latent_std`);
+    P(X | z) = N(`X_reconstructed`, `sigma_reconstructed`);
+    P(z) = N(0, 1).
+
+  :param X_original: ground-truth sample;
+  :param logits: reconstructed sample;
+  :param latent_mean: estimated mean of the posterior P(z | X);
+  :param latent_sigma: estimated log sigma of the posterior P(z | X);
+  :param sigma_reconstructed: variance for reconstructed sample, i.e. X | z ~ N(X_original, sigma_reconstructed)
+    If a scalar, `Var(X | z) = sigma_reconstructed * I`, if tensor then `Var(X | z) = diag(sigma_reconstructed)`
+  :param beta: coefficient for beta-VAE
+  :param exact: if true returns exact value of ELBO, otherwise returns rearranged ELBO equal to the original
+    up to a multiplicative constant, possibly increasing computational stability for low `sigma_reconstructed`.
+  :param axes: axes of reduction for samples, typically, all axes except for batch ones, if `None` all axes expect
+    for the first one. Latent batch axes are considered the same as the sample batch axes.
+
+  :return: Evidence Lower Bound (renormalized, if `exact=False`).
+  """
 
   if axes is None:
     sample_axes = range(1, X_original.ndim)
@@ -66,17 +103,22 @@ def elbo(
     sample_batch_axes = tuple(i for i in range(X_original.ndim) if i not in sample_axes)
     latent_axes = tuple(i for i in range(latent_mean.ndim) if i not in sample_batch_axes)
 
-  reconstruction_loss = jnp.mean(jnp.square(X_original - X_reconstructed), axis=sample_axes)
+  n = max(
+    math.prod(X_original.shape[i] for i in sample_axes),
+    math.prod(latent_mean.shape[i] for i in latent_axes),
+  )
 
-  posterior_penalty = jnp.mean(
+  reconstruction_loss = jnp.sum(
+    X_original * jax.nn.softplus(-logits) + (1 - X_original) * jax.nn.softplus(logits),
+    axis=sample_axes
+  )
+
+  posterior_penalty = 0.5 * jnp.sum(
     jnp.square(latent_sigma) + jnp.square(latent_mean) - 2 * jnp.log(latent_sigma),
     axis=latent_axes
   )
 
-  if exact:
-    return normalization * reconstruction_loss + beta * posterior_penalty
-  else:
-    return reconstruction_loss + normalization * posterior_penalty
+  return (reconstruction_loss + posterior_penalty) / n
 
 class VAE(Model):
   latent_dim: int
@@ -353,18 +395,18 @@ class CVAE(VAE):
 class DeepSetVAE(VAE):
   def __init__(
     self, input_shape: Sequence[int], design_shape: Sequence[int], target_shape: Sequence[int],
-    features: Sequence[Sequence[int]], *, rngs: nnx.Rngs
+    encoder_features: Sequence[Sequence[int]], decoder_features: Sequence[int], *, rngs: nnx.Rngs
   ):
     super().__init__(input_shape, design_shape, target_shape, rngs=rngs)
-    target_dim = math.prod(target_shape)
+    n_l, n_s = input_shape
     ### position + angle + B
     n_design = 3
+    n_input = n_s
 
-    n_layers, n_straws = input_shape
-    n_features = n_design + n_straws
+    n_features = n_design + n_input
 
     self.encoder: list[Block] =  []
-    for block_def in features:
+    for block_def in encoder_features:
       units = (n_features, *block_def)
       self.encoder.append(
         Block(
@@ -375,32 +417,21 @@ class DeepSetVAE(VAE):
           [nnx.Linear(units[-2], units[-1], rngs=rngs), nnx.Linear(units[-2], units[-1], rngs=rngs)]
         )
       )
-
       n_features = 3 * units[-1]
 
-    *_, last = features
+    *_, last = encoder_features
     *_, n_latent = last
     self.latent_dim = n_latent
 
-    n_features = n_design + n_latent
-    self.decoder: list[Block] = []
-    for block_def in features[::-1]:
-      units = (n_features, *block_def[::-1])
-      self.decoder.append(
-        Block(
-          *(
-            Block(nnx.Linear(n_in, n_out, rngs=rngs), LeakyTanh(n_out, ))
-            for n_in, n_out in zip(units[:-2], units[1:-1])
-          ),
-          [nnx.Linear(units[-2], units[-1], rngs=rngs), nnx.Linear(units[-2], units[-1], rngs=rngs)]
-        )
-      )
-      n_features = 3 * units[-1]
+    units = (n_design + n_latent, *decoder_features)
+    self.decoder: Block = Block(*(
+      Block(nnx.Linear(n_in, n_out, rngs=rngs), LeakyTanh(n_out, ))
+      for n_in, n_out in zip(units[:-1], units[1:])
+    ))
 
-    first, *_ = features
-    first_hidden, *_ = first
+    *_, last_hidden = decoder_features
 
-    self.output = nnx.Linear(3 * first_hidden, n_straws, rngs=rngs)
+    self.output = nnx.Linear(last_hidden, n_s, rngs=rngs)
 
   def combine(self, X, design):
     n_b, n_l, n_s = X.shape
@@ -419,13 +450,13 @@ class DeepSetVAE(VAE):
     *rest, last = self.encoder
     for block in rest:
       mus, log_sigmas = block(result)
-      mu, sigma = bayes_aggregate(mus, log_sigmas, axis=1, keepdims=True)
+      mu, sigma = bayes_aggregate(mus, log_sigmas, axis=(1, ), keepdims=True)
       mu = jnp.broadcast_to(mu, shape=mus.shape)
       sigma = jnp.broadcast_to(sigma, shape=mus.shape)
       result = jnp.concatenate([mus, mu, sigma], axis=-1)
 
     mus, log_sigmas = last(result)
-    mu, sigma = bayes_aggregate(mus, log_sigmas, axis=1, keepdims=False)
+    mu, sigma = bayes_aggregate(mus, log_sigmas, axis=(1, ), keepdims=False)
     return mu, sigma
 
   def decode(self, latent: jax.Array, design: jax.Array, *, deterministic: bool = True):
@@ -434,12 +465,6 @@ class DeepSetVAE(VAE):
 
     latent = jnp.broadcast_to(latent[:, None, :], shape=(n_b, n_l, n_z))
     result = self.combine(latent, design)
-
-    for block in self.decoder:
-      mus, log_sigmas = block(result)
-      mu, sigma = bayes_aggregate(mus, log_sigmas, axis=1, keepdims=True)
-      mu = jnp.broadcast_to(mu, shape=mus.shape)
-      sigma = jnp.broadcast_to(sigma, shape=mus.shape)
-      result = jnp.concatenate([mus, mu, sigma], axis=-1)
+    result = self.decoder(result)
 
     return self.output(result)

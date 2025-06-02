@@ -12,14 +12,14 @@ straw:
   n_layers: 16
   n_straws: 32
 
-  max_particles: 3
+  max_particles: 2
   origin: [0.0, 0.0, -10.0]
-  origin_sigma: [0.2, 0.2, 1.0]
+  origin_sigma: [1.0, 1.0, 1.0]
   momentum: [0.0, 0.0, 5.0]
   momentum_sigma: [0.25, 0.25, 0.5]
   noise_origin: [0.0, 0.0, -10.0]
   noise_origin_sigma: [1.0, 1.0, 1.0]
   noise_momentum: [0.0, 0.0, 5.0]
-  noise_momentum_sigma: [0.2, 0.2, 1.0]
-  straw_signal_rate: 200.0
-  straw_noise_rate: 10.0
+  noise_momentum_sigma: [0.25, 0.25, 0.5]
+  straw_signal_rate: 100.0
+  straw_noise_rate: 20.0

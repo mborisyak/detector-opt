@@ -8,18 +8,16 @@ import numpy as np
 
 import detopt
 
-def viz(design='data/design/default.json'):
-  rng = np.random.RandomState(123)
-
+def viz(seed=123, design='data/design/default.json', **config):
   n_batch = 3
   n_layers = 16
-  generator = detopt.detector.StrawDetector(n_layers=n_layers)
+  detector = detopt.detector.from_config(config['detector'])
 
   root = os.path.dirname(os.path.dirname(__file__))
 
   with open(os.path.join(root, design), 'r') as f:
     import json
-    design = generator.encode_design(json.load(f))
+    design = detector.encode_design(json.load(f))
 
   configs = np.broadcast_to(design[None], (n_batch, *design.shape))
 
@@ -27,7 +25,7 @@ def viz(design='data/design/default.json'):
   n_trials = 1024
   start_time = time.perf_counter()
   for i in range(n_trials):
-    _ = generator(seed=1, configurations=configs)
+    _ = detector(seed=1, configurations=configs)
   runtime = time.perf_counter() - start_time
   events_per_second_single_core = n_trials * n_batch / runtime
   print(f'events per second: {events_per_second_single_core}')
@@ -38,7 +36,7 @@ def viz(design='data/design/default.json'):
   start_time = time.perf_counter()
   with ThreadPoolExecutor(max_workers=n_cores) as executor:
     futures = [
-      executor.submit(generator, seed=1, configurations=configs)
+      executor.submit(detector, seed=1, configurations=configs)
       for _ in range(n_trials)
     ]
 
@@ -55,7 +53,7 @@ def viz(design='data/design/default.json'):
   v0s = list()
   ys = list()
   for i in range(1000):
-    _, _, _, v0, trajectories, response, signal = generator.sample(seed=i, design=configs)
+    _, _, _, v0, trajectories, response, signal = detector.sample(seed=i, design=configs)
     v0s.append(v0)
     ys.append(signal)
 
@@ -70,8 +68,8 @@ def viz(design='data/design/default.json'):
   plt.savefig('straw-events.png')
   plt.close()
 
-  _, _, _, _, trajectories, response, signal = generator.sample(seed=123456789, design=configs)
-  layers, angles, widths, heights, Bs, Ls = generator.get_design(design=configs)
+  _, _, _, _, trajectories, response, signal = detector.sample(seed=seed, design=configs)
+  layers, angles, widths, heights, Bs, Ls = detector.get_design(design=configs)
 
   print(response.shape)
   plt.matshow(response[0].T)
@@ -79,8 +77,11 @@ def viz(design='data/design/default.json'):
   plt.show()
   plt.close()
 
-  detopt.utils.viz.straw.show(layers[0], angles[0], widths[0], heights[0], response[0], trajectories[0], signal[0])
+  detopt.utils.viz.straw.show(
+    layers[0], angles[0], widths[0], heights[0], response[0], trajectories[0], signal[0],
+    threshold=0.3
+  )
 
 if __name__ == '__main__':
   import gearup
-  gearup.gearup(viz)()
+  gearup.gearup(viz).with_config('config/config.yaml')()

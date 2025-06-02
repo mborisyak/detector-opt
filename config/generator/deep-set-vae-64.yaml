@@ -1,6 +1,7 @@
 model:
   deep-set-vae:
-    features: [[128, 96], [64, 48], [32, 24]]
+    encoder_features: [[128, 96], [64, 48], [32, 24]]
+    decoder_features: [128, 96, 64]
 
 optimizer:
   adam:

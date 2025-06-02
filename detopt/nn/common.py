@@ -8,6 +8,8 @@ import jax.numpy as jnp
 
 from flax import nnx
 
+from ..detector import Detector
+
 __all__ = [
   'CELu', 'SiLU', 'LeakyTanh', 'Softplus', 'gated_leaky_tanh',
   'apply_with_kwargs',
@@ -16,22 +18,14 @@ __all__ = [
 
 class Model(nnx.Module):
   @classmethod
-  def from_config(
-    cls, input_shape: Sequence[int], design_shape: Sequence[int], target_shape: Sequence[int],
-    config, *, rngs: nnx.Rngs
-  ):
-    return cls(
-      input_shape=input_shape, design_shape=design_shape, target_shape=target_shape, rngs=rngs,
-      **config
-    )
+  def from_config(cls, detector: Detector, config, *, rngs: nnx.Rngs):
+    return cls(detector, rngs=rngs, **config)
 
-  def __init__(
-    self, input_shape: Sequence[int], design_shape: Sequence[int], target_shape: Sequence[int], *,
-    rngs: nnx.Rngs
-  ):
-    self.input_shape = input_shape
-    self.design_shape = design_shape
-    self.target_shape = target_shape
+  def __init__(self, detector: Detector, *, rngs: nnx.Rngs):
+    self.input_shape = detector.output_shape()
+    self.design_shape = detector.design_shape()
+    self.target_shape = detector.target_shape()
+    self.ground_truth_shape = detector.ground_truth_shape()
 
     self.rngs = rngs
 
@@ -70,6 +64,10 @@ class SiLU(nnx.Module):
 class Softplus(nnx.Module):
   def __call__(self, X):
     return jax.nn.softplus(X)
+
+class LeakyReLU(nnx.Module):
+  def __call__(self, X):
+    return jax.nn.leaky_relu(X, 0.05)
 
 class MaxPool(nnx.Module):
   def __call__(self, X):
@@ -133,10 +131,12 @@ class Block(nnx.Module):
     return result
 
 def bayes_aggregate(mu, log_sigma, axis, keepdims=False):
-  inv_sigma_sqr = jnp.exp(-2 * log_sigma)
+  min_log_sigma = jnp.min(log_sigma, axis=axis, keepdims=True)
+  inv_sigma_sqr = jnp.exp(-2 * (log_sigma - min_log_sigma))
+  min_log_sigma = jnp.min(log_sigma, axis=axis, keepdims=keepdims)
 
   mu_inv_sigma_sqr = jnp.sum(mu * inv_sigma_sqr, axis=axis, keepdims=keepdims)
-  inv_sum_inv_sigma_sqr = 1 / (1 + jnp.sum(inv_sigma_sqr, axis=axis, keepdims=keepdims))
+  inv_sum_inv_sigma_sqr = 1 / (jnp.exp(2 * min_log_sigma) + jnp.sum(inv_sigma_sqr, axis=axis, keepdims=keepdims))
 
   mu_aggregated = mu_inv_sigma_sqr * inv_sum_inv_sigma_sqr
   sigma_aggregated = jnp.sqrt(inv_sum_inv_sigma_sqr)

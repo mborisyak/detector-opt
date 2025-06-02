@@ -1,6 +1,6 @@
 model:
   mlp-vae:
-    units: [512, 256, 128, 64]
+    units: [512, 256, 128, 16]
 
 optimizer:
   adam:

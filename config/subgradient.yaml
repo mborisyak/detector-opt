@@ -13,7 +13,7 @@ optimizer:
     b2: 0.998
 
 batch: 8
-epochs: 32
+epochs: 128
 steps: 128
 substeps: 32
 validation_batches: 1024

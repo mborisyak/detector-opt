@@ -5,5 +5,3 @@ model:
 optimizer:
   adam:
     learning_rate: 1.0e-3
-
-steps: 8
