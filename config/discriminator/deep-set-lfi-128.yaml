@@ -1,0 +1,8 @@
+model:
+  deep-set-lfi:
+    features: [[128, 96], [64, 48]]
+    p_dropout: null
+
+optimizer:
+  adam:
+    learning_rate: 1.0e-3

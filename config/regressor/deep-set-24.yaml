@@ -1,7 +1,0 @@
-model:
-  deep-set:
-    features: [[96, 64], [48, 32], [32, 24]]
-
-optimizer:
-  adam:
-    learning_rate: 1.0e-3

@@ -24,7 +24,7 @@ class Discriminator(Model):
 class DeepSetLFI(Discriminator):
   def __init__(
     self, detector: Detector,
-    features: Sequence[Sequence[int]], p_dropout: float | None = 0.1,
+    features: Sequence[Sequence[int]], p_dropout: float | None = None,
     *, rngs: nnx.Rngs
   ):
     super().__init__(detector, rngs=rngs)
@@ -49,15 +49,18 @@ class DeepSetLFI(Discriminator):
             Block(*dropout(), nnx.Linear(n_in, n_out, rngs=rngs), LeakyTanh(n_out, ))
             for n_in, n_out in zip(units[:-2], units[1:-1])
           ),
-          Block(*dropout(), nnx.Linear(units[-2], units[-1], rngs=rngs))
+          [
+            Block(*dropout(), nnx.Linear(units[-2], units[-1], rngs=rngs)),
+            Block(*dropout(), nnx.Linear(units[-2], units[-1], rngs=rngs))
+          ]
         )
       )
-      n_features = 2 * units[-1]
+      n_features = 3 * units[-1]
 
     *_, last = features
     *_, n_latent = last
 
-    self.output = nnx.Linear(n_latent, target_dim, rngs=rngs)
+    self.output = nnx.Linear(2 * n_latent, target_dim, rngs=rngs)
 
   def combine(self, X, design, ground_truth):
     n_b, n_l, n_s = X.shape
@@ -81,13 +84,15 @@ class DeepSetLFI(Discriminator):
     *rest, last = self.blocks
 
     for block in rest:
-      mus = block(result)
-      mu = jnp.mean(mus, axis=1, keepdims=True)
+      mus, sigmas = block(result)
+      mu, sigma = bayes_aggregate(mus, sigmas, keepdims=True, axis=(1, ))
       mu = jnp.broadcast_to(mu, shape=mus.shape)
-      result = jnp.concatenate([mus, mu], axis=-1)
+      sigma = jnp.broadcast_to(sigma, shape=sigmas.shape)
+      result = jnp.concatenate([mus, mu, sigma], axis=-1)
 
-    mus = last(result)
-    result = jnp.mean(mus, axis=1, keepdims=False)
+    mus, sigmas = last(result)
+    mu, sigma = bayes_aggregate(mus, sigmas, keepdims=False, axis=(1,))
+    result = jnp.concatenate([mu, sigma], axis=-1)
 
     result = self.output(result)
 

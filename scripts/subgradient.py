@@ -10,9 +10,12 @@ import optax
 
 import detopt
 
+import matplotlib
+matplotlib.use('AGG')
+
 MAX_INT = 9223372036854775807
 
-def optimize(seed, output, progress=True, restore=True, trace=None, **config):
+def optimize(seed, output, progress=True, restore=True, trace=None, report=None, **config):
   print(f'using {config.get("regressor")} as regressor')
 
   np_rng = np.random.default_rng(seed=seed)
@@ -46,14 +49,14 @@ def optimize(seed, output, progress=True, restore=True, trace=None, **config):
   epochs, steps, substeps = config['epochs'], config['steps'], config['substeps']
   batch, validation_batches = config['batch'], config['validation_batches']
 
-  reg_coef = config.get('regularization', 1.0e-2)
+  reg_coef = config.get('regularization', 1.0e-4)
 
   @jax.jit
   def loss_f(x, c, t, r_params, r_state):
     regressor = nnx.merge(regressor_def, r_params, r_state)
     p = regressor(x, c, deterministic=False)
 
-    loss = jnp.mean(detector.loss(t, p)) + reg_coef * regressor.regularization()
+    loss = jnp.mean(detector.loss(t, p)) + reg_coef * regressor.regularization() + 1.0e-2 * jnp.mean(jnp.square(p))
 
     _, _, r_state = nnx.split(regressor, nnx.Param, nnx.Variable)
     return loss, r_state
@@ -61,7 +64,7 @@ def optimize(seed, output, progress=True, restore=True, trace=None, **config):
   @jax.jit
   def metric_f(x, c, t, r_params, r_state):
     regressor = nnx.merge(regressor_def, r_params, r_state)
-    p = regressor(x, c, deterministic=False)
+    p = regressor(x, c, deterministic=True)
 
     metric = detector.metric(t, p)
 
@@ -72,7 +75,8 @@ def optimize(seed, output, progress=True, restore=True, trace=None, **config):
     (loss, r_state), grad = jax.value_and_grad(loss_f, argnums=3, has_aux=True)(x, c, t, r_params, r_state)
     updates, opt_state = regressor_optimizer.update(grad, opt_state)
     r_params = optax.apply_updates(r_params, updates)
-    return loss, r_params, r_state, opt_state
+    grad_check = jax.tree.map(lambda g: jnp.all(jnp.isfinite(g)), grad)
+    return loss, r_params, r_state, opt_state, grad_check
 
   @jax.jit
   def step_design(design, x, c, t, r_params, r_state, opt_state):
@@ -109,13 +113,20 @@ def optimize(seed, output, progress=True, restore=True, trace=None, **config):
                             design_eps * np_rng.normal(size=(batch, *detector.design_shape())).astype(np.float32)
         _, measurements, target = detector(seed=get_seed(), configurations=design_batch)
 
-        regressor_losses[i, j, k], regressor_parameters, regressor_state, regressor_optimizer_state = \
+        regressor_losses[i, j, k], regressor_parameters, regressor_state, regressor_optimizer_state, grad_check = \
           step_regressor(
             measurements, design_batch, target,
             regressor_parameters, regressor_state, regressor_optimizer_state
           )
 
         if not check(regressor_parameters, regressor_state):
+          print('measurements', np.min(measurements), np.max(measurements))
+          print('target', np.min(target), np.max(target))
+          print(jax.tree.map(
+            lambda x: jnp.all(jnp.isfinite(x)),
+            regressor_parameters
+          ))
+          print(grad_check)
           raise ValueError()
 
       design_batch = np.broadcast_to(design[None], shape=(batch, *detector.design_shape()))
@@ -144,19 +155,48 @@ def optimize(seed, output, progress=True, restore=True, trace=None, **config):
 
       regressor_validation[i, j] = metric_f(measurements, design_batch, target, regressor_parameters, regressor_state)
 
+    aux = {
+      'regressor': {
+        'training': regressor_losses[:i + 1],
+        'validation': regressor_validation[:i + 1]
+      }
+    }
+
     detopt.utils.io.save_state(
       i, checkpointer, design=design, design_optimizer_state=design_optimizer_state,
 
       regressor_parameters=regressor_parameters, regressor_state=regressor_state,
       regressor_optimizer_state=regressor_optimizer_state,
-
-      aux={'regressor': {'training': regressor_losses[:i + 1], 'validation': regressor_validation[:i + 1]}}
+      aux=aux
     )
 
     if trace is not None:
       detopt.utils.io.save_design(detector, os.path.join(trace, f'design-{i:05d}.json'), design)
 
+    if report is not None:
+      import matplotlib.pyplot as plt
+      os.makedirs(report, exist_ok=True)
+
+      fig = plot(aux)
+      fig.savefig(os.path.join(report, 'losses.png'))
+      plt.close(fig)
+
   checkpointer.close()
+
+def plot(aux):
+  import matplotlib.pyplot as plt
+
+  fig = plt.figure(figsize=(9, 12))
+  axes = fig.subplots(2, 1)
+
+  detopt.utils.viz.losses.plot(aux['regressor']['training'], axes[0])
+  axes[0].set_title('Regressor losses')
+  detopt.utils.viz.losses.plot(aux['regressor']['validation'], axes[1])
+  axes[1].set_title('Regressor validation')
+
+  fig.tight_layout()
+  return fig
+
 
 def report(seed, checkpoint, report, **config):
   import matplotlib.pyplot as plt
@@ -173,15 +213,7 @@ def report(seed, checkpoint, report, **config):
 
   aux = restored['aux']
 
-  fig = plt.figure(figsize=(9, 12))
-  axes = fig.subplots(2, 1)
-
-  detopt.utils.viz.losses.plot(aux['regressor']['training'], axes[0])
-  axes[0].set_title('Regressor losses')
-  detopt.utils.viz.losses.plot(aux['regressor']['validation'], axes[1])
-  axes[1].set_title('Regressor validation')
-
-  fig.tight_layout()
+  fig = plot(aux)
   fig.savefig(os.path.join(report, 'losses.png'))
   plt.close(fig)
 

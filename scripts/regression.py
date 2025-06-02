@@ -1,38 +1,18 @@
+import os
+
 import numpy as np
 import jax
 import jax.numpy as jnp
 
-import flax
 from flax import nnx
 import optax
 
 import detopt
 
-def get_model(checkpointer, input_shape, design_shape, target_shape, config, *, rngs: nnx.Rngs, restore=True):
-  regressor = detopt.nn.from_config(input_shape, design_shape, target_shape, config=config['model'], rngs=rngs)
-  regressor_def, parameters, regressor_state = nnx.split(regressor, nnx.Param, nnx.Variable)
+import matplotlib
+matplotlib.use('AGG')
 
-  optimizer = detopt.utils.config.optimizer(config['optimizer'])
-
-  last_epoch = checkpointer.latest_step()
-  print(last_epoch)
-  if last_epoch is not None and restore:
-    parameters, regressor_state, optimizer_state = detopt.utils.io.restore_model(checkpointer)
-    state = optimizer.init(parameters)
-    optimizer_state = flax.serialization.from_state_dict(state, optimizer_state)
-    starting_epoch = last_epoch + 1
-  else:
-    optimizer_state = optimizer.init(parameters)
-    starting_epoch = 0
-
-  return starting_epoch, regressor_def, parameters, regressor_state, optimizer, optimizer_state
-
-def get_design(detector, design_path):
-  import json
-  with open(design_path, 'r') as f:
-    return detector.encode_design(
-      json.load(f)
-    )
+MAX_INT = 9223372036854775807
 
 def info(**config):
   import math
@@ -41,119 +21,159 @@ def info(**config):
   rngs = nnx.Rngs(1)
 
   detector = detopt.detector.from_config(config['detector'])
-  regressor = detopt.nn.from_config(
-    detector.output_shape(), detector.design_shape(), detector.target_shape(),
-    config=config['regressor']['model'], rngs=rngs
-  )
+  regressor = detopt.nn.from_config(detector, config=config['regressor']['model'], rngs=rngs)
   _, parameters, _ = nnx.split(regressor, nnx.Param, nnx.Variable)
   total_number_of_parameters = sum(math.prod(p.shape) for p in jax.tree.leaves(parameters))
 
   print(f'Total number of parameters: {total_number_of_parameters}')
 
-def regress(seed, output, progress=True, restore=True, **config):
-  rng = jax.random.PRNGKey(seed)
-  np_rng = np.random.default_rng(seed=(seed, 0))
+def regress(seed, output, progress=True, restore=True, report=None, **config):
+  print(f'using {config.get("regressor")} as regressor')
+
+  np_rng = np.random.default_rng(seed=seed)
+  get_seed = lambda: np_rng.integers(low=0, high=MAX_INT)
+  rng = jax.random.PRNGKey(get_seed())
+
+  checkpointer = detopt.utils.io.get_checkpointer(output)
+  if checkpointer.latest_step() is not None and checkpointer.latest_step() >= config['epochs']:
+    return
 
   detector = detopt.detector.from_config(config['detector'])
-  design = get_design(detector, config['initial_design'])
-  design_eps = float(config['design_epsilon'])
 
   rng, key_init = jax.random.split(rng, num=2)
+  restored = detopt.utils.io.restore_state(
+    checkpointer, detector, config, rngs=nnx.Rngs(key_init), restore=restore
+  )
+
+  starting_epoch = restored['starting_epoch']
+
+  design = restored['design']['design']
+  print(f'using {design} as initial design')
+  print(f'using {detector.decode_design(design)} as initial design')
+  design_optimizer, design_optimizer_state = restored['design']['optimizer'], restored['design']['optimizer_state']
+
+  regressor_def, regressor_optimizer = restored['regressor']['model'], restored['regressor']['optimizer']
+  regressor_parameters, regressor_state = restored['regressor']['parameters'], restored['regressor']['state']
+  regressor_optimizer_state = restored['regressor']['optimizer_state']
 
   epochs, steps = config['epochs'], config['steps']
   batch, validation_batches = config['batch'], config['validation_batches']
 
-  rng, key_init = jax.random.split(rng, num=2)
-  checkpointer = detopt.utils.io.get_checkpointer(output)
-
-  starting_epoch, regressor_def, parameters, regressor_state, optimizer, optimizer_state = get_model(
-    checkpointer,
-    input_shape=detector.output_shape(), design_shape=detector.design_shape(), target_shape=detector.target_shape(),
-    config=config['regressor'], rngs=nnx.Rngs(key_init), restore=restore
-  )
-
-  reg_coef = config['regressor'].get('regularization', 1.0e-2)
-
   @jax.jit
-  def loss_f(x, c, t, params, r_state):
-    regressor = nnx.merge(regressor_def, params, r_state)
+  def loss_f(x, c, t, r_params, r_state):
+    regressor = nnx.merge(regressor_def, r_params, r_state)
     p = regressor(x, c, deterministic=False)
-    reg = regressor.regularization()
+
+    loss = jnp.mean(detector.loss(t, p))
 
     _, _, r_state = nnx.split(regressor, nnx.Param, nnx.Variable)
-    return jnp.mean(detector.loss(t, p)) + reg_coef * reg, r_state
+    return loss, r_state
 
   @jax.jit
-  def metric_f(x, c, t, params, r_state):
-    regressor = nnx.merge(regressor_def, params, r_state)
+  def metric_f(x, c, t, r_params, r_state):
+    regressor = nnx.merge(regressor_def, r_params, r_state)
     p = regressor(x, c, deterministic=True)
-    return jnp.mean(detector.metric(t, p))
+
+    metric = detector.metric(t, p)
+
+    return metric
 
   @jax.jit
-  def step(x, c, t, parameters, r_state, state):
-    (loss, r_state), grad = jax.value_and_grad(loss_f, argnums=3, has_aux=True)(x, c, t, parameters, r_state)
-    updates, state = optimizer.update(grad, state)
-    parameters = optax.apply_updates(parameters, updates)
-    return loss, parameters, r_state, state
+  def step_regressor(x, c, t, r_params, r_state, opt_state):
+    (loss, r_state), grad = jax.value_and_grad(loss_f, argnums=3, has_aux=True)(x, c, t, r_params, r_state)
+    updates, opt_state = regressor_optimizer.update(grad, opt_state)
+    r_params = optax.apply_updates(r_params, updates)
+    return loss, r_params, r_state, opt_state
 
-  training_losses = np.ndarray(shape=(epochs, steps))
-  validation_losses = np.ndarray(shape=(epochs, validation_batches))
+  regressor_losses = np.ndarray(shape=(epochs, steps))
+  regressor_validation = np.ndarray(shape=(epochs, validation_batches, batch))
 
-  if starting_epoch > 0:
-    aux = detopt.utils.io.restore_aux(checkpointer)
-    training_losses[:starting_epoch] = aux['training'][:starting_epoch]
-    validation_losses[:starting_epoch] = aux['validation'][:starting_epoch]
+  aux: dict | None = restored['aux']
+  if aux is not None:
+    regressor_losses[:starting_epoch] = aux['regressor']['training'][:starting_epoch]
+    regressor_validation[:starting_epoch] = aux['regressor']['validation'][:starting_epoch]
 
   status = detopt.utils.progress.status_bar(disable=not progress)
 
   for i in status.epochs(starting_epoch, epochs):
     for j in status.training(steps):
-      design_batch = design[None, :] + design_eps * np_rng.normal(size=(batch, *detector.design_shape())).astype(np.float32)
-      measurements, target = detector(seed=(seed, i, j, 0), configurations=design_batch)
+      design_batch = np.broadcast_to(design[None], shape=(batch, *detector.design_shape()))
+      _, measurements, target = detector(seed=get_seed(), configurations=design_batch)
 
-      rng, key_step = jax.random.split(rng, num=2)
-      training_losses[i, j], parameters, regressor_state, optimizer_state = step(
-        measurements, design_batch, target,
-        parameters, regressor_state, optimizer_state
-      )
+      regressor_losses[i, j], regressor_parameters, regressor_state, regressor_optimizer_state = \
+        step_regressor(
+          measurements, design_batch, target,
+          regressor_parameters, regressor_state, regressor_optimizer_state
+        )
 
     for j in status.validation(validation_batches):
-      design_batch = design[None, :] + design_eps * np_rng.normal(size=(batch, *detector.design_shape())).astype(np.float32)
-      measurements, target = detector(seed=(seed, i, j, 1), configurations=design_batch)
+      design_batch = np.broadcast_to(design[None], shape=(batch, *detector.design_shape()))
+      _, measurements, target = detector(seed=get_seed(), configurations=design_batch)
 
-      validation_losses[i, j] = metric_f(measurements, design_batch, target, parameters, regressor_state)
+      regressor_validation[i, j] = metric_f(measurements, design_batch, target, regressor_parameters, regressor_state)
+
+    aux = {
+      'regressor': {
+        'training': regressor_losses[:i + 1],
+        'validation': regressor_validation[:i + 1]
+      }
+    }
 
     detopt.utils.io.save_state(
       i, checkpointer, design=design,
-      regressor_parameters=parameters, regressor_state=regressor_state, regressor_optimizer_state=optimizer_state,
-      aux={'training': training_losses, 'validation': validation_losses}
+
+      regressor_parameters=regressor_parameters, regressor_state=regressor_state,
+      regressor_optimizer_state=regressor_optimizer_state,
+      aux=aux
     )
+
+    if report is not None:
+      import matplotlib.pyplot as plt
+      os.makedirs(report, exist_ok=True)
+
+      fig = plot(aux)
+      fig.savefig(os.path.join(report, 'losses.png'))
+      plt.close(fig)
 
   checkpointer.close()
 
-def report(checkpoint, report):
+
+def plot(aux):
   import matplotlib.pyplot as plt
-
-  manager = detopt.utils.io.get_checkpointer(checkpoint)
-
-  aux = detopt.utils.io.restore_aux(manager)
-
-  training_losses = aux['training']
-  validation_losses = aux['validation']
 
   fig = plt.figure(figsize=(9, 12))
   axes = fig.subplots(2, 1)
 
-  detopt.utils.viz.losses.plot(training_losses, axes[0])
-  axes[0].set_title('training')
-  detopt.utils.viz.losses.plot(validation_losses, axes[1])
-  axes[1].set_title('validation')
+  detopt.utils.viz.losses.plot(aux['regressor']['training'], axes[0])
+  axes[0].set_title('Regressor losses')
+  detopt.utils.viz.losses.plot(aux['regressor']['validation'], axes[1])
+  axes[1].set_title('Regressor validation')
 
   fig.tight_layout()
-  fig.savefig(report)
+  return fig
+
+
+def report(seed, checkpoint, report, **config):
+  import matplotlib.pyplot as plt
+  os.makedirs(report, exist_ok=True)
+
+  rng = jax.random.PRNGKey(seed)
+
+  checkpointer = detopt.utils.io.get_checkpointer(checkpoint)
+  detector = detopt.detector.from_config(config['detector'])
+
+  restored = detopt.utils.io.restore_state(
+    checkpointer, detector, config, rngs=nnx.Rngs(rng), restore=True
+  )
+
+  aux = restored['aux']
+
+  fig = plot(aux)
+  fig.savefig(os.path.join(report, 'losses.png'))
   plt.close(fig)
+
 
 if __name__ == '__main__':
   import gearup
 
-  gearup.gearup(train=regress, report=report, info=info).with_config('config/regress.yaml')()
+  gearup.gearup(regress=regress, report=report).with_config('config/regress.yaml')()

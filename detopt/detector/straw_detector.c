@@ -154,6 +154,8 @@ static PyObject * solve(PyObject *self, PyObject *args) {
   const npy_intp n_layers = PyArray_DIM(response_array, 2);
   const npy_intp n_straws = PyArray_DIM(response_array, 3);
 
+//  printf("batch: %ld, particles: %ld, layers: %ld straws: %ld\n", n_batch, n_particles, n_layers, n_straws);
+
   PyArrayObject * trajectories_array;
 
   if (!Py_IsNone(py_trajectories)) {

@@ -1,6 +1,7 @@
 model:
   deep-set:
-    features: [[96, 64], [48, 32], [32, 24]]
+    features: [[128, 96], [64, 48]]
+    p_dropout: null
 
 optimizer:
   adam:

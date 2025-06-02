@@ -41,8 +41,8 @@ class Model(nnx.Module):
 
 class LeakyTanh(nnx.Module):
   def __init__(self, *shape):
-    self.positive = nnx.Param(jnp.zeros(shape=shape, ))
-    self.negative = nnx.Param(jnp.zeros(shape=shape, ))
+    self.positive = nnx.Param(jnp.ones(shape=shape, ))
+    self.negative = nnx.Param(jnp.ones(shape=shape, ))
 
   def __call__(self, x):
     return jax.nn.tanh(x) + self.positive.value * jax.nn.softplus(x) - self.negative * jax.nn.softplus(-x)
@@ -131,12 +131,11 @@ class Block(nnx.Module):
     return result
 
 def bayes_aggregate(mu, log_sigma, axis, keepdims=False):
-  min_log_sigma = jnp.min(log_sigma, axis=axis, keepdims=True)
-  inv_sigma_sqr = jnp.exp(-2 * (log_sigma - min_log_sigma))
-  min_log_sigma = jnp.min(log_sigma, axis=axis, keepdims=keepdims)
+  # inv_sigma_sqr = jnp.exp(-2 * log_sigma)
+  inv_sigma_sqr = jax.nn.softplus(-log_sigma)
 
   mu_inv_sigma_sqr = jnp.sum(mu * inv_sigma_sqr, axis=axis, keepdims=keepdims)
-  inv_sum_inv_sigma_sqr = 1 / (jnp.exp(2 * min_log_sigma) + jnp.sum(inv_sigma_sqr, axis=axis, keepdims=keepdims))
+  inv_sum_inv_sigma_sqr = 1 / (1 + jnp.sum(inv_sigma_sqr, axis=axis, keepdims=keepdims))
 
   mu_aggregated = mu_inv_sigma_sqr * inv_sum_inv_sigma_sqr
   sigma_aggregated = jnp.sqrt(inv_sum_inv_sigma_sqr)

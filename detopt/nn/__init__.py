@@ -13,6 +13,7 @@ __models__: dict[str, type[Regressor]] = {
   'resnet': AlphaResNet,
   'hyper-resnet': HyperResNet,
   'deep-set': DeepSet,
+  'bayes-deep-set': BayesDeepSet,
 
   'deep-set-vae': DeepSetVAE,
   'cvae': CVAE,

@@ -60,6 +60,7 @@ class StrawDetector(Detector):
     self.n_straws = n_straws
     assert max_particles > 1, 'signal events produce at least 2 particles'
     self.max_particles = max_particles
+    assert self.max_particles == 2, 'this is temporary'
 
     flight_distance = max(5 * L, layer_bounds[1]) - origin[2] - 3 * origin_sigma[2]
 
@@ -77,10 +78,10 @@ class StrawDetector(Detector):
 
   def target_shape(self):
     ### charges + momenta + initial positions
-    return (self.max_particles + 3 * self.max_particles + 3 * self.max_particles, )
+    return ()
 
   def ground_truth_shape(self):
-    return ()
+    return (self.max_particles + 3 * self.max_particles + 3 * self.max_particles, )
 
   def get_design(self, design: np.ndarray[tuple[int, int], np.dtype[np.float32]]):
     n, _ = design.shape
@@ -113,43 +114,42 @@ class StrawDetector(Detector):
     rng = np.random.default_rng(seed)
 
     n, _ = design.shape
+    m = 2
 
     layers, angles, widths, heights, Bs, Ls = self.get_design(design)
 
-    masses = np.ones(shape=(n ,self.max_particles, ), dtype=np.float32)
-    charges = (2 * rng.binomial(n=1, p=0.5, size=(n, self.max_particles)) - 1).astype(np.float32)
+    masses = np.ones(shape=(n, m, ), dtype=np.float32)
+    charges = (2 * rng.binomial(n=1, p=0.5, size=(n, m)) - 1).astype(np.float32)
 
-    initial_positions = np.ndarray(shape=(n, self.max_particles, 3), dtype=np.float32)
-    initial_momentum = np.ndarray(shape=(n, self.max_particles, 3), dtype=np.float32)
+    # initial_positions = np.ndarray(shape=(n, m, 3), dtype=np.float32)
+    # initial_momentum = np.ndarray(shape=(n, m, 3), dtype=np.float32)
 
-    u = rng.uniform(low=0.0, high=1.0, size=(n, ))
-    # included = (rng.uniform(low=0.0, high=1.0, size=(n, self.max_particles - 2)) < u[:, None]).astype(dtype=np.float32)
-    included = np.zeros(shape=(n, self.max_particles - 2), dtype=np.float32)
-
-    noise_positions = self.noise_origin_sigma * rng.normal(size=(n, self.max_particles, 3)) + self.noise_origin
-    ### the total momentum would be ~ N(m, sigma^2)
-    noise_momentum = self.noise_momentum_sigma * rng.normal(size=(n, self.max_particles, 3)) + self.noise_momentum
-
-    initial_positions[:, 2:, :] = included[:, :, None] * noise_positions[:, 2:]
-    initial_momentum[:, 2:, :] = included[:, :, None] * noise_momentum[:, 2:]
-
+    noise_positions = self.noise_origin_sigma * rng.normal(size=(n, m, 3)) + self.noise_origin
     signal_positions = self.origin_sigma * rng.normal(size=(n, 3)) + self.origin
     ### the total momentum would be ~ N(m, sigma^2)
-    signal_momentum = INV_SQRT_2 * self.momentum_sigma * rng.normal(size=(n, 2, 3)) + 0.5 * self.momentum
+    initial_momentum = INV_SQRT_2 * self.momentum_sigma * rng.normal(size=(n, m, 3)) + 0.5 * self.momentum
 
     signal = rng.binomial(n=1, p=0.5, size=(n,)).astype(dtype=np.float32)
-    initial_positions[:, :2, :] = signal[:, None, None] * signal_positions[:, None, :] + \
-                                  (1 - signal)[:, None, None] * noise_positions[:, :2, :]
-    # initial_momentum[:, :2, :] = signal[:, None, None] * signal_momentum + \
-    #                              (1 - signal)[:, None, None] * noise_momentum[:, :2, :]
-    initial_momentum[:, :2, :] = signal_momentum
+
+    initial_positions = signal[:, None, None] * signal_positions[:, None, :] + (1 - signal)[:, None, None] * noise_positions
+    initial_positions = initial_positions.astype(np.float32)
+    initial_momentum = initial_momentum.astype(np.float32)
+
+    # initial_positions[:, 2:, :] = included[:, :, None] * noise_positions[:, 2:]
+    # initial_momentum[:, 2:, :] = included[:, :, None] * noise_momentum[:, 2:]
+    #
+    # initial_positions[:, :2, :] = signal[:, None, None] * signal_positions[:, None, :] + \
+    #                               (1 - signal)[:, None, None] * noise_positions[:, :2, :]
+    # # initial_momentum[:, :2, :] = signal[:, None, None] * signal_momentum + \
+    # #                              (1 - signal)[:, None, None] * noise_momentum[:, :2, :]
+    # initial_momentum[:, :2, :] = signal_momentum
     charges[:, 0] = -charges[:, 1]
 
     momentum_norm_sqr = np.sum(np.square(initial_momentum), axis=-1)
     initial_velocities = initial_momentum / np.sqrt(np.square(masses) + momentum_norm_sqr)[..., None]
 
-    trajectories = np.zeros(shape=(n, self.max_particles, self.n_t, 3), dtype=np.float32)
-    response = np.zeros(shape=(n, self.max_particles, self.n_layers, self.n_straws), dtype=np.float32)
+    trajectories = np.zeros(shape=(n, m, self.n_t, 3), dtype=np.float32)
+    response = np.zeros(shape=(n, m, self.n_layers, self.n_straws), dtype=np.float32)
 
     straw_detector.solve(
       initial_positions, initial_velocities,
@@ -181,6 +181,9 @@ class StrawDetector(Detector):
   def loss(self, target, predicted):
     import optax
     return optax.sigmoid_binary_cross_entropy(predicted, target)
+
+  def metric(self, target, predicted):
+    return (target > 0.5) == (predicted > 0.0)
 
   def encode_design(self, design):
     positions = np.array(design['positions'], dtype=np.float32)

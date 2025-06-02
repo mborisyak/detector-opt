@@ -9,7 +9,7 @@ import jax.nn as jnn
 
 from flax import nnx
 from ..detector import Detector
-from .common import Model, Block, SiLU, LeakyTanh, bayes_aggregate
+from .common import Model, Block, SiLU, LeakyTanh, LeakyReLU, bayes_aggregate
 
 __all__ = [
   'Regressor',
@@ -17,7 +17,8 @@ __all__ = [
   'AlphaResNet',
   'CNN',
   'HyperResNet',
-  'DeepSet'
+  'DeepSet',
+  'BayesDeepSet'
 ]
 
 class Regressor(Model):
@@ -27,17 +28,17 @@ class Regressor(Model):
 class MLP(Regressor):
   def __init__(
     self, detector: Detector,
-    hidden_units: Sequence[int], *, layer_norm: bool=True, p_dropout: float | None=0.2, rngs: nnx.Rngs
+    features: Sequence[int], *, layer_norm: bool=False, p_dropout: float | None=None, rngs: nnx.Rngs
   ):
     super().__init__(detector, rngs=rngs)
     input_dim, design_dim = math.prod(self.input_shape), math.prod(self.design_shape)
     target_dim = math.prod(self.target_shape)
 
-    self.units = (input_dim + design_dim, *hidden_units, target_dim)
+    self.units = (input_dim + design_dim, *features, target_dim)
     self.layer_norm = layer_norm
 
     self.layers: list[nnx.Module] = list()
-    for i, (n_in, n_out) in enumerate(zip(self.units[1:-1], self.units[:-2])):
+    for i, (n_in, n_out) in enumerate(zip(self.units[:-2], self.units[1:-1])):
         if layer_norm:
           self.layers.append(
             nnx.LayerNorm(n_in, rngs=rngs)
@@ -49,7 +50,7 @@ class MLP(Regressor):
         self.layers.append(
           nnx.Linear(n_in, n_out, rngs=rngs)
         )
-        self.layers.append(SiLU())
+        self.layers.append(LeakyTanh(n_out, ))
 
     *_, n_in, n_out = self.units
     self.layers.append(
@@ -285,7 +286,6 @@ class DeepSet(Regressor):
     *, rngs: nnx.Rngs
   ):
     super().__init__(detector, rngs=rngs)
-    input_dim, design_dim = math.prod(self.input_shape), math.prod(self.design_shape)
     target_dim = math.prod(self.target_shape)
     ### position + angle + B
     n_design = 3
@@ -293,7 +293,7 @@ class DeepSet(Regressor):
     n_layers, n_straws = self.input_shape
     self.blocks: list[Block] =  []
 
-    dropout = lambda: () if p_dropout is None else (nnx.Dropout(rate=p_dropout, rngs=rngs), )
+    dropout = lambda: () #if p_dropout is None else (nnx.Dropout(rate=p_dropout, rngs=rngs), )
 
     n_features = n_design + n_straws
     for block_def in features:
@@ -346,9 +346,7 @@ class DeepSet(Regressor):
 
 class BayesDeepSet(Regressor):
   def __init__(
-              self, detector: Detector,
-              features: Sequence[Sequence[int]], p_dropout: float = 0.1,
-              *, rngs: nnx.Rngs
+    self, detector: Detector, features: Sequence[Sequence[int]], p_dropout: float | None = None, *, rngs: nnx.Rngs
   ):
     super().__init__(detector, rngs=rngs)
     input_dim, design_dim = math.prod(self.input_shape), math.prod(self.design_shape)

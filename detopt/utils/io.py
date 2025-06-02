@@ -67,9 +67,12 @@ def save_state(
   discriminator_parameters=None, discriminator_state=None, discriminator_optimizer_state=None,
   *, aux
 ):
+  if design_optimizer_state is not None:
+    design_optimizer_state =  jax.tree.leaves(design_optimizer_state)
+
   manager.save(step, args=ocp.args.Composite(
     ### because saving a standalone array is difficult
-    design=ocp.args.PyTreeSave({'design' : design, 'optimizer_state': jax.tree.leaves(design_optimizer_state)}),
+    design=ocp.args.PyTreeSave({'design' : design, 'optimizer_state': design_optimizer_state}),
 
     regressor=ocp.args.PyTreeSave(
       save_model(regressor_parameters, regressor_state, regressor_optimizer_state)
@@ -137,10 +140,12 @@ def restore_state(manager, detector, config, *, rngs: nnx.Rngs, restore=True):
     )
     ### design -> design because it is a standalone array
     design, design_optimizer_state = data['design']['design'], data['design']['optimizer_state']
-    design_optimizer_state = jax.tree.unflatten(
-      jax.tree.structure(design_optimizer.init(design)),
-      design_optimizer_state
-    )
+
+    if design_optimizer_state is not None:
+      design_optimizer_state = jax.tree.unflatten(
+        jax.tree.structure(design_optimizer.init(design)),
+        design_optimizer_state
+      )
 
   else:
     starting_epoch = 0
