@@ -1,3 +1,0 @@
-resnet:
-  n_hidden: 128
-  depth: 5
