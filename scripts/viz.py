@@ -9,8 +9,8 @@ import numpy as np
 import detopt
 
 def viz(seed=123, design='data/design/default.json', **config):
-  n_batch = 3
-  n_layers = 16
+  n_batch = 1
+  n_layers = 64
   detector = detopt.detector.from_config(config['detector'])
 
   root = os.path.dirname(os.path.dirname(__file__))
@@ -21,8 +21,9 @@ def viz(seed=123, design='data/design/default.json', **config):
 
   configs = np.broadcast_to(design[None], (n_batch, *design.shape))
 
+
   import time
-  n_trials = 1024
+  n_trials = 1
   start_time = time.perf_counter()
   for i in range(n_trials):
     _ = detector(seed=1, configurations=configs)
@@ -32,7 +33,7 @@ def viz(seed=123, design='data/design/default.json', **config):
 
   from concurrent.futures import ThreadPoolExecutor
 
-  n_cores = 5 # os.cpu_count()
+  n_cores = 1 # os.cpu_count()
   start_time = time.perf_counter()
   with ThreadPoolExecutor(max_workers=n_cores) as executor:
     futures = [
@@ -52,10 +53,12 @@ def viz(seed=123, design='data/design/default.json', **config):
 
   v0s = list()
   ys = list()
-  for i in range(1000):
+  for i in range(1):
     _, _, _, v0, trajectories, response, signal = detector.sample(seed=i, design=configs)
     v0s.append(v0)
     ys.append(signal)
+    # print(i, end='\n')
+    # print( *response, *signal, sep='\n', end='\n\n')
 
   v0s = np.concatenate(v0s, axis=0)
   ys = np.concatenate(ys, axis=0)
@@ -70,6 +73,11 @@ def viz(seed=123, design='data/design/default.json', **config):
 
   _, _, _, _, trajectories, response, signal = detector.sample(seed=seed, design=configs)
   layers, angles, widths, heights, Bs, Ls = detector.get_design(design=configs)
+
+  # print(layers, angles, widths, heights, Bs, Ls, sep='  \n\n')
+  # Bs, Ls - easy
+  # angles - easy
+  #
 
   print(response.shape)
   plt.matshow(response[0].T)

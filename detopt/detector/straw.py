@@ -1,5 +1,8 @@
 import math
 import numpy as np
+import subprocess
+import os
+# import ROOT
 
 from ..utils.encoding import uniform_to_normal, normal_to_uniform
 from .common import Detector
@@ -14,12 +17,22 @@ INV_SQRT_2 = math.sqrt(0.5)
 class StrawDetector(Detector):
   def __init__(
     self,
+    # Geometry hierarchy
+    # Real detector geometry
+    station_z: list = [2598.0, 2698.0, 3498.0, 3538.0],
+    n_views_per_station: int = 4,
+    n_layers_per_view: int = 4,
+    n_straws_per_layer: int = 200,
+    straw_pitch: float = 2.0,
+    straw_length: float = 200.0,
+    layer_x_offset: float = 1.0,
+    view_angles: tuple = (0.0, 0.0798,  -0.0798, 0.0),  # X, U, X', V
+    layer_z_gap: float = 1.732,
+    view_z_gap: float = 5.0,
+    # Physics parameters
     max_B: float=0.5, L=1.0,
     layer_bounds: tuple[float | int, float | int]=(-5.0, 5.0),
-    layer_width: float=5, layer_height: float=5,
-    angles_bounds: tuple[float | int, float | int]=(-1.0471975511965976, 1.0471975511965976),
     dt: float=1.0e-2,
-    n_layers: int=16, n_straws: int=32,
     max_particles=2,
     origin=(0.0, 0.0, -10.0), origin_sigma=(1.0, 1.0, 1.0),
     momentum=(0.0, 0.0, 5.0), momentum_sigma=(0.25, 0.25, 0.5),
@@ -27,6 +40,12 @@ class StrawDetector(Detector):
     noise_momentum=(0.0, 0.0, 5.0), noise_momentum_sigma=(0.25, 0.25, 0.5),
     straw_signal_rate=200.0,
     straw_noise_rate=10.0,
+    angles_bounds=None,  # <-- ADD THIS LINE
+    layer_width=None,
+    layer_height=None,
+    n_layers=None,
+    n_straws=None,
+
   ):
     """
     :param max_B: maximal strength of the magnetic field;
@@ -50,14 +69,33 @@ class StrawDetector(Detector):
     self.noise_momentum_sigma = np.array(noise_momentum_sigma, dtype=np.float32)
 
     self.layer_bounds = layer_bounds
-    self.angle_bounds = angles_bounds
     self.dt = dt
 
-    self.layer_width = layer_width
-    self.layer_height = layer_height
+    # Real detector geometry
+    self.station_z = station_z
+    self.n_stations = len(station_z)
+    self.n_views_per_station = n_views_per_station
+    self.n_layers_per_view = n_layers_per_view
+    self.n_straws = n_straws_per_layer
+    self.straw_pitch = straw_pitch
+    self.straw_length = straw_length
+    self.layer_x_offset = layer_x_offset
+    self.view_angles = view_angles
+    self.layer_z_gap = layer_z_gap
+    self.view_z_gap = view_z_gap
 
-    self.n_layers = n_layers
-    self.n_straws = n_straws
+    self.n_layers = self.n_stations * self.n_views_per_station * self.n_layers_per_view
+
+    # Layer height/width for visualization/hit logic
+    self.layer_height = self.straw_pitch * self.n_straws / 2.0  # half-length for +/- y
+    self.layer_width = self.straw_length / 2.0  # half-length for +/- x
+
+    # Angle bounds: use legacy if provided, else default
+    if angles_bounds is not None:
+        self.angle_bounds = angles_bounds
+    else:
+        self.angle_bounds = (-0.1, 0.1)
+
     assert max_particles > 1, 'signal events produce at least 2 particles'
     self.max_particles = max_particles
     assert self.max_particles == 2, 'this is temporary'
@@ -67,6 +105,7 @@ class StrawDetector(Detector):
     self.n_t = int(2 * flight_distance / dt)
     self.straw_signal_rate = straw_signal_rate
     self.straw_noise_rate = straw_noise_rate
+    print("\n\n\nSet up\n\n\n")
 
   def design_shape(self):
     ### positions + angles + magnetic field strength
@@ -87,28 +126,40 @@ class StrawDetector(Detector):
     n, _ = design.shape
     m = self.n_layers
 
+    print(n, m, end='\n\n\n')
+
     design_decoded = self._decode_design(design)
 
-    #layers = normal_to_uniform(positions_normalized, *self.layer_bounds).astype(np.float32)
-    layers = design_decoded['positions']
-    assert layers.shape == (n, m), layers.shape
-    assert np.all(np.isfinite(layers)), f'NaN decoding positions, {layers}'
-    ### overlapping angles for easier optimization
-    # angles = normal_to_uniform(angles_normalized, *self.angle_bounds).astype(np.float32)
-    angles = design_decoded['angles']
-    assert np.all(np.isfinite(angles)), f'NaN decoding angles, {angles}'
-
+    # Real detector geometry calculation
+    layer_positions = []
+    layer_angles = []
+    layer_x_offsets = []
+    for s, station_z in enumerate(self.station_z):
+        for v in range(self.n_views_per_station):
+            view_angle = self.view_angles[v]
+            view_z = station_z + v * self.view_z_gap
+            for l in range(self.n_layers_per_view):
+                layer_z = view_z + l * self.layer_z_gap
+                x_offset = l * self.layer_x_offset
+                layer_positions.append(layer_z)
+                layer_angles.append(view_angle)
+                layer_x_offsets.append(x_offset)
+    # Repeat for batch dimension
+    layers = np.array(layer_positions, dtype=np.float32)[None, :].repeat(n, axis=0)
+    angles = np.array(layer_angles, dtype=np.float32)[None, :].repeat(n, axis=0)
     widths = self.layer_width + np.zeros(shape=(n, m), dtype=np.float32)
     heights = self.layer_height + np.zeros(shape=(n, m), dtype=np.float32)
+    # Optionally: x_offsets = np.array(layer_x_offsets, dtype=np.float32)[None, :].repeat(n, axis=0)
+    # ... Bs, Ls as before ...
+    # Return arrays as before
 
-    #Bs = normal_to_uniform(magnetic_strength_normalized, 0.0, self.max_B).astype(np.float32)
     Bs = design_decoded['magnetic_strength']
     assert np.all(np.isfinite(Bs)), f'NaN decoding B, {Bs}'
     Ls = self.L + np.zeros(shape=(n,), dtype=np.float32)
 
     return layers, angles, widths, heights, Bs, Ls
 
-  def sample(self, seed: int, design: np.ndarray):
+  def sample(self, seed: int, design:  np.ndarray):
     ### the first two particles reserve for signal
     ### the rest is sampled as noise
     rng = np.random.default_rng(seed)
@@ -151,9 +202,11 @@ class StrawDetector(Detector):
     trajectories = np.zeros(shape=(n, m, self.n_t, 3), dtype=np.float32)
     response = np.zeros(shape=(n, m, self.n_layers, self.n_straws), dtype=np.float32)
 
+
     straw_detector.solve(
-      initial_positions, initial_velocities,
-      masses, charges, Bs, Ls,
+
+      initial_positions,  initial_velocities,
+      masses,charges,Bs, Ls,
       self.n_t, self.dt, layers, widths, heights,
       angles, trajectories, response
     )
@@ -162,8 +215,15 @@ class StrawDetector(Detector):
     measurements = rng.poisson(combined_response, size=combined_response.shape) / (self.straw_signal_rate + self.straw_noise_rate)
 
     # measurements = np.where(np.sum(response, axis=1) > 0.5, 1.0, 0.0)
+    print( 'ip',initial_positions, 'iv',initial_velocities,
+    'm',masses,'c',  charges,  'b',Bs, Ls,
+    self.n_t, self.dt, layers, widths, heights,
+    angles, trajectories, response,sep='\n')
 
     return masses, charges, initial_positions, initial_momentum, trajectories, measurements, signal
+
+
+
 
   def encode_ground_truth(self, masses, charges, initial_positions, initial_momentum):
     n, *_ = initial_positions.shape
@@ -215,5 +275,3 @@ class StrawDetector(Detector):
       angles=[float(a) for a in decoded['angles']],
       magnetic_strength=float(decoded['magnetic_strength'])
     )
-
-
