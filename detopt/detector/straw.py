@@ -4,6 +4,12 @@ import subprocess
 import os
 # import ROOT
 
+# For reading ROOT files
+try:
+    import uproot
+except ImportError:
+    uproot = None
+
 from ..utils.encoding import uniform_to_normal, normal_to_uniform
 from .common import Detector
 from . import straw_detector
@@ -13,6 +19,17 @@ __all__ = [
 ]
 
 INV_SQRT_2 = math.sqrt(0.5)
+
+NAME2PID = {
+    "mu-": 13,   "mu+": -13,
+    "e-": 11,    "e+": -11,
+    "pi-": -211, "pi+": 211,
+    "gamma": 22,
+    "proton": 2212, "antiproton": -2212,
+    "neutron": 2112, "antineutron": -2112,
+    "nu_e": 12, "nu_e_bar": -12,
+    "nu_mu": 14, "nu_mu_bar": -14,
+}
 
 class StrawDetector(Detector):
   def __init__(
@@ -232,6 +249,120 @@ class StrawDetector(Detector):
     normalized_momenta = np.reshape(initial_momentum, shape=(n, -1))
     ground_truth = np.concatenate([charges, normalized_positions, normalized_momenta], axis=-1)
     return ground_truth
+
+  def simulate_from_root(self, rootfile, tree_name="Events", px_name="px", py_name="py", pz_name="pz",
+                        x_name="x", y_name="y", z_name="z", pid_name="pid", batch_size=None, design=None):
+    """
+    Load particle properties from a ROOT file and run the detector simulation.
+
+    Args:
+        rootfile: Path to the ROOT file.
+        tree_name: Name of the TTree.
+        px_name, py_name, pz_name: Branch names for momentum.
+        x_name, y_name, z_name: Branch names for position.
+        pid_name: Branch name for particle ID.
+        batch_size: Number of events to process at once (None = all).
+        design: Detector design/configuration (if None, use default).
+
+    Returns:
+        Output of the detector simulation (trajectories, response, etc.)
+    """
+    if uproot is None:
+        raise ImportError("uproot is required to read ROOT files. Please install with `pip install uproot awkward`.")
+
+    with uproot.open(rootfile) as file:
+        tree = file[tree_name]
+        px = tree[px_name].array(library="np")
+        py = tree[py_name].array(library="np")
+        pz = tree[pz_name].array(library="np")
+        x = tree[x_name].array(library="np")
+        y = tree[y_name].array(library="np")
+        z = tree[z_name].array(library="np")
+        pid = tree[pid_name].array(library="np")
+
+    # Treat all loaded particles as a single event with n_particles
+    n_particles = px.shape[0]
+    n_events = 1
+
+    initial_positions = np.stack([x, y, z], axis=-1).reshape((1, n_particles, 3)).astype(np.float32)
+    initial_momentum = np.stack([px, py, pz], axis=-1).reshape((1, n_particles, 3)).astype(np.float32)
+    masses = np.ones((1, n_particles), dtype=np.float32)
+
+    def pid_to_charge(pid: int) -> float:
+        CHARGE = {
+            11: -1.0,  -11: +1.0,    # e-, e+
+            13: -1.0,  -13: +1.0,    # mu-, mu+
+            211: +1.0, -211: -1.0,   # pi+, pi-
+            2212: +1.0, -2212: -1.0, # p, pbar
+            2112: 0.0, -2112: 0.0,   # n, nbar
+            22: 0.0,                 # gamma
+            12: 0.0,  -12: 0.0,      # nu_e, anti
+            14: 0.0,  -14: 0.0,      # nu_mu, anti
+        }
+        return CHARGE.get(pid, 0.0)
+
+    # --- Rest masses in GeV (use abs(pid) for particle/antiparticle) ---
+    def pid_to_mass_GeV(pid: int) -> float:
+        MASS = {
+            11: 0.000510999,   # e±
+            13: 0.1056583755,  # mu±
+            211: 0.13957039,   # pi±
+            2212: 0.9382720813,# proton/antiproton
+            2112: 0.9395654133,# neutron/antineutron
+            22: 0.0,           # gamma
+            12: 0.0,  # ν_e (set ~0 for toy; tiny real mass irrelevant here)
+            14: 0.0,  # ν_μ
+        }
+        return MASS.get(abs(pid), 0.0)
+
+    # --- Example: build pid / mass / charge arrays for your particles ---
+    # Suppose you already have a (1, n_particles) array of pids:
+    # pids = np.array([[211, -211, 13, -13, 11, -11, 2212, 2112, 22, 12, -12, 14, -14]], dtype=np.int32)
+
+    def build_masses_and_charges(pids: np.ndarray):
+        pid_vec = np.vectorize  # convenience
+        masses = pid_vec(pid_to_mass_GeV)(pids).astype(np.float32)   # shape (1, n_particles)
+        charges = pid_vec(pid_to_charge)(pids).astype(np.float32)    # shape (1, n_particles)
+        if masses.ndim == 1:
+                masses = masses.reshape((1, -1))
+                charges = charges.reshape((1, -1))
+        return masses, charges
+
+
+
+
+    masses, charges = build_masses_and_charges(pid)
+    print("masses shape:", masses.shape, "dtype:", masses.dtype)
+    print("charges shape:", charges.shape, "dtype:", charges.dtype)
+
+    momentum_norm_sqr = np.sum(np.square(initial_momentum), axis=-1)
+    initial_velocities = initial_momentum / np.sqrt(np.square(masses) + momentum_norm_sqr)[..., None]
+
+
+    if design is None:
+        # Use a default design (single batch)
+        design = np.zeros((1, self.design_dim()), dtype=np.float32)
+    layers, angles, widths, heights, Bs, Ls = self.get_design(design)
+
+
+    # Allocate output arrays
+    trajectories = np.zeros((n_events, n_particles, self.n_t, 3), dtype=np.float32)
+    response = np.zeros((n_events, n_particles, self.n_layers, self.n_straws), dtype=np.float32)
+
+    print("response shape:", response.shape, "dtype:", response.dtype)
+    print("trajectories shape:", trajectories.shape, "dtype:", trajectories.dtype)
+    print("initial_positions shape:", initial_positions.shape, "dtype:", initial_positions.dtype)
+
+    # Call the C extension directly
+    from . import straw_detector
+
+    straw_detector.solve(
+        initial_positions, initial_velocities, masses, charges, Bs, Ls,
+        self.n_t, self.dt, layers, widths, heights, angles, trajectories, response
+    )
+
+    signal = np.ones((n_events,), dtype=np.float32)
+    return masses, charges, initial_positions, initial_momentum, trajectories, response, signal
 
   def __call__(self, seed: int, configurations: np.ndarray):
     masses, charges, initial_positions, initial_momentum, _, measurements, signal = self.sample(seed, configurations)

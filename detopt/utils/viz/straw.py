@@ -63,15 +63,15 @@ def show(layers, angles, width, height, response, trajectories=None, signal=None
         opacity=1.0
       )
 
-  # Comment out trajectory rendering for faster layout visualization
-  # if trajectories is not None:
-  #   n_particles, n_t, _ = trajectories.shape
-  #   if signal is None:
-  #     signal = 0.0
+  # Restore trajectory rendering for visualization
+  if trajectories is not None:
+    n_particles, n_t, _ = trajectories.shape
+    if signal is None:
+      signal = 1.0
 
-  #   for i in range(n_particles):
-  #     traj = pv.Spline(trajectories[i])#.tube(radius=0.05, )
-  #     plotter.add_mesh(traj, color='red' if signal > 0.5 and i < 2 else 'blue', line_width=4, opacity=0.5)
+    for i in range(n_particles):
+      traj = pv.Spline(trajectories[i])  # Optionally: .tube(radius=0.05)
+      plotter.add_mesh(traj, color='red' if signal > 0.5 and i < 2 else 'blue', line_width=4, opacity=0.5)
 
 
   plotter.show_grid()
