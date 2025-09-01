@@ -1,17 +1,25 @@
 straw:
+  # Station z-positions (mm)
+  station_z: [2598.0, 2698.0, 3498.0, 3538.0]
+  n_views_per_station: 4
+  n_layers_per_view: 4
+  n_straws_per_layer: 200 # Set to your actual number
+
+  # Straw geometry
+  straw_length: 200.0 # mm
+  straw_pitch: 2.0 # mm (centre-to-centre in a layer)
+  layer_x_offset: 1.0 # mm (Layer-2 vs Layer-1 x-offset)
+
+  # View geometry
+  view_angles: [0.0, 0.0798, -0.0798, 0.0] # X, U, X', V (radians, stereo angle = 4.57°)
+  layer_z_gap: 1.732 # mm (between layers in a view)
+  view_z_gap: 5.0 # mm (between consecutive views)
+
+  # Physics parameters
   dt: 1.0e-2
-
-  ### field strength
   max_B: 0.5
-  ### field extent
   L: 1.0
-
-  layer_bounds: [-5.0, 5.0]
-  layer_width: 5
-  layer_height: 5
-  n_layers: 16
-  n_straws: 32
-
+  layer_bounds: [259.80, 353.80] # Optional, for encoding/decoding
   max_particles: 2
   origin: [0.0, 0.0, -10.0]
   origin_sigma: [1.0, 1.0, 1.0]

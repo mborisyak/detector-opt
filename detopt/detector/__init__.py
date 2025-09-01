@@ -2,8 +2,8 @@ from typing import Any
 
 from .common import Detector
 
-from . import straw
 from . import straw_detector
+from . import straw
 
 from .. import utils
 from .straw import StrawDetector
