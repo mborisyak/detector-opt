@@ -24,7 +24,7 @@ inline npy_float f32_min(npy_float x, npy_float y) {
 }
 
 inline npy_float f32_max(npy_float x, npy_float y) {
-  return x > y ? y : x;
+  return x > y ? x : y;
 }
 
 inline npy_float imin(npy_int x, npy_int y) {
@@ -32,7 +32,7 @@ inline npy_float imin(npy_int x, npy_int y) {
 }
 
 inline npy_float imax(npy_int x, npy_int y) {
-  return x > y ? y : x;
+  return x > y ? x : y;
 }
 
 const PyArrayObject * check_vector_array(const PyObject * object, int batch, int size) {
@@ -94,6 +94,23 @@ const PyArrayObject * check_design_array(const PyObject * object, int batch) {
   }
 }
 
+// Helper function: check if point (x, y) is inside a convex quadrilateral (parallelogram)
+int point_in_parallelogram(npy_float x, npy_float y, const npy_float corners[4][2]) {
+    int i, j, sign = 0;
+    for (i = 0; i < 4; ++i) {
+        j = (i + 1) % 4;
+        npy_float dx = corners[j][0] - corners[i][0];
+        npy_float dy = corners[j][1] - corners[i][1];
+        npy_float px = x - corners[i][0];
+        npy_float py = y - corners[i][1];
+        npy_float cross = dx * py - dy * px;
+        if (cross == 0) continue;
+        if (sign == 0) sign = (cross > 0) ? 1 : -1;
+        else if ((cross > 0 && sign < 0) || (cross < 0 && sign > 0)) return 0;
+    }
+    return 1;
+}
+
 // see documentation for the python method
 static PyObject * solve(PyObject *self, PyObject *args) {
   PyObject *py_dt= NULL;
@@ -103,14 +120,17 @@ static PyObject * solve(PyObject *self, PyObject *args) {
 
   // particle parameters
   PyObject *py_initial_positions = NULL;
-  PyObject *py_initial_velocities = NULL;
-  PyObject *py_charges = NULL;
+  PyObject *py_initial_momenta = NULL;
   PyObject *py_masses = NULL;
+  PyObject *py_charges = NULL;
 
   PyObject *py_layers = NULL;
   PyObject *py_width = NULL;
   PyObject *py_heights = NULL;
   PyObject *py_angles = NULL;
+
+  PyObject *py_z0 = NULL;
+  PyObject *py_B_sigma = NULL;
 
   PyObject *py_steps = NULL;
 
@@ -118,9 +138,10 @@ static PyObject * solve(PyObject *self, PyObject *args) {
   PyObject *py_response = NULL;
 
   if (!PyArg_UnpackTuple(
-    args, "straw_solve", 14, 14,
-    &py_initial_positions, &py_initial_velocities, &py_masses, &py_charges,
+    args, "straw_solve", 16, 16,
+    &py_initial_positions, &py_initial_momenta, &py_masses, &py_charges,
     &py_B, &py_L,
+    &py_z0, &py_B_sigma,
     &py_steps, &py_dt,
     &py_layers, &py_width, &py_heights, &py_angles,
     &py_trajectories, &py_response
@@ -187,9 +208,9 @@ static PyObject * solve(PyObject *self, PyObject *args) {
     return NULL;
   }
 
-  const PyArrayObject * initial_velocities_array = check_vector_array(py_initial_velocities, n_batch, n_particles);
-  if (initial_velocities_array == NULL) {
-    PyErr_SetString(PyExc_TypeError, "Invalid value for initial velocities provided. Must be a (n, n_particles, 3) float64 array.");
+  const PyArrayObject * initial_momenta_array = check_vector_array(py_initial_momenta, n_batch, n_particles);
+  if (initial_momenta_array == NULL) {
+    PyErr_SetString(PyExc_TypeError, "Invalid value for initial momenta provided. Must be a (n, n_particles, 3) float64 array.");
     return NULL;
   }
 
@@ -240,6 +261,16 @@ static PyObject * solve(PyObject *self, PyObject *args) {
     PyErr_SetString(PyExc_TypeError, "Invalid value for L provided. Must be a (n, ) float64 array.");
     return NULL;
   }
+  const PyArrayObject * z0_array = check_design_array(py_z0, n_batch);
+  if (z0_array == NULL) {
+    PyErr_SetString(PyExc_TypeError, "Invalid value for z0 provided. Must be a (n, ) float64 array.");
+    return NULL;
+  }
+  const PyArrayObject * B_sigma_array = check_design_array(py_B_sigma, n_batch);
+  if (B_sigma_array == NULL) {
+    PyErr_SetString(PyExc_TypeError, "Invalid value for B_sigma provided. Must be a (n, ) float64 array.");
+    return NULL;
+  }
 
   if (!PyFloat_Check(py_dt)) {
       PyErr_SetString(PyExc_TypeError, "dt must be a double");
@@ -248,12 +279,14 @@ static PyObject * solve(PyObject *self, PyObject *args) {
   const npy_float dt = PyFloat_AsDouble(py_dt);
 
   const npy_float * initial_positions = PyArray_DATA(initial_positions_array);
-  const npy_float * initial_velocities = PyArray_DATA(initial_velocities_array);
+  const npy_float * initial_momenta = PyArray_DATA(initial_momenta_array);
   const npy_float * charges = PyArray_DATA(charges_array);
   const npy_float * masses = PyArray_DATA(masses_array);
 
   const npy_float * Bs = PyArray_DATA(B_array);
   const npy_float * Ls = PyArray_DATA(L_array);
+  const npy_float * z0s = PyArray_DATA(z0_array);
+  const npy_float * B_sigmas = PyArray_DATA(B_sigma_array);
 
   const npy_float * layers = PyArray_DATA(layers_array);
   const npy_float * widths = PyArray_DATA(width_array);
@@ -270,9 +303,9 @@ static PyObject * solve(PyObject *self, PyObject *args) {
   npy_intp ips1 = PyArray_STRIDE(initial_positions_array, 1) / sizeof(npy_float);
   npy_intp ips2 = PyArray_STRIDE(initial_positions_array, 2) / sizeof(npy_float);
 
-  npy_intp ivs0 = PyArray_STRIDE(initial_velocities_array, 0) / sizeof(npy_float);
-  npy_intp ivs1 = PyArray_STRIDE(initial_velocities_array, 1) / sizeof(npy_float);
-  npy_intp ivs2 = PyArray_STRIDE(initial_velocities_array, 2) / sizeof(npy_float);
+  npy_intp ivs0 = PyArray_STRIDE(initial_momenta_array, 0) / sizeof(npy_float);
+  npy_intp ivs1 = PyArray_STRIDE(initial_momenta_array, 1) / sizeof(npy_float);
+  npy_intp ivs2 = PyArray_STRIDE(initial_momenta_array, 2) / sizeof(npy_float);
 
   npy_intp chs0 = PyArray_STRIDE(charges_array, 0) / sizeof(npy_float);
   npy_intp chs1 = PyArray_STRIDE(charges_array, 1) / sizeof(npy_float);
@@ -314,33 +347,33 @@ static PyObject * solve(PyObject *self, PyObject *args) {
       npy_float y = initial_positions[l * ips0 + i * ips1 + ips2];
       npy_float z = initial_positions[l * ips0 + i * ips1 + 2 * ips2];
 
-      npy_float vx = initial_velocities[l * ivs0 + i * ivs1];
-      npy_float vy = initial_velocities[l * ivs0 + i * ivs1 + ivs2];
-      npy_float vz = initial_velocities[l * ivs0 + i * ivs1 + 2 * ivs2];
+      npy_float px = initial_momenta[l * ivs0 + i * ivs1];
+      npy_float py = initial_momenta[l * ivs0 + i * ivs1 + ivs2];
+      npy_float pz = initial_momenta[l * ivs0 + i * ivs1 + 2 * ivs2];
+
+      const npy_float charge = charges[l * chs0 + i * chs1];
+      const npy_float mass = masses[l * ms0 + i * ms1];
+
+      npy_float p2 = px * px + py * py + pz * pz;
+      const npy_float gamma = sqrtf(1.0f + p2 / (mass * mass));
+      npy_float vx = px / (gamma * mass);
+      npy_float vy = py / (gamma * mass);
+      npy_float vz = pz / (gamma * mass);
+      printf("gamma = %f mass = %f\n", gamma, mass);
 
       if (f32_abs(vx) < SLOW && f32_abs(vy) < SLOW && f32_abs(vz) < SLOW) {
         // ghost particle
         continue;
       }
 
-      npy_float v_sqr = vx * vx + vy * vy + vz * vz;
-
-      const npy_float gamma = 1.0 / sqrt(1 - v_sqr);
-
-      const npy_float charge = charges[l * chs0 + i * chs1];
-      const npy_float mass = masses[l * ms0 + i * ms1];
-
       const npy_float c = 0.5 * dt * charge / mass / gamma;
 
-      // printf("event %d, particle %d: %.2lf %.2lf %.2lf (c=%.2e)\n", l, i, vx, vy, vz, c);
-
-      // motion through a purely magnetic field preserves |p|
-      // npy_float px = vx * gamma * mass;
-      // npy_float py = vy * gamma * mass;
-      // npy_float pz = vz * gamma * mass;
+      // Magnetic field parameters for this batch/event
+      const npy_float z0 = z0s[l];
+      const npy_float B_sigma = B_sigmas[l];
 
       for (int j = 0; j < n_steps; ++j) {
-        const npy_float Bx = B * exp(-square(z / L));
+        const npy_float Bx = B * exp(-square((z - z0) / B_sigma));
         const npy_float tx = c * Bx;
         const npy_float t_norm_sqr = tx * tx;
 
@@ -355,12 +388,7 @@ static PyObject * solve(PyObject *self, PyObject *args) {
         const npy_float sx = 2 * tx / (1 + t_norm_sqr);
 
         vy = vy_m + vz_m * sx;
-        // const npy_float vy = vy_m;
         vz = vz_m - vy_m * sx;
-
-  //      const npy_float cx = ay * bz - az * by;
-  //      const npy_float cy = az * bx - ax * bz;
-  //      const npy_float cz = ax * by - ay * bx;
 
         const npy_float dx = dt * vx;
         const npy_float dy = dt * vy;
@@ -391,8 +419,17 @@ static PyObject * solve(PyObject *self, PyObject *args) {
           const npy_float ry = -ny * x + nx * y;
           const npy_float rx = nx * x + ny * y;
 
-          // outside the layer
-          if (f32_abs(rx) > width || f32_abs(ry) > height) {
+          // Compute parallelogram corners in local (rx, ry) frame
+          const npy_float skew = height * tanf(angle);
+          npy_float corners[4][2] = {
+            {-width - skew, -height},
+            {-width + skew,  height},
+            { width + skew,  height},
+            { width - skew, -height}
+          };
+
+          // outside the parallelogram (frame)
+          if (!point_in_parallelogram(rx, ry, corners)) {
             continue;
           }
 
@@ -402,16 +439,11 @@ static PyObject * solve(PyObject *self, PyObject *args) {
           const npy_float sqr_distance_to_wire = square(z - layer) + square(ry - straw_y);
 
           if (sqr_distance_to_wire > r * r) {
-//            printf(
-//              "Warning: missing a straw %d: z=%.3lf (%.3lf), y'=%.3lf (%.3lf), r=%.3lf, d=%.3lf\n",
-//              straw_i, z, layer, ry, straw_y, r, sqrt(sqr_distance_to_wire)
-//            );
             continue;
           }
 
           if (straw_i >= 0 && straw_i < n_straws) {
             response[l * rs0 + i * rs1 + k * rs2 + straw_i * rs3] += dt;
-//            response[l * rs0 + i * rs1 + k * rs2 + straw_i * rs3] = 1;
           } else {
             printf(
               "Warning: invalid straw %d: y'=%lf (x=%lf, y=%lf, theta=%lf), H=%lf, r=%lf\n",

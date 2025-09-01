@@ -11,6 +11,7 @@ import detopt
 def viz(seed=123, design='data/design/default.json', use_root_particles=True, **config):
     n_batch = 1
     n_layers = 64
+
     detector = detopt.detector.from_config(config['detector'])
 
     root = os.path.dirname(os.path.dirname(__file__))

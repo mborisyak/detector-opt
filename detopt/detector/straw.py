@@ -48,10 +48,11 @@ class StrawDetector(Detector):
     view_z_gap: float = 5.0,
     # Physics parameters
     max_B: float=0.5, L=1.0,
+    z0: float=None, B_sigma: float=None,
     layer_bounds: tuple[float | int, float | int]=(-5.0, 5.0),
     dt: float=1.0e-2,
     max_particles=2,
-    origin=(0.0, 0.0, -10.0), origin_sigma=(1.0, 1.0, 1.0),
+    origin=(-100.0, -100.0, 1700.0), origin_sigma=(1.0, 1.0, 1.0),
     momentum=(0.0, 0.0, 5.0), momentum_sigma=(0.25, 0.25, 0.5),
     noise_origin=(0.0, 0.0, -10.0), noise_origin_sigma=(1.0, 1.0, 1.0),
     noise_momentum=(0.0, 0.0, 5.0), noise_momentum_sigma=(0.25, 0.25, 0.5),
@@ -74,6 +75,8 @@ class StrawDetector(Detector):
 
     self.max_B = max_B
     self.L = L
+    self.z0 = z0
+    self.B_sigma = B_sigma
 
     self.origin = np.array(origin, dtype=np.float32)
     self.origin_sigma = np.array(origin_sigma, np.float32)
@@ -117,9 +120,9 @@ class StrawDetector(Detector):
     self.max_particles = max_particles
     assert self.max_particles == 2, 'this is temporary'
 
-    flight_distance = max(5 * L, layer_bounds[1]) - origin[2] - 3 * origin_sigma[2]
+    flight_distance = layer_bounds[1] - layer_bounds[0]
 
-    self.n_t = int(2 * flight_distance / dt)
+    self.n_t = int(flight_distance / dt)
     self.straw_signal_rate = straw_signal_rate
     self.straw_noise_rate = straw_noise_rate
     print("\n\n\nSet up\n\n\n")
@@ -219,11 +222,20 @@ class StrawDetector(Detector):
     trajectories = np.zeros(shape=(n, m, self.n_t, 3), dtype=np.float32)
     response = np.zeros(shape=(n, m, self.n_layers, self.n_straws), dtype=np.float32)
 
+    # Magnetic field parameters for the batch
+    if self.z0 is not None:
+        z0_arr = np.full((n,), self.z0, dtype=np.float32)
+    else:
+        z0_arr = np.mean(layers, axis=1).astype(np.float32)
+    if self.B_sigma is not None:
+        B_sigma_arr = np.full((n,), self.B_sigma, dtype=np.float32)
+    else:
+        B_sigma_arr = Ls.astype(np.float32)
 
     straw_detector.solve(
-
-      initial_positions,  initial_velocities,
-      masses,charges,Bs, Ls,
+      initial_positions,  initial_momentum,
+      masses, charges, Bs, Ls,
+      z0_arr, B_sigma_arr,
       self.n_t, self.dt, layers, widths, heights,
       angles, trajectories, response
     )
@@ -270,15 +282,16 @@ class StrawDetector(Detector):
     if uproot is None:
         raise ImportError("uproot is required to read ROOT files. Please install with `pip install uproot awkward`.")
 
+    n_viz = 10
     with uproot.open(rootfile) as file:
         tree = file[tree_name]
-        px = tree[px_name].array(library="np")
-        py = tree[py_name].array(library="np")
-        pz = tree[pz_name].array(library="np")
-        x = tree[x_name].array(library="np")
-        y = tree[y_name].array(library="np")
-        z = tree[z_name].array(library="np")
-        pid = tree[pid_name].array(library="np")
+        px = tree[px_name].array(library="np")[:n_viz]
+        py = tree[py_name].array(library="np")[:n_viz]
+        pz = tree[pz_name].array(library="np")[:n_viz]
+        x = tree[x_name].array(library="np")[:n_viz]
+        y = tree[y_name].array(library="np")[:n_viz]
+        z = tree[z_name].array(library="np")[:n_viz]
+        pid = tree[pid_name].array(library="np")[:n_viz]
 
     # Treat all loaded particles as a single event with n_particles
     n_particles = px.shape[0]
@@ -335,8 +348,8 @@ class StrawDetector(Detector):
     print("masses shape:", masses.shape, "dtype:", masses.dtype)
     print("charges shape:", charges.shape, "dtype:", charges.dtype)
 
-    momentum_norm_sqr = np.sum(np.square(initial_momentum), axis=-1)
-    initial_velocities = initial_momentum / np.sqrt(np.square(masses) + momentum_norm_sqr)[..., None]
+    # momentum_norm_sqr = np.sum(np.square(initial_momentum), axis=-1)
+    # initial_velocities = initial_momentum / np.sqrt(np.square(masses) + momentum_norm_sqr)[..., None]
 
 
     if design is None:
@@ -356,8 +369,19 @@ class StrawDetector(Detector):
     # Call the C extension directly
     from . import straw_detector
 
+    # Magnetic field parameters for the batch
+    if self.z0 is not None:
+        z0_arr = np.full((n_events,), self.z0, dtype=np.float32)
+    else:
+        z0_arr = np.mean(layers, axis=1).astype(np.float32)
+    if self.B_sigma is not None:
+        B_sigma_arr = np.full((n_events,), self.B_sigma, dtype=np.float32)
+    else:
+        B_sigma_arr = Ls.astype(np.float32)
+
     straw_detector.solve(
-        initial_positions, initial_velocities, masses, charges, Bs, Ls,
+        initial_positions, initial_momentum, masses, charges, Bs, Ls,
+        z0_arr, B_sigma_arr,
         self.n_t, self.dt, layers, widths, heights, angles, trajectories, response
     )
 

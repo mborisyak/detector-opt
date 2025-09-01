@@ -6,20 +6,22 @@ straw:
   n_straws_per_layer: 200 # Set to your actual number
 
   # Straw geometry
-  straw_length: 200.0 # mm
-  straw_pitch: 2.0 # mm (centre-to-centre in a layer)
-  layer_x_offset: 1.0 # mm (Layer-2 vs Layer-1 x-offset)
+  straw_length: 400.0 # cm
+  straw_pitch: 2.0 # cm (centre-to-centre in a layer)
+  layer_x_offset: 1.0 # cm (Layer-2 vs Layer-1 x-offset)
 
   # View geometry
   view_angles: [0.0, 0.0798, -0.0798, 0.0] # X, U, X', V (radians, stereo angle = 4.57°)
-  layer_z_gap: 1.732 # mm (between layers in a view)
-  view_z_gap: 5.0 # mm (between consecutive views)
+  layer_z_gap: 1.732 # cm (between layers in a view)
+  view_z_gap: 5.0 # cm (between consecutive views)
 
   # Physics parameters
   dt: 1.0e-2
-  max_B: 0.5
-  L: 1.0
-  layer_bounds: [259.80, 353.80] # Optional, for encoding/decoding
+  max_B: 0.00005
+  L: 3098.0
+  z0: 3098.0 # Center of magnetic field (cm)
+  B_sigma: 200.0 # Sigma (width) of magnetic field (cm)
+  layer_bounds: [2000., 4000.] # Optional, for encoding/decoding
   max_particles: 2
   origin: [0.0, 0.0, -10.0]
   origin_sigma: [1.0, 1.0, 1.0]
