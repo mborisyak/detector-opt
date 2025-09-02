@@ -22,9 +22,9 @@ def viz(seed=123, design='data/design/default.json', use_root_particles=True, **
       design_vec = detector.encode_design(json.load(f))
 
     if use_root_particles:
-      rootfile = "/Users/nikitagladin/SHiP/inputfile.root"
+      rootfile = "/Users/nikitagladin/SHiP/inputfile100.root"
       print(f"Loading particles from ROOT file: {rootfile}")
-      masses, charges, initial_positions, initial_momentum, trajectories, response, signal = detector.simulate_from_root(
+      masses, charges, initial_positions, initial_momentum, trajectories, response, signal, waveforms = detector.simulate_from_root(
         rootfile,
         tree_name="mytree",
         px_name="px", py_name="py", pz_name="pz",
@@ -37,7 +37,37 @@ def viz(seed=123, design='data/design/default.json', use_root_particles=True, **
         layers[0], angles[0], widths[0], heights[0], response[0], trajectories[0], signal[0] if hasattr(signal, '__getitem__') else signal,
         threshold=0.3
       )
-      return
+
+      # --- Plot all waveforms on the same canvas without normalization ---
+      import matplotlib.pyplot as plt
+      import matplotlib.cm as cm
+      import numpy as np
+      import yaml
+
+      # Draw a separate canvas for each station, visualizing only the layers belonging to that station
+      import yaml
+      with open("/Users/nikitagladin/SHiP/detector-opt/config/detector/straw.yaml") as f:
+          config = yaml.safe_load(f)
+      detector_cfg = config["straw"]
+      n_stations = len(detector_cfg["station_z"])
+      n_views_per_station = detector_cfg["n_views_per_station"]
+      n_layers_per_view = detector_cfg["n_layers_per_view"]
+      layers_per_station = n_views_per_station * n_layers_per_view
+
+      for station in range(n_stations):
+          plt.figure()
+          for key, (t, s) in waveforms.items():
+              layer = key[2]
+              this_station = layer // layers_per_station
+              if this_station == station:
+                  plt.plot(t, s, label=f"event={key[0]}, particle={key[1]}, layer={layer}, straw={key[3]}")
+          plt.xlabel("Time [ns]")
+          plt.ylabel("Signal [Coulombs]")
+          plt.title(f"Straw hit waveforms for Station {station+1} (not normalized)")
+          plt.legend(fontsize='x-small', ncol=2)
+          plt.show()
+
+
 
     configs = np.broadcast_to(design_vec[None], (n_batch, *design_vec.shape))
 

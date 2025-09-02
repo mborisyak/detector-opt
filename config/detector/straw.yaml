@@ -2,7 +2,7 @@ straw:
   # Station z-positions (mm)
   station_z: [2598.0, 2698.0, 3498.0, 3538.0]
   n_views_per_station: 4
-  n_layers_per_view: 4
+  n_layers_per_view: 2
   n_straws_per_layer: 200 # Set to your actual number
 
   # Straw geometry

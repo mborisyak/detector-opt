@@ -232,13 +232,31 @@ class StrawDetector(Detector):
     else:
         B_sigma_arr = Ls.astype(np.float32)
 
+    # Allocate edep array for energy deposit (MeV) per straw crossing
+    edep = np.zeros_like(response, dtype=np.float32)
+    r_mm = np.zeros_like(response, dtype=np.float32)
+
     straw_detector.solve(
       initial_positions,  initial_momentum,
       masses, charges, Bs, Ls,
       z0_arr, B_sigma_arr,
       self.n_t, self.dt, layers, widths, heights,
-      angles, trajectories, response
+      angles, trajectories, response, edep, r_mm
     )
+
+    # Example: Use edep for waveform modeling (per straw crossing)
+    from .straw_signal import straw_response
+    waveforms = {}  # {(event, particle, layer, straw): (t, s)}
+    for event in range(edep.shape[0]):
+        for particle in range(edep.shape[1]):
+            for layer in range(edep.shape[2]):
+                for straw in range(edep.shape[3]):
+                    Edep_mev = edep[event, particle, layer, straw]
+                    r_mm_val = r_mm[event, particle, layer, straw]
+                    if Edep_mev > 0:
+                        t0 = 0.0    # or compute from simulation
+                        t, s = straw_response(Edep_mev, r_mm_val, t0)
+                        waveforms[(event, particle, layer, straw)] = (t, s)
 
     combined_response = np.sum(response, axis=1) * self.straw_signal_rate + self.straw_noise_rate
     measurements = rng.poisson(combined_response, size=combined_response.shape) / (self.straw_signal_rate + self.straw_noise_rate)
@@ -379,14 +397,37 @@ class StrawDetector(Detector):
     else:
         B_sigma_arr = Ls.astype(np.float32)
 
+    # Allocate edep, r_mm, t0 arrays for energy deposit, drift distance, and hit time per straw crossing
+    edep = np.zeros_like(response, dtype=np.float32)
+    r_mm = np.zeros_like(response, dtype=np.float32)
+    t0_arr = np.zeros_like(response, dtype=np.float32)
+
     straw_detector.solve(
         initial_positions, initial_momentum, masses, charges, Bs, Ls,
         z0_arr, B_sigma_arr,
-        self.n_t, self.dt, layers, widths, heights, angles, trajectories, response
+        self.n_t, self.dt, layers, widths, heights, angles, trajectories, response, edep, r_mm, t0_arr
     )
 
+    # Example: Use edep, r_mm, t0 for waveform modeling (per straw crossing)
+    from .straw_signal import straw_response
+    waveforms = {}  # {(event, particle, layer, straw): (t, s)}
+    for event in range(edep.shape[0]):
+        for particle in range(edep.shape[1]):
+            for layer in range(edep.shape[2]):
+                if particle == 2: print(np.sum(edep[event, particle, layer,:]))
+                for straw in range(edep.shape[3]):
+                    Edep_mev = edep[event, particle, layer, straw]
+                    r_mm_val = r_mm[event, particle, layer, straw]
+                    t0 = t0_arr[event, particle, layer, straw]
+                    if Edep_mev > 0:
+                        if particle == 2: print(layer, Edep_mev, r_mm_val)
+                        t, s = straw_response(Edep_mev, r_mm_val, t0)
+                        if particle == 2: print(np.max(s))
+                        waveforms[(event, particle, layer, straw)] = (t, s)
+
+    print("edep shape:", edep.shape, "dtype:", edep.dtype)
     signal = np.ones((n_events,), dtype=np.float32)
-    return masses, charges, initial_positions, initial_momentum, trajectories, response, signal
+    return masses, charges, initial_positions, initial_momentum, trajectories, response, signal, waveforms
 
   def __call__(self, seed: int, configurations: np.ndarray):
     masses, charges, initial_positions, initial_momentum, _, measurements, signal = self.sample(seed, configurations)

@@ -136,18 +136,21 @@ static PyObject * solve(PyObject *self, PyObject *args) {
 
   PyObject *py_trajectories = NULL;
   PyObject *py_response = NULL;
+  PyObject *py_edep = NULL;
+  PyObject *py_r_mm = NULL;
+  PyObject *py_t0 = NULL;
 
   if (!PyArg_UnpackTuple(
-    args, "straw_solve", 16, 16,
-    &py_initial_positions, &py_initial_momenta, &py_masses, &py_charges,
-    &py_B, &py_L,
-    &py_z0, &py_B_sigma,
-    &py_steps, &py_dt,
-    &py_layers, &py_width, &py_heights, &py_angles,
-    &py_trajectories, &py_response
-  )) {
-    return NULL;
-  }
+       args, "straw_solve", 19, 19,
+       &py_initial_positions, &py_initial_momenta, &py_masses, &py_charges,
+       &py_B, &py_L,
+       &py_z0, &py_B_sigma,
+       &py_steps, &py_dt,
+       &py_layers, &py_width, &py_heights, &py_angles,
+       &py_trajectories, &py_response, &py_edep, &py_r_mm, &py_t0
+   )) {
+       return NULL;
+   }
 
   if (!PyLong_Check(py_steps)) {
     PyErr_SetString(PyExc_TypeError, "steps must be an int");
@@ -295,6 +298,27 @@ static PyObject * solve(PyObject *self, PyObject *args) {
 
   npy_float * response = PyArray_DATA(response_array);
   npy_float * trajectories = (trajectories_array == NULL) ? NULL : PyArray_DATA(trajectories_array);
+
+  // edep array: (n, n_particles, n_layers, n_straws)
+  npy_float * edep = NULL;
+  if (py_edep && py_edep != Py_None) {
+    PyArrayObject * edep_array = (PyArrayObject *) py_edep;
+    edep = PyArray_DATA(edep_array);
+  }
+
+  // r_mm array: (n, n_particles, n_layers, n_straws)
+  npy_float * r_mm = NULL;
+  if (py_r_mm && py_r_mm != Py_None) {
+    PyArrayObject * r_mm_array = (PyArrayObject *) py_r_mm;
+    r_mm = PyArray_DATA(r_mm_array);
+  }
+  // t0 array: (n, n_particles, n_layers, n_straws)
+  npy_float * t0 = NULL;
+  if (py_t0 && py_t0 != Py_None) {
+    PyArrayObject * t0_array = (PyArrayObject *) py_t0;
+    t0 = PyArray_DATA(t0_array);
+  }
+
 
   npy_intp Bs0 = PyArray_STRIDE(B_array, 0) / sizeof(npy_float);
   npy_intp Ls0 = PyArray_STRIDE(L_array, 0) / sizeof(npy_float);
@@ -444,6 +468,51 @@ static PyObject * solve(PyObject *self, PyObject *args) {
 
           if (straw_i >= 0 && straw_i < n_straws) {
             response[l * rs0 + i * rs1 + k * rs2 + straw_i * rs3] += dt;
+
+
+           // Store time of first hit (t0, in ns)
+           if (t0) {
+             npy_intp idx = l * rs0 + i * rs1 + k * rs2 + straw_i * rs3;
+             if (response[idx] == dt) { // first hit for this straw in this event/particle/layer
+               t0[idx] = j * dt;
+             }
+           }
+
+            // Store transverse distance to wire (r_mm)
+            if (r_mm) {
+              r_mm[l * rs0 + i * rs1 + k * rs2 + straw_i * rs3] = fabsf(ry - straw_y);
+            }
+
+            // --- Bethe-Bloch energy loss calculation ---
+            // Constants for Argon gas (default)
+            const npy_float K = 0.307075; // MeV*cm^2/g
+            const npy_float Z = 18.0;     // Argon
+            const npy_float A = 39.948;   // Argon
+            const npy_float I_exc = 188e-6;   // MeV
+            const npy_float rho = 1.66e-3; // g/cm^3
+            const npy_float me = 0.511;   // MeV/c^2
+
+            // Compute beta, gamma from momentum and mass
+            npy_float p = sqrtf(px*px + py*py + pz*pz);
+            npy_float beta = p / sqrtf(p*p + mass*mass);
+            npy_float gamma_bethe = sqrtf(1.0f + (p*p) / (mass*mass));
+            // Tmax for Bethe-Bloch
+            npy_float Tmax = (2 * me * beta * beta * gamma_bethe * gamma_bethe) /
+              (1 + 2 * gamma_bethe * me / 0.938 + (me / 0.938) * (me / 0.938));
+            npy_float argument = (2 * me * beta * beta * gamma_bethe * gamma_bethe * Tmax) / (I_exc*I_exc);
+            if (argument <= 0) argument = 1e-10;
+            npy_float log_term = logf(argument);
+            npy_float dEdx = K * (charge*charge) * Z / A / (beta*beta) * (0.5f * log_term - beta*beta) * rho; // MeV/cm
+
+            // Path length in this step (cm)
+            npy_float v = sqrtf(vx*vx + vy*vy + vz*vz);
+            npy_float path_cm = v * dt * 10.0f; // dt in ns, v in mm/ns, convert mm to cm
+
+            npy_float Edep = dEdx * path_cm; // MeV deposited in this step
+
+            if (edep) {
+              edep[l * rs0 + i * rs1 + k * rs2 + straw_i * rs3] += Edep;
+            }
           } else {
             printf(
               "Warning: invalid straw %d: y'=%lf (x=%lf, y=%lf, theta=%lf), H=%lf, r=%lf\n",
