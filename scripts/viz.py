@@ -22,9 +22,9 @@ def viz(seed=123, design='data/design/default.json', use_root_particles=True, **
       design_vec = detector.encode_design(json.load(f))
 
     if use_root_particles:
-      rootfile = "/Users/nikitagladin/SHiP/inputfile100.root"
+      rootfile = "/Users/nikitagladin/SHiP/clean.root"
       print(f"Loading particles from ROOT file: {rootfile}")
-      masses, charges, initial_positions, initial_momentum, trajectories, response, signal, waveforms = detector.simulate_from_root(
+      masses, charges, initial_positions, initial_momentum, trajectories, response, signal, waveforms, t0_arr, r_mm, fdigi_times = detector.simulate_from_root(
         rootfile,
         tree_name="mytree",
         px_name="px", py_name="py", pz_name="pz",
@@ -64,8 +64,48 @@ def viz(seed=123, design='data/design/default.json', use_root_particles=True, **
           plt.xlabel("Time [ns]")
           plt.ylabel("Signal [Coulombs]")
           plt.title(f"Straw hit waveforms for Station {station+1} (not normalized)")
-          plt.legend(fontsize='x-small', ncol=2)
+          # plt.legend(fontsize='x-small', ncol=2)
           plt.show()
+
+      # --- Plot histogram of FairShip-style fdigi_times per station ---
+      tdc_by_station = [[] for _ in range(n_stations)]
+      for key, fdigi in fdigi_times.items():
+          layer = key[2]
+          station = layer // layers_per_station
+          tdc_by_station[station].append(fdigi)
+      plt.figure()
+      for station in range(n_stations):
+          if tdc_by_station[station]:
+              plt.hist(tdc_by_station[station], bins=50, alpha=0.6, label=f"Station {station+1}")
+      plt.xlabel("TDC time [ns]")
+      plt.ylabel("Counts")
+      plt.title("Histogram of FairShip-style TDC times per station")
+      plt.legend()
+      plt.show()
+
+      # --- Compute and plot histogram of TDC times per station ---
+      from detopt.detector.straw_signal import compute_tdc_times
+      tdc_times = compute_tdc_times(
+          waveforms, t0_arr, r_mm,
+          straw_length=detector_cfg["straw_length"],
+          v_wire=0.2,  # mm/ns, adjust as needed
+          t0_event=0.0
+      )
+      tdc_by_station = [[] for _ in range(n_stations)]
+      for key, fdigi in tdc_times.items():
+          layer = key[2]
+          station = layer // layers_per_station
+          tdc_by_station[station].append(fdigi)
+      plt.figure()
+      # Only include stations with hits
+      tdc_data = [tdc_by_station[station] for station in range(n_stations) if tdc_by_station[station]]
+      labels = [f"Station {station+1}" for station in range(n_stations) if tdc_by_station[station]]
+      plt.hist(tdc_data, bins=50, stacked=True, label=labels, alpha=0.7)
+      plt.xlabel("TDC time [ns]")
+      plt.ylabel("Counts")
+      plt.title("Stacked histogram of TDC times per station")
+      plt.legend()
+      plt.show()
 
 
 

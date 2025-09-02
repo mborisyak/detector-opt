@@ -17,10 +17,10 @@ straw:
 
   # Physics parameters
   dt: 1.0e-2
-  max_B: 0.00005
+  max_B: 8e-6
   L: 3098.0
   z0: 3098.0 # Center of magnetic field (cm)
-  B_sigma: 200.0 # Sigma (width) of magnetic field (cm)
+  B_sigma: 300.0 # Sigma (width) of magnetic field (cm)
   layer_bounds: [2000., 4000.] # Optional, for encoding/decoding
   max_particles: 2
   origin: [0.0, 0.0, -10.0]

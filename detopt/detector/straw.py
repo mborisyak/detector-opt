@@ -366,6 +366,25 @@ class StrawDetector(Detector):
     print("masses shape:", masses.shape, "dtype:", masses.dtype)
     print("charges shape:", charges.shape, "dtype:", charges.dtype)
 
+    # # Print particle names using PDG codes
+    # PDG_NAMES = {
+    #     11: "e-", -11: "e+",
+    #     13: "mu-", -13: "mu+",
+    #     211: "pi+", -211: "pi-",
+    #     2212: "proton", -2212: "antiproton",
+    #     2112: "neutron", -2112: "antineutron",
+    #     22: "gamma",
+    #     12: "nu_e", -12: "nu_e_bar",
+    #     14: "nu_mu", -14: "nu_mu_bar",
+    # }
+    # print("Particle names by event/particle:")
+    # print(pid.shape)
+
+    # for part_idx in range(pid.shape[0]):
+    #     pdg = int(pid[part_idx])
+    #     name = PDG_NAMES.get(pdg, f"PDG {pdg}")
+    #     print(f"Particle {part_idx}: {name}")
+
     # momentum_norm_sqr = np.sum(np.square(initial_momentum), axis=-1)
     # initial_velocities = initial_momentum / np.sqrt(np.square(masses) + momentum_norm_sqr)[..., None]
 
@@ -401,12 +420,16 @@ class StrawDetector(Detector):
     edep = np.zeros_like(response, dtype=np.float32)
     r_mm = np.zeros_like(response, dtype=np.float32)
     t0_arr = np.zeros_like(response, dtype=np.float32)
+    hit_pos = np.zeros(response.shape + (3,), dtype=np.float32)
 
     straw_detector.solve(
         initial_positions, initial_momentum, masses, charges, Bs, Ls,
         z0_arr, B_sigma_arr,
-        self.n_t, self.dt, layers, widths, heights, angles, trajectories, response, edep, r_mm, t0_arr
+        self.n_t, self.dt, layers, widths, heights, angles, trajectories, response, edep, r_mm, t0_arr, hit_pos
     )
+
+
+
 
     # Example: Use edep, r_mm, t0 for waveform modeling (per straw crossing)
     from .straw_signal import straw_response
@@ -427,7 +450,58 @@ class StrawDetector(Detector):
 
     print("edep shape:", edep.shape, "dtype:", edep.dtype)
     signal = np.ones((n_events,), dtype=np.float32)
-    return masses, charges, initial_positions, initial_momentum, trajectories, response, signal, waveforms
+
+    # --- FairShip-style TDC calculation using real geometry ---
+
+    from detopt.detector.straw_signal import fairship_fdigi
+
+    def get_straw_endpoints(layer, straw, layers, angles, widths, heights, n_straws):
+        l_z = layers[layer]
+        angle = angles[layer]
+        w = widths[layer]
+        h = heights[layer]
+        r = h / n_straws
+        y_local = 2 * r * straw - h + r
+        # Endpoints in local coordinates
+        p0_local = np.array([-w, y_local, l_z])
+        p1_local = np.array([ w, y_local, l_z])
+        # Rotation matrix
+        A = np.array([
+            [np.cos(angle), np.sin(angle), 0],
+            [-np.sin(angle), np.cos(angle), 0],
+            [0, 0, 1],
+        ])
+        p0 = np.dot(p0_local, A)
+        p1 = np.dot(p1_local, A)
+        return p0, p1  # in cm
+
+    n_straws = widths.shape[1] if len(widths.shape) > 1 else widths.shape[0]
+    fdigi_times = {}
+    for key in waveforms:
+        event, particle, layer, straw = key
+        hit_xyz = hit_pos[event, particle, layer, straw]  # (x, y, z) in cm
+        # Get endpoints for this straw
+        p0, p1 = get_straw_endpoints(layer, straw, layers[0], angles[0], widths[0], heights[0], n_straws)
+        # Project hit onto wire
+        wire_vec = p1 - p0
+        wire_len = np.linalg.norm(wire_vec)
+        wire_dir = wire_vec / wire_len if wire_len > 0 else np.zeros(3)
+        proj = np.dot(hit_xyz - p0, wire_dir)
+        x_hit = proj  # position along the wire from start (in cm)
+        x_readout = wire_len  # readout at p1
+        fdigi = fairship_fdigi(
+            t0_event=0.0,
+            t_MC=t0_arr[event, particle, layer, straw],
+            r_mm=r_mm[event, particle, layer, straw],
+            x_hit=x_hit,
+            x_readout=x_readout,
+            sigma_spatial=0.012,   # mm
+            v_drift=0.0033,         # mm/ns
+            c=29.9792             # cm/ns
+        )
+        fdigi_times[key] = fdigi
+
+    return masses, charges, initial_positions, initial_momentum, trajectories, response, signal, waveforms, t0_arr, r_mm, fdigi_times
 
   def __call__(self, seed: int, configurations: np.ndarray):
     masses, charges, initial_positions, initial_momentum, _, measurements, signal = self.sample(seed, configurations)

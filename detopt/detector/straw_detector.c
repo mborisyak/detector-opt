@@ -139,15 +139,16 @@ static PyObject * solve(PyObject *self, PyObject *args) {
   PyObject *py_edep = NULL;
   PyObject *py_r_mm = NULL;
   PyObject *py_t0 = NULL;
+  PyObject *py_hit_pos = NULL;
 
   if (!PyArg_UnpackTuple(
-       args, "straw_solve", 19, 19,
+       args, "straw_solve", 20, 20,
        &py_initial_positions, &py_initial_momenta, &py_masses, &py_charges,
        &py_B, &py_L,
        &py_z0, &py_B_sigma,
        &py_steps, &py_dt,
        &py_layers, &py_width, &py_heights, &py_angles,
-       &py_trajectories, &py_response, &py_edep, &py_r_mm, &py_t0
+       &py_trajectories, &py_response, &py_edep, &py_r_mm, &py_t0, &py_hit_pos
    )) {
        return NULL;
    }
@@ -318,6 +319,12 @@ static PyObject * solve(PyObject *self, PyObject *args) {
     PyArrayObject * t0_array = (PyArrayObject *) py_t0;
     t0 = PyArray_DATA(t0_array);
   }
+  // hit_pos array: (n, n_particles, n_layers, n_straws, 3)
+  npy_float * hit_pos = NULL;
+  if (py_hit_pos && py_hit_pos != Py_None) {
+    PyArrayObject * hit_pos_array = (PyArrayObject *) py_hit_pos;
+    hit_pos = PyArray_DATA(hit_pos_array);
+  }
 
 
   npy_intp Bs0 = PyArray_STRIDE(B_array, 0) / sizeof(npy_float);
@@ -468,6 +475,15 @@ static PyObject * solve(PyObject *self, PyObject *args) {
 
           if (straw_i >= 0 && straw_i < n_straws) {
             response[l * rs0 + i * rs1 + k * rs2 + straw_i * rs3] += dt;
+            // Store hit position (x, y, z) for first hit
+            if (hit_pos) {
+              npy_intp idx = l * rs0 + i * rs1 + k * rs2 + straw_i * rs3;
+              if (response[idx] == dt) { // first hit for this straw
+                hit_pos[idx * 3 + 0] = x;
+                hit_pos[idx * 3 + 1] = y;
+                hit_pos[idx * 3 + 2] = z;
+              }
+            }
 
 
            // Store time of first hit (t0, in ns)
