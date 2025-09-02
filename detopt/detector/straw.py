@@ -48,10 +48,11 @@ class StrawDetector(Detector):
     view_z_gap: float = 5.0,
     # Physics parameters
     max_B: float=0.5, L=1.0,
+    z0: float=None, B_sigma: float=None,
     layer_bounds: tuple[float | int, float | int]=(-5.0, 5.0),
     dt: float=1.0e-2,
     max_particles=2,
-    origin=(0.0, 0.0, -10.0), origin_sigma=(1.0, 1.0, 1.0),
+    origin=(-100.0, -100.0, 1700.0), origin_sigma=(1.0, 1.0, 1.0),
     momentum=(0.0, 0.0, 5.0), momentum_sigma=(0.25, 0.25, 0.5),
     noise_origin=(0.0, 0.0, -10.0), noise_origin_sigma=(1.0, 1.0, 1.0),
     noise_momentum=(0.0, 0.0, 5.0), noise_momentum_sigma=(0.25, 0.25, 0.5),
@@ -74,6 +75,8 @@ class StrawDetector(Detector):
 
     self.max_B = max_B
     self.L = L
+    self.z0 = z0
+    self.B_sigma = B_sigma
 
     self.origin = np.array(origin, dtype=np.float32)
     self.origin_sigma = np.array(origin_sigma, np.float32)
@@ -117,9 +120,9 @@ class StrawDetector(Detector):
     self.max_particles = max_particles
     assert self.max_particles == 2, 'this is temporary'
 
-    flight_distance = max(5 * L, layer_bounds[1]) - origin[2] - 3 * origin_sigma[2]
+    flight_distance = layer_bounds[1] - layer_bounds[0]
 
-    self.n_t = int(2 * flight_distance / dt)
+    self.n_t = int(flight_distance / dt)
     self.straw_signal_rate = straw_signal_rate
     self.straw_noise_rate = straw_noise_rate
     print("\n\n\nSet up\n\n\n")
@@ -219,14 +222,41 @@ class StrawDetector(Detector):
     trajectories = np.zeros(shape=(n, m, self.n_t, 3), dtype=np.float32)
     response = np.zeros(shape=(n, m, self.n_layers, self.n_straws), dtype=np.float32)
 
+    # Magnetic field parameters for the batch
+    if self.z0 is not None:
+        z0_arr = np.full((n,), self.z0, dtype=np.float32)
+    else:
+        z0_arr = np.mean(layers, axis=1).astype(np.float32)
+    if self.B_sigma is not None:
+        B_sigma_arr = np.full((n,), self.B_sigma, dtype=np.float32)
+    else:
+        B_sigma_arr = Ls.astype(np.float32)
+
+    # Allocate edep array for energy deposit (MeV) per straw crossing
+    edep = np.zeros_like(response, dtype=np.float32)
+    r_mm = np.zeros_like(response, dtype=np.float32)
 
     straw_detector.solve(
-
-      initial_positions,  initial_velocities,
-      masses,charges,Bs, Ls,
+      initial_positions,  initial_momentum,
+      masses, charges, Bs, Ls,
+      z0_arr, B_sigma_arr,
       self.n_t, self.dt, layers, widths, heights,
-      angles, trajectories, response
+      angles, trajectories, response, edep, r_mm
     )
+
+    # Example: Use edep for waveform modeling (per straw crossing)
+    from .straw_signal import straw_response
+    waveforms = {}  # {(event, particle, layer, straw): (t, s)}
+    for event in range(edep.shape[0]):
+        for particle in range(edep.shape[1]):
+            for layer in range(edep.shape[2]):
+                for straw in range(edep.shape[3]):
+                    Edep_mev = edep[event, particle, layer, straw]
+                    r_mm_val = r_mm[event, particle, layer, straw]
+                    if Edep_mev > 0:
+                        t0 = 0.0    # or compute from simulation
+                        t, s = straw_response(Edep_mev, r_mm_val, t0)
+                        waveforms[(event, particle, layer, straw)] = (t, s)
 
     combined_response = np.sum(response, axis=1) * self.straw_signal_rate + self.straw_noise_rate
     measurements = rng.poisson(combined_response, size=combined_response.shape) / (self.straw_signal_rate + self.straw_noise_rate)
@@ -270,15 +300,16 @@ class StrawDetector(Detector):
     if uproot is None:
         raise ImportError("uproot is required to read ROOT files. Please install with `pip install uproot awkward`.")
 
+    n_viz = 10
     with uproot.open(rootfile) as file:
         tree = file[tree_name]
-        px = tree[px_name].array(library="np")
-        py = tree[py_name].array(library="np")
-        pz = tree[pz_name].array(library="np")
-        x = tree[x_name].array(library="np")
-        y = tree[y_name].array(library="np")
-        z = tree[z_name].array(library="np")
-        pid = tree[pid_name].array(library="np")
+        px = tree[px_name].array(library="np")[:n_viz]
+        py = tree[py_name].array(library="np")[:n_viz]
+        pz = tree[pz_name].array(library="np")[:n_viz]
+        x = tree[x_name].array(library="np")[:n_viz]
+        y = tree[y_name].array(library="np")[:n_viz]
+        z = tree[z_name].array(library="np")[:n_viz]
+        pid = tree[pid_name].array(library="np")[:n_viz]
 
     # Treat all loaded particles as a single event with n_particles
     n_particles = px.shape[0]
@@ -335,8 +366,27 @@ class StrawDetector(Detector):
     print("masses shape:", masses.shape, "dtype:", masses.dtype)
     print("charges shape:", charges.shape, "dtype:", charges.dtype)
 
-    momentum_norm_sqr = np.sum(np.square(initial_momentum), axis=-1)
-    initial_velocities = initial_momentum / np.sqrt(np.square(masses) + momentum_norm_sqr)[..., None]
+    # # Print particle names using PDG codes
+    # PDG_NAMES = {
+    #     11: "e-", -11: "e+",
+    #     13: "mu-", -13: "mu+",
+    #     211: "pi+", -211: "pi-",
+    #     2212: "proton", -2212: "antiproton",
+    #     2112: "neutron", -2112: "antineutron",
+    #     22: "gamma",
+    #     12: "nu_e", -12: "nu_e_bar",
+    #     14: "nu_mu", -14: "nu_mu_bar",
+    # }
+    # print("Particle names by event/particle:")
+    # print(pid.shape)
+
+    # for part_idx in range(pid.shape[0]):
+    #     pdg = int(pid[part_idx])
+    #     name = PDG_NAMES.get(pdg, f"PDG {pdg}")
+    #     print(f"Particle {part_idx}: {name}")
+
+    # momentum_norm_sqr = np.sum(np.square(initial_momentum), axis=-1)
+    # initial_velocities = initial_momentum / np.sqrt(np.square(masses) + momentum_norm_sqr)[..., None]
 
 
     if design is None:
@@ -356,13 +406,102 @@ class StrawDetector(Detector):
     # Call the C extension directly
     from . import straw_detector
 
+    # Magnetic field parameters for the batch
+    if self.z0 is not None:
+        z0_arr = np.full((n_events,), self.z0, dtype=np.float32)
+    else:
+        z0_arr = np.mean(layers, axis=1).astype(np.float32)
+    if self.B_sigma is not None:
+        B_sigma_arr = np.full((n_events,), self.B_sigma, dtype=np.float32)
+    else:
+        B_sigma_arr = Ls.astype(np.float32)
+
+    # Allocate edep, r_mm, t0 arrays for energy deposit, drift distance, and hit time per straw crossing
+    edep = np.zeros_like(response, dtype=np.float32)
+    r_mm = np.zeros_like(response, dtype=np.float32)
+    t0_arr = np.zeros_like(response, dtype=np.float32)
+    hit_pos = np.zeros(response.shape + (3,), dtype=np.float32)
+
     straw_detector.solve(
-        initial_positions, initial_velocities, masses, charges, Bs, Ls,
-        self.n_t, self.dt, layers, widths, heights, angles, trajectories, response
+        initial_positions, initial_momentum, masses, charges, Bs, Ls,
+        z0_arr, B_sigma_arr,
+        self.n_t, self.dt, layers, widths, heights, angles, trajectories, response, edep, r_mm, t0_arr, hit_pos
     )
 
+
+
+
+    # Example: Use edep, r_mm, t0 for waveform modeling (per straw crossing)
+    from .straw_signal import straw_response
+    waveforms = {}  # {(event, particle, layer, straw): (t, s)}
+    for event in range(edep.shape[0]):
+        for particle in range(edep.shape[1]):
+            for layer in range(edep.shape[2]):
+                if particle == 2: print(np.sum(edep[event, particle, layer,:]))
+                for straw in range(edep.shape[3]):
+                    Edep_mev = edep[event, particle, layer, straw]
+                    r_mm_val = r_mm[event, particle, layer, straw]
+                    t0 = t0_arr[event, particle, layer, straw]
+                    if Edep_mev > 0:
+                        if particle == 2: print(layer, Edep_mev, r_mm_val)
+                        t, s = straw_response(Edep_mev, r_mm_val, t0)
+                        if particle == 2: print(np.max(s))
+                        waveforms[(event, particle, layer, straw)] = (t, s)
+
+    print("edep shape:", edep.shape, "dtype:", edep.dtype)
     signal = np.ones((n_events,), dtype=np.float32)
-    return masses, charges, initial_positions, initial_momentum, trajectories, response, signal
+
+    # --- FairShip-style TDC calculation using real geometry ---
+
+    from detopt.detector.straw_signal import fairship_fdigi
+
+    def get_straw_endpoints(layer, straw, layers, angles, widths, heights, n_straws):
+        l_z = layers[layer]
+        angle = angles[layer]
+        w = widths[layer]
+        h = heights[layer]
+        r = h / n_straws
+        y_local = 2 * r * straw - h + r
+        # Endpoints in local coordinates
+        p0_local = np.array([-w, y_local, l_z])
+        p1_local = np.array([ w, y_local, l_z])
+        # Rotation matrix
+        A = np.array([
+            [np.cos(angle), np.sin(angle), 0],
+            [-np.sin(angle), np.cos(angle), 0],
+            [0, 0, 1],
+        ])
+        p0 = np.dot(p0_local, A)
+        p1 = np.dot(p1_local, A)
+        return p0, p1  # in cm
+
+    n_straws = widths.shape[1] if len(widths.shape) > 1 else widths.shape[0]
+    fdigi_times = {}
+    for key in waveforms:
+        event, particle, layer, straw = key
+        hit_xyz = hit_pos[event, particle, layer, straw]  # (x, y, z) in cm
+        # Get endpoints for this straw
+        p0, p1 = get_straw_endpoints(layer, straw, layers[0], angles[0], widths[0], heights[0], n_straws)
+        # Project hit onto wire
+        wire_vec = p1 - p0
+        wire_len = np.linalg.norm(wire_vec)
+        wire_dir = wire_vec / wire_len if wire_len > 0 else np.zeros(3)
+        proj = np.dot(hit_xyz - p0, wire_dir)
+        x_hit = proj  # position along the wire from start (in cm)
+        x_readout = wire_len  # readout at p1
+        fdigi = fairship_fdigi(
+            t0_event=0.0,
+            t_MC=t0_arr[event, particle, layer, straw],
+            r_mm=r_mm[event, particle, layer, straw],
+            x_hit=x_hit,
+            x_readout=x_readout,
+            sigma_spatial=0.012,   # mm
+            v_drift=0.0033,         # mm/ns
+            c=29.9792             # cm/ns
+        )
+        fdigi_times[key] = fdigi
+
+    return masses, charges, initial_positions, initial_momentum, trajectories, response, signal, waveforms, t0_arr, r_mm, fdigi_times
 
   def __call__(self, seed: int, configurations: np.ndarray):
     masses, charges, initial_positions, initial_momentum, _, measurements, signal = self.sample(seed, configurations)

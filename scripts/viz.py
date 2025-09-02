@@ -11,6 +11,7 @@ import detopt
 def viz(seed=123, design='data/design/default.json', use_root_particles=True, **config):
     n_batch = 1
     n_layers = 64
+
     detector = detopt.detector.from_config(config['detector'])
 
     root = os.path.dirname(os.path.dirname(__file__))
@@ -21,9 +22,9 @@ def viz(seed=123, design='data/design/default.json', use_root_particles=True, **
       design_vec = detector.encode_design(json.load(f))
 
     if use_root_particles:
-      rootfile = "/Users/nikitagladin/SHiP/inputfile.root"
+      rootfile = "/Users/nikitagladin/SHiP/clean.root"
       print(f"Loading particles from ROOT file: {rootfile}")
-      masses, charges, initial_positions, initial_momentum, trajectories, response, signal = detector.simulate_from_root(
+      masses, charges, initial_positions, initial_momentum, trajectories, response, signal, waveforms, t0_arr, r_mm, fdigi_times = detector.simulate_from_root(
         rootfile,
         tree_name="mytree",
         px_name="px", py_name="py", pz_name="pz",
@@ -36,7 +37,77 @@ def viz(seed=123, design='data/design/default.json', use_root_particles=True, **
         layers[0], angles[0], widths[0], heights[0], response[0], trajectories[0], signal[0] if hasattr(signal, '__getitem__') else signal,
         threshold=0.3
       )
-      return
+
+      # --- Plot all waveforms on the same canvas without normalization ---
+      import matplotlib.pyplot as plt
+      import matplotlib.cm as cm
+      import numpy as np
+      import yaml
+
+      # Draw a separate canvas for each station, visualizing only the layers belonging to that station
+      import yaml
+      with open("/Users/nikitagladin/SHiP/detector-opt/config/detector/straw.yaml") as f:
+          config = yaml.safe_load(f)
+      detector_cfg = config["straw"]
+      n_stations = len(detector_cfg["station_z"])
+      n_views_per_station = detector_cfg["n_views_per_station"]
+      n_layers_per_view = detector_cfg["n_layers_per_view"]
+      layers_per_station = n_views_per_station * n_layers_per_view
+
+      for station in range(n_stations):
+          plt.figure()
+          for key, (t, s) in waveforms.items():
+              layer = key[2]
+              this_station = layer // layers_per_station
+              if this_station == station:
+                  plt.plot(t, s, label=f"event={key[0]}, particle={key[1]}, layer={layer}, straw={key[3]}")
+          plt.xlabel("Time [ns]")
+          plt.ylabel("Signal [Coulombs]")
+          plt.title(f"Straw hit waveforms for Station {station+1} (not normalized)")
+          # plt.legend(fontsize='x-small', ncol=2)
+          plt.show()
+
+      # --- Plot histogram of FairShip-style fdigi_times per station ---
+      tdc_by_station = [[] for _ in range(n_stations)]
+      for key, fdigi in fdigi_times.items():
+          layer = key[2]
+          station = layer // layers_per_station
+          tdc_by_station[station].append(fdigi)
+      plt.figure()
+      for station in range(n_stations):
+          if tdc_by_station[station]:
+              plt.hist(tdc_by_station[station], bins=50, alpha=0.6, label=f"Station {station+1}")
+      plt.xlabel("TDC time [ns]")
+      plt.ylabel("Counts")
+      plt.title("Histogram of FairShip-style TDC times per station")
+      plt.legend()
+      plt.show()
+
+      # --- Compute and plot histogram of TDC times per station ---
+      from detopt.detector.straw_signal import compute_tdc_times
+      tdc_times = compute_tdc_times(
+          waveforms, t0_arr, r_mm,
+          straw_length=detector_cfg["straw_length"],
+          v_wire=0.2,  # mm/ns, adjust as needed
+          t0_event=0.0
+      )
+      tdc_by_station = [[] for _ in range(n_stations)]
+      for key, fdigi in tdc_times.items():
+          layer = key[2]
+          station = layer // layers_per_station
+          tdc_by_station[station].append(fdigi)
+      plt.figure()
+      # Only include stations with hits
+      tdc_data = [tdc_by_station[station] for station in range(n_stations) if tdc_by_station[station]]
+      labels = [f"Station {station+1}" for station in range(n_stations) if tdc_by_station[station]]
+      plt.hist(tdc_data, bins=50, stacked=True, label=labels, alpha=0.7)
+      plt.xlabel("TDC time [ns]")
+      plt.ylabel("Counts")
+      plt.title("Stacked histogram of TDC times per station")
+      plt.legend()
+      plt.show()
+
+
 
     configs = np.broadcast_to(design_vec[None], (n_batch, *design_vec.shape))
 

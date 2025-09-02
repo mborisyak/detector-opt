@@ -57,20 +57,25 @@ def show(layers, angles, width, height, response, trajectories=None, signal=None
         [-w, 2 * r * k - h + r, l_z], [w, 2 * r * k - h + r, l_z],
       ])
       verts = np.dot(verts, A)
-      mesh = pv.lines_from_points(verts)
+      mesh = pv.lines_from_points(verts)#.tube(radius=r, n_sides=20)
       plotter.add_mesh(
         mesh, color=(1.0, 0.0, 0.0), show_edges=False,
         opacity=1.0
       )
 
   # Restore trajectory rendering for visualization
+  print(trajectories.shape)
+  n_steps = trajectories.shape[1]
+  n_samples = 512
+  indices = np.linspace(0, n_steps - 1, n_samples).astype(int)
+  trajectories_downsampled = trajectories[:, indices, :]
   if trajectories is not None:
-    n_particles, n_t, _ = trajectories.shape
+    n_particles, n_t, _ = trajectories_downsampled.shape
     if signal is None:
       signal = 1.0
 
     for i in range(n_particles):
-      traj = pv.Spline(trajectories[i])  # Optionally: .tube(radius=0.05)
+      traj = pv.Spline(trajectories_downsampled[i])#.tube(radius=0.05)
       plotter.add_mesh(traj, color='red' if signal > 0.5 and i < 2 else 'blue', line_width=4, opacity=0.5)
 
 
