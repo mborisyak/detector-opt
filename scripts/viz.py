@@ -9,7 +9,7 @@ import numpy as np
 import detopt
 
 def viz(seed=123, design='data/design/default.json', **config):
-  n_batch = 3
+  n_batch = 32
   n_layers = 16
   detector = detopt.detector.from_config(config['detector'])
 
@@ -22,7 +22,7 @@ def viz(seed=123, design='data/design/default.json', **config):
   configs = np.broadcast_to(design[None], (n_batch, *design.shape))
 
   import time
-  n_trials = 1024
+  n_trials = 128
   start_time = time.perf_counter()
   for i in range(n_trials):
     _ = detector(seed=1, configurations=configs)
@@ -77,8 +77,12 @@ def viz(seed=123, design='data/design/default.json', **config):
   plt.show()
   plt.close()
 
+  n, m, *_ = trajectories.shape
+
+  trajectories = np.reshape(trajectories, shape=(n * m, *trajectories.shape[2:]))
+
   detopt.utils.viz.straw.show(
-    layers[0], angles[0], widths[0], heights[0], response[0], trajectories[0], signal[0],
+    layers[0], angles[0], widths[0], heights[0], response[0], trajectories, signal[0],
     threshold=0.3
   )
 

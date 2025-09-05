@@ -54,7 +54,7 @@ if __name__ == '__main__':
   n_layers = 16
   generator = detopt.detector.StrawDetector(n_layers=n_layers)
 
-  configs = np.ndarray(shape=(n_batch, 2 * n_layers + 1))
+  configs = np.ndarray(shape=(n_batch, 2 * n_layers + 1), dtype=np.float32)
 
   configs[:, :n_layers] = np.linspace(-3, 3, num=n_layers)[None, :]
   configs[:, n_layers:-1] = np.linspace(-3, 3, num=n_layers)[None, :]
