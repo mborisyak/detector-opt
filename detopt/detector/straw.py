@@ -3,12 +3,6 @@ from typing import Sequence
 import math
 import numpy as np
 
-# For reading ROOT files
-try:
-    import uproot
-except ImportError:
-    uproot = None
-
 from ..utils.encoding import uniform_to_normal, normal_to_uniform
 from .common import Detector
 from . import straw_detector
@@ -33,6 +27,7 @@ NAME2PID = {
 class StrawDetector(Detector):
   def __init__(
     self,
+    event_path: str,
     # Geometry hierarchy
     # Real detector geometry
     station_z: Sequence[float | int] = (2598.0, 2698.0, 3498.0, 3538.0),
@@ -55,6 +50,7 @@ class StrawDetector(Detector):
     view_angles_bounds=None
   ):
     """
+    :param event_path: path to the event file;
     :param max_B: maximal strength of the magnetic field;
     :param L: length parameter of the magnetic field;
     :param origin: the mean point of particles' origin;
