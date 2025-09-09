@@ -389,22 +389,31 @@ static PyObject * solve(PyObject *self, PyObject *args) {
 
       npy_float p2 = px * px + py * py + pz * pz;
       const npy_float gamma = sqrtf(1.0f + p2 / (mass * mass));
-      npy_float vx = px / (gamma * mass);
+      npy_float vx = px / (gamma * mass); // v's are dimensionless, in units of c
       npy_float vy = py / (gamma * mass);
       npy_float vz = pz / (gamma * mass);
       printf("gamma = %f mass = %f\n", gamma, mass);
-
+      printf("v %f %f %f", vx, vy, vz);
+      printf("charge %f", charge);
       if (f32_abs(vx) < SLOW && f32_abs(vy) < SLOW && f32_abs(vz) < SLOW) {
         // ghost particle
         continue;
       }
 
-      const npy_float c = 0.5 * dt * charge / mass / gamma;
+      const npy_float mass_MeV_kg = 1.78266192e-30f;
+      const npy_float charge_e_C = 1.602176634e-19f;
+      const npy_float c = 0.5 * (dt / 1e9) * (charge * charge_e_C) / (mass * mass_MeV_kg) / gamma;
+      // 1 / T = s * coulomb / kg / 1
+      // Convert mass from MeV/c^2 to kg, charge from e to Coulombs
+      // 1 MeV/c^2 = 1.78266192e-30 kg
+      // 1 e = 1.602176634e-19 C
+      printf("\n\nc = %f\n", c);
+      // Magnetic field parameters for this batch/event
 
       for (int j = 0; j < n_steps; ++j) {
-        const npy_float Bx = B * exp(-square((z - z0) / B_sigma));
-        const npy_float tx = c * Bx;
-        const npy_float t_norm_sqr = tx * tx;
+        const npy_float Bx = B * exp(-square((z - z0) / B_sigma)); // T = T * exp(cm /cm)
+        const npy_float tx = c * Bx; // 1 = 1/T * T
+        const npy_float t_norm_sqr = tx * tx; // dim..less
 
         // rotated speed
         // const npy_float vx_m = vx + vy * tz - vz * ty;
@@ -419,10 +428,11 @@ static PyObject * solve(PyObject *self, PyObject *args) {
         vy = vy_m + vz_m * sx;
         vz = vz_m - vy_m * sx;
 
-        const npy_float dx = dt * vx;
-        const npy_float dy = dt * vy;
-        const npy_float dz = dt * vz;
-
+        const npy_float dx = dt * vx * 30; //c*[ns] = 3 * 10^10 cm/s * 10^-9 s = 30 cm
+        const npy_float dy = dt * vy * 30;
+        const npy_float dz = dt * vz * 30;
+        printf("\ndl = %f, %f, %f\n", dx, dy, dz);
+        printf("\ndpos = %f, %f, %f\n", x, y, z);
         const npy_float x_ = x + dx;
         const npy_float y_ = y + dy;
         const npy_float z_ = z + dz;
@@ -506,20 +516,20 @@ static PyObject * solve(PyObject *self, PyObject *args) {
             const npy_float me = 0.511;   // MeV/c^2
 
             // Compute beta, gamma from momentum and mass
-            npy_float p = sqrtf(px*px + py*py + pz*pz);
-            npy_float beta = p / sqrtf(p*p + mass*mass);
-            npy_float gamma_bethe = sqrtf(1.0f + (p*p) / (mass*mass));
+            npy_float p = sqrtf(px*px + py*py + pz*pz); // MeV
+            npy_float beta = p / sqrtf(p*p + mass*mass); // MeV / sqrt(Mev^2 + MeV^2) = 1
+            npy_float gamma_bethe = sqrtf(1.0f + (p*p) / (mass*mass)); // 1
             // Tmax for Bethe-Bloch
             npy_float Tmax = (2 * me * beta * beta * gamma_bethe * gamma_bethe) /
-              (1 + 2 * gamma_bethe * me / 0.938 + (me / 0.938) * (me / 0.938));
+              (1 + 2 * gamma_bethe * me / mass + (me / mass) * (me / mass));
             npy_float argument = (2 * me * beta * beta * gamma_bethe * gamma_bethe * Tmax) / (I_exc*I_exc);
             if (argument <= 0) argument = 1e-10;
             npy_float log_term = logf(argument);
             npy_float dEdx = K * (charge*charge) * Z / A / (beta*beta) * (0.5f * log_term - beta*beta) * rho; // MeV/cm
 
             // Path length in this step (cm)
-            npy_float v = sqrtf(vx * vx + vy * vy + vz * vz);
-            npy_float path_cm = v * dt * 10.0f; // dt in ns, v in mm/ns, convert mm to cm
+            npy_float v = sqrtf(vx*vx + vy*vy + vz*vz);
+            npy_float path_cm = v * dt * 30.0f; // c*[ns] = 3 * 10^10 cm/s * 10^-9 s = 30 cm
 
             npy_float Edep = dEdx * path_cm; // MeV deposited in this step
 
