@@ -122,7 +122,7 @@ class StrawDetector(Detector):
 
     flight_distance = layer_bounds[1] - layer_bounds[0]
 
-    self.n_t = int(flight_distance / dt)
+    self.n_t = int(flight_distance / dt / 30) # cm/ns
     self.straw_signal_rate = straw_signal_rate
     self.straw_noise_rate = straw_noise_rate
     print("\n\n\nSet up\n\n\n")
@@ -300,12 +300,17 @@ class StrawDetector(Detector):
     if uproot is None:
         raise ImportError("uproot is required to read ROOT files. Please install with `pip install uproot awkward`.")
 
-    n_viz = 10
+    n_viz = 80
     with uproot.open(rootfile) as file:
+        """
+        By default, in FairShip prescription
+        Particle's momenta are in GeV, so the coefficient 1e3 added -> MASSES IN MEV
+        Positions are in cm
+        """
         tree = file[tree_name]
-        px = tree[px_name].array(library="np")[:n_viz]
-        py = tree[py_name].array(library="np")[:n_viz]
-        pz = tree[pz_name].array(library="np")[:n_viz]
+        px = tree[px_name].array(library="np")[:n_viz] * 1e3
+        py = tree[py_name].array(library="np")[:n_viz] * 1e3
+        pz = tree[pz_name].array(library="np")[:n_viz] * 1e3
         x = tree[x_name].array(library="np")[:n_viz]
         y = tree[y_name].array(library="np")[:n_viz]
         z = tree[z_name].array(library="np")[:n_viz]
@@ -314,6 +319,9 @@ class StrawDetector(Detector):
     # Treat all loaded particles as a single event with n_particles
     n_particles = px.shape[0]
     n_events = 1
+
+    # initial positions in CM
+    # Masses, energies, momenta - in MeV
 
     initial_positions = np.stack([x, y, z], axis=-1).reshape((1, n_particles, 3)).astype(np.float32)
     initial_momentum = np.stack([px, py, pz], axis=-1).reshape((1, n_particles, 3)).astype(np.float32)
@@ -332,14 +340,14 @@ class StrawDetector(Detector):
         }
         return CHARGE.get(pid, 0.0)
 
-    # --- Rest masses in GeV (use abs(pid) for particle/antiparticle) ---
-    def pid_to_mass_GeV(pid: int) -> float:
+    # --- Rest masses in MeV (use abs(pid) for particle/antiparticle) ---
+    def pid_to_mass_MeV(pid: int) -> float:
         MASS = {
-            11: 0.000510999,   # e±
-            13: 0.1056583755,  # mu±
-            211: 0.13957039,   # pi±
-            2212: 0.9382720813,# proton/antiproton
-            2112: 0.9395654133,# neutron/antineutron
+            11: 0.510999,   # e±
+            13: 105.6583755,  # mu±
+            211: 139.57039,   # pi±
+            2212: 938.2720813,# proton/antiproton
+            2112: 939.5654133,# neutron/antineutron
             22: 0.0,           # gamma
             12: 0.0,  # ν_e (set ~0 for toy; tiny real mass irrelevant here)
             14: 0.0,  # ν_μ
@@ -352,7 +360,7 @@ class StrawDetector(Detector):
 
     def build_masses_and_charges(pids: np.ndarray):
         pid_vec = np.vectorize  # convenience
-        masses = pid_vec(pid_to_mass_GeV)(pids).astype(np.float32)   # shape (1, n_particles)
+        masses = pid_vec(pid_to_mass_MeV)(pids).astype(np.float32)   # shape (1, n_particles)
         charges = pid_vec(pid_to_charge)(pids).astype(np.float32)    # shape (1, n_particles)
         if masses.ndim == 1:
                 masses = masses.reshape((1, -1))
@@ -365,28 +373,6 @@ class StrawDetector(Detector):
     masses, charges = build_masses_and_charges(pid)
     print("masses shape:", masses.shape, "dtype:", masses.dtype)
     print("charges shape:", charges.shape, "dtype:", charges.dtype)
-
-    # # Print particle names using PDG codes
-    # PDG_NAMES = {
-    #     11: "e-", -11: "e+",
-    #     13: "mu-", -13: "mu+",
-    #     211: "pi+", -211: "pi-",
-    #     2212: "proton", -2212: "antiproton",
-    #     2112: "neutron", -2112: "antineutron",
-    #     22: "gamma",
-    #     12: "nu_e", -12: "nu_e_bar",
-    #     14: "nu_mu", -14: "nu_mu_bar",
-    # }
-    # print("Particle names by event/particle:")
-    # print(pid.shape)
-
-    # for part_idx in range(pid.shape[0]):
-    #     pdg = int(pid[part_idx])
-    #     name = PDG_NAMES.get(pdg, f"PDG {pdg}")
-    #     print(f"Particle {part_idx}: {name}")
-
-    # momentum_norm_sqr = np.sum(np.square(initial_momentum), axis=-1)
-    # initial_velocities = initial_momentum / np.sqrt(np.square(masses) + momentum_norm_sqr)[..., None]
 
 
     if design is None:
@@ -416,7 +402,7 @@ class StrawDetector(Detector):
     else:
         B_sigma_arr = Ls.astype(np.float32)
 
-    # Allocate edep, r_mm, t0 arrays for energy deposit, drift distance, and hit time per straw crossing
+
     edep = np.zeros_like(response, dtype=np.float32)
     r_mm = np.zeros_like(response, dtype=np.float32)
     t0_arr = np.zeros_like(response, dtype=np.float32)
@@ -431,7 +417,7 @@ class StrawDetector(Detector):
 
 
 
-    # Example: Use edep, r_mm, t0 for waveform modeling (per straw crossing)
+    # Use edep, r_mm, t0 for waveform modeling (per straw crossing)
     from .straw_signal import straw_response
     waveforms = {}  # {(event, particle, layer, straw): (t, s)}
     for event in range(edep.shape[0]):
