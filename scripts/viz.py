@@ -8,7 +8,7 @@ import numpy as np
 
 import detopt
 
-def viz(seed=123, design='data/design/default.json', use_root_particles=True, **config):
+def viz(seed=123, design='data/design/default.json', rootfile='data/clean.root', **config):
     n_batch = 1
     n_layers = 64
 
@@ -21,8 +21,7 @@ def viz(seed=123, design='data/design/default.json', use_root_particles=True, **
       import json
       design_vec = detector.encode_design(json.load(f))
 
-    if use_root_particles:
-      rootfile = "/Users/nikitagladin/SHiP/clean.root"
+    if rootfile is not None:
       print(f"Loading particles from ROOT file: {rootfile}")
       masses, charges, initial_positions, initial_momentum, trajectories, response, signal, waveforms, t0_arr, r_mm, fdigi_times = detector.simulate_from_root(
         rootfile,
@@ -41,14 +40,7 @@ def viz(seed=123, design='data/design/default.json', use_root_particles=True, **
       # --- Plot all waveforms on the same canvas without normalization ---
       import matplotlib.pyplot as plt
       import matplotlib.cm as cm
-      import numpy as np
-      import yaml
-
-      # Draw a separate canvas for each station, visualizing only the layers belonging to that station
-      import yaml
-      with open("/Users/nikitagladin/SHiP/detector-opt/config/detector/straw.yaml") as f:
-          config = yaml.safe_load(f)
-      detector_cfg = config["straw"]
+      detector_cfg = config["detector"]["straw"]
       n_stations = len(detector_cfg["station_z"])
       n_views_per_station = detector_cfg["n_views_per_station"]
       n_layers_per_view = detector_cfg["n_layers_per_view"]

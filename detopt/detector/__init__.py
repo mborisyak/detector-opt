@@ -7,9 +7,11 @@ from . import straw
 
 from .. import utils
 from .straw import StrawDetector
+from .simple_straw import SimpleStrawDetector
 
 __detectors__: dict[str, type[Detector]] = {
-  'straw': StrawDetector
+  'straw': StrawDetector,
+  'simple_straw': SimpleStrawDetector
 }
 
 def from_config(config: dict[str, Any]):

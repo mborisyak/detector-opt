@@ -18,18 +18,11 @@ straw:
   # Physics parameters
   dt: 1.0e-2
   max_B: 8e-6
-  L: 3098.0
-  z0: 3098.0 # Center of magnetic field (cm)
+  B_z0: 3098.0 # Center of magnetic field (cm)
   B_sigma: 300.0 # Sigma (width) of magnetic field (cm)
-  layer_bounds: [2000., 4000.] # Optional, for encoding/decoding
-  max_particles: 2
-  origin: [0.0, 0.0, -10.0]
-  origin_sigma: [1.0, 1.0, 1.0]
-  momentum: [0.0, 0.0, 5.0]
-  momentum_sigma: [0.25, 0.25, 0.5]
-  noise_origin: [0.0, 0.0, -10.0]
-  noise_origin_sigma: [1.0, 1.0, 1.0]
-  noise_momentum: [0.0, 0.0, 5.0]
-  noise_momentum_sigma: [0.25, 0.25, 0.5]
+
+  station_z_bounds: [2000., 4000.] # for encoding/decoding
+  view_angles_bounds: [-0.1, 0.1]
+
   straw_signal_rate: 200.0
   straw_noise_rate: 20.0
