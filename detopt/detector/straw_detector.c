@@ -116,7 +116,8 @@ static PyObject * solve(PyObject *self, PyObject *args) {
   PyObject *py_dt= NULL;
   // field parameters
   PyObject *py_B = NULL;
-  PyObject *py_L = NULL;
+  PyObject *py_B_z0 = NULL;
+  PyObject *py_B_sigma = NULL;
 
   // particle parameters
   PyObject *py_initial_positions = NULL;
@@ -129,9 +130,6 @@ static PyObject * solve(PyObject *self, PyObject *args) {
   PyObject *py_heights = NULL;
   PyObject *py_angles = NULL;
 
-  PyObject *py_B_z0 = NULL;
-  PyObject *py_B_sigma = NULL;
-
   PyObject *py_steps = NULL;
 
   PyObject *py_trajectories = NULL;
@@ -142,12 +140,13 @@ static PyObject * solve(PyObject *self, PyObject *args) {
   PyObject *py_hit_pos = NULL;
 
   if (!PyArg_UnpackTuple(
-       args, "straw_solve", 20, 20,
+       args, "straw_solve", 19, 19,
        &py_initial_positions, &py_initial_momenta, &py_masses, &py_charges,
        &py_B, &py_B_z0, &py_B_sigma,
        &py_steps, &py_dt,
        &py_layers, &py_width, &py_heights, &py_angles,
-       &py_trajectories, &py_response, &py_edep, &py_r_mm, &py_t0, &py_hit_pos
+       &py_trajectories, &py_response,
+       &py_edep, &py_r_mm, &py_t0, &py_hit_pos
    )) {
        return NULL;
    }
@@ -259,11 +258,6 @@ static PyObject * solve(PyObject *self, PyObject *args) {
     PyErr_SetString(PyExc_TypeError, "Invalid value for B provided. Must be a (n, ) float64 array.");
     return NULL;
   }
-  const PyArrayObject * L_array = check_design_array(py_L, n_batch);
-  if (L_array == NULL) {
-    PyErr_SetString(PyExc_TypeError, "Invalid value for L provided. Must be a (n, ) float64 array.");
-    return NULL;
-  }
   const PyArrayObject * B_z0_array = check_design_array(py_B_z0, n_batch);
   if (B_z0_array == NULL) {
     PyErr_SetString(PyExc_TypeError, "Invalid value for z0 provided. Must be a (n, ) float64 array.");
@@ -287,8 +281,7 @@ static PyObject * solve(PyObject *self, PyObject *args) {
   const npy_float * masses = PyArray_DATA(masses_array);
 
   const npy_float * Bs = PyArray_DATA(B_array);
-  const npy_float * Ls = PyArray_DATA(L_array);
-  const npy_float * z0s = PyArray_DATA(B_z0_array);
+  const npy_float * B_z0 = PyArray_DATA(B_z0_array);
   const npy_float * B_sigmas = PyArray_DATA(B_sigma_array);
 
   const npy_float * layers = PyArray_DATA(layers_array);
@@ -327,7 +320,7 @@ static PyObject * solve(PyObject *self, PyObject *args) {
 
 
   npy_intp Bs0 = PyArray_STRIDE(B_array, 0) / sizeof(npy_float);
-  npy_intp z0s0 = PyArray_STRIDE(z0_array, 0) / sizeof(npy_float);
+  npy_intp B_z0s0 = PyArray_STRIDE(B_z0_array, 0) / sizeof(npy_float);
   npy_intp B_sigma_s0 = PyArray_STRIDE(B_sigma_array, 0) / sizeof(npy_float);
 
   npy_intp ips0 = PyArray_STRIDE(initial_positions_array, 0) / sizeof(npy_float);
@@ -372,7 +365,7 @@ static PyObject * solve(PyObject *self, PyObject *args) {
   for (int l = 0; l < n_batch; ++l) {
     // magnetic field parameters
     const npy_float B = Bs[l * Bs0];
-    const npy_float z0 = z0s[l * z0s0];
+    const npy_float z0 = B_z0[l * B_z0s0];
     const npy_float B_sigma = B_sigmas[l * B_sigma_s0];
 
     for (int i = 0; i < n_particles; ++i) {
