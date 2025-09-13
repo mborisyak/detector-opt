@@ -390,9 +390,9 @@ static PyObject * solve(PyObject *self, PyObject *args) {
       npy_float vx = px / (gamma * mass); // v's are dimensionless, in units of c
       npy_float vy = py / (gamma * mass);
       npy_float vz = pz / (gamma * mass);
-      printf("gamma = %f mass = %f\n", gamma, mass);
-      printf("v %f %f %f", vx, vy, vz);
-      printf("charge %f", charge);
+      // printf("gamma = %f mass = %f\n", gamma, mass);
+      // printf("v %f %f %f", vx, vy, vz);
+      // printf("charge %f", charge);
       if (f32_abs(vx) < SLOW && f32_abs(vy) < SLOW && f32_abs(vz) < SLOW) {
         // ghost particle
         continue;
@@ -405,7 +405,7 @@ static PyObject * solve(PyObject *self, PyObject *args) {
       // Convert mass from MeV/c^2 to kg, charge from e to Coulombs
       // 1 MeV/c^2 = 1.78266192e-30 kg
       // 1 e = 1.602176634e-19 C
-      printf("\n\nc = %f\n", c);
+      // printf("\n\nc = %f\n", c);
       // Magnetic field parameters for this batch/event
       const npy_float z0 = z0s[l];
       const npy_float B_sigma = B_sigmas[l];
@@ -428,11 +428,11 @@ static PyObject * solve(PyObject *self, PyObject *args) {
         vy = vy_m + vz_m * sx;
         vz = vz_m - vy_m * sx;
 
-        const npy_float dx = dt * vx * 30; //c*[ns] = 3 * 10^10 cm/s * 10^-9 s = 30 cm
-        const npy_float dy = dt * vy * 30;
-        const npy_float dz = dt * vz * 30;
-        printf("\ndl = %f, %f, %f\n", dx, dy, dz);
-        printf("\ndpos = %f, %f, %f\n", x, y, z);
+        const npy_float dx = dt * vx * 29.9792f; //c*[ns] = 3 * 10^10 cm/s * 10^-9 s = 30 cm
+        const npy_float dy = dt * vy * 29.9792f;
+        const npy_float dz = dt * vz * 29.9792f;
+        // printf("\ndl = %f, %f, %f\n", dx, dy, dz);
+        // printf("\ndpos = %f, %f, %f\n", x, y, z);
         const npy_float x_ = x + dx;
         const npy_float y_ = y + dy;
         const npy_float z_ = z + dz;
@@ -477,6 +477,7 @@ static PyObject * solve(PyObject *self, PyObject *args) {
 
           const npy_float sqr_distance_to_wire = square(z - layer) + square(ry - straw_y);
 
+          // printf("R=%f", r);
           if (sqr_distance_to_wire > r * r) {
             continue;
           }
@@ -504,7 +505,7 @@ static PyObject * solve(PyObject *self, PyObject *args) {
 
             // Store transverse distance to wire (r_mm)
             if (r_mm) {
-              r_mm[l * rs0 + i * rs1 + k * rs2 + straw_i * rs3] = fabsf(ry - straw_y);
+              r_mm[l * rs0 + i * rs1 + k * rs2 + straw_i * rs3] = fabsf(ry - straw_y) * 10.;
             }
 
             // --- Bethe-Bloch energy loss calculation ---
@@ -530,7 +531,7 @@ static PyObject * solve(PyObject *self, PyObject *args) {
 
             // Path length in this step (cm)
             npy_float v = sqrtf(vx*vx + vy*vy + vz*vz);
-            npy_float path_cm = v * dt * 30.0f; // c*[ns] = 3 * 10^10 cm/s * 10^-9 s = 30 cm
+            npy_float path_cm = v * dt * 29.9792f; // c*[ns] = 3 * 10^10 cm/s * 10^-9 s = 30 cm
 
             npy_float Edep = dEdx * path_cm; // MeV deposited in this step
 

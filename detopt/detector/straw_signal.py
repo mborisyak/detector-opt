@@ -58,7 +58,7 @@ def straw_response(Edep_mev, r_mm, t0=0.0, rng=np.random):
     return t, s
 
 def fairship_fdigi(
-    t0_event, t_MC, r_mm, x_hit, x_readout, sigma_spatial=0.012, v_drift=0.0033, c=29.9792, rng=np.random
+    layer, t0_event, t_MC, r_mm, x_hit, x_readout, sigma_spatial=0.12, v_drift=0.033, c=29.9792, rng=np.random
 ):
     """
     Compute FairShip-style TDC time (fdigi) for a straw hit.
@@ -78,7 +78,10 @@ def fairship_fdigi(
     t_drift = abs(rng.normal(r_mm, sigma_spatial)) / v_drift
     L_prop = abs(x_readout - x_hit)  # in cm
     t_wire = L_prop / c
-    return t0_event + t_MC + t_drift + t_wire
+    if 1:print(f"t0 is {t0_event}, t_MC is {t_MC}, drift {t_drift}, wire {t_wire}")
+    t_full = t0_event + t_MC + t_drift + t_wire
+    if 1:print(layer, t_full)
+    return t_full
 
 def compute_tdc_times(waveforms, t0_arr, r_mm, straw_length=400.0, v_wire=0.2, t0_event=0.0, rng=np.random):
     """

@@ -50,7 +50,7 @@ class StrawDetector(Detector):
     max_B: float=0.5, L=1.0,
     z0: float=None, B_sigma: float=None,
     layer_bounds: tuple[float | int, float | int]=(-5.0, 5.0),
-    dt: float=1.0e-2,
+    dt: float=1.0,
     max_particles=2,
     origin=(-100.0, -100.0, 1700.0), origin_sigma=(1.0, 1.0, 1.0),
     momentum=(0.0, 0.0, 5.0), momentum_sigma=(0.25, 0.25, 0.5),
@@ -122,7 +122,7 @@ class StrawDetector(Detector):
 
     flight_distance = layer_bounds[1] - layer_bounds[0]
 
-    self.n_t = int(flight_distance / dt / 30) # cm/ns
+    self.n_t = int(flight_distance / (dt * 29.9792)) #
     self.straw_signal_rate = straw_signal_rate
     self.straw_noise_rate = straw_noise_rate
     print("\n\n\nSet up\n\n\n")
@@ -300,7 +300,7 @@ class StrawDetector(Detector):
     if uproot is None:
         raise ImportError("uproot is required to read ROOT files. Please install with `pip install uproot awkward`.")
 
-    n_viz = 80
+    n_viz = 40
     with uproot.open(rootfile) as file:
         """
         By default, in FairShip prescription
@@ -463,6 +463,8 @@ class StrawDetector(Detector):
 
     n_straws = widths.shape[1] if len(widths.shape) > 1 else widths.shape[0]
     fdigi_times = {}
+    st = [0, 0, 0, 0]
+    ns = [0, 0, 0, 0]
     for key in waveforms:
         event, particle, layer, straw = key
         hit_xyz = hit_pos[event, particle, layer, straw]  # (x, y, z) in cm
@@ -475,18 +477,22 @@ class StrawDetector(Detector):
         proj = np.dot(hit_xyz - p0, wire_dir)
         x_hit = proj  # position along the wire from start (in cm)
         x_readout = wire_len  # readout at p1
-        fdigi = fairship_fdigi(
+        fdigi = fairship_fdigi(layer,
             t0_event=0.0,
             t_MC=t0_arr[event, particle, layer, straw],
             r_mm=r_mm[event, particle, layer, straw],
             x_hit=x_hit,
             x_readout=x_readout,
-            sigma_spatial=0.012,   # mm
-            v_drift=0.0033,         # mm/ns
+            sigma_spatial=0.12,   # mm
+            v_drift=0.033,         # mm/ns
             c=29.9792             # cm/ns
         )
+        st[layer // 8] += fdigi
+        ns[layer // 8] += 1
         fdigi_times[key] = fdigi
-
+    for kk in range(len(st)):
+        if ns[kk] == 0: print(0)
+        else: print(st[kk] / ns[kk])
     return masses, charges, initial_positions, initial_momentum, trajectories, response, signal, waveforms, t0_arr, r_mm, fdigi_times
 
   def __call__(self, seed: int, configurations: np.ndarray):
