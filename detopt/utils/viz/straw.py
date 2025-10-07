@@ -9,7 +9,11 @@ __all__ = [
   'show'
 ]
 
-def show(layers, angles, width, height, response, trajectories=None, signal=None, threshold=1.0):
+def show(layers, width, height, angles, response, trajectories=None, threshold=0.5):
+  z_min, z_max = np.min(layers), np.max(layers)
+  z_delta = z_max - z_min
+  z_min, z_max = z_min - 0.1 * z_delta, z_max + 0.1 * z_delta
+
   plotter = pv.Plotter(off_screen=False)
   plotter.camera_position = [
     (-100, 0, 50),
@@ -26,10 +30,9 @@ def show(layers, angles, width, height, response, trajectories=None, signal=None
   else:
     raise ValueError('response must be either 3D (per-particle) or 2D (combined) array')
 
-  # Limit to first 3 layers for fast layout checking
-  max_layers = len(layers)
-  max_straws = 10
-  for i, l_z in enumerate(layers[:max_layers]):
+  combined_response = combined_response / np.max(combined_response)
+
+  for i, l_z in enumerate(layers):
     A = np.array([
       [np.cos(angles[i]), np.sin(angles[i]), 0],
       [-np.sin(angles[i]), np.cos(angles[i]), 0],
@@ -37,48 +40,50 @@ def show(layers, angles, width, height, response, trajectories=None, signal=None
     ])
 
     h, w = height[i], width[i]
-    r = h / max_straws
+    r = h / n_straws
 
     # Draw parallelogram for stereo views (turned), rectangle for straight
     skew = h * np.tan(angles[i])
     verts = np.array([
-      [-w - skew, -h, l_z],   # bottom left
-      [-w + skew,  h, l_z],   # top left
-      [ w + skew,  h, l_z],   # top right
-      [ w - skew, -h, l_z]    # bottom right
+      [-w - skew, -h, l_z - z_min],   # bottom left
+      [-w + skew,  h, l_z - z_min],   # top left
+      [ w + skew,  h, l_z - z_min],   # top right
+      [ w - skew, -h, l_z - z_min]    # bottom right
     ])
     verts = np.dot(verts, A)
     faces = np.array([[4, 0, 1, 2, 3]])
     mesh = pv.PolyData(verts, faces=faces)
     plotter.add_mesh(mesh, color='black', style='wireframe', opacity=0.5, line_width=1.0)
 
-    for k in range(max_straws):
+    for k in range(n_straws):
       verts = np.array([
-        [-w, 2 * r * k - h + r, l_z], [w, 2 * r * k - h + r, l_z],
+        [-w, 2 * r * k - h + r, l_z - z_min],
+        [w, 2 * r * k - h + r, l_z - z_min],
       ])
       verts = np.dot(verts, A)
-      mesh = pv.lines_from_points(verts)#.tube(radius=r, n_sides=20)
-      plotter.add_mesh(
-        mesh, color=(1.0, 0.0, 0.0), show_edges=False,
-        opacity=1.0
-      )
 
-  # Restore trajectory rendering for visualization
-  print(trajectories.shape)
-  n_steps = trajectories.shape[1]
-  n_samples = 512
-  indices = np.linspace(0, n_steps - 1, n_samples).astype(int)
-  trajectories_downsampled = trajectories[:, indices, :]
+      if combined_response[i, k] > threshold:
+        mesh = pv.lines_from_points(verts).tube(radius=r, n_sides=5)
+        plotter.add_mesh(
+          mesh, color="red", show_edges=False, opacity=float(combined_response[i, k])
+        )
+
   if trajectories is not None:
-    n_particles, n_t, _ = trajectories_downsampled.shape
-    if signal is None:
-      signal = 1.0
+    n_particles, n_t, _ = trajectories.shape
 
     for i in range(n_particles):
-      traj = pv.Spline(trajectories_downsampled[i])#.tube(radius=0.05)
-      plotter.add_mesh(traj, color='red' if signal > 0.5 and i < 2 else 'blue', line_width=4, opacity=0.5)
+      indices, = np.where(np.logical_and(trajectories[i, :, 2] < z_max, trajectories[i, :, 2] > z_min))
+      trajectory = trajectories[i, indices, :]
+      n_samples = min(512, trajectory.shape[0])
+      indices = np.linspace(0, trajectory.shape[0] - 1, n_samples).astype(int)
+      trajectory = trajectory[indices, :]
+      trajectory = trajectory -np.array([0, 0, z_min])
 
+      if trajectory.shape[0] > 0:
+        traj = pv.Spline(trajectory)#.tube(radius=0.05)
+        plotter.add_mesh(traj, color='blue', line_width=4, opacity=0.5)
 
+  plotter.enable_depth_peeling()
   plotter.show_grid()
   plotter.reset_camera()
   plotter.show(screenshot='straw.png')

@@ -27,6 +27,7 @@ def optimize(seed, output, progress=True, restore=True, trace=None, report=None,
     return
 
   detector = detopt.detector.from_config(config['detector'])
+  metric_names = detector.metric_names()
 
   rng, key_init = jax.random.split(rng, num=2)
   restored = detopt.utils.io.restore_state(
@@ -56,7 +57,7 @@ def optimize(seed, output, progress=True, restore=True, trace=None, report=None,
     regressor = nnx.merge(regressor_def, r_params, r_state)
     p = regressor(x, c, deterministic=False)
 
-    loss = jnp.mean(detector.loss(t, p)) + reg_coef * regressor.regularization() + 1.0e-2 * jnp.mean(jnp.square(p))
+    loss = jnp.mean(detector.loss(t, p)) + reg_coef * regressor.regularization()
 
     _, _, r_state = nnx.split(regressor, nnx.Param, nnx.Variable)
     return loss, r_state
@@ -89,12 +90,29 @@ def optimize(seed, output, progress=True, restore=True, trace=None, report=None,
     return loss, design, opt_state
 
   regressor_losses = np.ndarray(shape=(epochs, steps, substeps))
-  regressor_validation = np.ndarray(shape=(epochs, validation_batches, batch))
+  regressor_validation = {
+    k: np.ndarray(shape=(epochs, validation_batches, batch))
+    for k in metric_names
+  }
 
   aux: dict | None = restored['aux']
   if aux is not None:
+    print(f'restoring with {starting_epoch}')
     regressor_losses[:starting_epoch] = aux['regressor']['training'][:starting_epoch]
-    regressor_validation[:starting_epoch] = aux['regressor']['validation'][:starting_epoch]
+    for k in metric_names:
+      regressor_validation[k][:starting_epoch] = aux['regressor']['validation'][k][:starting_epoch]
+
+  dataset_size = config['dataset_size']
+  dataset = detopt.utils.dataset.Dataset(
+    capacity=dataset_size,
+    condition_shape=detector.design_shape(),
+    sample_shape=detector.output_shape(),
+    target_shape=detector.target_shape()
+  )
+  design_batch = design[None, :] + \
+                 design_eps * np_rng.normal(size=(batch, *detector.design_shape())).astype(np.float32)
+  measurements, target = detector(seed=get_seed(), configurations=design_batch)
+  dataset.add(design_batch, measurements, target)
 
   status = detopt.utils.progress.status_bar(disable=not progress)
 
@@ -106,18 +124,28 @@ def optimize(seed, output, progress=True, restore=True, trace=None, report=None,
       ])
     )
 
+  c_batch = np.ndarray(shape=(2 * batch, *detector.design_shape()), dtype=np.float32)
+  X_batch = np.ndarray(shape=(2 * batch, *detector.output_shape()), dtype=np.float32)
+  y_batch = np.ndarray(shape=(2 * batch, *detector.target_shape()), dtype=np.float32)
+
   for i in status.epochs(starting_epoch, epochs):
     for j in status.training(steps):
+      design_batch = design[None, :] + \
+                     design_eps * np_rng.normal(size=(batch, *detector.design_shape())).astype(np.float32)
+      measurements, target = detector(seed=get_seed(), configurations=design_batch)
+
+      c_batch[:batch] = design_batch
+      X_batch[:batch] = measurements
+      y_batch[:batch] = target
+
       for k in range(substeps):
-        design_batch = design[None, :] + \
-                            design_eps * np_rng.normal(size=(batch, *detector.design_shape())).astype(np.float32)
-        _, measurements, target = detector(seed=get_seed(), configurations=design_batch)
+        c_old, X_old, y_old = dataset.sample(np_rng, batch)
+        c_batch[batch:] = c_old
+        X_batch[batch:] = X_old
+        y_batch[batch:] = y_old
 
         regressor_losses[i, j, k], regressor_parameters, regressor_state, regressor_optimizer_state, grad_check = \
-          step_regressor(
-            measurements, design_batch, target,
-            regressor_parameters, regressor_state, regressor_optimizer_state
-          )
+          step_regressor(X_batch, c_batch, y_batch, regressor_parameters, regressor_state, regressor_optimizer_state)
 
         if not check(regressor_parameters, regressor_state):
           print('measurements', np.min(measurements), np.max(measurements))
@@ -129,8 +157,10 @@ def optimize(seed, output, progress=True, restore=True, trace=None, report=None,
           print(grad_check)
           raise ValueError()
 
+      dataset.add(design_batch, measurements, target)
+
       design_batch = np.broadcast_to(design[None], shape=(batch, *detector.design_shape()))
-      _, measurements, target = detector(seed=get_seed(), configurations=design_batch)
+      measurements, target = detector(seed=get_seed(), configurations=design_batch)
 
       _, design_updated, design_optimizer_state = step_design(
         design,
@@ -140,7 +170,7 @@ def optimize(seed, output, progress=True, restore=True, trace=None, report=None,
       )
 
       if not np.all(np.isfinite(design_updated)):
-        print('oriignal:', design)
+        print('original:', design)
         print('updated:', design_updated)
         print('measurements', np.all(np.isfinite(measurements)), np.max(measurements))
         print('target', np.all(np.isfinite(target)), np.max(target))
@@ -151,14 +181,16 @@ def optimize(seed, output, progress=True, restore=True, trace=None, report=None,
     for j in status.validation(validation_batches):
       design_batch = design[None, :] + \
                      design_eps * np_rng.normal(size=(batch, *detector.design_shape())).astype(np.float32)
-      _, measurements, target = detector(seed=get_seed(), configurations=design_batch)
+      measurements, target = detector(seed=get_seed(), configurations=design_batch)
 
-      regressor_validation[i, j] = metric_f(measurements, design_batch, target, regressor_parameters, regressor_state)
+      metrics = metric_f(measurements, design_batch, target, regressor_parameters, regressor_state)
+      for k in metric_names:
+        regressor_validation[k][i, j] = metrics[k]
 
     aux = {
       'regressor': {
         'training': regressor_losses[:i + 1],
-        'validation': regressor_validation[:i + 1]
+        'validation': { k : regressor_validation[k][:i + 1] for k in metric_names }
       }
     }
 

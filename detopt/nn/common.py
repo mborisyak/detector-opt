@@ -21,11 +21,20 @@ class Model(nnx.Module):
   def from_config(cls, detector: Detector, config, *, rngs: nnx.Rngs):
     return cls(detector, rngs=rngs, **config)
 
+  def input_shape(self):
+    return self.detector_output_shape
+
+  def output_shape(self):
+    return self.detector_target_shape
+
+  def condition_shape(self):
+    return self.detector_design_shape
+
   def __init__(self, detector: Detector, *, rngs: nnx.Rngs):
-    self.input_shape = detector.output_shape()
-    self.design_shape = detector.design_shape()
-    self.target_shape = detector.target_shape()
-    self.ground_truth_shape = detector.ground_truth_shape()
+    self.detector_output_shape = detector.output_shape()
+    self.detector_design_shape = detector.design_shape()
+    self.detector_target_shape = detector.target_shape()
+    self.detector_ground_truth_shape = detector.ground_truth_shape()
 
     self.rngs = rngs
 
@@ -41,8 +50,8 @@ class Model(nnx.Module):
 
 class LeakyTanh(nnx.Module):
   def __init__(self, *shape):
-    self.positive = nnx.Param(jnp.ones(shape=shape, ))
-    self.negative = nnx.Param(jnp.ones(shape=shape, ))
+    self.positive = nnx.Param(0.05 * jnp.ones(shape=shape, ))
+    self.negative = nnx.Param(0.05 * jnp.ones(shape=shape, ))
 
   def __call__(self, x):
     return jax.nn.tanh(x) + self.positive.value * jax.nn.softplus(x) - self.negative * jax.nn.softplus(-x)

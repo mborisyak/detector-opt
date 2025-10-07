@@ -1,3 +1,4 @@
+import math
 import numpy as np
 
 # ---------- Parameters ----------
@@ -14,10 +15,55 @@ theta = 0.5    # Polya parameter
 tau_r = 2.0    # ns, rise time
 tau_f = 20.0   # ns, fall time
 
+waveform_peak_t = math.log((tau_f + tau_r) / tau_r) * tau_r
+# waveform_peak =  1.6e-19 * (1 - math.exp(-waveform_peak_t/tau_r)) * math.exp(-waveform_peak_t/tau_f)
+
+def max_poisson(rng: np.random.Generator, rate, n, m):
+    """
+    Approximates top m values from n samples from Poisson distribution with mean `rate`.
+    """
+    log_n = np.log(n)
+    log_log_n = np.log(log_n)
+    mean = rate + np.sqrt(2 * rate * log_n) - np.sqrt(rate) * (log_log_n + np.log(4 * np.pi)) / np.sqrt(8 * log_n)
+    spread = np.sqrt(0.5 * rate / log_n)
+
+    u = rng.gumbel(loc=0.0, scale=1.0, size=(m, ))
+
+    return mean + spread * u
+
+def simplified_ionisation(rng: np.random.Generator, edep):
+    n_mean = edep * 1.0e+6 / W
+    n_std= np.sqrt(Fano * n_mean)
+
+    n_electrons = np.floor(rng.normal(n_mean, n_std)).astype(np.int_)
+
+    return n_electrons
+
+def simplified_avalanche_gain(rng, n_electrons):
+    """Gas gain sampled from Polya distribution."""
+    # Polya ~ Gamma(k=1+θ, scale=G_mean/(1+θ))
+    ### sum of independent gammas is Gamma(sum_i k_i, scale)
+    gains = rng.gamma((1 + theta) * n_electrons, G_mean / (1 + theta))
+    return gains
+
+def simplified_straw_response(rng, edep, dark_current):
+    n_electrons = simplified_ionisation(rng, edep)
+    gain = simplified_avalanche_gain(rng, n_electrons)
+
+    noise = rng.poisson(dark_current, size=gain.shape)
+
+    return gain + noise
+
+def simpified_TDC(rng, t_hit, r_mm, x_hit, x_readout, sigma_spatial=0.012, v_drift=0.0033, c=29.9792):
+    t_drift = np.abs(rng.normal(r_mm, sigma_spatial)) / v_drift
+    L_prop = np.abs(x_readout - x_hit)  # in cm
+    t_wire = L_prop / c
+    return t_hit + t_drift + t_wire
+
 def primary_ionisation(Edep_mev, rng=np.random):
     """Return number of primary electrons with Fano smearing."""
     N_mean = Edep_mev * 1e6 / W
-    N = rng.normal(N_mean, np.sqrt(Fano*N_mean))
+    N = rng.normal(N_mean, np.sqrt(Fano * N_mean))
     return max(int(N), 0)
 
 def drift_time(r_mm, rng=np.random):
@@ -31,8 +77,9 @@ def avalanche_gain(n_electrons, rng=np.random):
     if n_electrons == 0:
         return 0.0
     # Polya ~ Gamma(k=1+θ, scale=G_mean/(1+θ))
-    gains = rng.gamma(1+theta, G_mean/(1+theta), size=n_electrons)
-    return np.sum(gains)
+    ### sum of independent gammas is Gamma(sum_i k_i, scale)
+    gains = rng.gamma((1+theta) * n_electrons, G_mean/(1+theta))
+    return gains
 
 def pulse_shape(t, Q):
     """Electronics shaping function for charge Q (Coulombs)."""

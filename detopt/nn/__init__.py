@@ -19,7 +19,8 @@ __models__: dict[str, type[Regressor]] = {
   'cvae': CVAE,
   'mlp-vae': MLPVAE,
 
-  'deep-set-lfi': DeepSetLFI
+  'deep-set-lfi': DeepSetLFI,
+  'resnet-lfi': AlphaResLFI
 }
 
 def from_config(

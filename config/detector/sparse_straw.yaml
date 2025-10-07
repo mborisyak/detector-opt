@@ -1,4 +1,4 @@
-straw:
+sparse_straw:
   # Station z-positions (mm)
   event_path: data/MC.npz
   n_stations: 4

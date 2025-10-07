@@ -2,19 +2,21 @@ detector: straw
 
 regressor: deep-set-128
 
-initial_design: data/design/default.json
-trace: data/design/subgradient/
-report: data/design/subgradient/
+initial_design: data/design/default/straw.json
+trace: data/design/subgradient-realistic/
+report: data/design/subgradient-realistic/
 
 design_eps: 1.0e-1
 optimizer:
   adam:
-    learning_rate: 1.0e-4
-    b1: 0.99
-    b2: 0.998
+    learning_rate: 1.0e-3
+    b1: 0.95
+    b2: 0.99
 
-batch: 8
-epochs: 256
-steps: 1024
-substeps: 1
-validation_batches: 1024
+batch: 4
+epochs: 128
+steps: 128
+substeps: 8
+validation_batches: 128
+
+dataset_size: 32768

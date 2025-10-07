@@ -8,6 +8,7 @@ import numpy as np
 
 import detopt
 
+
 def test_solve(seed, plot_root):
   n = 64
   rng = jax.random.PRNGKey(seed)
@@ -116,6 +117,6 @@ if __name__ == '__main__':
   plt.close()
 
   _, _, _, _, trajectories, response, signal = generator.sample(seed=1234567899, design=configs)
-  layers, angles, widths, heights, Bs, Ls = generator.get_design(design=configs)
+  layers, angles, widths, heights, Bs, Ls = generator.get_geometry(design=configs)
 
   detopt.utils.viz.straw.show(layers[0], angles[0], widths[0], heights[0], response[0], trajectories[0], signal[0])

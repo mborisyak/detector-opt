@@ -9,6 +9,7 @@ import optax
 
 import detopt
 
+from tqdm import tqdm
 import matplotlib
 matplotlib.use('AGG')
 
@@ -27,7 +28,7 @@ def info(**config):
 
   print(f'Total number of parameters: {total_number_of_parameters}')
 
-def regress(seed, output, progress=True, restore=True, report=None, **config):
+def regress(seed, output, dataset=None, progress=True, restore=True, report=None, **config):
   print(f'using {config.get("regressor")} as regressor')
 
   np_rng = np.random.default_rng(seed=seed)
@@ -86,19 +87,66 @@ def regress(seed, output, progress=True, restore=True, report=None, **config):
     return loss, r_params, r_state, opt_state
 
   regressor_losses = np.ndarray(shape=(epochs, steps))
-  regressor_validation = np.ndarray(shape=(epochs, validation_batches, batch))
+  metric_names = detector.metric_names()
+  regressor_validation = {
+    k: np.ndarray(shape=(epochs, validation_batches, batch))
+    for k in metric_names
+  }
 
   aux: dict | None = restored['aux']
   if aux is not None:
     regressor_losses[:starting_epoch] = aux['regressor']['training'][:starting_epoch]
-    regressor_validation[:starting_epoch] = aux['regressor']['validation'][:starting_epoch]
+    for k in metric_names:
+      regressor_validation[k][:starting_epoch] = aux['regressor']['validation'][k][:starting_epoch]
+
+  design_batch = np.broadcast_to(design[None], shape=(batch, *detector.design_shape()))
+
+  if dataset is not None:
+    try:
+      f = np.load(dataset)
+      X, y, X_val, y_val = f['X'], f['y'], f['X_val'], f['y_val']
+      n_total, n_total_val = X.shape[0], X_val.shape[0]
+    except FileNotFoundError:
+      X, y, X_val, y_val = None, None, None, None
+      n_total, n_total_val = None, None
+  else:
+    X, y, X_val, y_val = None, None, None, None
+    n_total, n_total_val = None, None
+
+  if X is None:
+    n_total = batch * steps
+
+    X = np.ndarray(shape=(n_total, *detector.output_shape()), dtype=np.float32)
+    y = np.ndarray(shape=(n_total, *detector.target_shape()), dtype=np.float32)
+
+    if progress:
+      progress_bar = tqdm
+    else:
+      progress_bar = lambda x, *args, **kwargs: x
+
+    for i in progress_bar(range(steps), desc='sampling training'):
+      X[i * batch: (i + 1) * batch], y[i * batch: (i + 1) * batch] = detector(
+        seed=get_seed(), configurations=design_batch
+      )
+
+    n_total_val = batch * steps
+    X_val = np.ndarray(shape=(n_total_val, *detector.output_shape()), dtype=np.float32)
+    y_val = np.ndarray(shape=(n_total_val, *detector.target_shape()), dtype=np.float32)
+
+    for i in progress_bar(range(validation_batches), desc='sampling validation'):
+      X_val[i * batch: (i + 1) * batch], y_val[i * batch: (i + 1) * batch] = detector(
+        seed=get_seed(), configurations=design_batch
+      )
+
+    if dataset is not None:
+      np.savez(dataset, X=X, y=y, X_val=X_val, y_val=y_val)
 
   status = detopt.utils.progress.status_bar(disable=not progress)
 
   for i in status.epochs(starting_epoch, epochs):
     for j in status.training(steps):
-      design_batch = np.broadcast_to(design[None], shape=(batch, *detector.design_shape()))
-      _, measurements, target = detector(seed=get_seed(), configurations=design_batch)
+      indx = np_rng.integers(low=0, high=n_total, size=(batch, ))
+      measurements, target = X[indx], y[indx]
 
       regressor_losses[i, j], regressor_parameters, regressor_state, regressor_optimizer_state = \
         step_regressor(
@@ -107,15 +155,16 @@ def regress(seed, output, progress=True, restore=True, report=None, **config):
         )
 
     for j in status.validation(validation_batches):
-      design_batch = np.broadcast_to(design[None], shape=(batch, *detector.design_shape()))
-      _, measurements, target = detector(seed=get_seed(), configurations=design_batch)
+      measurements, target = X_val[i * batch: (i + 1) * batch], y_val[i * batch: (i + 1) * batch]
 
-      regressor_validation[i, j] = metric_f(measurements, design_batch, target, regressor_parameters, regressor_state)
+      metrics = metric_f(measurements, design_batch, target, regressor_parameters, regressor_state)
+      for k, m in metrics.items():
+        regressor_validation[k][i, j] = m
 
     aux = {
       'regressor': {
         'training': regressor_losses[:i + 1],
-        'validation': regressor_validation[:i + 1]
+        'validation': {k: v[:i + 1] for k, v in regressor_validation.items()}
       }
     }
 
@@ -176,4 +225,4 @@ def report(seed, checkpoint, report, **config):
 if __name__ == '__main__':
   import gearup
 
-  gearup.gearup(regress=regress, report=report).with_config('config/regress.yaml')()
+  gearup.gearup(regress=regress, report=report).with_config('config/regression.yaml')()

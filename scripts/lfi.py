@@ -58,6 +58,8 @@ def optimize(seed, output, progress=True, restore=True, trace=None, report=None,
   reg_coef = config.get('regularization', 1.0e-4)
   discr_reg_coef = config.get('discriminator_regularization', 1.0e-2)
 
+  metric_names = detector.metric_names()
+
   @jax.jit
   def loss_f(x, c, t, r_params, r_state):
     regressor = nnx.merge(regressor_def, r_params, r_state)
@@ -85,30 +87,30 @@ def optimize(seed, output, progress=True, restore=True, trace=None, report=None,
     return loss, r_params, r_state, opt_state
 
   @jax.jit
-  def combine(x_real, c_real, gt_real, x_gen, c_gen, gt_gen):
+  def combine(x_real, c_real, y_real, x_gen, c_gen, y_gen):
     n_real, *_ = x_real.shape
     n_gen, *_ = x_gen.shape
 
     x = jnp.concatenate([x_real, x_gen], axis=0)
     c = jnp.concatenate([c_real, c_gen], axis=0)
-    gt = jnp.concatenate([gt_real, gt_gen], axis=0)
+    y = jnp.concatenate([y_real, y_gen], axis=0)
 
-    y = jnp.concatenate([
+    labels = jnp.concatenate([
       jnp.ones(shape=(n_real,), dtype=x_real.dtype),
       jnp.zeros(shape=(n_gen,), dtype=x_gen.dtype),
     ], axis=0)
 
-    return x, c, gt, y
+    return x, c, y, labels
 
   @jax.jit
-  def loss_discriminator_f(x_true, c_true, gt_true, x_gen, c_gen, gt_gen, d_params, d_state):
-    x, c, gt, y = combine(x_true, c_true, gt_true, x_gen, c_gen, gt_gen)
+  def loss_discriminator_f(x_true, c_true, y_true, x_gen, c_gen, y_gen, d_params, d_state):
+    x, c, y, labels = combine(x_true, c_true, y_true, x_gen, c_gen, y_gen)
 
     discriminator = nnx.merge(discriminator_def, d_params, d_state)
 
-    p = discriminator(x, c, gt)
+    p = discriminator(x, c, y)
 
-    cross_entropy = jnp.mean(y * jax.nn.softplus(-p) + (1 - y) * jax.nn.softplus(p))
+    cross_entropy = jnp.mean(labels * jax.nn.softplus(-p) + (1 - labels) * jax.nn.softplus(p))
     loss = cross_entropy + reg_coef * discriminator.regularization() + discr_reg_coef * jnp.mean(jnp.square(p))
 
     _, _, d_state = nnx.split(discriminator, nnx.Param, nnx.Variable)
@@ -116,47 +118,47 @@ def optimize(seed, output, progress=True, restore=True, trace=None, report=None,
     return loss, d_state
 
   @jax.jit
-  def metric_discriminator_f(x_true, c_true, gt_true, x_gen, c_gen, gt_gen, d_params, d_state):
-    x, c, gt, y = combine(x_true, c_true, gt_true, x_gen, c_gen, gt_gen)
+  def metric_discriminator_f(x_true, c_true, y_true, x_gen, c_gen, y_gen, d_params, d_state):
+    x, c, y, labels = combine(x_true, c_true, y_true, x_gen, c_gen, y_gen)
     discriminator = nnx.merge(discriminator_def, d_params, d_state)
-    p = discriminator(x, c, gt)
-    metric = (p > 0.0) == (y > 0.5)
+    p = discriminator(x, c, y)
+    metric = (p > 0.0) == (labels > 0.5)
 
     return metric
 
   @jax.jit
-  def step_discriminator(x_true, c_true, gt_true, x_gen, c_gen, gt_gen, d_params, d_state, opt_state):
+  def step_discriminator(x_true, c_true, y_true, x_gen, c_gen, y_gen, d_params, d_state, opt_state):
     (loss, d_state), grad = jax.value_and_grad(loss_discriminator_f, argnums=6, has_aux=True)(
-      x_true, c_true, gt_true, x_gen, c_gen, gt_gen, d_params, d_state
+      x_true, c_true, y_true, x_gen, c_gen, y_gen, d_params, d_state
     )
     updates, opt_state = discriminator_optimizer.update(grad, opt_state)
     d_params = optax.apply_updates(d_params, updates)
     return loss, d_params, d_state, opt_state
 
   @jax.jit
-  def log_P_x_given_c_gt(x, c, gt, d_params, d_state):
-    ### log P(x | c, gt) - log P(x)
+  def log_P_x_given_c(x, c, y, d_params, d_state):
+    ### log P(x, y | c) - log P(c)
     discriminator = nnx.merge(discriminator_def, d_params, d_state)
 
-    return discriminator(x, c, gt)
+    return discriminator(x, c, y)
 
   @jax.jit
-  def loss_design(x, c, gt, t, r_params, r_state, d_params, d_state):
+  def loss_design(x, c, y, r_params, r_state, d_params, d_state):
     regressor = nnx.merge(regressor_def, r_params, r_state)
 
     p_t = regressor(x, c)
     ### loss due to change of the optimal regressor
-    loss_reg = detector.loss(t, p_t)
+    loss_reg = detector.loss(y, p_t)
 
     ### loss due to change of the distribution of x
-    loss_gen = log_P_x_given_c_gt(x, c, gt, d_params, d_state) * jax.lax.stop_gradient(loss_reg - 0.5)
+    loss_gen = log_P_x_given_c(x, c, y, d_params, d_state) * jax.lax.stop_gradient(loss_reg - 0.5)
 
     return jnp.mean(loss_reg) + jnp.mean(loss_gen)
 
   @jax.jit
-  def step_design(design, x, c, gt, t, r_params, r_state, d_params, d_state, opt_state):
+  def step_design(design, x, c, y, r_params, r_state, d_params, d_state, opt_state):
     loss, grad = jax.value_and_grad(loss_design, argnums=1)(
-      x, c, gt, t, r_params, r_state, d_params, d_state
+      x, c, y, r_params, r_state, d_params, d_state
     )
 
     grad = jax.tree.map(lambda g: jnp.mean(g, axis=0), grad)
@@ -168,7 +170,10 @@ def optimize(seed, output, progress=True, restore=True, trace=None, report=None,
   design_losses = np.ndarray(shape=(epochs, steps, substeps))
 
   regressor_losses = np.ndarray(shape=(epochs, steps, substeps))
-  regressor_validation = np.ndarray(shape=(epochs, validation_batches, batch))
+  regressor_validation = {
+    k: np.ndarray(shape=(epochs, validation_batches, batch))
+    for k in metric_names
+  }
 
   discriminator_losses = np.ndarray(shape=(epochs, steps, substeps))
   discriminator_validation = np.ndarray(shape=(epochs, validation_batches, 2 * batch))
@@ -178,7 +183,8 @@ def optimize(seed, output, progress=True, restore=True, trace=None, report=None,
     design_losses[:starting_epoch] = aux['design']['training'][:starting_epoch]
 
     regressor_losses[:starting_epoch] = aux['regressor']['training'][:starting_epoch]
-    regressor_validation[:starting_epoch] = aux['regressor']['validation'][:starting_epoch]
+    for k in metric_names:
+      regressor_validation[k][:starting_epoch] = aux['regressor']['validation'][k][:starting_epoch]
 
     discriminator_losses[:starting_epoch] = aux['discriminator']['training'][:starting_epoch]
     discriminator_validation[:starting_epoch] = aux['discriminator']['validation'][:starting_epoch]
@@ -197,20 +203,20 @@ def optimize(seed, output, progress=True, restore=True, trace=None, report=None,
     design_noise = design_eps * np_rng.normal(size=(batch, *detector.design_shape())).astype(np.float32)
     c_batch = c[None, :] + design_noise
 
-    gt, x, t = detector(seed=rng_seed, configurations=c_batch)
-    return gt, x, c_batch, t
+    x, t = detector(seed=rng_seed, configurations=c_batch)
+    return x, c_batch, t
 
   def sample_independent(rng_seed_1, rng_seed_2, c):
-    _, x, _, _ = sample(rng_seed_1, c)
-    gt, _, c_batch, _ = sample(rng_seed_2, c)
+    x, _, t = sample(rng_seed_1, c)
+    _, c_batch, _ = sample(rng_seed_2, c)
 
-    return gt, x, c_batch
+    return x, c_batch, t
 
 
   for i in status.epochs(starting_epoch, epochs):
     for j in status.training(steps):
       for k in range(substeps):
-        ground_truth, measurements, design_batch, target = sample(get_seed(), design)
+        measurements, design_batch, target = sample(get_seed(), design)
 
         regressor_losses[i, j, k], regressor_parameters, regressor_state, regressor_optimizer_state = \
           step_regressor(
@@ -220,26 +226,26 @@ def optimize(seed, output, progress=True, restore=True, trace=None, report=None,
         if not check(regressor_parameters):
           raise ValueError()
 
-        ground_truth_pseudo, measurements_pseudo, design_batch_pseudo = sample_independent(
+        measurements_pseudo, design_batch_pseudo, target_pseudo = sample_independent(
           get_seed(), get_seed(), design
         )
 
         discriminator_losses[i, j, k], discriminator_parameters, discriminator_state, discriminator_optimizer_state = \
           step_discriminator(
-            measurements, design_batch, ground_truth,
-            measurements_pseudo, design_batch_pseudo, ground_truth_pseudo,
+            measurements, design_batch, target,
+            measurements_pseudo, design_batch_pseudo, target_pseudo,
             discriminator_parameters, discriminator_state, discriminator_optimizer_state
           )
         if not check(discriminator_parameters):
           raise ValueError()
 
       design_batch = np.broadcast_to(design[None], shape=(batch, *detector.design_shape()))
-      ground_truth, measurements, target = detector(seed=get_seed(), configurations=design_batch)
+      measurements, target = detector(seed=get_seed(), configurations=design_batch)
 
       if i >= warmup:
         design_losses[i, j], design_updated, design_optimizer_state = step_design(
           design,
-          measurements, design_batch, ground_truth, target,
+          measurements, design_batch, target,
           regressor_parameters, regressor_state,
           discriminator_parameters, discriminator_state,
           design_optimizer_state
@@ -258,22 +264,27 @@ def optimize(seed, output, progress=True, restore=True, trace=None, report=None,
         design = design_updated
 
     for j in status.validation(validation_batches):
-      ground_truth, measurements, design_batch, target = sample(get_seed(), design)
-      regressor_validation[i, j] = metric_f(measurements, design_batch, target, regressor_parameters, regressor_state)
+      measurements, design_batch, target = sample(get_seed(), design)
+      metrics = metric_f(measurements, design_batch, target, regressor_parameters, regressor_state)
+      for k in metric_names:
+        regressor_validation[k][i, j] = metrics[k]
 
-      ground_truth_pseudo, measurements_pseudo, design_batch_pseudo = sample_independent(
+      measurements_pseudo, design_batch_pseudo, target_pseudo = sample_independent(
         get_seed(), get_seed(), design
       )
 
       discriminator_validation[i, j] = metric_discriminator_f(
-        measurements, design_batch, ground_truth,
-        measurements_pseudo, design_batch_pseudo, ground_truth_pseudo,
+        measurements, design_batch, target,
+        measurements_pseudo, design_batch_pseudo, target_pseudo,
         discriminator_parameters, discriminator_state
       )
 
     aux = {
       'design': {'training': design_losses[:i + 1]},
-      'regressor': {'training': regressor_losses[:i + 1], 'validation': regressor_validation[:i + 1]},
+      'regressor': {
+        'training': regressor_losses[:i + 1],
+        'validation': {k: regressor_validation[k][:i + 1] for k in metric_names}
+      },
       'discriminator': {'training': discriminator_losses[:i + 1], 'validation': discriminator_validation[:i + 1]},
     }
 

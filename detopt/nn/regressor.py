@@ -281,21 +281,90 @@ class HyperResNet(Regressor):
 
 class DeepSet(Regressor):
   def __init__(
-    self, detector: Detector,
-    features: Sequence[Sequence[int]], p_dropout: float = 0.1,
-    *, rngs: nnx.Rngs
+    self, detector: Detector, features: Sequence[Sequence[int]], p_dropout: float | None = None, *, rngs: nnx.Rngs
   ):
     super().__init__(detector, rngs=rngs)
+
     target_dim = math.prod(self.target_shape)
-    ### position + angle + B
-    n_design = 3
+    ### B, station z, view offset, view angle, layer offset, straw_offset
+    n_design = 6
 
-    n_layers, n_straws = self.input_shape
-    self.blocks: list[Block] =  []
+    n_stations, n_views, n_layers, n_straws, n_f = self.input_shape
+    self.blocks: list[Block] = []
 
-    dropout = lambda: () #if p_dropout is None else (nnx.Dropout(rate=p_dropout, rngs=rngs), )
+    n_features = n_design + n_f
 
-    n_features = n_design + n_straws
+    for block_def in features:
+      units = (n_features, *block_def)
+      self.blocks.append(
+        Block(
+          *(
+            Block(nnx.Linear(n_in, n_out, rngs=rngs), SiLU())
+            for n_in, n_out in zip(units[:-2], units[1:-1])
+          ),
+          nnx.Linear(units[-2], units[-1], rngs=rngs)
+        )
+      )
+      n_features = units[-1]
+
+    *_, last = features
+    *_, n_latent = last
+
+    self.output = nnx.Linear(n_latent, target_dim, rngs=rngs)
+
+  def combine(self, X, design):
+    n_b, n_s, n_v, n_l, n_straw, n_f = X.shape
+    _, n_d = design.shape
+
+    view_offset = jnp.linspace(-1, 1, num=n_v)
+    layer_offset = jnp.linspace(-1, 1, num=n_l)
+    straw_offset = jnp.linspace(-1, 1, num=n_straw)
+
+    stations, angles, magnetic_strength = design[:, :n_s], design[:, n_s:-1], design[:, -1]
+
+    shape = (n_b, n_s, n_v, n_l, n_straw, 1)
+
+    station_offset = jnp.broadcast_to(stations[:, :, None, None, None, None], shape=shape)
+    angles_br = jnp.reshape(angles, shape=(n_b, n_v, n_s))
+    angles_br = jnp.broadcast_to(angles_br[:, :, :, None, None, None], shape=shape)
+    view_offsets = jnp.broadcast_to(view_offset[None, None, :, None, None, None], shape=shape)
+    layer_offset = jnp.broadcast_to(layer_offset[None, None, None, :, None, None], shape=shape)
+    straw_offset = jnp.broadcast_to(straw_offset[None, None, None, None, :, None], shape=shape)
+    B = jnp.broadcast_to(magnetic_strength[:, None, None, None, None, None], shape=shape)
+
+    return jnp.concatenate([X, station_offset, angles_br, view_offsets, layer_offset, straw_offset, B], axis=-1)
+
+  def __call__(self, X: jax.Array, design: jax.Array, *, deterministic: bool = True):
+    result = self.combine(X, design)
+
+    for block in self.blocks:
+      mus = block(result)
+      result = jnp.mean(mus, axis=-2)
+    result = self.output(result)
+
+    return jnp.reshape(result, shape=(result.shape[0], *self.target_shape))
+
+
+class BayesDeepSet(Regressor):
+  def condition_shape(self):
+    return (6,)
+
+  def __init__(
+    self, detector: Detector, features: Sequence[Sequence[int]], p_dropout: float | None = None, *, rngs: nnx.Rngs
+  ):
+    super().__init__(detector, rngs=rngs)
+
+    output_dim = math.prod(self.output_shape())
+    ### B, station z, view offset, view angle, layer offset, straw_offset
+    n_design, = self.condition_shape()
+
+    n_stations, n_views, n_layers, n_straws, n_f = self.input_shape()
+    self.blocks: list[Block] = []
+
+    n_features = n_design + n_f
+
+    dropout = lambda: () if p_dropout is None else (nnx.Dropout(rate=p_dropout), )
+
     for block_def in features:
       units = (n_features, *block_def)
       self.blocks.append(
@@ -304,7 +373,7 @@ class DeepSet(Regressor):
             Block(*dropout(), nnx.Linear(n_in, n_out, rngs=rngs), LeakyTanh(n_out, ))
             for n_in, n_out in zip(units[:-2], units[1:-1])
           ),
-          Block(*dropout(), nnx.Linear(units[-2], units[-1], rngs=rngs))
+          [nnx.Linear(units[-2], units[-1], rngs=rngs), nnx.Linear(units[-2], units[-1], rngs=rngs)]
         )
       )
       n_features = 2 * units[-1]
@@ -312,19 +381,29 @@ class DeepSet(Regressor):
     *_, last = features
     *_, n_latent = last
 
-    self.output = nnx.Linear(n_latent, target_dim, rngs=rngs)
+    self.output = nnx.Linear(2 * n_latent, output_dim, rngs=rngs)
 
   def combine(self, X, design):
-    n_b, n_l, n_s = X.shape
+    n_b, n_s, n_v, n_l, n_straw, n_f = X.shape
     _, n_d = design.shape
 
-    X = jnp.reshape(X, shape=(n_b, n_l, n_s))
-    positions, angles, magnetic_strength = design[:, :n_l], design[:, n_l:2 * n_l], design[:, -1]
-    positions = jnp.broadcast_to(positions[:, :, None], shape=(n_b, n_l, 1))
-    angles = jnp.broadcast_to(angles[:, :, None], shape=(n_b, n_l, 1))
-    magnetic_strength = jnp.broadcast_to(magnetic_strength[:, None, None], shape=(n_b, n_l, 1))
+    view_offset = jnp.linspace(-1, 1, num=n_v)
+    layer_offset = jnp.linspace(-1, 1, num=n_l)
+    straw_offset = jnp.linspace(-1, 1, num=n_straw)
 
-    return jnp.concatenate([X, positions, angles, magnetic_strength], axis=-1)
+    stations, angles, magnetic_strength = design[:, :n_s], design[:, n_s:-1], design[:, -1]
+
+    shape = (n_b, n_s, n_v, n_l, n_straw, 1)
+
+    station_offset = jnp.broadcast_to(stations[:, :, None, None, None, None], shape=shape)
+    angles_br = jnp.reshape(angles, shape=(n_b, n_v, n_s))
+    angles_br = jnp.broadcast_to(angles_br[:, :, :, None, None, None], shape=shape)
+    view_offsets = jnp.broadcast_to(view_offset[None, None, :, None, None, None], shape=shape)
+    layer_offset = jnp.broadcast_to(layer_offset[None, None, None, :, None, None], shape=shape)
+    straw_offset = jnp.broadcast_to(straw_offset[None, None, None, None, :, None], shape=shape)
+    B = jnp.broadcast_to(magnetic_strength[:, None, None, None, None, None], shape=shape)
+
+    return jnp.concatenate([X, station_offset, angles_br, view_offsets, layer_offset, straw_offset, B], axis=-1)
 
   def __call__(self, X: jax.Array, design: jax.Array, *, deterministic: bool = True):
     result = self.combine(X, design)
@@ -332,78 +411,14 @@ class DeepSet(Regressor):
     *rest, last = self.blocks
 
     for block in rest:
-      mus = block(result)
-      mu = jnp.mean(mus, axis=1, keepdims=True)
-      mu = jnp.broadcast_to(mu, shape=mus.shape)
-      result = jnp.concatenate([mus, mu], axis=-1)
-
-    mus = last(result)
-    result = jnp.mean(mus, axis=1, keepdims=False)
-
-    result = self.output(result)
-
-    return jnp.reshape(result, shape=(result.shape[0], *self.target_shape))
-
-class BayesDeepSet(Regressor):
-  def __init__(
-    self, detector: Detector, features: Sequence[Sequence[int]], p_dropout: float | None = None, *, rngs: nnx.Rngs
-  ):
-    super().__init__(detector, rngs=rngs)
-    input_dim, design_dim = math.prod(self.input_shape), math.prod(self.design_shape)
-    target_dim = math.prod(self.target_shape)
-    ### position + angle + B
-    n_design = 3
-
-    n_layers, n_straws = self.input_shape
-    self.blocks: list[Block] = []
-
-    n_features = n_design + n_straws
-    for block_def in features:
-      units = (n_features, *block_def)
-      self.blocks.append(
-        Block(
-          *(
-            Block(nnx.Linear(n_in, n_out, rngs=rngs), LeakyTanh(n_out, ))
-            for n_in, n_out in zip(units[:-2], units[1:-1])
-          ),
-          [nnx.Linear(units[-2], units[-1], rngs=rngs), nnx.Linear(units[-2], units[-1], rngs=rngs)]
-        )
-      )
-      n_features = 3 * units[-1]
-
-    *_, last = features
-    *_, n_latent = last
-
-    self.output = nnx.Linear(2 * n_latent, target_dim, rngs=rngs)
-
-  def combine(self, X, design):
-    n_b, n_l, n_s = X.shape
-    _, n_d = design.shape
-
-    X = jnp.reshape(X, shape=(n_b, n_l, n_s))
-    positions, angles, magnetic_strength = design[:, :n_l], design[:, n_l:2 * n_l], design[:, -1]
-    positions = jnp.broadcast_to(positions[:, :, None], shape=(n_b, n_l, 1))
-    angles = jnp.broadcast_to(angles[:, :, None], shape=(n_b, n_l, 1))
-    magnetic_strength = jnp.broadcast_to(magnetic_strength[:, None, None], shape=(n_b, n_l, 1))
-
-    return jnp.concatenate([X, positions, angles, magnetic_strength], axis=-1)
-
-  def __call__(self, X: jax.Array, design: jax.Array, *, deterministic: bool = True):
-    result = self.combine(X, design)
-
-    *rest, last = self.blocks
-
-    for block in rest:
-      mus, log_sigmas = block(result)
-      mu, sigma = bayes_aggregate(mus, log_sigmas, axis=1, keepdims=True)
-      mu = jnp.broadcast_to(mu, shape=mus.shape)
-      sigma = jnp.broadcast_to(sigma, shape=mus.shape)
-      result = jnp.concatenate([mus, mu, sigma], axis=-1)
+      mus, log_sigmas = block(result, deterministic=deterministic)
+      mu, sigma = bayes_aggregate(mus, log_sigmas, axis=-2, keepdims=False)
+      result = jnp.concatenate([mu, sigma], axis=-1)
 
     mus, log_sigmas = last(result)
-    mu, sigma = bayes_aggregate(mus, log_sigmas, axis=1, keepdims=False)
+    mu, sigma = bayes_aggregate(mus, log_sigmas, axis=-2, keepdims=False)
     result = jnp.concatenate([mu, sigma], axis=-1)
 
     result = self.output(result)
 
-    return jnp.reshape(result, shape=(result.shape[0], *self.target_shape))
+    return jnp.reshape(result, shape=(result.shape[0], *self.output_shape()))

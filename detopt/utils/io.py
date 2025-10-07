@@ -1,6 +1,5 @@
 import os
 
-import flax
 import jax.tree
 from flax import nnx
 
@@ -17,7 +16,9 @@ __all__ = [
   'load_design',
   'save_design',
   'restore_state',
-  'save_state'
+  'save_state',
+
+  'load_model'
 ]
 
 def get_checkpointer(path):
@@ -108,10 +109,13 @@ def restore_model(config, detector, restored, rngs):
   else:
     parameters = restored['parameters']
     model_state = restored['state']
-    optimizer_state = jax.tree.unflatten(
-      jax.tree.structure(optimizer.init(parameters)),
-      restored['optimizer_state']
-    )
+    if restored['optimizer_state'] is not None:
+      optimizer_state = jax.tree.unflatten(
+        jax.tree.structure(optimizer.init(parameters)),
+        restored['optimizer_state']
+      )
+    else:
+      optimizer_state = None
 
   return dict(
     model=model_def, optimizer=optimizer,
@@ -176,3 +180,28 @@ def restore_state(manager, detector, config, *, rngs: nnx.Rngs, restore=True):
     regressor=regressor, generator=generator, discriminator=discriminator,
     aux=data.get('aux', None)
   )
+
+def load_model(model_type, checkpoint, detector, config, *, rngs: nnx.Rngs):
+  from .. import nn
+
+  manager = get_checkpointer(checkpoint)
+
+  last_epoch = manager.latest_step()
+  if last_epoch is None:
+    raise ValueError('Non-existent checkpoint')
+
+  data = manager.restore(
+    manager.latest_step(),
+    args=ocp.args.Composite(
+      **{model_type: ocp.args.PyTreeRestore()},
+    )
+  )
+
+  model = nn.from_config(
+    detector, config=config[model_type]['model'], rngs=rngs
+  )
+  model_def, _, _ = nnx.split(model, nnx.Param, nnx.Variable)
+  parameters = data[model_type]['parameters']
+  model_state = data[model_type]['state']
+
+  return model_def, parameters, model_state

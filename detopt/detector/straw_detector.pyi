@@ -4,7 +4,7 @@ float64_array = np.ndarray[tuple[int, ...], np.dtype[np.float64]]
 
 def solve(
   initial_positions: float64_array,
-  initial_velocities: float64_array,
+  initial_momenta: float64_array,
   masses: float64_array,
   charges: float64_array,
 

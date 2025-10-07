@@ -1,0 +1,8 @@
+model:
+  deep-set-lfi:
+    features: [[64, 64], [64, 64], [64, 64], [64, 64]]
+    p_dropout: null
+
+optimizer:
+  adabelief:
+    learning_rate: 1.0e-3
