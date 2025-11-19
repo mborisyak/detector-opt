@@ -1,6 +1,6 @@
 straw:
   # Station z-positions (cm)
-  station_z: [2598.0, 2698.0, 3898.0, 3998.0]
+  station_z: [8407.0, 8607.0, 9307.0, 9507.0]
   n_views_per_station: 4
   n_layers_per_view: 2
   n_straws_per_layer: 200
@@ -17,9 +17,9 @@ straw:
 
   # Physics parameters
   dt: 0.1 #ns
-  max_B: 0.0
+  max_B: 0.15
   L: 3098.0
-  z0: 3098.0 # Center of magnetic field (cm)
+  z0: 8957.0 # Center of magnetic field (cm)
   B_sigma: 300.0 # Sigma (width) of magnetic field (cm)
   layer_bounds: [2000., 4000.]
   max_particles: 2
