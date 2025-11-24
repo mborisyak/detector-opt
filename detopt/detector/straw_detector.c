@@ -157,13 +157,10 @@ sparse_buffer_add(sparse_hit_buffer_t *buf, int event, int particle, int layer, 
     }
   }
   
-  /* new hit - need to add */
+  /* new hit - check if we have space */
   if (buf->count >= buf->capacity) {
-    size_t new_capacity = buf->capacity * 2;
-    sparse_hit_t *new_hits = (sparse_hit_t *)realloc(buf->hits, sizeof(sparse_hit_t) * new_capacity);
-    if (!new_hits) return 0;
-    buf->hits = new_hits;
-    buf->capacity = new_capacity;
+    /* buffer is full - cannot add more hits */
+    return 0;
   }
   
   sparse_hit_t *hit = &buf->hits[buf->count++];
@@ -235,11 +232,230 @@ static void particle_pusher(
   npy_float *mask, const npy_intp mask_s0, const npy_intp mask_s1,
   uint32_t rng_state, int depth, int max_depth,
   float p_spawn, float E_sec_MeV,
+  float p_pair,  /* probability of e+e- pair production */
   int *next_free_per_batch,
   int n_slots,
   /* sparse buffer (may be NULL, if provided, used instead of dense arrays) */
   sparse_hit_buffer_t *sparse_buf
 );
+
+/* -------------------------------------------------------------------------- */
+/* helper: spawn e+e- pair                                                    */
+/* -------------------------------------------------------------------------- */
+static void spawn_pair(
+  int l, int i,
+  npy_float x, npy_float y, npy_float z,
+  const npy_float px, const npy_float py, const npy_float pz,
+  const npy_float mass, const npy_float charge, const npy_float gamma,
+  const npy_float c, const npy_float dt, const int n_steps, const int j,
+  const npy_float B, const npy_float z0, const npy_float B_sigma,
+  const npy_float *layers, const npy_float *widths,
+  const npy_float *angles, const npy_float *heights,
+  const npy_intp ls0, const npy_intp ls1,
+  const npy_intp hs0, const npy_intp hs1,
+  const npy_intp ws0, const npy_intp ws1,
+  const npy_intp as0, const npy_intp as1,
+  const int n_layers, const int n_straws,
+  npy_float *response, npy_float *trajectories,
+  npy_float *edep, npy_float *r_mm, npy_float *t0, npy_float *hit_pos,
+  const npy_intp rs0, const npy_intp rs1, const npy_intp rs2, const npy_intp rs3,
+  const npy_intp trs0, const npy_intp trs1, const npy_intp trs2, const npy_intp trs3,
+  int step_offset,
+  npy_float *mask, const npy_intp mask_s0, const npy_intp mask_s1,
+  uint32_t *rng_state, int depth, int max_depth,
+  float p_spawn, float E_sec_MeV,
+  float p_pair,
+  int *next_free_per_batch, int n_slots,
+  sparse_hit_buffer_t *sparse_buf
+) {
+  /* build child kinematics for e+e- pair */
+  uint32_t child_state = *rng_state;
+  
+  /* isotropic direction for the pair axis */
+  float u = rand01(&child_state);
+  float v = rand01(&child_state);
+  float cos_theta = 2.0f * u - 1.0f;
+  float sin_theta = sqrtf(fmaxf(0.0f, 1.0f - cos_theta * cos_theta));
+  float phi = 2.0f * (float)M_PI * v;
+  float dir_x = sin_theta * cosf(phi);
+  float dir_y = sin_theta * sinf(phi);
+  float dir_z = cos_theta;
+  
+  /* electron/positron properties */
+  const npy_float mass_e = 0.511f;
+  const npy_float charge_e_minus = -1.0f;
+  const npy_float charge_e_plus = 1.0f;
+  
+  /* Each particle gets half the energy (simplified) */
+  const npy_float T = E_sec_MeV * 0.5f;
+  npy_float p_sec = sqrtf(T * T + 2.0f * T * mass_e);
+  
+  /* e- momentum along direction */
+  npy_float px_e_minus = p_sec * dir_x;
+  npy_float py_e_minus = p_sec * dir_y;
+  npy_float pz_e_minus = p_sec * dir_z;
+  
+  /* e+ momentum opposite (back-to-back) */
+  npy_float px_e_plus = -px_e_minus;
+  npy_float py_e_plus = -py_e_minus;
+  npy_float pz_e_plus = -pz_e_minus;
+  
+  /* e- kinematics */
+  npy_float gamma_e_minus = sqrtf(1.0f + (p_sec * p_sec) / (mass_e * mass_e));
+  npy_float vx_e_minus = px_e_minus / (gamma_e_minus * mass_e);
+  npy_float vy_e_minus = py_e_minus / (gamma_e_minus * mass_e);
+  npy_float vz_e_minus = pz_e_minus / (gamma_e_minus * mass_e);
+  
+  /* e+ kinematics */
+  npy_float gamma_e_plus = gamma_e_minus;  /* same momentum magnitude */
+  npy_float vx_e_plus = px_e_plus / (gamma_e_plus * mass_e);
+  npy_float vy_e_plus = py_e_plus / (gamma_e_plus * mass_e);
+  npy_float vz_e_plus = pz_e_plus / (gamma_e_plus * mass_e);
+  
+  /* start both at parent position */
+  npy_float x_child = x;
+  npy_float y_child = y;
+  npy_float z_child = z;
+  
+  /* Try to store e- */
+  int can_store_e_minus = (next_free_per_batch != NULL) &&
+                          (next_free_per_batch[l] < n_slots);
+  
+  if (can_store_e_minus) {
+    int child_i_e_minus = next_free_per_batch[l];
+    next_free_per_batch[l] += 1;
+    
+    particle_pusher(
+      l, child_i_e_minus,
+      &x_child, &y_child, &z_child,
+      vx_e_minus,
+      &vy_e_minus, &vz_e_minus,
+      px_e_minus, py_e_minus, pz_e_minus,
+      mass_e, charge_e_minus, gamma_e_minus,
+      c, dt, n_steps - j,
+      B, z0, B_sigma,
+      layers, widths, angles, heights,
+      ls0, ls1, hs0, hs1,
+      ws0, ws1, as0, as1,
+      n_layers, n_straws,
+      response, trajectories,
+      edep, r_mm, t0, hit_pos,
+      rs0, rs1, rs2, rs3,
+      trs0, trs1, trs2, trs3,
+      step_offset + j,
+      mask, mask_s0, mask_s1,
+      child_state, depth + 1, max_depth,
+      p_spawn, E_sec_MeV,
+      p_pair,
+      next_free_per_batch,
+      n_slots,
+      sparse_buf
+    );
+  } else {
+    /* simulate but don't store */
+    npy_float dummy_vy = vy_e_minus;
+    npy_float dummy_vz = vz_e_minus;
+    particle_pusher(
+      l, i,
+      &x_child, &y_child, &z_child,
+      vx_e_minus,
+      &dummy_vy, &dummy_vz,
+      px_e_minus, py_e_minus, pz_e_minus,
+      mass_e, charge_e_minus, gamma_e_minus,
+      c, dt, n_steps - j,
+      B, z0, B_sigma,
+      layers, widths, angles, heights,
+      ls0, ls1, hs0, hs1,
+      ws0, ws1, as0, as1,
+      n_layers, n_straws,
+      NULL, NULL, NULL, NULL, NULL, NULL,  /* discard mode */
+      0, 0, 0, 0,
+      0, 0, 0, 0,
+      step_offset + j,
+      NULL, 0, 0,
+      child_state, depth + 1, max_depth,
+      p_spawn, E_sec_MeV,
+      0.0f,  /* p_pair */
+      NULL, 0,
+      NULL
+    );
+  }
+  
+  /* Try to store e+ */
+  uint32_t child_state_e_plus = child_state;  /* use different RNG state */
+  int can_store_e_plus = (next_free_per_batch != NULL) &&
+                         (next_free_per_batch[l] < n_slots);
+  
+  if (can_store_e_plus) {
+    int child_i_e_plus = next_free_per_batch[l];
+    next_free_per_batch[l] += 1;
+    
+    /* reset position for e+ */
+    x_child = x;
+    y_child = y;
+    z_child = z;
+    
+    particle_pusher(
+      l, child_i_e_plus,
+      &x_child, &y_child, &z_child,
+      vx_e_plus,
+      &vy_e_plus, &vz_e_plus,
+      px_e_plus, py_e_plus, pz_e_plus,
+      mass_e, charge_e_plus, gamma_e_plus,
+      c, dt, n_steps - j,
+      B, z0, B_sigma,
+      layers, widths, angles, heights,
+      ls0, ls1, hs0, hs1,
+      ws0, ws1, as0, as1,
+      n_layers, n_straws,
+      response, trajectories,
+      edep, r_mm, t0, hit_pos,
+      rs0, rs1, rs2, rs3,
+      trs0, trs1, trs2, trs3,
+      step_offset + j,
+      mask, mask_s0, mask_s1,
+      child_state_e_plus, depth + 1, max_depth,
+      p_spawn, E_sec_MeV,
+      p_pair,
+      next_free_per_batch,
+      n_slots,
+      sparse_buf
+    );
+  } else {
+    /* simulate but don't store */
+    npy_float dummy_vy = vy_e_plus;
+    npy_float dummy_vz = vz_e_plus;
+    x_child = x;
+    y_child = y;
+    z_child = z;
+    particle_pusher(
+      l, i,
+      &x_child, &y_child, &z_child,
+      vx_e_plus,
+      &dummy_vy, &dummy_vz,
+      px_e_plus, py_e_plus, pz_e_plus,
+      mass_e, charge_e_plus, gamma_e_plus,
+      c, dt, n_steps - j,
+      B, z0, B_sigma,
+      layers, widths, angles, heights,
+      ls0, ls1, hs0, hs1,
+      ws0, ws1, as0, as1,
+      n_layers, n_straws,
+      NULL, NULL, NULL, NULL, NULL, NULL,  /* discard mode */
+      0, 0, 0, 0,
+      0, 0, 0, 0,
+      step_offset + j,
+      NULL, 0, 0,
+      child_state_e_plus, depth + 1, max_depth,
+      p_spawn, E_sec_MeV,
+      0.0f,  /* p_pair */
+      NULL, 0,
+      NULL
+    );
+  }
+  
+  *rng_state = child_state_e_plus;
+}
 
 /* -------------------------------------------------------------------------- */
 /* helper: spawn a secondary particle                                         */
@@ -266,109 +482,112 @@ static void spawn_secondary(
   npy_float *mask, const npy_intp mask_s0, const npy_intp mask_s1,
   uint32_t *rng_state, int depth, int max_depth,
   float p_spawn, float E_sec_MeV,
+  float p_pair,
   int *next_free_per_batch, int n_slots,
   sparse_hit_buffer_t *sparse_buf
 ) {
-  /* build child kinematics */
+        /* build child kinematics */
   uint32_t child_state = *rng_state;
 
-  /* isotropic direction */
-  float u = rand01(&child_state);
-  float v = rand01(&child_state);
-  float cos_theta = 2.0f * u - 1.0f;
-  float sin_theta = sqrtf(fmaxf(0.0f, 1.0f - cos_theta * cos_theta));
-  float phi = 2.0f * (float)M_PI * v;
-  float dir_x = sin_theta * cosf(phi);
-  float dir_y = sin_theta * sinf(phi);
-  float dir_z = cos_theta;
+        /* isotropic direction */
+        float u = rand01(&child_state);
+        float v = rand01(&child_state);
+        float cos_theta = 2.0f * u - 1.0f;
+        float sin_theta = sqrtf(fmaxf(0.0f, 1.0f - cos_theta * cos_theta));
+        float phi = 2.0f * (float)M_PI * v;
+        float dir_x = sin_theta * cosf(phi);
+        float dir_y = sin_theta * sinf(phi);
+        float dir_z = cos_theta;
 
-  /* electron-like secondary */
-  const npy_float mass_e   = 0.511f;
-  const npy_float charge_e = -1.0f;
-  const npy_float T        = E_sec_MeV;
-  npy_float p_sec = sqrtf(T * T + 2.0f * T * mass_e);
+        /* electron-like secondary */
+        const npy_float mass_e   = 0.511f;
+        const npy_float charge_e = -1.0f;
+        const npy_float T        = E_sec_MeV;
+        npy_float p_sec = sqrtf(T * T + 2.0f * T * mass_e);
 
-  npy_float px_sec = p_sec * dir_x;
-  npy_float py_sec = p_sec * dir_y;
-  npy_float pz_sec = p_sec * dir_z;
+        npy_float px_sec = p_sec * dir_x;
+        npy_float py_sec = p_sec * dir_y;
+        npy_float pz_sec = p_sec * dir_z;
 
-  npy_float gamma_sec = sqrtf(1.0f + (p_sec * p_sec) / (mass_e * mass_e));
+        npy_float gamma_sec = sqrtf(1.0f + (p_sec * p_sec) / (mass_e * mass_e));
 
-  npy_float vx_sec = px_sec / (gamma_sec * mass_e);
-  npy_float vy_sec = py_sec / (gamma_sec * mass_e);
-  npy_float vz_sec = pz_sec / (gamma_sec * mass_e);
+        npy_float vx_sec = px_sec / (gamma_sec * mass_e);
+        npy_float vy_sec = py_sec / (gamma_sec * mass_e);
+        npy_float vz_sec = pz_sec / (gamma_sec * mass_e);
 
-  /* start child at parent position */
-  npy_float x_child = x;
-  npy_float y_child = y;
-  npy_float z_child = z;
+        /* start child at parent position */
+        npy_float x_child = x;
+        npy_float y_child = y;
+        npy_float z_child = z;
 
-  /* can we actually STORE this secondary? */
-  int can_store = (next_free_per_batch != NULL) &&
-                  (next_free_per_batch[l] < n_slots);
+        /* can we actually STORE this secondary? */
+        int can_store = (next_free_per_batch != NULL) &&
+                        (next_free_per_batch[l] < n_slots);
 
-  if (can_store) {
-    /* grab real slot */
-    int child_i = next_free_per_batch[l];
-    next_free_per_batch[l] += 1;
+        if (can_store) {
+          /* grab real slot */
+          int child_i = next_free_per_batch[l];
+          next_free_per_batch[l] += 1;
 
-    particle_pusher(
-      l, child_i,
-      &x_child, &y_child, &z_child,
-      vx_sec,
-      &vy_sec, &vz_sec,
-      px_sec, py_sec, pz_sec,
-      mass_e, charge_e, gamma_sec,
-      c, dt, n_steps - j,
-      B, z0, B_sigma,
-      layers, widths, angles, heights,
-      ls0, ls1, hs0, hs1,
-      ws0, ws1, as0, as1,
-      n_layers, n_straws,
-      /* real buffers */ response, trajectories,
-      edep, r_mm, t0, hit_pos,
-      rs0, rs1, rs2, rs3,
-      trs0, trs1, trs2, trs3,
-      step_offset + j,
-      /* real mask */ mask, mask_s0, mask_s1,
-      child_state, depth + 1, max_depth,
-      p_spawn, E_sec_MeV,
-      next_free_per_batch,
+          particle_pusher(
+            l, child_i,
+            &x_child, &y_child, &z_child,
+            vx_sec,
+            &vy_sec, &vz_sec,
+            px_sec, py_sec, pz_sec,
+            mass_e, charge_e, gamma_sec,
+            c, dt, n_steps - j,
+            B, z0, B_sigma,
+            layers, widths, angles, heights,
+            ls0, ls1, hs0, hs1,
+            ws0, ws1, as0, as1,
+            n_layers, n_straws,
+            /* real buffers */ response, trajectories,
+            edep, r_mm, t0, hit_pos,
+            rs0, rs1, rs2, rs3,
+            trs0, trs1, trs2, trs3,
+            step_offset + j,
+            /* real mask */ mask, mask_s0, mask_s1,
+            child_state, depth + 1, max_depth,
+            p_spawn, E_sec_MeV,
+      p_pair,
+            next_free_per_batch,
       n_slots,
       sparse_buf
-    );
-  } else {
-    /* array is full → simulate but DO NOT store anything */
-    npy_float dummy_vy = vy_sec;
-    npy_float dummy_vz = vz_sec;
-    particle_pusher(
-      l, i,               /* slot doesn't matter, we're not writing */
-      &x_child, &y_child, &z_child,
-      vx_sec,
-      &dummy_vy, &dummy_vz,
-      px_sec, py_sec, pz_sec,
-      mass_e, charge_e, gamma_sec,
-      c, dt, n_steps - j,
-      B, z0, B_sigma,
-      layers, widths, angles, heights,
-      ls0, ls1, hs0, hs1,
-      ws0, ws1, as0, as1,
-      n_layers, n_straws,
-      /* discard mode: NULL outputs */ NULL, NULL,
-      NULL, NULL, NULL, NULL,
-      0,0,0,0,
-      0,0,0,0,
-      step_offset + j,
-      /* no mask */ NULL, 0, 0,
-      child_state, depth + 1, max_depth,
-      p_spawn, E_sec_MeV,
-      /* allocator unused */ NULL,
+          );
+        } else {
+          /* array is full → simulate but DO NOT store anything */
+          npy_float dummy_vy = vy_sec;
+          npy_float dummy_vz = vz_sec;
+          particle_pusher(
+            l, i,               /* slot doesn't matter, we're not writing */
+            &x_child, &y_child, &z_child,
+            vx_sec,
+            &dummy_vy, &dummy_vz,
+            px_sec, py_sec, pz_sec,
+            mass_e, charge_e, gamma_sec,
+            c, dt, n_steps - j,
+            B, z0, B_sigma,
+            layers, widths, angles, heights,
+            ls0, ls1, hs0, hs1,
+            ws0, ws1, as0, as1,
+            n_layers, n_straws,
+            /* discard mode: NULL outputs */ NULL, NULL,
+            NULL, NULL, NULL, NULL,
+            0,0,0,0,
+            0,0,0,0,
+            step_offset + j,
+            /* no mask */ NULL, 0, 0,
+            child_state, depth + 1, max_depth,
+            p_spawn, E_sec_MeV,
+      0.0f,  /* p_pair */
+            /* allocator unused */ NULL,
       0,
-      sparse_buf
-    );
-  }
+      NULL
+          );
+        }
 
-  /* decorrelate parent RNG a bit */
+        /* decorrelate parent RNG a bit */
   (void)xorshift32_next(rng_state);
   (void)xorshift32_next(rng_state);
 }
@@ -413,6 +632,7 @@ static void particle_pusher(
   /* RNG + recursion */
   uint32_t rng_state, int depth, int max_depth,
   float p_spawn, float E_sec_MeV,
+  float p_pair,  /* probability of e+e- pair production */
   /* slot allocator (may be NULL) */
   int *next_free_per_batch,
   int n_slots,
@@ -504,34 +724,34 @@ static void particle_pusher(
         npy_float t0_val = (j + step_offset) * dt;
         npy_float edep_val = 0.0f;
         int is_first_hit = 0;
-        
-        /* Bethe–Bloch-ish dE/dx */
+
+          /* Bethe–Bloch-ish dE/dx */
         if (edep || sparse_buf) {
-          const npy_float K     = 0.307075f;   // MeV*cm^2/g
-          const npy_float Z     = 18.0f;       // Argon
-          const npy_float A     = 39.948f;     // Argon
-          const npy_float I_exc = 188e-6f;     // MeV
-          const npy_float rho   = 1.66e-3f;    // g/cm^3
-          const npy_float me    = 0.511f;      // MeV/c^2
+            const npy_float K     = 0.307075f;   // MeV*cm^2/g
+            const npy_float Z     = 18.0f;       // Argon
+            const npy_float A     = 39.948f;     // Argon
+            const npy_float I_exc = 188e-6f;     // MeV
+            const npy_float rho   = 1.66e-3f;    // g/cm^3
+            const npy_float me    = 0.511f;      // MeV/c^2
 
-          npy_float p = sqrtf(px * px + py * py + pz * pz);
-          npy_float beta = p / sqrtf(p * p + mass * mass);
-          npy_float gamma_bethe = sqrtf(1.0f + (p * p) / (mass * mass));
+            npy_float p = sqrtf(px * px + py * py + pz * pz);
+            npy_float beta = p / sqrtf(p * p + mass * mass);
+            npy_float gamma_bethe = sqrtf(1.0f + (p * p) / (mass * mass));
 
-          npy_float Tmax =
-            (2.0f * me * beta * beta * gamma_bethe * gamma_bethe) /
-            (1.0f + 2.0f * gamma_bethe * me / mass + (me / mass) * (me / mass));
+            npy_float Tmax =
+              (2.0f * me * beta * beta * gamma_bethe * gamma_bethe) /
+              (1.0f + 2.0f * gamma_bethe * me / mass + (me / mass) * (me / mass));
 
-          npy_float arg =
-            (2.0f * me * beta * beta * gamma_bethe * gamma_bethe * Tmax) / (I_exc * I_exc);
-          if (arg <= 0.0f) arg = 1e-10f;
+            npy_float arg =
+              (2.0f * me * beta * beta * gamma_bethe * gamma_bethe * Tmax) / (I_exc * I_exc);
+            if (arg <= 0.0f) arg = 1e-10f;
 
-          npy_float log_term = logf(arg);
-          npy_float dEdx = K * (charge * charge) * Z / A / (beta * beta) *
-            (0.5f * log_term - beta * beta) * rho;
+            npy_float log_term = logf(arg);
+            npy_float dEdx = K * (charge * charge) * Z / A / (beta * beta) *
+              (0.5f * log_term - beta * beta) * rho;
 
-          npy_float v = sqrtf(vx * vx + vy * vy + vz * vz);
-          npy_float path_cm = v * dt * 29.9792f;
+            npy_float v = sqrtf(vx * vx + vy * vy + vz * vz);
+            npy_float path_cm = v * dt * 29.9792f;
 
           edep_val = dEdx * path_cm;
         }
@@ -586,9 +806,34 @@ static void particle_pusher(
         }
         
         /* --- spawn secondary when particle hits straw tube --- */
-        if (is_first_hit && p_spawn > 0.0f && depth < max_depth) {
+        if (is_first_hit && depth < max_depth) {
           float r = rand01(&state);
-          if (r < p_spawn) {
+          /* First check for pair production */
+          if (p_pair > 0.0f && r < p_pair) {
+            spawn_pair(
+              l, i, x, y, z,
+              px, py, pz, mass, charge, gamma,
+              c, dt, n_steps, j,
+              B, z0, B_sigma,
+              layers, widths, angles, heights,
+              ls0, ls1, hs0, hs1,
+              ws0, ws1, as0, as1,
+              n_layers, n_straws,
+              response, trajectories,
+              edep, r_mm, t0, hit_pos,
+              rs0, rs1, rs2, rs3,
+              trs0, trs1, trs2, trs3,
+              step_offset,
+              mask, mask_s0, mask_s1,
+              &state, depth, max_depth,
+              p_spawn, E_sec_MeV,
+              p_pair,
+              next_free_per_batch, n_slots,
+              sparse_buf
+            );
+          }
+          /* Otherwise check for single secondary */
+          else if (p_spawn > 0.0f && r < (p_pair + p_spawn)) {
             spawn_secondary(
               l, i, x, y, z,
               px, py, pz, mass, charge, gamma,
@@ -606,6 +851,7 @@ static void particle_pusher(
               mask, mask_s0, mask_s1,
               &state, depth, max_depth,
               p_spawn, E_sec_MeV,
+              p_pair,
               next_free_per_batch, n_slots,
               sparse_buf
             );
@@ -969,6 +1215,7 @@ static PyObject *solve(PyObject *self, PyObject *args) {
         seed,
         0, SEC_MAX_DEPTH,
         SEC_SPAWN_PROB, SEC_E_MEV,
+        0.0f,  /* p_pair - can be made configurable later */
         /* slot allocator */
         next_free,
         (int)n_particles,
@@ -1072,8 +1319,8 @@ static PyObject *solve_sparse(PyObject *self, PyObject *args) {
     return NULL;
   }
 
-  /* create sparse buffer */
-  size_t initial_capacity = (size_t)(n_batch * n_particles * n_layers * 4);
+  /* create sparse buffer: 100x the number of initial particles */
+  size_t initial_capacity = (size_t)(n_particles * 100);
   sparse_hit_buffer_t *sparse_buf = sparse_buffer_create(initial_capacity);
   if (!sparse_buf) {
     PyErr_SetString(PyExc_MemoryError, "Failed to allocate sparse buffer");
@@ -1253,6 +1500,7 @@ static PyObject *solve_sparse(PyObject *self, PyObject *args) {
         seed,
         0, SEC_MAX_DEPTH,
         SEC_SPAWN_PROB, SEC_E_MEV,
+        0.0f,  /* p_pair - can be made configurable later */
         next_free,
         (int)n_particles,
         sparse_buf
