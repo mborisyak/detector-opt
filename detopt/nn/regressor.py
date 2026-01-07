@@ -314,6 +314,19 @@ class DeepSet(Regressor):
 
     self.output = nnx.Linear(n_latent, target_dim, rngs=rngs)
 
+  def fdigi_to_dense(self, hit_idx, hit_tdc, batch_size: int):
+    # hit_idx: (n_hits, 4) = [event, particle, layer, straw]
+    event = hit_idx[:, 0]
+    layer = hit_idx[:, 2]
+    straw = hit_idx[:, 3]
+
+    n_layers, n_straws = self.input_shape
+
+    t0 = jnp.full((batch_size, n_layers, n_straws), jnp.inf, dtype=hit_tdc.dtype)
+    t0 = t0.at[event, layer, straw].min(hit_tdc) 
+    t0 = jnp.where(jnp.isfinite(t0), t0, 0.0) 
+    return t0
+
   def combine(self, X, design):
     n_b, n_l, n_s = X.shape
     _, n_d = design.shape
@@ -327,6 +340,7 @@ class DeepSet(Regressor):
     return jnp.concatenate([X, positions, angles, magnetic_strength], axis=-1)
 
   def __call__(self, X: jax.Array, design: jax.Array, *, deterministic: bool = True):
+    X = self.fdigi_to_dense(hit_idx, hit_tdc, batch_size=design.shape[0])
     result = self.combine(X, design)
 
     *rest, last = self.blocks

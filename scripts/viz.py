@@ -24,8 +24,8 @@ def viz(seed=123, design="data/design/default.json", use_root_particles=True, **
         design_vec = detector.encode_design(json.load(f))
 
     if use_root_particles:
-        rootfile = "/Users/nikitagladin/clean.root"
-        print(f"Loading particles from ROOT file: {rootfile}")
+        numpyfile = "/Users/nikitagladin/SHiP/detector-opt/scripts/clean.npz"
+        print(f"Loading particles from file: {numpyfile}")
         (
             masses,
             charges,
@@ -39,16 +39,8 @@ def viz(seed=123, design="data/design/default.json", use_root_particles=True, **
             r_mm,
             fdigi_times,
             mask,
-        ) = detector.simulate_from_root(
-            rootfile,
-            tree_name="mytree",
-            px_name="px",
-            py_name="py",
-            pz_name="pz",
-            x_name="vx",
-            y_name="vy",
-            z_name="vz",
-            pid_name="pdgcode",
+        ) = detector.simulate(
+            numpyfile=numpyfile,
             design=design_vec[None],
         )
         layers, angles, widths, heights, Bs, Ls = detector.get_design(

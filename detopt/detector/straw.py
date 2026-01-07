@@ -265,40 +265,26 @@ class StrawDetector(Detector):
 
         return layers, angles, widths, heights, Bs, Ls
 
-    def simulate_from_root(
+    def simulate(
         self,
-        rootfile,
-        tree_name="Events",
-        px_name="px",
-        py_name="py",
-        pz_name="pz",
-        x_name="x",
-        y_name="y",
-        z_name="z",
-        pid_name="pid",
+        numpyfile,
         batch_size=None,
         design=None,
         use_sparse=True,
     ):
         """
-        Load particle properties from a ROOT file and run the detector simulation.
+        Load particle properties from a numpy file and run the detector simulation.
         """
-        if uproot is None:
-            raise ImportError(
-                "uproot is required to read ROOT files. Please install with `pip install uproot awkward`."
-            )
-
-        # how many particles to actually read for this test
-        n_viz = 20
-        with uproot.open(rootfile) as file:
-            tree = file[tree_name]
-            px = tree[px_name].array(library="np")[:n_viz] * 1e3  # GeV -> MeV
-            py = tree[py_name].array(library="np")[:n_viz] * 1e3
-            pz = tree[pz_name].array(library="np")[:n_viz] * 1e3
-            x = tree[x_name].array(library="np")[:n_viz]
-            y = tree[y_name].array(library="np")[:n_viz]
-            z = tree[z_name].array(library="np")[:n_viz]
-            pid = tree[pid_name].array(library="np")[:n_viz]
+        
+        n_viz = 1
+        with np.load(numpyfile) as data:
+            px = data["px"][:n_viz] * 1e3  # GeV -> MeV
+            py = data["py"][:n_viz] * 1e3
+            pz = data["pz"][:n_viz] * 1e3
+            x = data["x"][:n_viz]
+            y = data["y"][:n_viz]
+            z = data["z"][:n_viz]
+            pid = data["pid"][:n_viz]
 
         # Treat all loaded particles as a single event
         n_particles = px.shape[0]
@@ -424,13 +410,13 @@ class StrawDetector(Detector):
             print(f"Total hits: {len(sparse_hits)}")
             print(f"Events: {n_events}, Particles: {p_slots}, Layers: {self.n_layers}, Straws: {self.n_straws}")
             print(f"Sparse representation: {len(sparse_hits)} hits vs {n_events * p_slots * self.n_layers * self.n_straws} dense array elements")
-            print(f"Memory savings: {100.0 * (1.0 - len(sparse_hits) / (n_events * p_slots * self.n_layers * self.n_straws)):.2f}%")
+            
             
             if len(sparse_hits) > 0:
                 print(f"\nFirst 10 hits:")
                 print(f"{'Event':<8} {'Particle':<10} {'Layer':<8} {'Straw':<8} {'Value':<12} {'Edep (MeV)':<15} {'r_mm':<10} {'t0 (ns)':<12}")
                 print("-" * 95)
-                for i in range(min(10, len(sparse_hits))):
+                for i in range(len(sparse_hits)):
                     print(f"{sparse_hits.events[i]:<8} {sparse_hits.particles[i]:<10} "
                           f"{sparse_hits.layers[i]:<8} {sparse_hits.straws[i]:<8} "
                           f"{sparse_hits.values[i]:<12.6f} {sparse_hits.edep[i]:<15.6e} "
@@ -487,8 +473,8 @@ class StrawDetector(Detector):
                 mask,
             )
         print("mask shape:", mask.shape, "dtype:", mask.dtype)
-        print(mask)
-        print(trajectories)
+        # print(mask)
+        # print(trajectories)
 
         # waveform modeling
         from .straw_signal import straw_response
@@ -596,6 +582,7 @@ class StrawDetector(Detector):
                 v_drift=0.033,
                 c=29.9792,
             )
+            print(fdigi)
             st[layer // 8] += fdigi
             ns[layer // 8] += 1
             fdigi_times[key] = fdigi
@@ -604,7 +591,7 @@ class StrawDetector(Detector):
                 print(0)
             else:
                 print(st[kk] / ns[kk])
-
+        print(fdigi_times)
         return (
             masses,
             charges,
