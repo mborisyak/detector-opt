@@ -1,0 +1,15 @@
+stations: 4
+views: 4
+layers: 2
+tubes: 318
+
+normalization:
+  momentum: [50, 50, 50]
+  decay: [200, 200, 8000]
+  tdc: [1000.0, ]
+
+design:
+  lower: [1.732, 2.0, 0.0]
+  upper: [6.0, 24.0, 8.0]
+
+tdc_cutoff: 3000.0

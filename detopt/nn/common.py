@@ -130,12 +130,16 @@ class Block(nnx.Module):
     result = eval_with_kwargs(last, result, kwargs)
     return result
 
-def bayes_aggregate(mu, log_sigma, axis, keepdims=False):
+def bayes_aggregate(mu, log_sigma, mask=None, *, axis, keepdims=False):
   # inv_sigma_sqr = jnp.exp(-2 * log_sigma)
   inv_sigma_sqr = jax.nn.softplus(-log_sigma)
 
-  mu_inv_sigma_sqr = jnp.sum(mu * inv_sigma_sqr, axis=axis, keepdims=keepdims)
-  inv_sum_inv_sigma_sqr = 1 / (1 + jnp.sum(inv_sigma_sqr, axis=axis, keepdims=keepdims))
+  if mask is None:
+    mu_inv_sigma_sqr = jnp.sum(mu * inv_sigma_sqr, axis=axis, keepdims=keepdims)
+    inv_sum_inv_sigma_sqr = 1 / (1 + jnp.sum(inv_sigma_sqr, axis=axis, keepdims=keepdims))
+  else:
+    mu_inv_sigma_sqr = jnp.sum(mu * inv_sigma_sqr * mask[..., None], axis=axis, keepdims=keepdims)
+    inv_sum_inv_sigma_sqr = 1 / (1 + jnp.sum(inv_sigma_sqr * mask[..., None], axis=axis, keepdims=keepdims))
 
   mu_aggregated = mu_inv_sigma_sqr * inv_sum_inv_sigma_sqr
   sigma_aggregated = jnp.sqrt(inv_sum_inv_sigma_sqr)

@@ -18,7 +18,8 @@ __all__ = [
   'CNN',
   'HyperResNet',
   'DeepSet',
-  'BayesDeepSet'
+  'BayesDeepSet',
+  'SparseDeepSet'
 ]
 
 class Regressor(Model):
@@ -407,3 +408,63 @@ class BayesDeepSet(Regressor):
     result = self.output(result)
 
     return jnp.reshape(result, shape=(result.shape[0], *self.target_shape))
+
+class SparseBlock(nnx.Module):
+  def __init__(self, x_dim, z_dim, hidden, dropout: float=0.2, *, rngs: nnx.Rngs):
+    self.input_xs_activation = LeakyTanh(x_dim)
+    self.input_xs = nnx.Linear(x_dim, hidden, rngs=rngs)
+    self.input_zs_activation = LeakyTanh(z_dim)
+    self.input_zs = nnx.Linear(z_dim, hidden, rngs=rngs)
+
+    if dropout is None:
+      self.droupout = None
+    else:
+      self.droupout = nnx.Dropout(rate=dropout, rngs=rngs)
+
+    self.output_activation = LeakyTanh(hidden,)
+    self.output = nnx.Linear(hidden, 2 * hidden, rngs=rngs)
+
+  def __call__(self, xs, zs, deterministic: bool=True):
+    hidden = self.input_xs(self.input_xs_activation(xs)) + \
+      self.input_zs_activation(self.input_zs(zs))
+
+    if self.droupout and not deterministic:
+      hidden = self.droupout(hidden)
+
+    mu_sigma = self.output(self.output_activation(hidden))
+    mu, sigma = jnp.split(mu_sigma, 2, axis=-1)
+
+    return mu, sigma
+
+class SparseDeepSet(nnx.Module):
+  def __init__(self, inputs, conditions, outputs, depth: int, hidden: int, dropout: float=0.2, *, rngs: nnx.Rngs):
+    self.blocks = nnx.List(
+      [SparseBlock(inputs, conditions, hidden, rngs=rngs)] + [
+      SparseBlock(hidden, hidden, hidden, dropout=dropout, rngs=rngs)
+      for _ in range(depth)
+    ])
+
+    self.output = nnx.List([
+      nnx.Linear(hidden, hidden, rngs=rngs),
+      LeakyTanh(hidden),
+      nnx.Linear(hidden, outputs, rngs=rngs),
+    ])
+
+  def __call__(self, X, c, mask=None, deterministic=True):
+    xs = X
+    zs = c
+
+    *body, head = self.blocks
+    for block in body:
+      mus, sigmas_raw = block(xs, zs, deterministic=deterministic)
+      mu_aggr, _ = bayes_aggregate(mus, sigmas_raw, mask=mask, axis=1, keepdims=True)
+      xs, zs = mus, mu_aggr
+
+    mus, sigmas_raw = head(xs, zs, deterministic=deterministic)
+    mu_aggr, _ = bayes_aggregate(mus, sigmas_raw, mask=mask, axis=1, keepdims=False)
+
+    result = mu_aggr
+    for l in self.output:
+      result = l(result)
+
+    return result
