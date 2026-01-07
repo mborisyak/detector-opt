@@ -283,6 +283,7 @@ class DeepSet(Regressor):
   def __init__(
     self, detector: Detector,
     features: Sequence[Sequence[int]], p_dropout: float = 0.1,
+    angle_range=(-5.0, 5.0),
     *, rngs: nnx.Rngs
   ):
     super().__init__(detector, rngs=rngs)
@@ -312,47 +313,62 @@ class DeepSet(Regressor):
     *_, last = features
     *_, n_latent = last
 
+    self.angle_range = angle_range
+
     self.output = nnx.Linear(n_latent, target_dim, rngs=rngs)
 
-  def fdigi_to_dense(self, hit_idx, hit_tdc, batch_size: int):
-    # hit_idx: (n_hits, 4) = [event, particle, layer, straw]
-    event = hit_idx[:, 0]
-    layer = hit_idx[:, 2]
-    straw = hit_idx[:, 3]
+  def combine(self, hit_idx, hit_tdc, mask, design):
+    # n_max_hits = 200
+    # hit_idx: (*, n_max_hits, 4) = [station, view, layer, straw]
+    # mask: (*, n_max_hits)
+    station_indx = hit_idx[:, 0]
+    view_indx = hit_idx[:, 1]
+    layer_indx = hit_idx[:, 2]
+    straw_indx = hit_idx[:, 3]
 
-    n_layers, n_straws = self.input_shape
+    positions, angles, magnetic_strength = ... # design
 
-    t0 = jnp.full((batch_size, n_layers, n_straws), jnp.inf, dtype=hit_tdc.dtype)
-    t0 = t0.at[event, layer, straw].min(hit_tdc) 
-    t0 = jnp.where(jnp.isfinite(t0), t0, 0.0) 
-    return t0
+    hit_normed_index = ... # hit_indx / [max stations = 4, max views = 4, max layers = 2, max straws = 300]
 
-  def combine(self, X, design):
-    n_b, n_l, n_s = X.shape
-    _, n_d = design.shape
+    # station_indx = jnp.where(mask, station_indx, 0)
 
-    X = jnp.reshape(X, shape=(n_b, n_l, n_s))
-    positions, angles, magnetic_strength = design[:, :n_l], design[:, n_l:2 * n_l], design[:, -1]
-    positions = jnp.broadcast_to(positions[:, :, None], shape=(n_b, n_l, 1))
-    angles = jnp.broadcast_to(angles[:, :, None], shape=(n_b, n_l, 1))
-    magnetic_strength = jnp.broadcast_to(magnetic_strength[:, None, None], shape=(n_b, n_l, 1))
+    station_positions = jnp.take_along_axis(positions, station_indx)
+    ...
+    magnetic_strength = jnp.broadcast_to(magnetic_strength, shape=(*, n_max_hits, 4))
 
-    return jnp.concatenate([X, positions, angles, magnetic_strength], axis=-1)
+    ### (*, max_hits, features)
+    sparse_event = jnp.concat([
+      hit_normed_index,
+      station_positions,
+      ...,
+      angles,
+      magnetic_strength,
+      hit_tdc
+    ])
 
-  def __call__(self, X: jax.Array, design: jax.Array, *, deterministic: bool = True):
-    X = self.fdigi_to_dense(hit_idx, hit_tdc, batch_size=design.shape[0])
-    result = self.combine(X, design)
+    return sparse_event
+
+  def __call__(self, X: jax.Array, mask: jax.Array, design: jax.Array, *, deterministic: bool = True):
+    hit_idx, hit_tdc = X
+    combined = self.combine(hit_idx, hit_tdc, design, mask)
 
     *rest, last = self.blocks
 
+    ### (batch, hits, features)
+    result = combined
+
     for block in rest:
       mus = block(result)
-      mu = jnp.mean(mus, axis=1, keepdims=True)
+      mu = jnp.sum(mask[..., None] * mus, axis=1, keepdims=True) / jnp.clip(
+        jnp.sum(mask, axis=1, keepdims=True)[..., None], min=1.0
+      )
       mu = jnp.broadcast_to(mu, shape=mus.shape)
       result = jnp.concatenate([mus, mu], axis=-1)
 
     mus = last(result)
-    result = jnp.mean(mus, axis=1, keepdims=False)
+    result = jnp.sum(mask[..., None] * mus, axis=1, keepdims=False) / jnp.clip(
+      jnp.sum(mask, axis=1, keepdims=False)[..., None], min=1.0
+    )
 
     result = self.output(result)
 

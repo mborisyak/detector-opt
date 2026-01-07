@@ -277,6 +277,7 @@ class StrawDetector(Detector):
         """
         
         n_viz = 1
+        ### TODO: don't load the file each call
         with np.load(numpyfile) as data:
             px = data["px"][:n_viz] * 1e3  # GeV -> MeV
             py = data["py"][:n_viz] * 1e3
@@ -608,6 +609,9 @@ class StrawDetector(Detector):
         )
 
     def __call__(self, seed: int, configurations: np.ndarray):
+        """
+        returns normalized tdc, normalized target
+        """
         (
             masses,
             charges,
@@ -620,6 +624,7 @@ class StrawDetector(Detector):
         ground_truth = self.encode_ground_truth(
             masses, charges, initial_positions, initial_momentum
         )
+        ### measurements = (indx, tdc)
         return ground_truth, measurements, signal
 
     def loss(self, target, predicted):
