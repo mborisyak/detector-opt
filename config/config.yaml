@@ -2,9 +2,16 @@ detector: straw
 method: subgradient
 
 ### for direct training
-model: resnet-128
-optimizer: adam
+regressor:
+  deep-set:
+    features: [[128, 96], [64, 48]]
+    p_dropout: 0.1
 
+optimizer:
+  adam:
+    learning_rate: 1.0e-3
+
+batch: 8
 epochs: 128
 steps: 1024
 validation_batches: 4096

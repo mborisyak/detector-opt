@@ -6,7 +6,7 @@ from flax import nnx
 
 import detopt
 
-def regress(seed, output, progress=False, report=None, **config):
+def regress(seed, output, progress=False, restore=True, trace=None, report=None, **config):
   print(config)
 
   rngs = nnx.Rngs(seed)
@@ -14,7 +14,7 @@ def regress(seed, output, progress=False, report=None, **config):
 
   detector = detopt.detector.from_config(config['detector'])
   regressor = detopt.nn.from_config(
-    detector.output_shape(), detector.design_shape(), detector.target_shape(),
+    detector,
     config=config['regressor'], rngs=rngs
   )
   optimizer = nnx.Optimizer(regressor, detopt.utils.config.optimizer(config['optimizer']))
@@ -47,15 +47,17 @@ def regress(seed, output, progress=False, report=None, **config):
   for i in status.epochs():
     for j in status.training():
       design = np_rng.normal(size=(batch, *detector.design_shape())).astype(np.float32)
+      print(design)
       measurements, target = detector(seed=(seed, i, j, 0), configurations=design)
-
+      print(measurements)
+      print(target)
       training_losses[i, j] = step(optimizer, measurements, design, target)
 
     for j in status.validation():
       design = np_rng.normal(size=(batch, *detector.design_shape())).astype(np.float32)
       measurements, target = detector(seed=(seed, i, j, 1), configurations=design)
 
-      validation_losses[i, j] = metric_f(regressor, design, measurements, target)
+      validation_losses[i, j] = metric_f(regressor, measurements, design, target)
 
   if report is not None:
     import matplotlib.pyplot as plt
@@ -74,8 +76,27 @@ def regress(seed, output, progress=False, report=None, **config):
     fig.savefig(report)
     plt.close(fig)
 
-  detopt.utils.io.save_model(output, regressor, aux=None)
+  # Save model parameters and state
+  import os
+  import orbax.checkpoint as ocp
+  os.makedirs(output, exist_ok=True)
+  manager = ocp.CheckpointManager(output, ocp.CheckpointManagerOptions(max_to_keep=1))
+  
+  _, parameters, state = nnx.split(regressor, nnx.Param, nnx.Variable)
+  parameters = nnx.to_pure_dict(parameters)
+  state = nnx.to_pure_dict(state)
+  
+  # Create fresh optimizer state (can be reinitialized on load)
+  optax_optimizer = detopt.utils.config.optimizer(config['optimizer'])
+  optimizer_state = optax_optimizer.init(parameters)
+  
+  manager.save(
+    0,
+    args=ocp.args.Composite(
+      model=ocp.args.PyTreeSave(detopt.utils.io.save_model(parameters, state, optimizer_state))
+    )
+  )
 
 if __name__ == '__main__':
   import gearup
-  gearup.gearup(regress).with_config('config/config.yaml')()
+  gearup.gearup(regress=regress).with_config('config/config.yaml')()

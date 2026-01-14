@@ -11,7 +11,7 @@ import detopt
 
 def viz(seed=123, design="data/design/default.json", use_root_particles=True, **config):
     n_batch = 1
-    n_layers = 64
+    n_layers = 32
 
     detector = detopt.detector.from_config(config["detector"])
 
@@ -34,9 +34,6 @@ def viz(seed=123, design="data/design/default.json", use_root_particles=True, **
             trajectories,
             response,
             signal,
-            waveforms,
-            t0_arr,
-            r_mm,
             fdigi_times,
             mask,
         ) = detector.simulate(
@@ -46,17 +43,36 @@ def viz(seed=123, design="data/design/default.json", use_root_particles=True, **
         layers, angles, widths, heights, Bs, Ls = detector.get_design(
             design=design_vec[None]
         )
-        detopt.utils.viz.straw.show(
-            layers[0],
-            angles[0],
-            widths[0],
-            heights[0],
-            response[0],
-            trajectories[0],
-            signal[0] if hasattr(signal, "__getitem__") else signal,
-            threshold=0.3,
-            mask=mask[0],
-        )
+        
+        # Handle sparse response dict
+        if isinstance(response, dict):
+            # Sparse data - pass dict and required dimensions
+            detopt.utils.viz.straw.show(
+                layers[0],
+                angles[0],
+                widths[0],
+                heights[0],
+                response,
+                trajectories[0],
+                signal[0] if hasattr(signal, "__getitem__") else signal,
+                threshold=0.3,
+                mask=mask[0],
+                n_particles=trajectories.shape[1],
+                n_straws=detector.n_straws,
+            )
+        else:
+            # Dense array
+            detopt.utils.viz.straw.show(
+                layers[0],
+                angles[0],
+                widths[0],
+                heights[0],
+                response[0],
+                trajectories[0],
+                signal[0] if hasattr(signal, "__getitem__") else signal,
+                threshold=0.3,
+                mask=mask[0],
+            )
 
         # --- Plot all waveforms on the same canvas without normalization ---
         import matplotlib.pyplot as plt
@@ -94,7 +110,7 @@ def viz(seed=123, design="data/design/default.json", use_root_particles=True, **
         tdc_by_station = [[] for _ in range(n_stations)]
         for key, fdigi in fdigi_times.items():
             layer = key[2]
-            station = layer // layers_per_station
+            station = key[0]
             tdc_by_station[station].append(fdigi)
         plt.figure()
         # Only include stations with hits
@@ -103,6 +119,7 @@ def viz(seed=123, design="data/design/default.json", use_root_particles=True, **
             for station in range(n_stations)
             if tdc_by_station[station]
         ]
+        print(tdc_data)
         labels = [
             f"Station {station + 1}"
             for station in range(n_stations)
