@@ -18,7 +18,7 @@
 #define SLOW    1.0e-6f
 
 /* secondary / spawning knobs */
-#define SEC_SPAWN_PROB 1.0f//0.0005f       /* per-step spawn probability (demo value) */
+#define SEC_SPAWN_PROB 0.001f              /* per-step spawn probability (demo value) */
 #define SEC_E_MEV      0.01f      /* secondary kinetic energy in MeV (tiny)  */
 #define SEC_MAX_DEPTH  1          /* depth of recursion for secondaries      */
 #define RNG_SEED_BASE  123456789u /* base RNG seed                            */
@@ -142,7 +142,7 @@ sparse_buffer_add(sparse_hit_buffer_t *buf, int event, int particle, int layer, 
                   npy_float value, npy_float edep, npy_float r_mm, npy_float t0,
                   npy_float x, npy_float y, npy_float z) {
   if (!buf) return 0;
-  
+
   /* check if hit already exists and accumulate */
   for (size_t i = 0; i < buf->count; ++i) {
     if (buf->hits[i].event == event &&
@@ -156,13 +156,13 @@ sparse_buffer_add(sparse_hit_buffer_t *buf, int event, int particle, int layer, 
       return 1;
     }
   }
-  
+
   /* new hit - check if we have space */
   if (buf->count >= buf->capacity) {
     /* buffer is full - cannot add more hits */
     return 0;
   }
-  
+
   sparse_hit_t *hit = &buf->hits[buf->count++];
   hit->event = event;
   hit->particle = particle;
@@ -270,7 +270,7 @@ static void spawn_pair(
 ) {
   /* build child kinematics for e+e- pair */
   uint32_t child_state = *rng_state;
-  
+
   /* isotropic direction for the pair axis */
   float u = rand01(&child_state);
   float v = rand01(&child_state);
@@ -280,51 +280,51 @@ static void spawn_pair(
   float dir_x = sin_theta * cosf(phi);
   float dir_y = sin_theta * sinf(phi);
   float dir_z = cos_theta;
-  
+
   /* electron/positron properties */
   const npy_float mass_e = 0.511f;
   const npy_float charge_e_minus = -1.0f;
   const npy_float charge_e_plus = 1.0f;
-  
+
   /* Each particle gets half the energy (simplified) */
   const npy_float T = E_sec_MeV * 0.5f;
   npy_float p_sec = sqrtf(T * T + 2.0f * T * mass_e);
-  
+
   /* e- momentum along direction */
   npy_float px_e_minus = p_sec * dir_x;
   npy_float py_e_minus = p_sec * dir_y;
   npy_float pz_e_minus = p_sec * dir_z;
-  
+
   /* e+ momentum opposite (back-to-back) */
   npy_float px_e_plus = -px_e_minus;
   npy_float py_e_plus = -py_e_minus;
   npy_float pz_e_plus = -pz_e_minus;
-  
+
   /* e- kinematics */
   npy_float gamma_e_minus = sqrtf(1.0f + (p_sec * p_sec) / (mass_e * mass_e));
   npy_float vx_e_minus = px_e_minus / (gamma_e_minus * mass_e);
   npy_float vy_e_minus = py_e_minus / (gamma_e_minus * mass_e);
   npy_float vz_e_minus = pz_e_minus / (gamma_e_minus * mass_e);
-  
+
   /* e+ kinematics */
   npy_float gamma_e_plus = gamma_e_minus;  /* same momentum magnitude */
   npy_float vx_e_plus = px_e_plus / (gamma_e_plus * mass_e);
   npy_float vy_e_plus = py_e_plus / (gamma_e_plus * mass_e);
   npy_float vz_e_plus = pz_e_plus / (gamma_e_plus * mass_e);
-  
+
   /* start both at parent position */
   npy_float x_child = x;
   npy_float y_child = y;
   npy_float z_child = z;
-  
+
   /* Try to store e- */
   int can_store_e_minus = (next_free_per_batch != NULL) &&
                           (next_free_per_batch[l] < n_slots);
-  
+
   if (can_store_e_minus) {
     int child_i_e_minus = next_free_per_batch[l];
     next_free_per_batch[l] += 1;
-    
+
     particle_pusher(
       l, child_i_e_minus,
       &x_child, &y_child, &z_child,
@@ -380,21 +380,21 @@ static void spawn_pair(
       NULL
     );
   }
-  
+
   /* Try to store e+ */
   uint32_t child_state_e_plus = child_state;  /* use different RNG state */
   int can_store_e_plus = (next_free_per_batch != NULL) &&
                          (next_free_per_batch[l] < n_slots);
-  
+
   if (can_store_e_plus) {
     int child_i_e_plus = next_free_per_batch[l];
     next_free_per_batch[l] += 1;
-    
+
     /* reset position for e+ */
     x_child = x;
     y_child = y;
     z_child = z;
-    
+
     particle_pusher(
       l, child_i_e_plus,
       &x_child, &y_child, &z_child,
@@ -453,7 +453,7 @@ static void spawn_pair(
       NULL
     );
   }
-  
+
   *rng_state = child_state_e_plus;
 }
 
@@ -645,6 +645,12 @@ static void particle_pusher(
   npy_float vy = *vy_ptr;
   npy_float vz = *vz_ptr;
 
+  /* Skip particles with NaN positions or velocities */
+  if (!isfinite(x) || !isfinite(y) || !isfinite(z) ||
+      !isfinite(vx) || !isfinite(vy) || !isfinite(vz)) {
+    return;
+  }
+
   /* secondaries get marked */
   if (mask && depth > 0) {
     mask[l * mask_s0 + i * mask_s1] = 1.0f;
@@ -755,7 +761,7 @@ static void particle_pusher(
 
           edep_val = dEdx * path_cm;
         }
-        
+
         if (sparse_buf) {
           /* sparse mode: check if hit already exists before adding */
           int hit_exists = 0;
@@ -769,8 +775,24 @@ static void particle_pusher(
             }
           }
           is_first_hit = !hit_exists;
-          /* add to sparse buffer */
-          sparse_buffer_add(sparse_buf, l, i, k, straw_i, dt, edep_val, r_mm_val, t0_val, x, y, z);
+          /* add to sparse buffer - protect against division by zero */
+          float dz = z_ - z;
+          float t_cross = 0.5f;  // default to midpoint if no z motion
+          if (fabsf(dz) > 1e-6f) {
+            t_cross = (layer - z) / dz;
+            // Clamp to [0, 1] to stay within step
+            if (t_cross < 0.0f) t_cross = 0.0f;
+            if (t_cross > 1.0f) t_cross = 1.0f;
+          }
+          float x_cross = x + t_cross * (x_ - x);
+          float y_cross = y + t_cross * (y_ - y);
+          
+          /* Skip hits with NaN coordinates or distance */
+          if (!isfinite(x_cross) || !isfinite(y_cross) || !isfinite(r_mm_val)) {
+            continue;
+          }
+          
+          sparse_buffer_add(sparse_buf, l, i, k, straw_i, dt, edep_val, r_mm_val, t0_val, x_cross, y_cross, layer);
         } else if (response) {
           /* dense mode: use original logic */
           const npy_intp idx =
@@ -778,7 +800,7 @@ static void particle_pusher(
 
           /* increment response by dt */
           response[idx] += dt;
-          
+
           /* check if this is the first hit to this straw (for secondary spawning) */
           is_first_hit = (response[idx] == dt);
 
@@ -804,7 +826,7 @@ static void particle_pusher(
             edep[idx] += edep_val;
           }
         }
-        
+
         /* --- spawn secondary when particle hits straw tube --- */
         if (is_first_hit && depth < max_depth) {
           float r = rand01(&state);
@@ -882,355 +904,6 @@ static void particle_pusher(
 /* -------------------------------------------------------------------------- */
 /* Python wrapper: solve                                                      */
 /* -------------------------------------------------------------------------- */
-static PyObject *solve(PyObject *self, PyObject *args) {
-  /* python-level args */
-  PyObject *py_dt = NULL;
-  PyObject *py_B = NULL, *py_L = NULL;
-  PyObject *py_initial_positions = NULL, *py_initial_momenta = NULL;
-  PyObject *py_masses = NULL, *py_charges = NULL;
-  PyObject *py_layers = NULL, *py_width = NULL, *py_heights = NULL, *py_angles = NULL;
-  PyObject *py_z0 = NULL, *py_B_sigma = NULL;
-  PyObject *py_steps = NULL;
-  PyObject *py_trajectories = NULL, *py_response = NULL;
-  PyObject *py_edep = NULL, *py_r_mm = NULL, *py_t0 = NULL, *py_hit_pos = NULL;
-  PyObject *py_mask = NULL;
-
-  if (!PyArg_UnpackTuple(
-        args, "straw_solve", 21, 21,
-        &py_initial_positions, &py_initial_momenta,
-        &py_masses, &py_charges,
-        &py_B, &py_L,
-        &py_z0, &py_B_sigma,
-        &py_steps, &py_dt,
-        &py_layers, &py_width, &py_heights, &py_angles,
-        &py_trajectories, &py_response, &py_edep, &py_r_mm, &py_t0, &py_hit_pos,
-        &py_mask)) {
-    return NULL;
-  }
-
-  /* basic checks */
-  if (!PyLong_Check(py_steps)) {
-    PyErr_SetString(PyExc_TypeError, "steps must be an int");
-    return NULL;
-  }
-  const long n_steps = PyLong_AsLong(py_steps);
-
-  if (!PyFloat_Check(py_dt)) {
-    PyErr_SetString(PyExc_TypeError, "dt must be a float");
-    return NULL;
-  }
-  const npy_float dt = (npy_float)PyFloat_AsDouble(py_dt);
-
-  if (!PyArray_Check(py_response)) {
-    PyErr_SetString(PyExc_TypeError, "response must be a numpy float32 array");
-    return NULL;
-  }
-  const PyArrayObject *response_array = (PyArrayObject *)py_response;
-  if (!(PyArray_TYPE(response_array) == NPY_FLOAT32 &&
-        PyArray_NDIM(response_array) == 4)) {
-    PyErr_SetString(PyExc_TypeError,
-                    "response must be shape (batch, n_particles, n_layers, n_straws) float32");
-    return NULL;
-  }
-
-  const npy_intp n_batch     = PyArray_DIM(response_array, 0);
-  const npy_intp n_particles = PyArray_DIM(response_array, 1);
-  const npy_intp n_layers    = PyArray_DIM(response_array, 2);
-  const npy_intp n_straws    = PyArray_DIM(response_array, 3);
-
-  /* optional trajectories */
-  PyArrayObject *trajectories_array = NULL;
-  if (!Py_IsNone(py_trajectories)) {
-    if (!PyArray_Check(py_trajectories)) {
-      PyErr_SetString(PyExc_TypeError, "trajectories must be a numpy array or None");
-      return NULL;
-    }
-    trajectories_array = (PyArrayObject *)py_trajectories;
-    if (!(PyArray_TYPE(trajectories_array) == NPY_FLOAT32 &&
-          PyArray_NDIM(trajectories_array) == 4 &&
-          PyArray_DIM(trajectories_array, 0) == n_batch &&
-          PyArray_DIM(trajectories_array, 1) == n_particles &&
-          PyArray_DIM(trajectories_array, 2) == n_steps &&
-          PyArray_DIM(trajectories_array, 3) == SPACE_DIM)) {
-      PyErr_SetString(PyExc_TypeError,
-        "trajectories must be shape (batch, n_particles, n_steps, 3) float32");
-      return NULL;
-    }
-  }
-
-  /* input vectors/scalars */
-  const PyArrayObject *initial_positions_array =
-    check_vector_array(py_initial_positions, n_batch, n_particles);
-  if (!initial_positions_array) {
-    PyErr_SetString(PyExc_TypeError,
-      "initial_positions must be shape (batch, n_particles, 3) float32");
-    return NULL;
-  }
-
-  const PyArrayObject *initial_momenta_array =
-    check_vector_array(py_initial_momenta, n_batch, n_particles);
-  if (!initial_momenta_array) {
-    PyErr_SetString(PyExc_TypeError,
-      "initial_momenta must be shape (batch, n_particles, 3) float32");
-    return NULL;
-  }
-
-  const PyArrayObject *masses_array =
-    check_scalar_array(py_masses, n_batch, n_particles);
-  if (!masses_array) {
-    PyErr_SetString(PyExc_TypeError,
-      "masses must be shape (batch, n_particles) float32");
-    return NULL;
-  }
-
-  const PyArrayObject *charges_array =
-    check_scalar_array(py_charges, n_batch, n_particles);
-  if (!charges_array) {
-    PyErr_SetString(PyExc_TypeError,
-      "charges must be shape (batch, n_particles) float32");
-    return NULL;
-  }
-
-  const PyArrayObject *layers_array =
-    check_scalar_array(py_layers, n_batch, n_layers);
-  if (!layers_array) {
-    PyErr_SetString(PyExc_TypeError,
-      "layers must be shape (batch, n_layers) float32");
-    return NULL;
-  }
-
-  const PyArrayObject *width_array =
-    check_scalar_array(py_width, n_batch, n_layers);
-  if (!width_array) {
-    PyErr_SetString(PyExc_TypeError,
-      "widths must be shape (batch, n_layers) float32");
-    return NULL;
-  }
-
-  const PyArrayObject *heights_array =
-    check_scalar_array(py_heights, n_batch, n_layers);
-  if (!heights_array) {
-    PyErr_SetString(PyExc_TypeError,
-      "heights must be shape (batch, n_layers) float32");
-    return NULL;
-  }
-
-  const PyArrayObject *angles_array =
-    check_scalar_array(py_angles, n_batch, n_layers);
-  if (!angles_array) {
-    PyErr_SetString(PyExc_TypeError,
-      "angles must be shape (batch, n_layers) float32");
-    return NULL;
-  }
-
-  const PyArrayObject *B_array  = check_design_array(py_B,  n_batch);
-  const PyArrayObject *L_array  = check_design_array(py_L,  n_batch);
-  const PyArrayObject *z0_array = check_design_array(py_z0, n_batch);
-  const PyArrayObject *B_sigma_array = check_design_array(py_B_sigma, n_batch);
-  if (!B_array || !L_array || !z0_array || !B_sigma_array) {
-    PyErr_SetString(PyExc_TypeError,
-      "B, L, z0, B_sigma must be shape (batch,) float32");
-    return NULL;
-  }
-
-  /* optional outputs */
-  npy_float *edep    = NULL;
-  npy_float *r_mm    = NULL;
-  npy_float *t0      = NULL;
-  npy_float *hit_pos = NULL;
-
-  if (py_edep && py_edep != Py_None) {
-    edep = (npy_float *)PyArray_DATA((PyArrayObject *)py_edep);
-  }
-  if (py_r_mm && py_r_mm != Py_None) {
-    r_mm = (npy_float *)PyArray_DATA((PyArrayObject *)py_r_mm);
-  }
-  if (py_t0 && py_t0 != Py_None) {
-    t0 = (npy_float *)PyArray_DATA((PyArrayObject *)py_t0);
-  }
-  if (py_hit_pos && py_hit_pos != Py_None) {
-    hit_pos = (npy_float *)PyArray_DATA((PyArrayObject *)py_hit_pos);
-  }
-
-  /* mask (new) */
-  npy_float *mask = NULL;
-  npy_intp  mask_s0 = 0, mask_s1 = 0;
-  if (py_mask && py_mask != Py_None) {
-    PyArrayObject *mask_array = (PyArrayObject *)py_mask;
-    if (!(PyArray_TYPE(mask_array) == NPY_FLOAT32 &&
-          PyArray_NDIM(mask_array) == 2 &&
-          PyArray_DIM(mask_array, 0) == n_batch &&
-          PyArray_DIM(mask_array, 1) == n_particles)) {
-      PyErr_SetString(PyExc_TypeError,
-        "mask must be shape (batch, n_particles) float32");
-      return NULL;
-    }
-    mask = (npy_float *)PyArray_DATA(mask_array);
-    mask_s0 = PyArray_STRIDE(mask_array, 0) / sizeof(npy_float);
-    mask_s1 = PyArray_STRIDE(mask_array, 1) / sizeof(npy_float);
-  }
-
-  /* data pointers */
-  const npy_float *initial_positions = (const npy_float *)PyArray_DATA(initial_positions_array);
-  const npy_float *initial_momenta   = (const npy_float *)PyArray_DATA(initial_momenta_array);
-  const npy_float *charges           = (const npy_float *)PyArray_DATA(charges_array);
-  const npy_float *masses            = (const npy_float *)PyArray_DATA(masses_array);
-
-  const npy_float *Bs       = (const npy_float *)PyArray_DATA(B_array);
-  const npy_float *Ls       = (const npy_float *)PyArray_DATA(L_array);
-  const npy_float *z0s      = (const npy_float *)PyArray_DATA(z0_array);
-  const npy_float *B_sigmas = (const npy_float *)PyArray_DATA(B_sigma_array);
-
-  const npy_float *layers = (const npy_float *)PyArray_DATA(layers_array);
-  const npy_float *widths = (const npy_float *)PyArray_DATA(width_array);
-  const npy_float *angles = (const npy_float *)PyArray_DATA(angles_array);
-  const npy_float *heights= (const npy_float *)PyArray_DATA(heights_array);
-
-  npy_float *response = (npy_float *)PyArray_DATA(response_array);
-  npy_float *trajectories = trajectories_array
-    ? (npy_float *)PyArray_DATA(trajectories_array)
-    : NULL;
-
-  /* strides */
-  const npy_intp Bs0  = PyArray_STRIDE(B_array, 0)  / sizeof(npy_float);
-  const npy_intp Ls0  = PyArray_STRIDE(L_array, 0)  / sizeof(npy_float);
-  const npy_intp ips0 = PyArray_STRIDE(initial_positions_array, 0) / sizeof(npy_float);
-  const npy_intp ips1 = PyArray_STRIDE(initial_positions_array, 1) / sizeof(npy_float);
-  const npy_intp ips2 = PyArray_STRIDE(initial_positions_array, 2) / sizeof(npy_float);
-  const npy_intp ivs0 = PyArray_STRIDE(initial_momenta_array, 0)   / sizeof(npy_float);
-  const npy_intp ivs1 = PyArray_STRIDE(initial_momenta_array, 1)   / sizeof(npy_float);
-  const npy_intp ivs2 = PyArray_STRIDE(initial_momenta_array, 2)   / sizeof(npy_float);
-  const npy_intp chs0 = PyArray_STRIDE(charges_array, 0)           / sizeof(npy_float);
-  const npy_intp chs1 = PyArray_STRIDE(charges_array, 1)           / sizeof(npy_float);
-  const npy_intp ms0  = PyArray_STRIDE(masses_array, 0)            / sizeof(npy_float);
-  const npy_intp ms1  = PyArray_STRIDE(masses_array, 1)            / sizeof(npy_float);
-  const npy_intp ls0  = PyArray_STRIDE(layers_array, 0)            / sizeof(npy_float);
-  const npy_intp ls1  = PyArray_STRIDE(layers_array, 1)            / sizeof(npy_float);
-  const npy_intp hs0  = PyArray_STRIDE(heights_array, 0)           / sizeof(npy_float);
-  const npy_intp hs1  = PyArray_STRIDE(heights_array, 1)           / sizeof(npy_float);
-  const npy_intp ws0  = PyArray_STRIDE(width_array, 0)             / sizeof(npy_float);
-  const npy_intp ws1  = PyArray_STRIDE(width_array, 1)             / sizeof(npy_float);
-  const npy_intp as0  = PyArray_STRIDE(angles_array, 0)            / sizeof(npy_float);
-  const npy_intp as1  = PyArray_STRIDE(angles_array, 1)            / sizeof(npy_float);
-  const npy_intp rs0  = PyArray_STRIDE(response_array, 0)          / sizeof(npy_float);
-  const npy_intp rs1  = PyArray_STRIDE(response_array, 1)          / sizeof(npy_float);
-  const npy_intp rs2  = PyArray_STRIDE(response_array, 2)          / sizeof(npy_float);
-  const npy_intp rs3  = PyArray_STRIDE(response_array, 3)          / sizeof(npy_float);
-  const npy_intp trs0 = trajectories_array ? PyArray_STRIDE(trajectories_array, 0) / sizeof(npy_float) : 0;
-  const npy_intp trs1 = trajectories_array ? PyArray_STRIDE(trajectories_array, 1) / sizeof(npy_float) : 0;
-  const npy_intp trs2 = trajectories_array ? PyArray_STRIDE(trajectories_array, 2) / sizeof(npy_float) : 0;
-  const npy_intp trs3 = trajectories_array ? PyArray_STRIDE(trajectories_array, 3) / sizeof(npy_float) : 0;
-
-  /* ---------------------------------------------------------------------- */
-  /* main loop                                                              */
-  /* ---------------------------------------------------------------------- */
-
-  /* per-batch "next free slot" */
-  int *next_free = (int *)malloc(sizeof(int) * (size_t)n_batch);
-  if (!next_free) {
-    PyErr_SetString(PyExc_MemoryError, "failed to allocate next_free array");
-    return NULL;
-  }
-
-  /* detect first free slot per batch: consider slots with ~zero momentum free */
-  for (int l = 0; l < n_batch; ++l) {
-    int first_free = (int)n_particles;  /* fallback: no free slot */
-    for (int i = 0; i < (int)n_particles; ++i) {
-      npy_float px = initial_momenta[l * ivs0 + i * ivs1];
-      npy_float py = initial_momenta[l * ivs0 + i * ivs1 + ivs2];
-      npy_float pz = initial_momenta[l * ivs0 + i * ivs1 + 2 * ivs2];
-      if (f32_abs(px) < SLOW && f32_abs(py) < SLOW && f32_abs(pz) < SLOW) {
-        first_free = i;
-        break;
-      }
-    }
-    next_free[l] = first_free;
-  }
-
-  Py_BEGIN_ALLOW_THREADS
-
-  for (int l = 0; l < n_batch; ++l) {
-    const npy_float B = Bs[l * Bs0];
-    const npy_float L = Ls[l * Ls0];
-    (void)L;
-
-    const npy_float z0_val      = z0s[l];
-    const npy_float B_sigma_val = B_sigmas[l];
-
-    for (int i = 0; i < n_particles; ++i) {
-      /* initial state for this particle */
-      npy_float x = initial_positions[l * ips0 + i * ips1];
-      npy_float y = initial_positions[l * ips0 + i * ips1 + ips2];
-      npy_float z = initial_positions[l * ips0 + i * ips1 + 2 * ips2];
-
-      npy_float px = initial_momenta[l * ivs0 + i * ivs1];
-      npy_float py = initial_momenta[l * ivs0 + i * ivs1 + ivs2];
-      npy_float pz = initial_momenta[l * ivs0 + i * ivs1 + 2 * ivs2];
-
-      const npy_float charge = charges[l * chs0 + i * chs1];
-      const npy_float mass   = masses[l * ms0  + i * ms1];
-
-      /* if this is an empty slot, skip */
-      if (f32_abs(px) < SLOW && f32_abs(py) < SLOW && f32_abs(pz) < SLOW) {
-        continue;
-      }
-
-      npy_float p2 = px * px + py * py + pz * pz;
-      const npy_float gamma = sqrtf(1.0f + p2 / (mass * mass));
-
-      npy_float vx = px / (gamma * mass);
-      npy_float vy = py / (gamma * mass);
-      npy_float vz = pz / (gamma * mass);
-
-      const npy_float mass_MeV_kg = 1.78266192e-30f;
-      const npy_float charge_e_C  = 1.602176634e-19f;
-      const npy_float c =
-        0.5f * (dt / 1e9f) * (charge * charge_e_C) / (mass * mass_MeV_kg) / gamma;
-
-      /* deterministic per-particle RNG seed */
-      uint32_t seed = RNG_SEED_BASE;
-      seed ^= (uint32_t)l * 0x9e3779b1u;
-      seed ^= (uint32_t)i * 0x85ebca6bu;
-      seed ^= (uint32_t)((uintptr_t)&seed >> 3);
-
-      particle_pusher(
-        l, i,
-        &x, &y, &z,
-        vx,
-        &vy, &vz,
-        px, py, pz,
-        mass, charge, gamma,
-        c, dt, (int)n_steps,
-        B, z0_val, B_sigma_val,
-        layers, widths, angles, heights,
-        ls0, ls1, hs0, hs1,
-        ws0, ws1, as0, as1,
-        (int)n_layers, (int)n_straws,
-        response, trajectories,
-        edep, r_mm, t0, hit_pos,
-        rs0, rs1, rs2, rs3,
-        trs0, trs1, trs2, trs3,
-        /* step_offset */ 0,
-        mask, mask_s0, mask_s1,
-        seed,
-        0, SEC_MAX_DEPTH,
-        SEC_SPAWN_PROB, SEC_E_MEV,
-        0.0f,  /* p_pair - can be made configurable later */
-        /* slot allocator */
-        next_free,
-        (int)n_particles,
-        /* sparse buffer: NULL for dense mode */
-        NULL
-      );
-    }
-  }
-
-  Py_END_ALLOW_THREADS
-
-  free(next_free);
-
-  return PyLong_FromLong(0);
-}
 
 /* -------------------------------------------------------------------------- */
 /* Python wrapper: solve_sparse - returns sparse hits as tuple of arrays     */
@@ -1284,7 +957,7 @@ static PyObject *solve_sparse(PyObject *self, PyObject *args) {
 
   const npy_intp n_batch     = PyArray_DIM(initial_positions_array, 0);
   const npy_intp n_particles = PyArray_DIM(initial_positions_array, 1);
-  
+
   /* get n_layers from layers array */
   const PyArrayObject *layers_array = (PyArrayObject *)py_layers;
   if (!PyArray_Check(layers_array) || PyArray_NDIM(layers_array) != 2) {
@@ -1514,10 +1187,10 @@ static PyObject *solve_sparse(PyObject *self, PyObject *args) {
 
   /* convert sparse hits to Python arrays */
   npy_intp n_hits = (npy_intp)sparse_buf->count;
-  
+
   /* create separate arrays for each field */
   npy_intp dims[1] = {n_hits};
-  
+
   PyArrayObject *events = (PyArrayObject *)PyArray_SimpleNew(1, dims, NPY_INT32);
   PyArrayObject *particles = (PyArrayObject *)PyArray_SimpleNew(1, dims, NPY_INT32);
   PyArrayObject *layers_arr = (PyArrayObject *)PyArray_SimpleNew(1, dims, NPY_INT32);
@@ -1528,8 +1201,8 @@ static PyObject *solve_sparse(PyObject *self, PyObject *args) {
   PyArrayObject *t0_arr = (PyArrayObject *)PyArray_SimpleNew(1, dims, NPY_FLOAT32);
   npy_intp hit_pos_dims[2] = {n_hits, 3};
   PyArrayObject *hit_pos_arr = (PyArrayObject *)PyArray_SimpleNew(2, hit_pos_dims, NPY_FLOAT32);
-  
-  if (!events || !particles || !layers_arr || !straws || !values || 
+
+  if (!events || !particles || !layers_arr || !straws || !values ||
       !edep_arr || !r_mm_arr || !t0_arr || !hit_pos_arr) {
     Py_XDECREF(events); Py_XDECREF(particles); Py_XDECREF(layers_arr);
     Py_XDECREF(straws); Py_XDECREF(values); Py_XDECREF(edep_arr);
@@ -1538,7 +1211,7 @@ static PyObject *solve_sparse(PyObject *self, PyObject *args) {
     sparse_buffer_free(sparse_buf);
     return NULL;
   }
-  
+
   /* copy data */
   int32_t *events_ptr = (int32_t *)PyArray_DATA(events);
   int32_t *particles_ptr = (int32_t *)PyArray_DATA(particles);
@@ -1549,7 +1222,7 @@ static PyObject *solve_sparse(PyObject *self, PyObject *args) {
   npy_float *r_mm_ptr = (npy_float *)PyArray_DATA(r_mm_arr);
   npy_float *t0_ptr = (npy_float *)PyArray_DATA(t0_arr);
   npy_float *hit_pos_ptr = (npy_float *)PyArray_DATA(hit_pos_arr);
-  
+
   for (size_t i = 0; i < sparse_buf->count; ++i) {
     const sparse_hit_t *hit = &sparse_buf->hits[i];
     events_ptr[i] = hit->event;
@@ -1564,9 +1237,9 @@ static PyObject *solve_sparse(PyObject *self, PyObject *args) {
     hit_pos_ptr[i * 3 + 1] = hit->hit_pos[1];
     hit_pos_ptr[i * 3 + 2] = hit->hit_pos[2];
   }
-  
+
   sparse_buffer_free(sparse_buf);
-  
+
   /* return as tuple of arrays */
   return Py_BuildValue("(OOOOOOOOO)", events, particles, layers_arr, straws,
                        values, edep_arr, r_mm_arr, t0_arr, hit_pos_arr);
@@ -1576,8 +1249,6 @@ static PyObject *solve_sparse(PyObject *self, PyObject *args) {
 /* module defs                                                                */
 /* -------------------------------------------------------------------------- */
 static PyMethodDef StrawDetectorMethods[] = {
-  {"solve", solve, METH_VARARGS,
-   "Solve trajectories and fill detector response, including secondaries."},
   {"solve_sparse", solve_sparse, METH_VARARGS,
    "Solve trajectories and return sparse hits as tuple of arrays: (events, particles, layers, straws, values, edep, r_mm, t0, hit_pos)."},
   {NULL, NULL, 0, NULL}

@@ -25,7 +25,7 @@ def show(
 ):
     """
     Visualize detector response and trajectories.
-    
+
     Args:
         response: Can be:
             - Dense array: (n_particles, n_layers, n_straws) or (n_layers, n_straws)
@@ -44,23 +44,29 @@ def show(
     # Handle sparse representation
     if SparseHits is not None and isinstance(response, SparseHits):
         if n_particles is None or n_straws is None:
-            raise ValueError("n_particles and n_straws required when response is SparseHits")
+            raise ValueError(
+                "n_particles and n_straws required when response is SparseHits"
+            )
         n_layers = len(layers)
         # Convert sparse to dense for visualization
-        response_dense, _, _, _, _ = response.to_dense(1, n_particles, n_layers, n_straws)
+        response_dense, _, _, _, _ = response.to_dense(
+            1, n_particles, n_layers, n_straws
+        )
         # Sum over particles
         combined_response = np.sum(response_dense[0], axis=0)  # (n_layers, n_straws)
-    elif isinstance(response, dict) and 'values' in response:
+    elif isinstance(response, dict) and "values" in response:
         # Sparse arrays as dict
         if n_particles is None or n_straws is None:
-            raise ValueError("n_particles and n_straws required when response is sparse dict")
+            raise ValueError(
+                "n_particles and n_straws required when response is sparse dict"
+            )
         n_layers = len(layers)
-        events = response['events']
-        particles = response['particles']
-        layers_arr = response['layers']
-        straws = response['straws']
-        values = response['values']
-        
+        events = response["events"]
+        particles = response["particles"]
+        layers_arr = response["layers"]
+        straws = response["straws"]
+        values = response["values"]
+
         # Create dense array from sparse data
         combined_response = np.zeros((n_layers, n_straws), dtype=np.float32)
         for i in range(len(events)):
@@ -167,6 +173,13 @@ def show(
 
             start = nonzero_idx[0]
             sub_traj = traj[start:]  # from first non-zero point to the end
+
+            # Skip stationary particles (trajectory doesn't move significantly)
+            # Calculate total path length
+            if len(sub_traj) > 1:
+                path_length = np.sum(np.linalg.norm(np.diff(sub_traj, axis=0), axis=1))
+                if path_length < 1.0:  # Less than 1mm total movement
+                    continue
 
             # downsample
             n_sub = sub_traj.shape[0]

@@ -2,15 +2,20 @@ import os
 
 import jax
 import jax.numpy as jnp
-
 import matplotlib.pyplot as plt
 import numpy as np
 
 import detopt
 
 
-def viz(seed=123, design="data/design/default.json", use_root_particles=True, **config):
-    n_batch = 1
+def viz(
+    seed=137,  # Changed to 137 for better trajectory visualization (has moving particles)
+    design="data/design/default.json",
+    use_root_particles=False,
+    batch_size=1,
+    **config,
+):
+    n_batch = batch_size
     n_layers = 32
 
     detector = detopt.detector.from_config(config["detector"])
@@ -23,8 +28,13 @@ def viz(seed=123, design="data/design/default.json", use_root_particles=True, **
 
         design_vec = detector.encode_design(json.load(f))
 
+    # Visualize first batch with batch_size=1
+    configs = np.broadcast_to(design_vec[None], (n_batch, *design_vec.shape))
+
     if use_root_particles:
-        numpyfile = "/Users/nikitagladin/SHiP/detector-opt/scripts/clean.npz"
+        numpyfile = (
+            "/Users/nikitagladin/SHiP/detector-opt/combined/combined_data_0005.npz"
+        )
         print(f"Loading particles from file: {numpyfile}")
         (
             masses,
@@ -40,48 +50,102 @@ def viz(seed=123, design="data/design/default.json", use_root_particles=True, **
             numpyfile=numpyfile,
             design=design_vec[None],
         )
-        layers, angles, widths, heights, Bs, Ls = detector.get_design(
-            design=design_vec[None]
+        target = None
+    else:
+        print(f"Simulating first batch (batch_size={n_batch}) from HNL data...")
+        try:
+            (
+                masses,
+                charges,
+                initial_positions,
+                initial_momentum,
+                trajectories,
+                response,
+                signal,
+                fdigi_times,
+                mask,
+                target,
+            ) = detector.simulate(seed=seed, configurations=configs, use_sparse=True)
+        except Exception as e:
+            print(f"Error during simulation: {e}")
+            print("Tip: Reduce max_particles in detector config if memory issues occur")
+            raise
+
+    layers, angles, widths, heights, Bs, Ls = detector.get_design(configs)
+
+    print(f"\nFirst event details:")
+    print(f"  - Particles: {int(np.sum(mask[0] > 0.5))}")
+    if target is not None:
+        print(f"  - Target (HNL vertex): {target[0]}")
+
+    # Handle sparse response dict - filter for first event only
+    print(f"\nVisualization:")
+    if isinstance(response, dict) and len(response.get("events", [])) > 0:
+        # Filter sparse hits for event 0 only
+        event_mask = response["events"] == 0
+        response_dict = {
+            "events": response["events"][event_mask],
+            "particles": response["particles"][event_mask],
+            "layers": response["layers"][event_mask],
+            "straws": response["straws"][event_mask],
+            "values": response["values"][event_mask],
+        }
+        print(f"  - Sparse hits in first event: {len(response_dict['events'])}")
+        print(
+            f"  - Detector z-range: [{layers[0].min():.2f}, {layers[0].max():.2f}] mm"
         )
-        
-        # Handle sparse response dict
-        if isinstance(response, dict):
-            # Sparse data - pass dict and required dimensions
+        print(
+            f"  - Particle z-range: [{initial_positions[0, :, 2].min():.2f}, {initial_positions[0, :, 2].max():.2f}] mm"
+        )
+
+        if len(response_dict["events"]) > 0:
+            # Visualize first batch
+            print(f"  - Creating visualization...")
             detopt.utils.viz.straw.show(
                 layers[0],
                 angles[0],
                 widths[0],
                 heights[0],
-                response,
+                response_dict,
                 trajectories[0],
                 signal[0] if hasattr(signal, "__getitem__") else signal,
                 threshold=0.3,
                 mask=mask[0],
-                n_particles=trajectories.shape[1],
+                n_particles=detector.max_particles,
                 n_straws=detector.n_straws,
             )
+            print(f"  ✓ Saved to straw.png")
         else:
-            # Dense array
-            detopt.utils.viz.straw.show(
-                layers[0],
-                angles[0],
-                widths[0],
-                heights[0],
-                response[0],
-                trajectories[0],
-                signal[0] if hasattr(signal, "__getitem__") else signal,
-                threshold=0.3,
-                mask=mask[0],
-            )
+            print(f"  ⚠️  No hits in first event after filtering")
+    elif isinstance(response, np.ndarray):
+        # Dense array
+        print(f"  - Dense response shape: {response.shape}")
+        print(f"  - Creating visualization...")
+        detopt.utils.viz.straw.show(
+            layers[0],
+            angles[0],
+            widths[0],
+            heights[0],
+            response[0],
+            trajectories[0],
+            signal[0] if hasattr(signal, "__getitem__") else signal,
+            threshold=0.3,
+            mask=mask[0],
+        )
+        print(f"  ✓ Saved to straw.png")
+    else:
+        print("  ⚠️  No hits generated - cannot visualize")
+        print(
+            f"  Particle z-range: [{initial_positions[0, :, 2].min():.2f}, {initial_positions[0, :, 2].max():.2f}]"
+        )
+        print(f"  Detector z-range: [{layers[0].min():.2f}, {layers[0].max():.2f}]")
 
+    if use_root_particles:
         # --- Plot all waveforms on the same canvas without normalization ---
-        import matplotlib.pyplot as plt
         import matplotlib.cm as cm
-        import numpy as np
         import yaml
 
         # Draw a separate canvas for each station, visualizing only the layers belonging to that station
-        import yaml
 
         with open(
             "/Users/nikitagladin/SHiP/detector-opt/config/detector/straw.yaml"
@@ -156,7 +220,8 @@ def viz(seed=123, design="data/design/default.json", use_root_particles=True, **
         # plt.legend()
         # plt.show()
 
-    configs = np.broadcast_to(design_vec[None], (n_batch, *design_vec.shape))
+    # Performance testing (optional)
+    # configs already defined above
 
     import time
 
@@ -188,56 +253,9 @@ def viz(seed=123, design="data/design/default.json", use_root_particles=True, **
         f"(eff. {events_per_second_multi_core / events_per_second_single_core / n_cores})"
     )
 
-    v0s = list()
-    ys = list()
-    for i in range(1):
-        _, _, _, v0, trajectories, response, signal = detector.sample(
-            seed=i, design=configs
-        )
-        v0s.append(v0)
-        ys.append(signal)
-        # print(i, end='\n')
-        # print( *response, *signal, sep='\n', end='\n\n')
-
-    v0s = np.concatenate(v0s, axis=0)
-    ys = np.concatenate(ys, axis=0)
-
-    ns = np.sum(np.sum(np.square(v0s), axis=-1) > 1.0e-3, axis=-1)
-
-    plt.hist(
-        [ns[ys > 0.5], ns[ys < 0.5]], bins=7, label=["signal", "noise"], histtype="step"
-    )
-    plt.title("Number of trajectories per event")
-    plt.legend()
-    plt.savefig("straw-events.png")
-    plt.close()
-
-    _, _, _, _, trajectories, response, signal = detector.sample(
-        seed=seed, design=configs
-    )
-    layers, angles, widths, heights, Bs, Ls = detector.get_design(design=configs)
-
-    # print(layers, angles, widths, heights, Bs, Ls, sep='  \n\n')
-    # Bs, Ls - easy
-    # angles - easy
-    #
-
-    print(response.shape)
-    plt.matshow(response[0].T)
-    plt.colorbar()
-    plt.show()
-    plt.close()
-
-    detopt.utils.viz.straw.show(
-        layers[0],
-        angles[0],
-        widths[0],
-        heights[0],
-        response[0],
-        trajectories[0],
-        signal[0],
-        threshold=0.3,
-    )
+    # Legacy code - detector.sample() doesn't exist anymore
+    # Visualization already completed above
+    print("\n✅ Visualization complete - see straw.png")
 
 
 def compare(
@@ -248,8 +266,9 @@ def compare(
     seed=123456789,
     **config,
 ):
-    import matplotlib.pyplot as plt
     import json
+
+    import matplotlib.pyplot as plt
 
     detector: detopt.detector.StrawDetector = detopt.detector.from_config(
         config["detector"]
