@@ -9,14 +9,10 @@ import detopt
 
 
 def viz(
-    seed=137,  # Changed to 137 for better trajectory visualization (has moving particles)
-    design="data/design/default.json",
-    use_root_particles=False,
-    batch_size=1,
-    **config,
+    seed=123, design="data/design/default.json", use_root_particles=False, **config
 ):
-    n_batch = batch_size
-    n_layers = 32
+    n_batch = 1
+    n_layers = 64
 
     detector = detopt.detector.from_config(config["detector"])
 
@@ -28,124 +24,89 @@ def viz(
 
         design_vec = detector.encode_design(json.load(f))
 
-    # Visualize first batch with batch_size=1
-    configs = np.broadcast_to(design_vec[None], (n_batch, *design_vec.shape))
-
-    if use_root_particles:
-        numpyfile = (
-            "/Users/nikitagladin/SHiP/detector-opt/combined/combined_data_0005.npz"
-        )
-        print(f"Loading particles from file: {numpyfile}")
+    if True:
+        print(f"Loading particles from numpy")
         (
             masses,
             charges,
             initial_positions,
             initial_momentum,
             trajectories,
-            response,
+            sparse_hits,
             signal,
+            waveforms,
             fdigi_times,
             mask,
+            hnl_targets,
         ) = detector.simulate(
-            numpyfile=numpyfile,
-            design=design_vec[None],
-        )
-        target = None
-    else:
-        print(f"Simulating first batch (batch_size={n_batch}) from HNL data...")
-        try:
-            (
-                masses,
-                charges,
-                initial_positions,
-                initial_momentum,
-                trajectories,
-                response,
-                signal,
-                fdigi_times,
-                mask,
-                target,
-            ) = detector.simulate(seed=seed, configurations=configs, use_sparse=True)
-        except Exception as e:
-            print(f"Error during simulation: {e}")
-            print("Tip: Reduce max_particles in detector config if memory issues occur")
-            raise
-
-    layers, angles, widths, heights, Bs, Ls = detector.get_design(configs)
-
-    print(f"\nFirst event details:")
-    print(f"  - Particles: {int(np.sum(mask[0] > 0.5))}")
-    if target is not None:
-        print(f"  - Target (HNL vertex): {target[0]}")
-
-    # Handle sparse response dict - filter for first event only
-    print(f"\nVisualization:")
-    if isinstance(response, dict) and len(response.get("events", [])) > 0:
-        # Filter sparse hits for event 0 only
-        event_mask = response["events"] == 0
-        response_dict = {
-            "events": response["events"][event_mask],
-            "particles": response["particles"][event_mask],
-            "layers": response["layers"][event_mask],
-            "straws": response["straws"][event_mask],
-            "values": response["values"][event_mask],
-        }
-        print(f"  - Sparse hits in first event: {len(response_dict['events'])}")
-        print(
-            f"  - Detector z-range: [{layers[0].min():.2f}, {layers[0].max():.2f}] mm"
-        )
-        print(
-            f"  - Particle z-range: [{initial_positions[0, :, 2].min():.2f}, {initial_positions[0, :, 2].max():.2f}] mm"
+            seed=seed,
+            configurations=design_vec[None],
+            use_sparse=True,
         )
 
-        if len(response_dict["events"]) > 0:
-            # Visualize first batch
-            print(f"  - Creating visualization...")
-            detopt.utils.viz.straw.show(
-                layers[0],
-                angles[0],
-                widths[0],
-                heights[0],
-                response_dict,
-                trajectories[0],
-                signal[0] if hasattr(signal, "__getitem__") else signal,
-                threshold=0.3,
-                mask=mask[0],
-                n_particles=detector.max_particles,
-                n_straws=detector.n_straws,
-            )
-            print(f"  ✓ Saved to straw.png")
-        else:
-            print(f"  ⚠️  No hits in first event after filtering")
-    elif isinstance(response, np.ndarray):
-        # Dense array
-        print(f"  - Dense response shape: {response.shape}")
-        print(f"  - Creating visualization...")
+        # Print loaded particle information
+        print(f"\n{'=' * 80}")
+        print(f"Loaded Particle Information")
+        print(f"{'=' * 80}")
+        print(f"Number of events: {masses.shape[0]}")
+        print(f"Max particles per event: {masses.shape[1]}")
+
+        for event_idx in range(masses.shape[0]):  # Show first 3 events
+            print(f"\n--- Event {event_idx} ---")
+            # Count non-zero mass particles (actual particles)
+            n_particles = np.sum(masses[event_idx] > 0)
+            print(f"Number of particles: {n_particles}")
+
+            if n_particles > 0:
+                print(
+                    f"\n{'Idx':<4} {'Mass (MeV)':<12} {'Charge':<8} {'Position (x,y,z) [cm]':<35} {'Momentum (px,py,pz) [GeV/c]'}"
+                )
+                print("-" * 110)
+                for i in range(min(n_particles, 10)):  # Show first 10 particles
+                    mass = masses[event_idx, i]
+                    charge = charges[event_idx, i]
+                    pos = initial_positions[event_idx, i]
+                    mom = initial_momentum[event_idx, i]
+
+                    print(
+                        f"{i:<4} {mass:<12.2f} {charge:+.1f}     ({pos[0] / 10:8.2f},{pos[1] / 10:8.2f},{pos[2] / 10:8.2f})  ({mom[0]:7.4f},{mom[1]:7.4f},{mom[2]:7.4f})"
+                    )
+
+                if n_particles > 10:
+                    print(f"... and {n_particles - 10} more particles")
+
+        print(f"\n{'=' * 80}\n")
+
+        layers, angles, widths, heights, Bs, Ls = detector.get_design(
+            design=design_vec[None]
+        )
+
+        # Debug: check sparse_hits type
+        print(f"DEBUG: sparse_hits type = {type(sparse_hits)}")
+        print(f"DEBUG: sparse_hits = {sparse_hits}")
+        from detopt.detector.straw import SparseHits
+
+        print(f"DEBUG: isinstance check = {isinstance(sparse_hits, SparseHits)}")
+
         detopt.utils.viz.straw.show(
             layers[0],
             angles[0],
             widths[0],
             heights[0],
-            response[0],
+            sparse_hits,
             trajectories[0],
             signal[0] if hasattr(signal, "__getitem__") else signal,
             threshold=0.3,
             mask=mask[0],
+            n_particles=detector.max_particles,
+            n_straws=detector.n_straws,
         )
-        print(f"  ✓ Saved to straw.png")
-    else:
-        print("  ⚠️  No hits generated - cannot visualize")
-        print(
-            f"  Particle z-range: [{initial_positions[0, :, 2].min():.2f}, {initial_positions[0, :, 2].max():.2f}]"
-        )
-        print(f"  Detector z-range: [{layers[0].min():.2f}, {layers[0].max():.2f}]")
 
-    if use_root_particles:
         # --- Plot all waveforms on the same canvas without normalization ---
         import matplotlib.cm as cm
-        import yaml
 
         # Draw a separate canvas for each station, visualizing only the layers belonging to that station
+        import yaml
 
         with open(
             "/Users/nikitagladin/SHiP/detector-opt/config/detector/straw.yaml"
@@ -174,7 +135,7 @@ def viz(
         tdc_by_station = [[] for _ in range(n_stations)]
         for key, fdigi in fdigi_times.items():
             layer = key[2]
-            station = key[0]
+            station = layer // layers_per_station
             tdc_by_station[station].append(fdigi)
         plt.figure()
         # Only include stations with hits
@@ -183,7 +144,6 @@ def viz(
             for station in range(n_stations)
             if tdc_by_station[station]
         ]
-        print(tdc_data)
         labels = [
             f"Station {station + 1}"
             for station in range(n_stations)
@@ -220,8 +180,7 @@ def viz(
         # plt.legend()
         # plt.show()
 
-    # Performance testing (optional)
-    # configs already defined above
+    configs = np.broadcast_to(design_vec[None], (n_batch, *design_vec.shape))
 
     import time
 
@@ -253,9 +212,56 @@ def viz(
         f"(eff. {events_per_second_multi_core / events_per_second_single_core / n_cores})"
     )
 
-    # Legacy code - detector.sample() doesn't exist anymore
-    # Visualization already completed above
-    print("\n✅ Visualization complete - see straw.png")
+    v0s = list()
+    ys = list()
+    for i in range(1):
+        _, _, _, v0, trajectories, response, signal = detector.sample(
+            seed=i, design=configs
+        )
+        v0s.append(v0)
+        ys.append(signal)
+        # print(i, end='\n')
+        # print( *response, *signal, sep='\n', end='\n\n')
+
+    v0s = np.concatenate(v0s, axis=0)
+    ys = np.concatenate(ys, axis=0)
+
+    ns = np.sum(np.sum(np.square(v0s), axis=-1) > 1.0e-3, axis=-1)
+
+    plt.hist(
+        [ns[ys > 0.5], ns[ys < 0.5]], bins=7, label=["signal", "noise"], histtype="step"
+    )
+    plt.title("Number of trajectories per event")
+    plt.legend()
+    plt.savefig("straw-events.png")
+    plt.close()
+
+    _, _, _, _, trajectories, response, signal = detector.sample(
+        seed=seed, design=configs
+    )
+    layers, angles, widths, heights, Bs, Ls = detector.get_design(design=configs)
+
+    # print(layers, angles, widths, heights, Bs, Ls, sep='  \n\n')
+    # Bs, Ls - easy
+    # angles - easy
+    #
+
+    print(response.shape)
+    plt.matshow(response[0].T)
+    plt.colorbar()
+    plt.show()
+    plt.close()
+
+    detopt.utils.viz.straw.show(
+        layers[0],
+        angles[0],
+        widths[0],
+        heights[0],
+        response[0],
+        trajectories[0],
+        signal[0],
+        threshold=0.3,
+    )
 
 
 def compare(

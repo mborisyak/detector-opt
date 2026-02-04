@@ -483,43 +483,8 @@ class DeepSet(Regressor):
             axis=-1,
         )
 
-        # Vectorized slot assignment using cumsum within segments
-        # Sort by event to group hits together
-        sort_indices = jnp.argsort(events)
-        sorted_events = events[sort_indices]
-        sorted_features = hit_features[sort_indices]
-
-        # Compute slot index for each hit within its event (vectorized)
-        # By comparing each event with the previous, we can detect boundaries
-        event_changes = jnp.concatenate(
-            [jnp.array([True]), sorted_events[1:] != sorted_events[:-1]]
-        )
-        # Cumsum of changes gives us segment IDs, subtract to get within-segment index
-        segment_ids = jnp.cumsum(event_changes) - 1
-        # Create a counter that resets at each segment boundary
-        hit_slots = jnp.arange(len(sorted_events)) - jnp.maximum.accumulate(
-            jnp.where(event_changes, jnp.arange(len(sorted_events)), 0)
-        )
-
-        # Create output arrays
-        combined = jnp.zeros((n_batch, self.n_max_hits, 8), dtype=jnp.float32)
-        mask = jnp.zeros((n_batch, self.n_max_hits), dtype=jnp.bool_)
-
-        # Only keep hits that fit within n_max_hits - use where to mask values
-        valid_mask = hit_slots < self.n_max_hits
-
-        # Use where to select valid indices, then clip for safety
-        safe_events = jnp.where(valid_mask, sorted_events, 0)
-        safe_slots = jnp.where(valid_mask, hit_slots, 0)
-
-        # Scatter all hits, but only those with valid_mask will have correct positions
-        # Invalid hits go to position 0, which we'll overwrite or mask out
-        combined = combined.at[safe_events, safe_slots].set(
-            jnp.where(valid_mask[:, None], sorted_features, 0.0)
-        )
-        mask = mask.at[safe_events, safe_slots].set(valid_mask)
-
-        return combined, mask
+        # Return hit features directly - no padding needed
+        return hit_features
 
     # FIXED: Correct signature (removed extra mask parameter)
     def __call__(self, X: jax.Array, design: jax.Array, *, deterministic: bool = True):

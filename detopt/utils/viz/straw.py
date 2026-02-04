@@ -3,11 +3,7 @@ import pyvista as pv
 
 __all__ = ["show"]
 
-try:
-    from detopt.detector.straw import SparseHits, sparse_to_dense
-except ImportError:
-    SparseHits = None
-    sparse_to_dense = None
+# Import SparseHits lazily to avoid circular import
 
 
 def show(
@@ -30,9 +26,8 @@ def show(
         response: Can be:
             - Dense array: (n_particles, n_layers, n_straws) or (n_layers, n_straws)
             - SparseHits object: sparse hit representation
-            - Dict with sparse arrays: {'events', 'particles', 'layers', 'straws', 'values'}
-        n_particles: Required if response is SparseHits or sparse dict
-        n_straws: Required if response is SparseHits or sparse dict
+        n_particles: Required if response is SparseHits
+        n_straws: Required if response is SparseHits
     """
     plotter = pv.Plotter(off_screen=False)
     plotter.camera_position = [
@@ -41,8 +36,15 @@ def show(
         (0, 1, 0),
     ]
 
-    # Handle sparse representation
-    if SparseHits is not None and isinstance(response, SparseHits):
+    # Handle sparse representation (import lazily to avoid circular import)
+    try:
+        from detopt.detector.straw import SparseHits
+
+        is_sparse_hits = isinstance(response, SparseHits)
+    except ImportError:
+        is_sparse_hits = False
+
+    if is_sparse_hits:
         if n_particles is None or n_straws is None:
             raise ValueError(
                 "n_particles and n_straws required when response is SparseHits"
@@ -54,26 +56,6 @@ def show(
         )
         # Sum over particles
         combined_response = np.sum(response_dense[0], axis=0)  # (n_layers, n_straws)
-    elif isinstance(response, dict) and "values" in response:
-        # Sparse arrays as dict
-        if n_particles is None or n_straws is None:
-            raise ValueError(
-                "n_particles and n_straws required when response is sparse dict"
-            )
-        n_layers = len(layers)
-        events = response["events"]
-        particles = response["particles"]
-        layers_arr = response["layers"]
-        straws = response["straws"]
-        values = response["values"]
-
-        # Create dense array from sparse data
-        combined_response = np.zeros((n_layers, n_straws), dtype=np.float32)
-        for i in range(len(events)):
-            layer_idx = int(layers_arr[i])
-            straw_idx = int(straws[i])
-            if layer_idx < n_layers and straw_idx < n_straws:
-                combined_response[layer_idx, straw_idx] += values[i]
     elif isinstance(response, np.ndarray):
         # Dense array - original logic
         if response.ndim == 3:
@@ -84,12 +66,10 @@ def show(
             combined_response = response
         else:
             raise ValueError(
-                "response must be either 3D (per-particle) or 2D (combined) array, SparseHits, or sparse dict"
+                "response must be either 3D (per-particle) or 2D (combined) array, or SparseHits"
             )
     else:
-        raise ValueError(
-            "response must be numpy array, SparseHits object, or dict with sparse arrays"
-        )
+        raise ValueError("response must be numpy array or SparseHits object")
 
     # draw detector frames
     max_layers = len(layers)
@@ -173,13 +153,6 @@ def show(
 
             start = nonzero_idx[0]
             sub_traj = traj[start:]  # from first non-zero point to the end
-
-            # Skip stationary particles (trajectory doesn't move significantly)
-            # Calculate total path length
-            if len(sub_traj) > 1:
-                path_length = np.sum(np.linalg.norm(np.diff(sub_traj, axis=0), axis=1))
-                if path_length < 1.0:  # Less than 1mm total movement
-                    continue
 
             # downsample
             n_sub = sub_traj.shape[0]

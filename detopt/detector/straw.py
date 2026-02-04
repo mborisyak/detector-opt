@@ -2,7 +2,6 @@ import math
 import os
 import subprocess
 
-import jax.numpy as jnp
 import numpy as np
 
 # For reading ROOT files
@@ -15,7 +14,145 @@ from ..utils.encoding import normal_to_uniform, uniform_to_normal
 from . import straw_detector
 from .common import Detector
 
-__all__ = ["StrawDetector"]
+__all__ = ["StrawDetector", "SparseHits", "sparse_to_dense"]
+
+
+class SparseHits:
+    """Container for sparse hit representation."""
+
+    def __init__(
+        self, events, particles, layers, straws, values, edep, r_mm, t0, hit_pos
+    ):
+        self.events = np.asarray(events, dtype=np.int32)
+        self.particles = np.asarray(particles, dtype=np.int32)
+        self.layers = np.asarray(layers, dtype=np.int32)
+        self.straws = np.asarray(straws, dtype=np.int32)
+        self.values = np.asarray(values, dtype=np.float32)
+        self.edep = np.asarray(edep, dtype=np.float32)
+        self.r_mm = np.asarray(r_mm, dtype=np.float32)
+        self.t0 = np.asarray(t0, dtype=np.float32)
+        self.hit_pos = np.asarray(hit_pos, dtype=np.float32)
+        if self.hit_pos.ndim == 1:
+            self.hit_pos = self.hit_pos.reshape(-1, 3)
+
+    def __len__(self):
+        return len(self.events)
+
+    def to_dense(self, n_events, n_particles, n_layers, n_straws):
+        """Convert sparse hits to dense arrays."""
+        return sparse_to_dense(
+            self.events,
+            self.particles,
+            self.layers,
+            self.straws,
+            self.values,
+            self.edep,
+            self.r_mm,
+            self.t0,
+            self.hit_pos,
+            n_events,
+            n_particles,
+            n_layers,
+            n_straws,
+        )
+
+
+def sparse_to_dense(
+    events,
+    particles,
+    layers,
+    straws,
+    values,
+    edep,
+    r_mm,
+    t0,
+    hit_pos,
+    n_events,
+    n_particles,
+    n_layers,
+    n_straws,
+):
+    """
+    Convert sparse hit representation to dense arrays.
+
+    Returns:
+        response: (n_events, n_particles, n_layers, n_straws) array
+        edep: (n_events, n_particles, n_layers, n_straws) array
+        r_mm: (n_events, n_particles, n_layers, n_straws) array
+        t0: (n_events, n_particles, n_layers, n_straws) array
+        hit_pos: (n_events, n_particles, n_layers, n_straws, 3) array
+    """
+    response = np.zeros((n_events, n_particles, n_layers, n_straws), dtype=np.float32)
+    edep_dense = np.zeros((n_events, n_particles, n_layers, n_straws), dtype=np.float32)
+    r_mm_dense = np.zeros((n_events, n_particles, n_layers, n_straws), dtype=np.float32)
+    t0_dense = np.zeros((n_events, n_particles, n_layers, n_straws), dtype=np.float32)
+    hit_pos_dense = np.zeros(
+        (n_events, n_particles, n_layers, n_straws, 3), dtype=np.float32
+    )
+
+    events = np.asarray(events, dtype=np.int32)
+    particles = np.asarray(particles, dtype=np.int32)
+    layers = np.asarray(layers, dtype=np.int32)
+    straws = np.asarray(straws, dtype=np.int32)
+    values = np.asarray(values, dtype=np.float32)
+    edep = np.asarray(edep, dtype=np.float32)
+    r_mm = np.asarray(r_mm, dtype=np.float32)
+    t0 = np.asarray(t0, dtype=np.float32)
+    hit_pos = np.asarray(hit_pos, dtype=np.float32)
+    if hit_pos.ndim == 1:
+        hit_pos = hit_pos.reshape(-1, 3)
+
+    # Filter valid indices
+    valid = (
+        (events >= 0)
+        & (events < n_events)
+        & (particles >= 0)
+        & (particles < n_particles)
+        & (layers >= 0)
+        & (layers < n_layers)
+        & (straws >= 0)
+        & (straws < n_straws)
+    )
+
+    if np.any(valid):
+        response[events[valid], particles[valid], layers[valid], straws[valid]] = (
+            values[valid]
+        )
+        edep_dense[events[valid], particles[valid], layers[valid], straws[valid]] = (
+            edep[valid]
+        )
+        r_mm_dense[events[valid], particles[valid], layers[valid], straws[valid]] = (
+            r_mm[valid]
+        )
+        t0_dense[events[valid], particles[valid], layers[valid], straws[valid]] = t0[
+            valid
+        ]
+        hit_pos_dense[events[valid], particles[valid], layers[valid], straws[valid]] = (
+            hit_pos[valid]
+        )
+
+    return response, edep_dense, r_mm_dense, t0_dense, hit_pos_dense
+
+
+INV_SQRT_2 = math.sqrt(0.5)
+
+NAME2PID = {
+    "mu-": 13,
+    "mu+": -13,
+    "e-": 11,
+    "e+": -11,
+    "pi-": -211,
+    "pi+": 211,
+    "gamma": 22,
+    "proton": 2212,
+    "antiproton": -2212,
+    "neutron": 2112,
+    "antineutron": -2112,
+    "nu_e": 12,
+    "nu_e_bar": -12,
+    "nu_mu": 14,
+    "nu_mu_bar": -14,
+}
 
 
 class StrawDetector(Detector):
@@ -24,7 +161,7 @@ class StrawDetector(Detector):
         # Geometry hierarchy
         station_z: list = [2598.0, 2698.0, 3498.0, 3538.0],
         n_views_per_station: int = 4,
-        n_layers_per_view: int = 2,
+        n_layers_per_view: int = 4,
         n_straws_per_layer: int = 200,
         straw_pitch: float = 2.0,
         straw_length: float = 200.0,
@@ -35,8 +172,8 @@ class StrawDetector(Detector):
         # Physics parameters
         max_B: float = 0.5,
         L=1.0,
-        z0: float | None = None,
-        B_sigma: float | None = None,
+        z0: float = None,
+        B_sigma: float = None,
         layer_bounds: tuple[float | int, float | int] = (-5.0, 5.0),
         dt: float = 1.0,
         max_particles=2,
@@ -56,7 +193,7 @@ class StrawDetector(Detector):
         layer_height=None,
         n_layers=None,
         n_straws=None,
-        # Loss function parameters
+        data_dir="combined_all_10",
         loss=None,
     ):
         """
@@ -127,11 +264,10 @@ class StrawDetector(Detector):
         self.straw_signal_rate = straw_signal_rate
         self.straw_noise_rate = straw_noise_rate
 
-        # Cache for numpy file data to avoid reloading on each call
+        # NPZ data loading support
         self._numpyfile_cache = None
         self._numpyfile_path = None
-
-        self.data_dir = "combined_all"
+        self.data_dir = data_dir
         self.max_particles_real = 50
         self._data_loader = None
 
@@ -150,8 +286,7 @@ class StrawDetector(Detector):
         return (self.n_layers + self.n_layers + 1,)
 
     def output_shape(self):
-        # Returns shape per sample; actual batch dimension added at runtime
-        return (self.secondary_multiplier,)
+        return (self.n_layers, self.n_straws)
 
     def target_shape(self):
         # Return shape for decay vertex reconstruction: [x, y, z, px, py, pz]
@@ -175,19 +310,27 @@ class StrawDetector(Detector):
         n, _ = design.shape
         m = self.n_layers
 
-        print(design.shape, n, m, end="\n\n\n")
-        print(design)
+        print(n, m, end="\n\n\n")
 
         design_decoded = self._decode_design(design)
-        print(design_decoded.keys())
-        print(design_decoded["positions"].shape)
-        print(design_decoded["angles"].shape)
-        print(design_decoded["magnetic_strength"].shape)
 
-        # Use decoded design positions and angles instead of fixed geometry
-        # This allows detector design optimization via subgradient method
-        layers = design_decoded["positions"]
-        angles = design_decoded["angles"]
+        # Real detector geometry calculation
+        layer_positions = []
+        layer_angles = []
+        layer_x_offsets = []
+        for s, station_z in enumerate(self.station_z):
+            for v in range(self.n_views_per_station):
+                view_angle = self.view_angles[v]
+                view_z = station_z + v * self.view_z_gap
+                for l in range(self.n_layers_per_view):
+                    layer_z = view_z + l * self.layer_z_gap
+                    x_offset = l * self.layer_x_offset
+                    layer_positions.append(layer_z)
+                    layer_angles.append(view_angle)
+                    layer_x_offsets.append(x_offset)
+
+        layers = np.array(layer_positions, dtype=np.float32)[None, :].repeat(n, axis=0)
+        angles = np.array(layer_angles, dtype=np.float32)[None, :].repeat(n, axis=0)
         widths = self.layer_width + np.zeros(shape=(n, m), dtype=np.float32)
         heights = self.layer_height + np.zeros(shape=(n, m), dtype=np.float32)
 
@@ -199,17 +342,16 @@ class StrawDetector(Detector):
 
     def simulate(self, seed, configurations, use_sparse=True):
         """
-        Load real daughter particles and simulate through detector.
+        Load real daughter particles from NPZ files and run detector simulation.
 
         Args:
             seed: Random seed for event sampling
             configurations: (batch, 65) detector design parameters
-            use_sparse: If True, return sparse hit format
+            use_sparse: If True, return sparse hit format (only option now)
 
         Returns:
             Tuple of (masses, charges, initial_positions, initial_momentum,
-                     trajectories, sparse_response, signal, fdigi_times, mask, target)
-            where target is (batch, 6) = [dx, dy, dz, px, py, pz] HNL decay vertex
+                     trajectories, sparse_hits, signal, waveforms, fdigi_times, mask, target)
         """
         n_events = configurations.shape[0]
         rng = np.random.default_rng(seed)
@@ -224,78 +366,130 @@ class StrawDetector(Detector):
         initial_momentum = daughter_data["momenta"]  # (batch, max_particles, 3)
         n_particles_per_event = daughter_data["n_particles"]
 
-        print("/n/n/n/nMMMMMM/n/n/n/n/n/n/n", initial_positions)
-
         # Get detector design parameters
         layers, angles, widths, heights, Bs, Ls = self.get_design(configurations)
 
         # Prepare arrays for solve_sparse
-        max_particles = initial_positions.shape[1]
-        trajectories = np.zeros(
-            (n_events, max_particles, self.n_t, 3), dtype=np.float32
-        )
+        p_slots = initial_positions.shape[1]
+        n_events = configurations.shape[0]
 
-        # Create mask for valid particles
-        mask = np.zeros((n_events, max_particles), dtype=np.float32)
-        for i in range(n_events):
-            n_parts = min(n_particles_per_event[i], max_particles)
-            mask[i, :n_parts] = 1.0
+        # Allocate output arrays with p_slots
+        trajectories = np.zeros((n_events, p_slots, self.n_t, 3), dtype=np.float32)
+        mask = np.zeros((n_events, p_slots), dtype=np.float32)
 
-        # Magnetic field parameters
-        z0_arr = (
-            np.mean(layers, axis=1).astype(np.float32)
-            if self.z0 is None
-            else np.full((n_events,), self.z0, dtype=np.float32)
-        )
-        B_sigma_arr = (
-            Ls.astype(np.float32)
-            if self.B_sigma is None
-            else np.full((n_events,), self.B_sigma, dtype=np.float32)
-        )
+        # Magnetic field parameters for the batch
+        if self.z0 is not None:
+            z0_arr = np.full((n_events,), self.z0, dtype=np.float32)
+        else:
+            z0_arr = np.mean(layers, axis=1).astype(np.float32)
+        if self.B_sigma is not None:
+            B_sigma_arr = np.full((n_events,), self.B_sigma, dtype=np.float32)
+        else:
+            B_sigma_arr = Ls.astype(np.float32)
 
-        # Run detector simulation using solve_sparse
-        print(f"Running solve_sparse for {n_events} events...")
+        sparse_hits = None
+        if use_sparse:
+            # Sparse mode: call solve_sparse
+            sparse_result = straw_detector.solve_sparse(
+                initial_positions,
+                initial_momentum,
+                masses,
+                charges,
+                Bs,
+                Ls,
+                z0_arr,
+                B_sigma_arr,
+                self.n_t,
+                self.dt,
+                layers,
+                widths,
+                heights,
+                angles,
+                trajectories,
+                mask,
+            )
+            # Unpack sparse results
+            (
+                events,
+                particles,
+                layers_arr,
+                straws,
+                values,
+                edep_sparse,
+                r_mm_sparse,
+                t0_sparse,
+                hit_pos_sparse,
+            ) = sparse_result
+            print(sparse_result)
+            # Convert to SparseHits object
+            sparse_hits = SparseHits(
+                events,
+                particles,
+                layers_arr,
+                straws,
+                values,
+                edep_sparse,
+                r_mm_sparse,
+                t0_sparse,
+                hit_pos_sparse,
+            )
 
-        sparse_response = None
-        fdigi_times = {}
+            # Print sparse output information
+            print(f"\n=== Sparse Hits Summary ===")
+            print(f"Total hits: {len(sparse_hits)}")
+            print(
+                f"Events: {n_events}, Particles: {p_slots}, Layers: {self.n_layers}, Straws: {self.n_straws}"
+            )
+            print(
+                f"Sparse representation: {len(sparse_hits)} hits vs {n_events * p_slots * self.n_layers * self.n_straws} dense array elements"
+            )
+            print(
+                f"Memory savings: {100.0 * (1.0 - len(sparse_hits) / (n_events * p_slots * self.n_layers * self.n_straws)):.2f}%"
+            )
 
-        from . import straw_detector
+            if len(sparse_hits) > 0:
+                print(f"\nFirst 10 hits:")
+                print(
+                    f"{'Event':<8} {'Particle':<10} {'Layer':<8} {'Straw':<8} {'Value':<12} {'Edep (MeV)':<15} {'r_mm':<10} {'t0 (ns)':<12}"
+                )
+                print("-" * 95)
+                for i in range(min(10, len(sparse_hits))):
+                    print(
+                        f"{sparse_hits.events[i]:<8} {sparse_hits.particles[i]:<10} "
+                        f"{sparse_hits.layers[i]:<8} {sparse_hits.straws[i]:<8} "
+                        f"{sparse_hits.values[i]:<12.6f} {sparse_hits.edep[i]:<15.6e} "
+                        f"{sparse_hits.r_mm[i]:<10.4f} {sparse_hits.t0[i]:<12.6f}"
+                    )
+                if len(sparse_hits) > 10:
+                    print(f"... and {len(sparse_hits) - 10} more hits")
+            print("=" * 95 + "\n")
+        print("mask shape:", mask.shape, "dtype:", mask.dtype)
+        print(mask)
+        print(trajectories)
 
-        # Run detector simulation
-        sparse_result = straw_detector.solve_sparse(
-            initial_positions,
-            initial_momentum,
-            masses,
-            charges,
-            Bs,
-            Ls,
-            z0_arr,
-            B_sigma_arr,
-            self.n_t,
-            self.dt,
-            layers,
-            widths,
-            heights,
-            angles,
-            trajectories,
-            mask,
-        )
+        # waveform modeling
+        from .straw_signal import straw_response
 
-        (
-            events,
-            particles,
-            layers_arr,
-            straws,
-            values,
-            edep_sparse,
-            r_mm_sparse,
-            t0_sparse,
-            hit_pos_sparse,
-        ) = sparse_result
+        waveforms = {}
+        if sparse_hits is not None:
+            # Use sparse data directly for waveform generation
+            for i in range(len(sparse_hits)):
+                event = int(sparse_hits.events[i])
+                particle = int(sparse_hits.particles[i])
+                layer = int(sparse_hits.layers[i])
+                straw = int(sparse_hits.straws[i])
+                Edep_mev = float(sparse_hits.edep[i])
+                r_mm_val = float(sparse_hits.r_mm[i])
+                t0 = float(sparse_hits.t0[i])
+                if Edep_mev > 0:
+                    t, s = straw_response(Edep_mev, r_mm_val, t0)
+                    waveforms[(event, particle, layer, straw)] = (t, s)
 
-        print(f"Generated {len(events)} hits from solve_sparse")
+        signal = np.ones((n_events,), dtype=np.float32)
 
-        # Helper function to get straw endpoints
+        # --- FairShip-style TDC calculation using real geometry ---
+        from detopt.detector.straw_signal import fairship_fdigi
+
         def get_straw_endpoints(
             layer, straw, layers, angles, widths, heights, n_straws
         ):
@@ -318,97 +512,82 @@ class StrawDetector(Detector):
             p1 = np.dot(p1_local, A)
             return p0, p1
 
-        # Compute fdigi values for all hits
-        fdigi_values = np.zeros(len(events), dtype=np.float32)
-
-        from .straw_signal import fairship_fdigi
-
         n_straws = widths.shape[1] if len(widths.shape) > 1 else widths.shape[0]
+        fdigi_times = {}
+        st = [0, 0, 0, 0]
+        ns = [0, 0, 0, 0]
 
-        for i in range(len(events)):
-            event_idx = events[i]
-            layer_idx = layers_arr[i]
-            straw_idx = straws[i]
-            r_mm = r_mm_sparse[i]
-            t0 = t0_sparse[i]
-            hit_xyz = hit_pos_sparse[i]
-            print(event_idx, layer_idx, straw_idx, r_mm, t0, hit_xyz)
+        # Create lookup dict for sparse hits if available
+        sparse_lookup = None
+        if use_sparse and sparse_hits is not None:
+            sparse_lookup = {}
+            for i in range(len(sparse_hits)):
+                key = (
+                    int(sparse_hits.events[i]),
+                    int(sparse_hits.particles[i]),
+                    int(sparse_hits.layers[i]),
+                    int(sparse_hits.straws[i]),
+                )
+                sparse_lookup[key] = i
 
-            # Get straw endpoints to calculate wire position
+        for key in waveforms:
+            event, particle, layer, straw = key
+            if sparse_lookup is not None and key in sparse_lookup:
+                # Use sparse data
+                hit_idx = sparse_lookup[key]
+                hit_xyz = sparse_hits.hit_pos[hit_idx]
+                t_MC_val = sparse_hits.t0[hit_idx]
+                r_mm_val = sparse_hits.r_mm[hit_idx]
+
             p0, p1 = get_straw_endpoints(
-                layer_idx,
-                straw_idx,
-                layers[event_idx],
-                angles[event_idx],
-                widths[event_idx],
-                heights[event_idx],
-                n_straws,
+                layer, straw, layers[0], angles[0], widths[0], heights[0], n_straws
             )
-
-            # Calculate wire direction and hit position along wire
             wire_vec = p1 - p0
             wire_len = np.linalg.norm(wire_vec)
             wire_dir = wire_vec / wire_len if wire_len > 0 else np.zeros(3)
             proj = np.dot(hit_xyz - p0, wire_dir)
-            x_hit = proj / 10.0  # Convert to cm
-            x_readout = wire_len / 10.0  # Convert to cm
-
-            # Calculate fdigi using fairship_fdigi
-            print(layer_idx, 0, t0, r_mm, x_hit, x_readout, 0.12, 0.033, 29.9792)
+            x_hit = proj
+            x_readout = wire_len
             fdigi = fairship_fdigi(
-                layer=layer_idx,
+                layer,
                 t0_event=0.0,
-                t_MC=t0,
-                r_mm=r_mm,
+                t_MC=t_MC_val,
+                r_mm=r_mm_val,
                 x_hit=x_hit,
                 x_readout=x_readout,
                 sigma_spatial=0.12,
                 v_drift=0.033,
                 c=29.9792,
             )
-            print(t0, fdigi)
-            fdigi_values[i] = fdigi
-
-            # Also store in fdigi_times dict for diagnostics
-            station = layer_idx // (self.n_layers_per_view * self.n_views_per_station)
-            view = (
-                layer_idx % (self.n_layers_per_view * self.n_views_per_station)
-            ) // self.n_layers_per_view
-            layer_local = layer_idx % self.n_layers_per_view + 1
-            key = (station, view, layer_local, straw_idx)
+            st[layer // 8] += fdigi
+            ns[layer // 8] += 1
             fdigi_times[key] = fdigi
+        for kk in range(len(st)):
+            if ns[kk] == 0:
+                print(0)
+            else:
+                print(st[kk] / ns[kk])
 
-        # Package sparse response with fdigi VALUES (not raw values)
-        sparse_response = {
-            "events": events,
-            "particles": particles,
-            "layers": layers_arr,
-            "straws": straws,
-            "values": fdigi_values,  # USE FDIGI, not raw values!
-        }
-
-        # Signal array (all real data is signal)
         signal = np.ones((n_events,), dtype=np.float32)
 
-        # Return with HNL targets
+        # Return sparse_hits directly
         return (
             masses,
             charges,
             initial_positions,
             initial_momentum,
             trajectories,
-            sparse_response,
+            sparse_hits,
             signal,
+            waveforms,
             fdigi_times,
             mask,
-            hnl_targets,  # (batch, 6) = [dx, dy, dz, px, py, pz]
+            hnl_targets,  # (batch, 6) = [dx, dy, dz, px, py, pz] in cm and GeV/c
         )
 
     def _load_real_data(self, n_events, rng):
         """
         Load real daughter particle data from NPZ files.
-
-        This should be added as a method to StrawDetector class.
 
         Args:
             n_events: Number of events to load
@@ -416,7 +595,7 @@ class StrawDetector(Detector):
 
         Returns:
             daughter_data: Dict with particle info
-            hnl_targets: (n_events, 6) HNL decay vertex targets
+            hnl_targets: (n_events, 6) HNL decay vertex targets [dx, dy, dz in cm, px, py, pz in GeV/c]
         """
         # Initialize data loader if not already done
         if self._data_loader is None:
@@ -439,13 +618,13 @@ class StrawDetector(Detector):
 
         return daughter_data, hnl_targets
 
-    def __call__(self, seed: int | tuple, configurations: np.ndarray):
+    def __call__(self, seed: int, configurations: np.ndarray):
         """
         returns ground_truth, measurements, target
 
         Returns:
             ground_truth: (batch, 14) encoded daughter particle info
-            measurements: dict with sparse hits or None
+            measurements: SparseHits object or dense array
             target: (batch, 6) HNL decay vertex [x, y, z, px, py, pz]
         """
         (
@@ -456,8 +635,9 @@ class StrawDetector(Detector):
             _,
             measurements,
             signal,
-            fdigi_times,
-            mask,
+            _,
+            _,
+            _,
             target,
         ) = self.simulate(seed, configurations)
         ground_truth = self.encode_ground_truth(
@@ -470,6 +650,7 @@ class StrawDetector(Detector):
     def loss(self, target, predicted):
         # Weighted and normalized MSE for position (cm) and momentum (GeV/c)
         # target shape: (batch, 6) where [:3] is position (x,y,z) and [3:] is momentum (px,py,pz)
+        import jax.numpy as jnp
 
         # Separate position and momentum
         pos_target = target[..., :3]
@@ -493,6 +674,7 @@ class StrawDetector(Detector):
     def metric(self, target, predicted):
         # Separate RMSE for position and momentum, then average
         # This gives interpretable error metrics in original units
+        import jax.numpy as jnp
 
         pos_target = target[..., :3]
         pos_pred = predicted[..., :3]
