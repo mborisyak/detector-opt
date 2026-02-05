@@ -193,7 +193,7 @@ class StrawDetector(Detector):
         layer_height=None,
         n_layers=None,
         n_straws=None,
-        data_dir="combined_all_10",
+        data_dir="combined_all_100",
         loss=None,
     ):
         """
@@ -259,8 +259,8 @@ class StrawDetector(Detector):
             self.secondary_multiplier = 1
 
         flight_distance = layer_bounds[1] - layer_bounds[0]
-        self.n_t = int(flight_distance / (dt * 29.9792))  #
-        print(self.n_t)
+        self.n_t = int(flight_distance / (dt * 29.9792)) * 10  #
+
         self.straw_signal_rate = straw_signal_rate
         self.straw_noise_rate = straw_noise_rate
 
@@ -279,7 +279,16 @@ class StrawDetector(Detector):
         self.position_weight = loss.get("position_weight", 1.0)
         self.momentum_weight = loss.get("momentum_weight", 1.0)
 
-        print("\n\n\nSet up\n\n\n")
+        # Target normalization: calculated from actual data (combined_all_100)
+        # Units: positions in cm, momenta in GeV/c
+        self.target_mean = np.array(
+            [-26.74728, 6.876283, 6029.46, -0.11996946, 0.050958868, 35.228668],
+            dtype=np.float32,
+        )
+        self.target_std = np.array(
+            [149.0265, 142.9359, 1384.0433, 0.8211833, 0.7007604, 21.184158],
+            dtype=np.float32,
+        )
 
     def design_shape(self):
         # positions + angles + magnetic field strength
@@ -309,8 +318,6 @@ class StrawDetector(Detector):
     def get_design(self, design: np.ndarray):
         n, _ = design.shape
         m = self.n_layers
-
-        print(n, m, end="\n\n\n")
 
         design_decoded = self._decode_design(design)
 
@@ -420,7 +427,7 @@ class StrawDetector(Detector):
                 t0_sparse,
                 hit_pos_sparse,
             ) = sparse_result
-            print(sparse_result)
+
             # Convert to SparseHits object
             sparse_hits = SparseHits(
                 events,
@@ -435,37 +442,37 @@ class StrawDetector(Detector):
             )
 
             # Print sparse output information
-            print(f"\n=== Sparse Hits Summary ===")
-            print(f"Total hits: {len(sparse_hits)}")
-            print(
-                f"Events: {n_events}, Particles: {p_slots}, Layers: {self.n_layers}, Straws: {self.n_straws}"
-            )
-            print(
-                f"Sparse representation: {len(sparse_hits)} hits vs {n_events * p_slots * self.n_layers * self.n_straws} dense array elements"
-            )
-            print(
-                f"Memory savings: {100.0 * (1.0 - len(sparse_hits) / (n_events * p_slots * self.n_layers * self.n_straws)):.2f}%"
-            )
+        #     print(f"\n=== Sparse Hits Summary ===")
+        #     print(f"Total hits: {len(sparse_hits)}")
+        #     print(
+        #         f"Events: {n_events}, Particles: {p_slots}, Layers: {self.n_layers}, Straws: {self.n_straws}"
+        #     )
+        #     print(
+        #         f"Sparse representation: {len(sparse_hits)} hits vs {n_events * p_slots * self.n_layers * self.n_straws} dense array elements"
+        #     )
+        #     print(
+        #         f"Memory savings: {100.0 * (1.0 - len(sparse_hits) / (n_events * p_slots * self.n_layers * self.n_straws)):.2f}%"
+        #     )
 
-            if len(sparse_hits) > 0:
-                print(f"\nFirst 10 hits:")
-                print(
-                    f"{'Event':<8} {'Particle':<10} {'Layer':<8} {'Straw':<8} {'Value':<12} {'Edep (MeV)':<15} {'r_mm':<10} {'t0 (ns)':<12}"
-                )
-                print("-" * 95)
-                for i in range(min(10, len(sparse_hits))):
-                    print(
-                        f"{sparse_hits.events[i]:<8} {sparse_hits.particles[i]:<10} "
-                        f"{sparse_hits.layers[i]:<8} {sparse_hits.straws[i]:<8} "
-                        f"{sparse_hits.values[i]:<12.6f} {sparse_hits.edep[i]:<15.6e} "
-                        f"{sparse_hits.r_mm[i]:<10.4f} {sparse_hits.t0[i]:<12.6f}"
-                    )
-                if len(sparse_hits) > 10:
-                    print(f"... and {len(sparse_hits) - 10} more hits")
-            print("=" * 95 + "\n")
-        print("mask shape:", mask.shape, "dtype:", mask.dtype)
-        print(mask)
-        print(trajectories)
+        #     if len(sparse_hits) > 0:
+        #         print(f"\nFirst 10 hits:")
+        #         print(
+        #             f"{'Event':<8} {'Particle':<10} {'Layer':<8} {'Straw':<8} {'Value':<12} {'Edep (MeV)':<15} {'r_mm':<10} {'t0 (ns)':<12}"
+        #         )
+        #         print("-" * 95)
+        #         for i in range(min(10, len(sparse_hits))):
+        #             print(
+        #                 f"{sparse_hits.events[i]:<8} {sparse_hits.particles[i]:<10} "
+        #                 f"{sparse_hits.layers[i]:<8} {sparse_hits.straws[i]:<8} "
+        #                 f"{sparse_hits.values[i]:<12.6f} {sparse_hits.edep[i]:<15.6e} "
+        #                 f"{sparse_hits.r_mm[i]:<10.4f} {sparse_hits.t0[i]:<12.6f}"
+        #             )
+        #         if len(sparse_hits) > 10:
+        #             print(f"... and {len(sparse_hits) - 10} more hits")
+        #     print("=" * 95 + "\n")
+        # print("mask shape:", mask.shape, "dtype:", mask.dtype)
+        # print(mask)
+        # print(trajectories)
 
         # waveform modeling
         from .straw_signal import straw_response
@@ -562,11 +569,6 @@ class StrawDetector(Detector):
             st[layer // 8] += fdigi
             ns[layer // 8] += 1
             fdigi_times[key] = fdigi
-        for kk in range(len(st)):
-            if ns[kk] == 0:
-                print(0)
-            else:
-                print(st[kk] / ns[kk])
 
         signal = np.ones((n_events,), dtype=np.float32)
 
@@ -607,7 +609,6 @@ class StrawDetector(Detector):
 
             self._data_loader = HNLDataLoader(self.data_dir)
             print(f"Initialized HNL data loader from {self.data_dir}")
-
         # Set max_particles based on detector config
         max_particles = getattr(self, "max_particles_real", 50)
 
@@ -648,49 +649,31 @@ class StrawDetector(Detector):
         return ground_truth, measurements, target
 
     def loss(self, target, predicted):
-        # Weighted and normalized MSE for position (cm) and momentum (GeV/c)
+        # MSE on normalized targets
+        # Network outputs normalized values, targets need to be normalized
         # target shape: (batch, 6) where [:3] is position (x,y,z) and [3:] is momentum (px,py,pz)
         import jax.numpy as jnp
 
-        # Separate position and momentum
-        pos_target = target[..., :3]
-        pos_pred = predicted[..., :3]
-        mom_target = target[..., 3:]
-        mom_pred = predicted[..., 3:]
+        # Normalize targets (predictions are already normalized from network)
+        target_norm = (target - self.target_mean) / self.target_std
 
-        # Normalized MSE for each component using configured scales
-        pos_loss = jnp.mean(
-            jnp.square((pos_target - pos_pred) / self.position_scale), axis=-1
-        )
-        mom_loss = jnp.mean(
-            jnp.square((mom_target - mom_pred) / self.momentum_scale), axis=-1
-        )
+        # MSE on normalized values (all dimensions have equal weight now)
+        mse = jnp.mean(jnp.square(target_norm - predicted), axis=-1)
 
-        # Weighted combination using configured weights
-        return (
-            self.position_weight * pos_loss + self.momentum_weight * mom_loss
-        )  # Shape: (batch,)
+        return mse  # Shape: (batch,)
 
     def metric(self, target, predicted):
-        # Separate RMSE for position and momentum, then average
-        # This gives interpretable error metrics in original units
+        # RMSE on normalized targets (same as loss but with sqrt)
+        # Network outputs normalized values, targets need to be normalized
         import jax.numpy as jnp
 
-        pos_target = target[..., :3]
-        pos_pred = predicted[..., :3]
-        mom_target = target[..., 3:]
-        mom_pred = predicted[..., 3:]
+        # Normalize targets (predictions are already normalized from network)
+        target_norm = (target - self.target_mean) / self.target_std
 
-        # RMSE in original units
-        pos_rmse = jnp.sqrt(jnp.mean(jnp.square(pos_target - pos_pred), axis=-1))  # cm
-        mom_rmse = jnp.sqrt(
-            jnp.mean(jnp.square(mom_target - mom_pred), axis=-1)
-        )  # GeV/c
+        # RMSE on normalized values
+        rmse = jnp.sqrt(jnp.mean(jnp.square(target_norm - predicted), axis=-1))
 
-        # Return average of normalized errors for fair comparison using configured scales
-        return 0.5 * (
-            pos_rmse / self.position_scale + mom_rmse / self.momentum_scale
-        )  # Shape: (batch,)
+        return rmse  # Shape: (batch,)
 
     def encode_design(self, design):
         positions = np.array(design["positions"], dtype=np.float32)

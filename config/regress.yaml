@@ -1,11 +1,20 @@
 detector: straw
 
-regressor: deep-set-256
+regressor:
+  deep-set:
+    features: [[64, 128], [128, 96]]
+    p_dropout: 0.1
+
+optimizer:
+  adabelief:
+    learning_rate: 5.0e-5
 
 initial_design: data/design/default.json
 
-batch: 8
-epochs: 256
-steps: 1024
+batch: 16
+epochs: 8
+steps: 32
 
-validation_batches: 1024
+validation_batches: 32
+
+report: output/losses.png

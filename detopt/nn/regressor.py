@@ -302,10 +302,8 @@ class HyperResNet(Regressor):
         )
         target_dim = math.prod(self.target_shape)
 
-        dropout = (
-            lambda: []
-            if p_dropout is None
-            else [nnx.Dropout(rate=p_dropout, rngs=rngs)]
+        dropout = lambda: (
+            [] if p_dropout is None else [nnx.Dropout(rate=p_dropout, rngs=rngs)]
         )
         self.initial_embeddings = (
             nnx.Linear(input_dim, n_hidden, rngs=rngs),
@@ -390,6 +388,17 @@ class DeepSet(Regressor):
         print(f"DeepSet target_shape: {self.target_shape}")
         target_dim = math.prod(self.target_shape)
 
+        # Input feature normalization statistics (estimated from data)
+        # Feature order: [station, view, layer, straw, tdc_value, position, angle, B]
+        self.tdc_mean = 200.0  # ns (typical TDC time)
+        self.tdc_std = 100.0  # ns (typical spread)
+        self.position_mean = 9000.0  # cm (middle of detector)
+        self.position_std = 500.0  # cm (layer spread)
+        self.angle_mean = 0.0  # radians
+        self.angle_std = 0.1  # radians (max stereo angle)
+        self.B_mean = 0.15  # T (typical field)
+        self.B_std = 0.1  # T (field range)
+
         # ADDED: Store detector geometry - use detector's parameters instead of hardcoding
         self.n_max_hits = n_max_hits
         self.n_stations = detector.n_stations  # From StrawDetector.n_stations
@@ -468,77 +477,79 @@ class DeepSet(Regressor):
         layer_angles = angles[batch_indices, layers]  # (n_hits,)
         magnetic_strength_hits = magnetic_strength[batch_indices]  # (n_hits,)
 
-        # Stack all features per hit: (n_hits, 8)
+        # Normalize remaining features
+        values_norm = (values - self.tdc_mean) / self.tdc_std
+        positions_norm = (layer_positions - self.position_mean) / self.position_std
+        angles_norm = (layer_angles - self.angle_mean) / self.angle_std
+        B_norm = (magnetic_strength_hits - self.B_mean) / self.B_std
+
+        # Stack all features per hit: (n_hits, 8) - all normalized to ~[-3, 3] range
         hit_features = jnp.stack(
             [
                 station_norm,
                 view_norm,
                 layer_norm,
                 straw_norm,
-                values,
-                layer_positions,
-                layer_angles,
-                magnetic_strength_hits,
+                values_norm,
+                positions_norm,
+                angles_norm,
+                B_norm,
             ],
             axis=-1,
         )
 
-        # Return hit features directly - no padding needed
-        return hit_features
+        # Return hit features and event indices directly for segment operations
+        return hit_features, events
 
     # FIXED: Correct signature (removed extra mask parameter)
     def __call__(self, X: jax.Array, design: jax.Array, *, deterministic: bool = True):
-        # Handle input format
-        print(
-            f"DEBUG: X type = {type(X)}, X = {X if not isinstance(X, dict) else 'dict with keys: ' + str(X.keys())}"
-        )
         if isinstance(X, dict):
-            # Sparse format: convert to dense
-            combined, mask = self.combine(X, design)
-        else:
-            # Dense format (for compatibility)
-            combined = X
-            mask = jnp.any(X != 0, axis=-1)
+            # Sparse format: use segment operations (no padding needed)
+            hit_features, event_indices = self.combine(X, design)
+            n_batch = design.shape[0]
 
-        result = combined
-        *rest, last = self.blocks
+            result = hit_features
+            *rest, last = self.blocks
 
-        # DeepSet pattern with masked aggregation
-        for block_layers in rest:
-            # Apply all layers in this block sequentially
-            hit_features = result
-            for layer in block_layers:
+            # DeepSet pattern with segment-based aggregation
+            for block_layers in rest:
+                # Apply layers to all hits
+                for layer in block_layers:
+                    if isinstance(layer, nnx.Dropout):
+                        result = layer(result, deterministic=deterministic)
+                    else:
+                        result = layer(result)
+
+                # Segment mean aggregation per event
+                sum_per_event = jax.ops.segment_sum(
+                    result, event_indices, num_segments=n_batch
+                )
+                count_per_event = jax.ops.segment_sum(
+                    jnp.ones((result.shape[0], 1)), event_indices, num_segments=n_batch
+                )
+                aggregated = sum_per_event / jnp.clip(count_per_event, min=1.0)
+
+                # Broadcast back to hit level and concatenate
+                aggregated_per_hit = aggregated[event_indices]
+                result = jnp.concatenate([result, aggregated_per_hit], axis=-1)
+
+            # Final aggregation
+            for layer in last:
                 if isinstance(layer, nnx.Dropout):
-                    hit_features = layer(hit_features, deterministic=deterministic)
+                    result = layer(result, deterministic=deterministic)
                 else:
-                    hit_features = layer(hit_features)
+                    result = layer(result)
 
-            # Masked mean aggregation
-            masked_features = mask[..., None] * hit_features
-            sum_features = jnp.sum(masked_features, axis=1, keepdims=True)
-            count = jnp.sum(mask, axis=1, keepdims=True)[..., None]
-            aggregated = sum_features / jnp.clip(
-                count, min=1.0
-            )  # Avoid division by zero
+            sum_per_event = jax.ops.segment_sum(
+                result, event_indices, num_segments=n_batch
+            )
+            count_per_event = jax.ops.segment_sum(
+                jnp.ones((result.shape[0], 1)), event_indices, num_segments=n_batch
+            )
+            aggregated = sum_per_event / jnp.clip(count_per_event, min=1.0)
 
-            # Broadcast and concatenate
-            aggregated = jnp.broadcast_to(aggregated, shape=hit_features.shape)
-            result = jnp.concatenate([hit_features, aggregated], axis=-1)
-
-        # Final aggregation - apply last block layers
-        hit_features = result
-        for layer in last:
-            if isinstance(layer, nnx.Dropout):
-                hit_features = layer(hit_features, deterministic=deterministic)
-            else:
-                hit_features = layer(hit_features)
-        masked_features = mask[..., None] * hit_features
-        sum_features = jnp.sum(masked_features, axis=1)
-        count = jnp.sum(mask, axis=1)[..., None]
-        result = sum_features / jnp.clip(count, min=1.0)
-
-        result = self.output(result)
-        return jnp.reshape(result, shape=(result.shape[0], *self.target_shape))
+            result = self.output(aggregated)
+            return jnp.reshape(result, shape=(result.shape[0], *self.target_shape))
 
 
 class BayesDeepSet(Regressor):
