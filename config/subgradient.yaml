@@ -1,41 +1,6 @@
-detector:
-  straw:
-    station_z: [8407.0, 8607.0, 9307.0, 9507.0]
-    n_views_per_station: 4
-    n_layers_per_view: 2
-    n_straws_per_layer: 200
-    straw_pitch: 2.0
-    straw_length: 400.0
-    layer_x_offset: 1.0
-    view_angles: [0.0, 0.0798, -0.0798, 0.0]
-    layer_z_gap: 1.732
-    view_z_gap: 5.0
-    dt: 0.1
-    max_B: 0.15
-    L: 3098.0
-    z0: 8957.0
-    B_sigma: 300.0
-    layer_bounds: [8000.0, 10000.0]
-    max_particles: 10
-    origin: [0.0, 0.0, -10.0]
-    origin_sigma: [1.0, 1.0, 1.0]
-    momentum: [0.0, 0.0, 5.0]
-    momentum_sigma: [0.25, 0.25, 0.5]
-    noise_origin: [0.0, 0.0, -10.0]
-    noise_origin_sigma: [1.0, 1.0, 1.0]
-    noise_momentum: [0.0, 0.0, 5.0]
-    noise_momentum_sigma: [0.25, 0.25, 0.5]
-    straw_signal_rate: 200.0
-    straw_noise_rate: 20.0
+detector: straw
 
-regressor: deep-set-sparse-hnl
-
-# Loss function parameters for position and momentum prediction
-loss:
-  position_scale: 100.0 # cm - typical scale for position errors
-  momentum_scale: 10.0 # GeV/c - typical scale for momentum errors
-  position_weight: 1.0 # relative weight for position loss
-  momentum_weight: 1.0 # relative weight for momentum loss
+regressor: deep-set-128
 
 initial_design: data/design/default.json
 trace: data/design/subgradient/

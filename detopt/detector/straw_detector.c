@@ -18,7 +18,7 @@
 #define SLOW    1.0e-6f
 
 /* secondary / spawning knobs */
-#define SEC_SPAWN_PROB 1.0f//0.0005f       /* per-step spawn probability (demo value) */
+#define SEC_SPAWN_PROB 0.0f//0.0005f       /* per-step spawn probability (demo value) */
 #define SEC_E_MEV      0.01f      /* secondary kinetic energy in MeV (tiny)  */
 #define SEC_MAX_DEPTH  1          /* depth of recursion for secondaries      */
 #define RNG_SEED_BASE  123456789u /* base RNG seed                            */
@@ -142,7 +142,7 @@ sparse_buffer_add(sparse_hit_buffer_t *buf, int event, int particle, int layer, 
                   npy_float value, npy_float edep, npy_float r_mm, npy_float t0,
                   npy_float x, npy_float y, npy_float z) {
   if (!buf) return 0;
-  
+
   /* check if hit already exists and accumulate */
   for (size_t i = 0; i < buf->count; ++i) {
     if (buf->hits[i].event == event &&
@@ -156,13 +156,13 @@ sparse_buffer_add(sparse_hit_buffer_t *buf, int event, int particle, int layer, 
       return 1;
     }
   }
-  
+
   /* new hit - check if we have space */
   if (buf->count >= buf->capacity) {
     /* buffer is full - cannot add more hits */
     return 0;
   }
-  
+
   sparse_hit_t *hit = &buf->hits[buf->count++];
   hit->event = event;
   hit->particle = particle;
@@ -270,7 +270,7 @@ static void spawn_pair(
 ) {
   /* build child kinematics for e+e- pair */
   uint32_t child_state = *rng_state;
-  
+
   /* isotropic direction for the pair axis */
   float u = rand01(&child_state);
   float v = rand01(&child_state);
@@ -280,51 +280,51 @@ static void spawn_pair(
   float dir_x = sin_theta * cosf(phi);
   float dir_y = sin_theta * sinf(phi);
   float dir_z = cos_theta;
-  
+
   /* electron/positron properties */
   const npy_float mass_e = 0.511f;
   const npy_float charge_e_minus = -1.0f;
   const npy_float charge_e_plus = 1.0f;
-  
+
   /* Each particle gets half the energy (simplified) */
   const npy_float T = E_sec_MeV * 0.5f;
   npy_float p_sec = sqrtf(T * T + 2.0f * T * mass_e);
-  
+
   /* e- momentum along direction */
   npy_float px_e_minus = p_sec * dir_x;
   npy_float py_e_minus = p_sec * dir_y;
   npy_float pz_e_minus = p_sec * dir_z;
-  
+
   /* e+ momentum opposite (back-to-back) */
   npy_float px_e_plus = -px_e_minus;
   npy_float py_e_plus = -py_e_minus;
   npy_float pz_e_plus = -pz_e_minus;
-  
+
   /* e- kinematics */
   npy_float gamma_e_minus = sqrtf(1.0f + (p_sec * p_sec) / (mass_e * mass_e));
   npy_float vx_e_minus = px_e_minus / (gamma_e_minus * mass_e);
   npy_float vy_e_minus = py_e_minus / (gamma_e_minus * mass_e);
   npy_float vz_e_minus = pz_e_minus / (gamma_e_minus * mass_e);
-  
+
   /* e+ kinematics */
   npy_float gamma_e_plus = gamma_e_minus;  /* same momentum magnitude */
   npy_float vx_e_plus = px_e_plus / (gamma_e_plus * mass_e);
   npy_float vy_e_plus = py_e_plus / (gamma_e_plus * mass_e);
   npy_float vz_e_plus = pz_e_plus / (gamma_e_plus * mass_e);
-  
+
   /* start both at parent position */
   npy_float x_child = x;
   npy_float y_child = y;
   npy_float z_child = z;
-  
+
   /* Try to store e- */
   int can_store_e_minus = (next_free_per_batch != NULL) &&
                           (next_free_per_batch[l] < n_slots);
-  
+
   if (can_store_e_minus) {
     int child_i_e_minus = next_free_per_batch[l];
     next_free_per_batch[l] += 1;
-    
+
     particle_pusher(
       l, child_i_e_minus,
       &x_child, &y_child, &z_child,
@@ -380,21 +380,21 @@ static void spawn_pair(
       NULL
     );
   }
-  
+
   /* Try to store e+ */
   uint32_t child_state_e_plus = child_state;  /* use different RNG state */
   int can_store_e_plus = (next_free_per_batch != NULL) &&
                          (next_free_per_batch[l] < n_slots);
-  
+
   if (can_store_e_plus) {
     int child_i_e_plus = next_free_per_batch[l];
     next_free_per_batch[l] += 1;
-    
+
     /* reset position for e+ */
     x_child = x;
     y_child = y;
     z_child = z;
-    
+
     particle_pusher(
       l, child_i_e_plus,
       &x_child, &y_child, &z_child,
@@ -453,7 +453,7 @@ static void spawn_pair(
       NULL
     );
   }
-  
+
   *rng_state = child_state_e_plus;
 }
 
@@ -755,7 +755,7 @@ static void particle_pusher(
 
           edep_val = dEdx * path_cm;
         }
-        
+
         if (sparse_buf) {
           /* sparse mode: check if hit already exists before adding */
           int hit_exists = 0;
@@ -778,7 +778,7 @@ static void particle_pusher(
 
           /* increment response by dt */
           response[idx] += dt;
-          
+
           /* check if this is the first hit to this straw (for secondary spawning) */
           is_first_hit = (response[idx] == dt);
 
@@ -804,7 +804,7 @@ static void particle_pusher(
             edep[idx] += edep_val;
           }
         }
-        
+
         /* --- spawn secondary when particle hits straw tube --- */
         if (is_first_hit && depth < max_depth) {
           float r = rand01(&state);
@@ -1284,7 +1284,7 @@ static PyObject *solve_sparse(PyObject *self, PyObject *args) {
 
   const npy_intp n_batch     = PyArray_DIM(initial_positions_array, 0);
   const npy_intp n_particles = PyArray_DIM(initial_positions_array, 1);
-  
+
   /* get n_layers from layers array */
   const PyArrayObject *layers_array = (PyArrayObject *)py_layers;
   if (!PyArray_Check(layers_array) || PyArray_NDIM(layers_array) != 2) {
@@ -1514,10 +1514,10 @@ static PyObject *solve_sparse(PyObject *self, PyObject *args) {
 
   /* convert sparse hits to Python arrays */
   npy_intp n_hits = (npy_intp)sparse_buf->count;
-  
+
   /* create separate arrays for each field */
   npy_intp dims[1] = {n_hits};
-  
+
   PyArrayObject *events = (PyArrayObject *)PyArray_SimpleNew(1, dims, NPY_INT32);
   PyArrayObject *particles = (PyArrayObject *)PyArray_SimpleNew(1, dims, NPY_INT32);
   PyArrayObject *layers_arr = (PyArrayObject *)PyArray_SimpleNew(1, dims, NPY_INT32);
@@ -1528,8 +1528,8 @@ static PyObject *solve_sparse(PyObject *self, PyObject *args) {
   PyArrayObject *t0_arr = (PyArrayObject *)PyArray_SimpleNew(1, dims, NPY_FLOAT32);
   npy_intp hit_pos_dims[2] = {n_hits, 3};
   PyArrayObject *hit_pos_arr = (PyArrayObject *)PyArray_SimpleNew(2, hit_pos_dims, NPY_FLOAT32);
-  
-  if (!events || !particles || !layers_arr || !straws || !values || 
+
+  if (!events || !particles || !layers_arr || !straws || !values ||
       !edep_arr || !r_mm_arr || !t0_arr || !hit_pos_arr) {
     Py_XDECREF(events); Py_XDECREF(particles); Py_XDECREF(layers_arr);
     Py_XDECREF(straws); Py_XDECREF(values); Py_XDECREF(edep_arr);
@@ -1538,7 +1538,7 @@ static PyObject *solve_sparse(PyObject *self, PyObject *args) {
     sparse_buffer_free(sparse_buf);
     return NULL;
   }
-  
+
   /* copy data */
   int32_t *events_ptr = (int32_t *)PyArray_DATA(events);
   int32_t *particles_ptr = (int32_t *)PyArray_DATA(particles);
@@ -1549,7 +1549,7 @@ static PyObject *solve_sparse(PyObject *self, PyObject *args) {
   npy_float *r_mm_ptr = (npy_float *)PyArray_DATA(r_mm_arr);
   npy_float *t0_ptr = (npy_float *)PyArray_DATA(t0_arr);
   npy_float *hit_pos_ptr = (npy_float *)PyArray_DATA(hit_pos_arr);
-  
+
   for (size_t i = 0; i < sparse_buf->count; ++i) {
     const sparse_hit_t *hit = &sparse_buf->hits[i];
     events_ptr[i] = hit->event;
@@ -1564,9 +1564,9 @@ static PyObject *solve_sparse(PyObject *self, PyObject *args) {
     hit_pos_ptr[i * 3 + 1] = hit->hit_pos[1];
     hit_pos_ptr[i * 3 + 2] = hit->hit_pos[2];
   }
-  
+
   sparse_buffer_free(sparse_buf);
-  
+
   /* return as tuple of arrays */
   return Py_BuildValue("(OOOOOOOOO)", events, particles, layers_arr, straws,
                        values, edep_arr, r_mm_arr, t0_arr, hit_pos_arr);

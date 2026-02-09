@@ -106,16 +106,9 @@ def viz(
         import matplotlib.cm as cm
 
         # Draw a separate canvas for each station, visualizing only the layers belonging to that station
-        import yaml
-
-        with open(
-            "/Users/nikitagladin/SHiP/detector-opt/config/detector/straw.yaml"
-        ) as f:
-            config = yaml.safe_load(f)
-        detector_cfg = config["straw"]
-        n_stations = len(detector_cfg["station_z"])
-        n_views_per_station = detector_cfg["n_views_per_station"]
-        n_layers_per_view = detector_cfg["n_layers_per_view"]
+        n_stations = detector.n_stations
+        n_views_per_station = detector.n_views_per_station
+        n_layers_per_view = detector.n_layers_per_view
         layers_per_station = n_views_per_station * n_layers_per_view
 
         # for station in range(n_stations):
@@ -160,7 +153,7 @@ def viz(
         # from detopt.detector.straw_signal import compute_tdc_times
         # tdc_times = compute_tdc_times(
         #     waveforms, t0_arr, r_mm,
-        #     straw_length=detector_cfg["straw_length"],
+        #     straw_length=detector.straw_length,
         #     v_wire=0.2,  # mm/ns, adjust as needed
         #     t0_event=0.0
         # )

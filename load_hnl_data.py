@@ -1,13 +1,13 @@
 """
-HNL Data Loader for Real Experimental Data
+HNL Data Loader for Real Experimental Data - Memory-Optimized Version
 
-This loader reads daughter particle data from combined_all/*.npz files
-and returns it in a format suitable for detector simulation via solve_sparse.
+This loader reads ALL daughter particle data from combined_all/*.npz files
+into memory once at initialization for fast sampling during training.
 
 Data flow:
-1. Load daughter particles (prestraw_x, y, z, px, py, pz, pdg) from NPZ
-2. Pass to straw_detector.solve_sparse() to simulate detector response
-3. Get fdigi_times (TDC hits) as simulation output
+1. Load ALL daughter particles at initialization
+2. Sample from memory during training (fast!)
+3. Pass to straw_detector.solve_sparse() to simulate detector response
 4. Use hits as input to neural network
 5. Target is HNL decay vertex (prestraw_hnl_dx, dy, dz, px, py, pz)
 """
@@ -17,178 +17,163 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 import numpy as np
+from tqdm import tqdm
 
 
 class HNLDataLoader:
     """
-    Loads daughter particle data from HNL decay events.
+    Loads ALL daughter particle data from HNL decay events into memory.
 
-    The data is formatted for use with straw_detector.solve_sparse()
-    to simulate detector response and generate TDC hits.
+    Fast sampling with no file I/O during training.
     """
 
-    def __init__(self, data_dir: str = "combined_all"):
+    def __init__(self, data_dir: str = "combined_all", max_particles: int = 50):
         """
-        Initialize data loader.
+        Initialize data loader - loads ALL data into memory.
 
         Args:
             data_dir: Directory containing combined_data_*.npz files
+            max_particles: Maximum particles per event (for padding)
         """
         self.data_dir = Path(data_dir)
-        # Try both naming conventions
-        self.files = sorted(glob.glob(str(self.data_dir / "combined_data_*.npz")))
-        if len(self.files) == 0:
-            # Try alternative naming pattern
-            self.files = sorted(
-                glob.glob(str(self.data_dir / "geom_*_combined_data.npz"))
-            )
+        self.max_particles = max_particles
 
-        if len(self.files) == 0:
+        # Try both naming conventions
+        files = sorted(glob.glob(str(self.data_dir / "combined_data_*.npz")))
+        if len(files) == 0:
+            files = sorted(glob.glob(str(self.data_dir / "geom_*_combined_data.npz")))
+
+        if len(files) == 0:
             raise FileNotFoundError(f"No NPZ files found in {data_dir}")
 
-        print(f"HNLDataLoader: Found {len(self.files)} data files")
+        print(f"HNLDataLoader: Loading {len(files)} files into memory...")
 
-        # Cache for loaded files
-        self._cache = {}
-        self._current_file_idx = 0
+        # Pre-allocate lists
+        all_masses = []
+        all_charges = []
+        all_positions = []
+        all_momenta = []
+        all_n_particles = []
+        all_targets = []
 
-    def _load_file(self, file_idx: int) -> dict:
-        """Load a single NPZ file into cache."""
-        if file_idx in self._cache:
-            return self._cache[file_idx]
-
-        data = np.load(self.files[file_idx], allow_pickle=True)
-
-        # Extract relevant fields
-        result = {
-            "ev": data["prestraw_ev"],  # Event number for grouping
-            "x": data["prestraw_x"].astype(np.float32),
-            "y": data["prestraw_y"].astype(np.float32),
-            "z": data["prestraw_z"].astype(np.float32),
-            "px": data["prestraw_px"].astype(np.float32),
-            "py": data["prestraw_py"].astype(np.float32),
-            "pz": data["prestraw_pz"].astype(np.float32),
-            "pdg": data["prestraw_pdg"],
-            # HNL decay vertex (TARGET)
-            "hnl_dx": data["prestraw_hnl_dx"].astype(np.float32),
-            "hnl_dy": data["prestraw_hnl_dy"].astype(np.float32),
-            "hnl_dz": data["prestraw_hnl_dz"].astype(np.float32),
-            "hnl_px": data["prestraw_hnl_px"].astype(np.float32),
-            "hnl_py": data["prestraw_hnl_py"].astype(np.float32),
-            "hnl_pz": data["prestraw_hnl_pz"].astype(np.float32),
-        }
-
-        # Keep limited cache (10 files)
-        if len(self._cache) > 10:
-            oldest_key = min(self._cache.keys())
-            del self._cache[oldest_key]
-
-        self._cache[file_idx] = result
-        return result
-
-    def get_batch(
-        self,
-        batch_size: int,
-        max_particles: int = 50,
-        rng: Optional[np.random.Generator] = None,
-    ) -> Tuple[dict, np.ndarray]:
-        """
-        Get a batch of events with daughter particle data.
-
-        Args:
-            batch_size: Number of events to return
-            max_particles: Maximum particles per event (for padding)
-            rng: Random number generator (optional)
-
-        Returns:
-            daughter_data: Dict with daughter particle info
-                {
-                    'masses': (batch, max_particles) - particle masses in MeV
-                    'charges': (batch, max_particles) - particle charges
-                    'positions': (batch, max_particles, 3) - initial positions [x,y,z] in mm
-                    'momenta': (batch, max_particles, 3) - initial momenta [px,py,pz] in GeV/c
-                    'n_particles': (batch,) - actual number of particles per event
-                }
-            targets: (batch_size, 6) array of [dx, dy, dz, px, py, pz]
-                - dx, dy, dz: HNL decay vertex position in mm
-                - px, py, pz: HNL momentum in GeV/c
-        """
-        if rng is None:
-            rng = np.random.default_rng()
-
-        # Initialize padded arrays
-        masses = np.zeros((batch_size, max_particles), dtype=np.float32)
-        charges = np.zeros((batch_size, max_particles), dtype=np.float32)
-        positions = np.zeros((batch_size, max_particles, 3), dtype=np.float32)
-        momenta = np.zeros((batch_size, max_particles, 3), dtype=np.float32)
-        n_particles = np.zeros(batch_size, dtype=np.int32)
-        targets = np.zeros((batch_size, 6), dtype=np.float32)
-
-        event_count = 0
-
-        while event_count < batch_size:
-            # Load current file
-            data = self._load_file(self._current_file_idx)
+        # Load ALL files
+        for file_path in tqdm(files, desc="Loading data"):
+            data = np.load(file_path, allow_pickle=True)
 
             # Get unique events in this file
-            unique_events = np.unique(data["ev"])
+            unique_events = np.unique(data["prestraw_ev"])
 
-            # Sample events from this file
-            events_needed = min(batch_size - event_count, len(unique_events))
-            sampled_events = rng.choice(
-                unique_events, size=events_needed, replace=False
-            )
-
-            for global_ev_id in sampled_events:
-                if event_count >= batch_size:
-                    break
-
-                # Get daughter particles for this event
-                mask = data["ev"] == global_ev_id
+            for event_id in unique_events:
+                mask = data["prestraw_ev"] == event_id
                 n_parts = min(np.sum(mask), max_particles)
 
                 if n_parts == 0:
                     continue
 
+                # Initialize padded arrays for this event
+                masses = np.zeros(max_particles, dtype=np.float32)
+                charges = np.zeros(max_particles, dtype=np.float32)
+                positions = np.zeros((max_particles, 3), dtype=np.float32)
+                momenta = np.zeros((max_particles, 3), dtype=np.float32)
+
                 # Extract particle data
-                positions[event_count, :n_parts, 0] = data["x"][mask][:n_parts]
-                positions[event_count, :n_parts, 1] = data["y"][mask][:n_parts]
-                positions[event_count, :n_parts, 2] = data["z"][mask][:n_parts]
+                positions[:n_parts, 0] = data["prestraw_x"][mask][:n_parts]
+                positions[:n_parts, 1] = data["prestraw_y"][mask][:n_parts]
+                positions[:n_parts, 2] = data["prestraw_z"][mask][:n_parts]
 
-                momenta[event_count, :n_parts, 0] = data["px"][mask][:n_parts]
-                momenta[event_count, :n_parts, 1] = data["py"][mask][:n_parts]
-                momenta[event_count, :n_parts, 2] = data["pz"][mask][:n_parts]
+                momenta[:n_parts, 0] = data["prestraw_px"][mask][:n_parts]
+                momenta[:n_parts, 1] = data["prestraw_py"][mask][:n_parts]
+                momenta[:n_parts, 2] = data["prestraw_pz"][mask][:n_parts]
 
-                pdg_codes = data["pdg"][mask][:n_parts]
+                pdg_codes = data["prestraw_pdg"][mask][:n_parts]
 
                 # Map PDG codes to masses and charges
                 for i, pdg in enumerate(pdg_codes):
-                    masses[event_count, i], charges[event_count, i] = (
-                        self._pdg_to_mass_charge(int(pdg))
-                    )
+                    masses[i], charges[i] = self._pdg_to_mass_charge(int(pdg))
 
-                n_particles[event_count] = n_parts
+                # Extract HNL target
+                target = np.array(
+                    [
+                        data["prestraw_hnl_dx"][mask][0],
+                        data["prestraw_hnl_dy"][mask][0],
+                        data["prestraw_hnl_dz"][mask][0],
+                        data["prestraw_hnl_px"][mask][0],
+                        data["prestraw_hnl_py"][mask][0],
+                        data["prestraw_hnl_pz"][mask][0],
+                    ],
+                    dtype=np.float32,
+                )
 
-                # Extract HNL target (same for all particles in event)
-                targets[event_count, 0] = data["hnl_dx"][mask][0]  # dx
-                targets[event_count, 1] = data["hnl_dy"][mask][0]  # dy
-                targets[event_count, 2] = data["hnl_dz"][mask][0]  # dz
-                targets[event_count, 3] = data["hnl_px"][mask][0]  # px
-                targets[event_count, 4] = data["hnl_py"][mask][0]  # py
-                targets[event_count, 5] = data["hnl_pz"][mask][0]  # pz
+                all_masses.append(masses)
+                all_charges.append(charges)
+                all_positions.append(positions)
+                all_momenta.append(momenta)
+                all_n_particles.append(n_parts)
+                all_targets.append(target)
 
-                event_count += 1
+        # Convert to arrays
+        self.masses = np.array(all_masses, dtype=np.float32)
+        self.charges = np.array(all_charges, dtype=np.float32)
+        self.positions = np.array(all_positions, dtype=np.float32)
+        self.momenta = np.array(all_momenta, dtype=np.float32)
+        self.n_particles = np.array(all_n_particles, dtype=np.int32)
+        self.targets = np.array(all_targets, dtype=np.float32)
 
-            # Move to next file
-            self._current_file_idx = (self._current_file_idx + 1) % len(self.files)
+        self.n_events = len(self.n_particles)
 
+        print(f"✓ Loaded {self.n_events} events into memory")
+        print(f"  Memory usage: ~{self._estimate_memory_mb():.1f} MB")
+        print(
+            f"  Particles per event: min={self.n_particles.min()}, "
+            f"max={self.n_particles.max()}, mean={self.n_particles.mean():.1f}"
+        )
+
+    def _estimate_memory_mb(self) -> float:
+        """Estimate memory usage in MB."""
+        total_bytes = (
+            self.masses.nbytes
+            + self.charges.nbytes
+            + self.positions.nbytes
+            + self.momenta.nbytes
+            + self.n_particles.nbytes
+            + self.targets.nbytes
+        )
+        return total_bytes / (1024 * 1024)
+
+    def get_batch(
+        self,
+        batch_size: int,
+        max_particles: int = 50,  # Kept for API compatibility
+        rng: Optional[np.random.Generator] = None,
+    ) -> Tuple[dict, np.ndarray]:
+        """
+        Get a batch of events - samples from pre-loaded memory (FAST!).
+
+        Args:
+            batch_size: Number of events to return
+            max_particles: Ignored (uses self.max_particles from init)
+            rng: Random number generator (optional)
+
+        Returns:
+            daughter_data: Dict with daughter particle info
+            targets: (batch_size, 6) array of [dx, dy, dz, px, py, pz]
+        """
+        if rng is None:
+            rng = np.random.default_rng()
+
+        # Sample random event indices
+        indices = rng.choice(self.n_events, size=batch_size, replace=True)
+
+        # Return pre-loaded data (just indexing - super fast!)
         daughter_data = {
-            "masses": masses,
-            "charges": charges,
-            "positions": positions,
-            "momenta": momenta,
-            "n_particles": n_particles,
+            "masses": self.masses[indices],
+            "charges": self.charges[indices],
+            "positions": self.positions[indices],
+            "momenta": self.momenta[indices],
+            "n_particles": self.n_particles[indices],
         }
+
+        targets = self.targets[indices]
 
         return daughter_data, targets
 
@@ -222,6 +207,8 @@ class HNLDataLoader:
             -12: (0.0, 0.0),  # nu_e_bar
             14: (0.0, 0.0),  # nu_mu
             -14: (0.0, 0.0),  # nu_mu_bar
+            2112: (939.57, 0.0),  # neutron
+            -2112: (939.57, 0.0),  # antineutron
         }
 
         if pdg in pdg_mass_map:
@@ -231,59 +218,41 @@ class HNLDataLoader:
             charge = 1.0 if pdg > 0 else -1.0 if pdg < 0 else 0.0
             return (139.57, charge)
 
-    def get_statistics(self, n_files: int = 10) -> dict:
-        """
-        Compute dataset statistics.
-
-        Args:
-            n_files: Number of files to sample
-
-        Returns:
-            Dictionary of statistics
-        """
-        all_n_particles = []
-        all_targets = []
-
-        for i in range(min(n_files, len(self.files))):
-            data = self._load_file(i)
-            unique_events = np.unique(data["ev"])
-
-            for ev in unique_events:
-                mask = data["ev"] == ev
-                n_parts = np.sum(mask)
-                all_n_particles.append(n_parts)
-
-                target = np.array(
-                    [
-                        data["hnl_dx"][mask][0],
-                        data["hnl_dy"][mask][0],
-                        data["hnl_dz"][mask][0],
-                        data["hnl_px"][mask][0],
-                        data["hnl_py"][mask][0],
-                        data["hnl_pz"][mask][0],
-                    ]
-                )
-                all_targets.append(target)
-
-        all_n_particles = np.array(all_n_particles)
-        all_targets = np.array(all_targets)
-
+    def get_statistics(self) -> dict:
+        """Compute dataset statistics from loaded data."""
         return {
-            "n_events_sampled": len(all_n_particles),
-            "n_files": len(self.files),
+            "n_events": self.n_events,
             "particles_per_event": {
-                "min": int(all_n_particles.min()),
-                "max": int(all_n_particles.max()),
-                "mean": float(all_n_particles.mean()),
-                "median": float(np.median(all_n_particles)),
+                "min": int(self.n_particles.min()),
+                "max": int(self.n_particles.max()),
+                "mean": float(self.n_particles.mean()),
+                "median": float(np.median(self.n_particles)),
             },
             "target_ranges": {
-                "dx": (float(all_targets[:, 0].min()), float(all_targets[:, 0].max())),
-                "dy": (float(all_targets[:, 1].min()), float(all_targets[:, 1].max())),
-                "dz": (float(all_targets[:, 2].min()), float(all_targets[:, 2].max())),
-                "px": (float(all_targets[:, 3].min()), float(all_targets[:, 3].max())),
-                "py": (float(all_targets[:, 4].min()), float(all_targets[:, 4].max())),
-                "pz": (float(all_targets[:, 5].min()), float(all_targets[:, 5].max())),
+                "dx": (
+                    float(self.targets[:, 0].min()),
+                    float(self.targets[:, 0].max()),
+                ),
+                "dy": (
+                    float(self.targets[:, 1].min()),
+                    float(self.targets[:, 1].max()),
+                ),
+                "dz": (
+                    float(self.targets[:, 2].min()),
+                    float(self.targets[:, 2].max()),
+                ),
+                "px": (
+                    float(self.targets[:, 3].min()),
+                    float(self.targets[:, 3].max()),
+                ),
+                "py": (
+                    float(self.targets[:, 4].min()),
+                    float(self.targets[:, 4].max()),
+                ),
+                "pz": (
+                    float(self.targets[:, 5].min()),
+                    float(self.targets[:, 5].max()),
+                ),
             },
         }
 
@@ -291,43 +260,36 @@ class HNLDataLoader:
 # Test the loader
 if __name__ == "__main__":
     print("=" * 70)
-    print("Testing HNL Data Loader")
+    print("Testing HNL Data Loader (Memory-Optimized)")
     print("=" * 70)
 
     try:
-        loader = HNLDataLoader("combined_all")
+        loader = HNLDataLoader("combined_all_10")
 
-        print("\nComputing statistics...")
-        stats = loader.get_statistics(n_files=5)
-        print(f"\nDataset Statistics (from 5 files):")
-        print(f"  Total files: {stats['n_files']}")
-        print(f"  Events sampled: {stats['n_events_sampled']}")
+        print("\nDataset Statistics:")
+        stats = loader.get_statistics()
+        print(f"  Total events: {stats['n_events']}")
         print(f"  Particles per event: {stats['particles_per_event']}")
         print(f"\n  Target ranges:")
         for key, (vmin, vmax) in stats["target_ranges"].items():
             print(f"    {key}: [{vmin:8.2f}, {vmax:8.2f}]")
 
-        print("\n\nLoading test batch...")
-        daughter_data, targets = loader.get_batch(
-            batch_size=4, max_particles=50, rng=np.random.default_rng(42)
-        )
+        print("\n\nLoading test batch (should be instant)...")
+        import time
 
-        print(f"\nBatch loaded:")
-        print(f"  Batch size: 4 events")
+        start = time.time()
+        daughter_data, targets = loader.get_batch(
+            batch_size=128, rng=np.random.default_rng(42)
+        )
+        elapsed = time.time() - start
+
+        print(f"✓ Loaded 128 events in {elapsed * 1000:.2f} ms")
         print(f"  Masses shape: {daughter_data['masses'].shape}")
-        print(f"  Charges shape: {daughter_data['charges'].shape}")
         print(f"  Positions shape: {daughter_data['positions'].shape}")
-        print(f"  Momenta shape: {daughter_data['momenta'].shape}")
-        print(f"  N particles: {daughter_data['n_particles']}")
         print(f"  Targets shape: {targets.shape}")
-        print(f"\nFirst event:")
-        print(f"  N particles: {daughter_data['n_particles'][0]}")
-        print(f"  First particle position: {daughter_data['positions'][0, 0]}")
-        print(f"  First particle momentum: {daughter_data['momenta'][0, 0]}")
-        print(f"  HNL target: {targets[0]}")
 
         print("\n" + "=" * 70)
-        print("✅ Data loader working!")
+        print("✅ Memory-optimized data loader working!")
         print("=" * 70)
 
     except Exception as e:

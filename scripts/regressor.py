@@ -64,45 +64,89 @@ def regress(
 
     status = detopt.utils.progress.status_bar(disable=not progress)
 
+    # Use fixed design for all training and validation
+    fixed_design = np.zeros((batch, *detector.design_shape()), dtype=np.float32)
+
     for i in status.epochs(epochs):
         for j in status.training(steps):
-            design = np_rng.normal(size=(batch, *detector.design_shape())).astype(
-                np.float32
-            )
             ground_truth, measurements, target = detector(
-                seed=(seed, i, j, 0), configurations=design
+                seed=(seed, i, j, 0), configurations=fixed_design
             )
             measurements_dict = sparse_to_dict(measurements)
             training_losses[i, j] = step(
-                regressor, optimizer, measurements_dict, design, target
+                regressor, optimizer, measurements_dict, fixed_design, target
             )
 
         for j in status.validation(validation_batches):
-            design = np_rng.normal(size=(batch, *detector.design_shape())).astype(
-                np.float32
-            )
             ground_truth, measurements, target = detector(
-                seed=(seed, i, j, 1), configurations=design
+                seed=(seed, i, j, 1), configurations=fixed_design
             )
 
             measurements_dict = sparse_to_dict(measurements)
 
             # Get predictions for precision analysis (normalized outputs)
-            predictions_norm = regressor(measurements_dict, jnp.array(design))
+            predictions_norm = regressor(measurements_dict, jnp.array(fixed_design))
 
             # Denormalize predictions to raw units for visualization
             predictions = predictions_norm * detector.target_std + detector.target_mean
 
             validation_losses[i, j] = metric_f(
-                regressor, measurements_dict, design, target
+                regressor, measurements_dict, fixed_design, target
             )
 
-            # Debug: print first batch of first validation to check values
-            if i == 0 and j == 0:
-                print(f"\nDEBUG Epoch {i + 1}:")
-                print(f"  Target[0]: {target[0]}")
-                print(f"  Predicted[0] (denormalized): {predictions[0]}")
-                print(f"  Diff: {np.abs(predictions[0] - target[0])}")
+            # Debug: print detailed input/output info for first validation batch of first epoch
+            if j == 0:
+                print("\n" + "=" * 80)
+                print("GENUINE INPUTS AND OUTPUTS - First Validation Batch")
+                print("=" * 80)
+
+                # Show raw detector hits (inputs to NN)
+                print(f"\nDetector Hits (NN Input):")
+                print(f"  Number of hits: {len(measurements_dict['events'])}")
+                print(f"  Events: {measurements_dict['events'][:10]}...")
+                print(f"  Layers: {measurements_dict['layers'][:10]}...")
+                print(f"  Straws: {measurements_dict['straws'][:10]}...")
+                print(f"  TDC values: {measurements_dict['values'][:10]}...")
+
+                # Show normalization parameters
+                print(f"\nTarget Normalization:")
+                print(f"  target_mean: {detector.target_mean}")
+                print(f"  target_std: {detector.target_std}")
+
+                # Show first event in detail
+                print(f"\nFirst Event (index 0):")
+                print(f"  Target (ground truth): {target[0]}")
+                print(
+                    f"    Position (dx, dy, dz): ({target[0][0]:.2f}, {target[0][1]:.2f}, {target[0][2]:.2f}) cm"
+                )
+                print(
+                    f"    Momentum (px, py, pz): ({target[0][3]:.4f}, {target[0][4]:.4f}, {target[0][5]:.4f}) GeV/c"
+                )
+
+                print(
+                    f"\n  Raw NN Output (BEFORE denormalization): {predictions_norm[0]}"
+                )
+                print(f"    This is the actual output from the neural network")
+                print(f"    Values should be roughly in range [-3, 3] (normalized)")
+
+                print(f"\n  Prediction (AFTER denormalization): {predictions[0]}")
+                print(
+                    f"    Position (dx, dy, dz): ({predictions[0][0]:.2f}, {predictions[0][1]:.2f}, {predictions[0][2]:.2f}) cm"
+                )
+                print(
+                    f"    Momentum (px, py, pz): ({predictions[0][3]:.4f}, {predictions[0][4]:.4f}, {predictions[0][5]:.4f}) GeV/c"
+                )
+
+                print(f"\n  Absolute Error:")
+                errors = np.abs(predictions[0] - target[0])
+                print(
+                    f"    Position: ({errors[0]:.2f}, {errors[1]:.2f}, {errors[2]:.2f}) cm"
+                )
+                print(
+                    f"    Momentum: ({errors[3]:.4f}, {errors[4]:.4f}, {errors[5]:.4f}) GeV/c"
+                )
+
+                print("=" * 80 + "\n")
 
             # Store predictions and targets for this epoch
             if j == 0:  # Store only first validation batch per epoch

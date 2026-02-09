@@ -1,9 +1,0 @@
-model:
-  deep-set:
-    features: [[64, 128, 256], [256, 128], [128, 64, 32]]
-    n_max_hits: 500
-    p_dropout: 0.1
-
-optimizer:
-  adam:
-    learning_rate: 1.0e-3

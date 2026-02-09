@@ -159,26 +159,26 @@ class StrawDetector(Detector):
     def __init__(
         self,
         # Geometry hierarchy
-        station_z: list = [2598.0, 2698.0, 3498.0, 3538.0],
+        station_z: list = [8407.0, 8607.0, 9307.0, 9507.0],
         n_views_per_station: int = 4,
-        n_layers_per_view: int = 4,
+        n_layers_per_view: int = 2,
         n_straws_per_layer: int = 200,
         straw_pitch: float = 2.0,
-        straw_length: float = 200.0,
+        straw_length: float = 400.0,
         layer_x_offset: float = 1.0,
         view_angles: tuple = (0.0, 0.0798, -0.0798, 0.0),  # X, U, X', V
         layer_z_gap: float = 1.732,
         view_z_gap: float = 5.0,
         # Physics parameters
-        max_B: float = 0.5,
-        L=1.0,
-        z0: float = None,
-        B_sigma: float = None,
-        layer_bounds: tuple[float | int, float | int] = (-5.0, 5.0),
-        dt: float = 1.0,
+        max_B: float = 0.0,
+        L=3098.0,
+        z0: float = 8957.0,
+        B_sigma: float = 300.0,
+        layer_bounds: tuple[float | int, float | int] = (2000.0, 4000.0),
+        dt: float = 0.1,
         max_particles=2,
         secondary_multiplier=5,
-        origin=(-100.0, -100.0, 1700.0),
+        origin=(0.0, 0.0, -10.0),
         origin_sigma=(1.0, 1.0, 1.0),
         momentum=(0.0, 0.0, 5.0),
         momentum_sigma=(0.25, 0.25, 0.5),
@@ -187,7 +187,7 @@ class StrawDetector(Detector):
         noise_momentum=(0.0, 0.0, 5.0),
         noise_momentum_sigma=(0.25, 0.25, 0.5),
         straw_signal_rate=200.0,
-        straw_noise_rate=10.0,
+        straw_noise_rate=20.0,
         angles_bounds=None,
         layer_width=None,
         layer_height=None,
@@ -607,14 +607,15 @@ class StrawDetector(Detector):
             sys.path.insert(0, str(Path(__file__).parent.parent.parent))
             from load_hnl_data import HNLDataLoader
 
-            self._data_loader = HNLDataLoader(self.data_dir)
+            # Pass max_particles to loader so it loads data with correct padding
+            max_particles = getattr(self, "max_particles_real", 50)
+            self._data_loader = HNLDataLoader(
+                self.data_dir, max_particles=max_particles
+            )
             print(f"Initialized HNL data loader from {self.data_dir}")
-        # Set max_particles based on detector config
-        max_particles = getattr(self, "max_particles_real", 50)
-
-        # Load batch of events
+        # Load batch of events (data is already in memory - fast!)
         daughter_data, hnl_targets = self._data_loader.get_batch(
-            batch_size=n_events, max_particles=max_particles, rng=rng
+            batch_size=n_events, rng=rng
         )
 
         return daughter_data, hnl_targets

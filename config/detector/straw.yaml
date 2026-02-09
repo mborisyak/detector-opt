@@ -17,12 +17,12 @@ straw:
 
   # Physics parameters
   dt: 0.1 #ns
-  max_B: 0.15
+  max_B: 0.0
   L: 3098.0
   z0: 8957.0 # Center of magnetic field (cm)
   B_sigma: 300.0 # Sigma (width) of magnetic field (cm)
-  layer_bounds: [0.0, 10000.0] # Must cover full particle trajectory range
-  max_particles: 10 # Increased for HNL data (events have ~40-50 particles, truncated to 10)
+  layer_bounds: [2000., 4000.]
+  max_particles: 2
   origin: [0.0, 0.0, -10.0]
   origin_sigma: [1.0, 1.0, 1.0]
   momentum: [0.0, 0.0, 5.0]
@@ -33,3 +33,15 @@ straw:
   noise_momentum_sigma: [0.25, 0.25, 0.5]
   straw_signal_rate: 200.0
   straw_noise_rate: 20.0
+
+  # Data loading
+  data_dir: "combined_all_10"
+
+  # Loss function parameters for HNL reconstruction
+  # NOTE: Normalization now uses target_mean and target_std computed from data
+  # The scales below are kept for backward compatibility but not used in loss
+  loss:
+    position_scale: 1384.0 # cm - DEPRECATED: not used (proper normalization in loss)
+    momentum_scale: 21.2 # GeV/c - DEPRECATED: not used (proper normalization in loss)
+    position_weight: 1.0 # DEPRECATED: not used
+    momentum_weight: 1.0 # DEPRECATED: not used
