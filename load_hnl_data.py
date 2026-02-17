@@ -27,7 +27,7 @@ class HNLDataLoader:
     Fast sampling with no file I/O during training.
     """
 
-    def __init__(self, data_dir: str = "combined_all", max_particles: int = 50):
+    def __init__(self, data_dir: str = "combined_tof", max_particles: int = 50):
         """
         Initialize data loader - loads ALL data into memory.
 
@@ -53,9 +53,11 @@ class HNLDataLoader:
         all_charges = []
         all_positions = []
         all_momenta = []
+        all_times = []
         all_n_particles = []
         all_targets = []
-
+        cnt = 0
+        cnt2 = 0
         # Load ALL files
         for file_path in tqdm(files, desc="Loading data"):
             data = np.load(file_path, allow_pickle=True)
@@ -75,15 +77,21 @@ class HNLDataLoader:
                 charges = np.zeros(max_particles, dtype=np.float32)
                 positions = np.zeros((max_particles, 3), dtype=np.float32)
                 momenta = np.zeros((max_particles, 3), dtype=np.float32)
+                times = np.zeros(max_particles, dtype=np.float32)
 
                 # Extract particle data
                 positions[:n_parts, 0] = data["prestraw_x"][mask][:n_parts]
                 positions[:n_parts, 1] = data["prestraw_y"][mask][:n_parts]
                 positions[:n_parts, 2] = data["prestraw_z"][mask][:n_parts]
 
-                momenta[:n_parts, 0] = data["prestraw_px"][mask][:n_parts]
-                momenta[:n_parts, 1] = data["prestraw_py"][mask][:n_parts]
-                momenta[:n_parts, 2] = data["prestraw_pz"][mask][:n_parts]
+                # Convert momentum from GeV/c to MeV/c (multiply by 1000)
+                momenta[:n_parts, 0] = data["prestraw_px"][mask][:n_parts] * 1000.0
+                momenta[:n_parts, 1] = data["prestraw_py"][mask][:n_parts] * 1000.0
+                momenta[:n_parts, 2] = data["prestraw_pz"][mask][:n_parts] * 1000.0
+
+                # Extract time of flight (TOF) in nanoseconds
+                if "prestraw_tof" in data:
+                    times[:n_parts] = data["prestraw_tof"][mask][:n_parts]
 
                 pdg_codes = data["prestraw_pdg"][mask][:n_parts]
 
@@ -92,6 +100,7 @@ class HNLDataLoader:
                     masses[i], charges[i] = self._pdg_to_mass_charge(int(pdg))
 
                 # Extract HNL target
+                # Target: positions in cm, momenta in GeV/c (keep as GeV for targets)
                 target = np.array(
                     [
                         data["prestraw_hnl_dx"][mask][0],
@@ -108,25 +117,33 @@ class HNLDataLoader:
                 all_charges.append(charges)
                 all_positions.append(positions)
                 all_momenta.append(momenta)
+                all_times.append(times)
                 all_n_particles.append(n_parts)
                 all_targets.append(target)
+                cnt += -n_parts + max_particles
+                cnt2 += 1
+                print(-n_parts + max_particles)
 
         # Convert to arrays
         self.masses = np.array(all_masses, dtype=np.float32)
         self.charges = np.array(all_charges, dtype=np.float32)
         self.positions = np.array(all_positions, dtype=np.float32)
         self.momenta = np.array(all_momenta, dtype=np.float32)
+        self.times = np.array(all_times, dtype=np.float32)
         self.n_particles = np.array(all_n_particles, dtype=np.int32)
         self.targets = np.array(all_targets, dtype=np.float32)
 
         self.n_events = len(self.n_particles)
+        print(cnt / cnt2)
+        print(self.n_events)
+        input("wait")
 
-        print(f"✓ Loaded {self.n_events} events into memory")
-        print(f"  Memory usage: ~{self._estimate_memory_mb():.1f} MB")
-        print(
-            f"  Particles per event: min={self.n_particles.min()}, "
-            f"max={self.n_particles.max()}, mean={self.n_particles.mean():.1f}"
-        )
+        # print(f"✓ Loaded {self.n_events} events into memory")
+        # print(f"  Memory usage: ~{self._estimate_memory_mb():.1f} MB")
+        # print(
+        #     f"  Particles per event: min={self.n_particles.min()}, "
+        #     f"max={self.n_particles.max()}, mean={self.n_particles.mean():.1f}"
+        # )
 
     def _estimate_memory_mb(self) -> float:
         """Estimate memory usage in MB."""
@@ -135,6 +152,7 @@ class HNLDataLoader:
             + self.charges.nbytes
             + self.positions.nbytes
             + self.momenta.nbytes
+            + self.times.nbytes
             + self.n_particles.nbytes
             + self.targets.nbytes
         )
@@ -156,7 +174,12 @@ class HNLDataLoader:
 
         Returns:
             daughter_data: Dict with daughter particle info
-            targets: (batch_size, 6) array of [dx, dy, dz, px, py, pz]
+                - masses: MeV
+                - charges: e
+                - positions: cm
+                - momenta: MeV/c
+                - times: ns (time of flight)
+            targets: (batch_size, 6) array of [dx, dy, dz in cm, px, py, pz in GeV/c]
         """
         if rng is None:
             rng = np.random.default_rng()
@@ -170,6 +193,7 @@ class HNLDataLoader:
             "charges": self.charges[indices],
             "positions": self.positions[indices],
             "momenta": self.momenta[indices],
+            "times": self.times[indices],
             "n_particles": self.n_particles[indices],
         }
 
@@ -181,11 +205,14 @@ class HNLDataLoader:
         """
         Convert PDG code to mass (MeV) and charge.
 
+        Note: Masses are in MeV to match C code expectations.
+        Momenta are converted to MeV/c in get_batch().
+
         Args:
             pdg: Particle PDG code
 
         Returns:
-            (mass, charge) tuple
+            (mass in MeV, charge) tuple
         """
         # Common particles in HNL decays
         pdg_mass_map = {
@@ -221,6 +248,8 @@ class HNLDataLoader:
     def get_statistics(self) -> dict:
         """Compute dataset statistics from loaded data."""
         return {
+            "stds": {"targets": self.targets.std(axis=0)},
+            "means": {"targets": self.targets.mean(axis=0)},
             "n_events": self.n_events,
             "particles_per_event": {
                 "min": int(self.n_particles.min()),
@@ -264,10 +293,12 @@ if __name__ == "__main__":
     print("=" * 70)
 
     try:
-        loader = HNLDataLoader("combined_all_10")
+        loader = HNLDataLoader()
 
         print("\nDataset Statistics:")
         stats = loader.get_statistics()
+        print(stats["stds"]["targets"])
+        print(stats["means"]["targets"])
         print(f"  Total events: {stats['n_events']}")
         print(f"  Particles per event: {stats['particles_per_event']}")
         print(f"\n  Target ranges:")

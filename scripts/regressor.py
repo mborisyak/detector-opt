@@ -7,18 +7,6 @@ import detopt
 from detopt.detector.straw import SparseHits
 
 
-def sparse_to_dict(sparse_hits):
-    """Convert SparseHits object to dictionary for neural network input."""
-    if isinstance(sparse_hits, SparseHits):
-        return {
-            "events": sparse_hits.events,
-            "layers": sparse_hits.layers,
-            "straws": sparse_hits.straws,
-            "values": sparse_hits.values,
-        }
-    return sparse_hits
-
-
 def regress(
     seed, output, progress=False, restore=True, trace=None, report=None, **config
 ):
@@ -29,13 +17,27 @@ def regress(
     np_rng = np.random.default_rng(seed=(seed, 0))
 
     detector = detopt.detector.from_config(config["detector"])
+    print(detector.get_current_design())
+    enc = detector.get_encoded_current_design()
+    enc = enc.reshape(1, -1)
+    print(enc)
+    # input("Waiting ")
+    print(detector.get_design(enc))
+    # input("Waiting ")
+    print(detector.p_spawn_single)
     regressor = detopt.nn.from_config(detector, config=config["regressor"], rngs=rngs)
     optimizer = nnx.Optimizer(
         regressor, detopt.utils.config.optimizer(config["optimizer"]), wrt=nnx.Param
     )
-
+    # input("Waiting 1")
     epochs, steps = config["epochs"], config["steps"]
+    print(epochs, steps)
     batch, validation_batches = config["batch"], config["validation_batches"]
+    # input("Waiting 2")
+    design = np.tile(enc, (batch, 1))
+    # print(design)
+    # print(design.shape)
+    # input("wait design")
 
     @nnx.jit
     def loss_f(model, x, c, t):
@@ -63,90 +65,51 @@ def regress(
     val_targets = []
 
     status = detopt.utils.progress.status_bar(disable=not progress)
-
-    # Use fixed design for all training and validation
-    fixed_design = np.zeros((batch, *detector.design_shape()), dtype=np.float32)
-
+    # input("Waiting start")
     for i in status.epochs(epochs):
         for j in status.training(steps):
-            ground_truth, measurements, target = detector(
-                seed=(seed, i, j, 0), configurations=fixed_design
+            _, measurements, target = detector(
+                seed=(seed, 1, 1, 0), configurations=design
             )
-            measurements_dict = sparse_to_dict(measurements)
+            print(measurements[0])
+            # input("Waiting for step")
             training_losses[i, j] = step(
-                regressor, optimizer, measurements_dict, fixed_design, target
+                regressor, optimizer, measurements, design, target
             )
 
         for j in status.validation(validation_batches):
-            ground_truth, measurements, target = detector(
-                seed=(seed, i, j, 1), configurations=fixed_design
+            design = np_rng.normal(size=(batch, *detector.design_shape())).astype(
+                np.float32
+            )
+            _, measurements, target = detector(
+                seed=(seed, 1, 1, 1), configurations=design
             )
 
-            measurements_dict = sparse_to_dict(measurements)
-
             # Get predictions for precision analysis (normalized outputs)
-            predictions_norm = regressor(measurements_dict, jnp.array(fixed_design))
+            predictions_norm = regressor(measurements, jnp.array(design))
 
             # Denormalize predictions to raw units for visualization
             predictions = predictions_norm * detector.target_std + detector.target_mean
 
-            validation_losses[i, j] = metric_f(
-                regressor, measurements_dict, fixed_design, target
-            )
+            validation_losses[i, j] = metric_f(regressor, measurements, design, target)
 
-            # Debug: print detailed input/output info for first validation batch of first epoch
-            if j == 0:
-                print("\n" + "=" * 80)
-                print("GENUINE INPUTS AND OUTPUTS - First Validation Batch")
-                print("=" * 80)
+            # Debug: print first batch of first validation to check values
+            if True:
+                print(f"\nDEBUG Epoch {i + 1}:")
+                print(f"  Target[0]: {target[0]}")
+                print(f"  Predicted[0] : {predictions_norm[0]}")
+                print(f"  Predicted[0] (denormalized): {predictions[0]}")
+                print(f"  Diff: {np.abs(predictions[0] - target[0])}")
+                t = target[0]  # physical
+                mu = detector.target_mean  # shape (6,)
+                sd = detector.target_std  # shape (6,)
 
-                # Show raw detector hits (inputs to NN)
-                print(f"\nDetector Hits (NN Input):")
-                print(f"  Number of hits: {len(measurements_dict['events'])}")
-                print(f"  Events: {measurements_dict['events'][:10]}...")
-                print(f"  Layers: {measurements_dict['layers'][:10]}...")
-                print(f"  Straws: {measurements_dict['straws'][:10]}...")
-                print(f"  TDC values: {measurements_dict['values'][:10]}...")
+                t_norm = (t - mu) / sd  # normalized target
+                p_norm = predictions_norm[0]  # normalized prediction
 
-                # Show normalization parameters
-                print(f"\nTarget Normalization:")
-                print(f"  target_mean: {detector.target_mean}")
-                print(f"  target_std: {detector.target_std}")
-
-                # Show first event in detail
-                print(f"\nFirst Event (index 0):")
-                print(f"  Target (ground truth): {target[0]}")
-                print(
-                    f"    Position (dx, dy, dz): ({target[0][0]:.2f}, {target[0][1]:.2f}, {target[0][2]:.2f}) cm"
-                )
-                print(
-                    f"    Momentum (px, py, pz): ({target[0][3]:.4f}, {target[0][4]:.4f}, {target[0][5]:.4f}) GeV/c"
-                )
-
-                print(
-                    f"\n  Raw NN Output (BEFORE denormalization): {predictions_norm[0]}"
-                )
-                print(f"    This is the actual output from the neural network")
-                print(f"    Values should be roughly in range [-3, 3] (normalized)")
-
-                print(f"\n  Prediction (AFTER denormalization): {predictions[0]}")
-                print(
-                    f"    Position (dx, dy, dz): ({predictions[0][0]:.2f}, {predictions[0][1]:.2f}, {predictions[0][2]:.2f}) cm"
-                )
-                print(
-                    f"    Momentum (px, py, pz): ({predictions[0][3]:.4f}, {predictions[0][4]:.4f}, {predictions[0][5]:.4f}) GeV/c"
-                )
-
-                print(f"\n  Absolute Error:")
-                errors = np.abs(predictions[0] - target[0])
-                print(
-                    f"    Position: ({errors[0]:.2f}, {errors[1]:.2f}, {errors[2]:.2f}) cm"
-                )
-                print(
-                    f"    Momentum: ({errors[3]:.4f}, {errors[4]:.4f}, {errors[5]:.4f}) GeV/c"
-                )
-
-                print("=" * 80 + "\n")
+                print("Target_norm[0]:", t_norm)
+                print("Pred_norm[0]:", p_norm)
+                print("Diff_norm:", t_norm - p_norm)
 
             # Store predictions and targets for this epoch
             if j == 0:  # Store only first validation batch per epoch
@@ -170,8 +133,10 @@ def regress(
             # Plot losses up to current epoch
             detopt.utils.viz.losses.plot(training_losses[: i + 1], axes[0, 0])
             axes[0, 0].set_title("Training losses")
+            axes[0, 0].set_yscale("log")
             detopt.utils.viz.losses.plot(validation_losses[: i + 1], axes[0, 1])
             axes[0, 1].set_title("Validation losses")
+            axes[0, 1].set_yscale("log")
 
             # Compute position and momentum errors
             if len(val_predictions) > 0:
@@ -195,6 +160,7 @@ def regress(
                 axes[1, 0].plot(epochs_so_far, pos_rmse, "b-", linewidth=2)
                 axes[1, 0].set_title("HNL Vertex Position RMSE")
                 axes[1, 0].set_xlabel("Epoch")
+                axes[1, 0].set_yscale("log")
                 axes[1, 0].set_ylabel("Position RMSE (cm)")
                 axes[1, 0].grid(True, alpha=0.3)
 
@@ -202,6 +168,7 @@ def regress(
                 axes[1, 1].plot(epochs_so_far, mom_rmse, "r-", linewidth=2)
                 axes[1, 1].set_title("HNL Momentum RMSE")
                 axes[1, 1].set_xlabel("Epoch")
+                axes[1, 1].set_yscale("log")
                 axes[1, 1].set_ylabel("Momentum RMSE (GeV/c)")
                 axes[1, 1].grid(True, alpha=0.3)
 
