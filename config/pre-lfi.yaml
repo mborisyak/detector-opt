@@ -1,0 +1,19 @@
+detector: straw
+
+regressor: deep-set-128
+discriminator: resnet-64
+
+initial_design: data/design/default/straw.json
+trace: data/design/pre-lfi/
+report: data/report/pre-lfi/
+
+optimizer:
+  adamax:
+    learning_rate: 1.0e-3
+    b1: 0.95
+    b2: 0.99
+
+batch: 8
+epochs: 256
+steps: 128
+validation_batches: 128

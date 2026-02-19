@@ -1,0 +1,8 @@
+model:
+  bayes-deep-set:
+    features: [[32, 32], [32, 32], [32, 32], [32, 32]]
+    p_dropout: null
+
+optimizer:
+  adabelief:
+    learning_rate: 1.0e-3

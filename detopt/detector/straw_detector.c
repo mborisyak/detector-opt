@@ -10,6 +10,7 @@
 
 #define SLOW_VZ 1.0e-3
 #define SLOW 1.0e-6
+#define SPEED_OF_LIGHT 30.0f
 
 inline npy_float square(npy_float x) {
   return x * x;
@@ -116,7 +117,8 @@ static PyObject * solve(PyObject *self, PyObject *args) {
   PyObject *py_dt= NULL;
   // field parameters
   PyObject *py_B = NULL;
-  PyObject *py_L = NULL;
+  PyObject *py_B_z0 = NULL;
+  PyObject *py_B_sigma = NULL;
 
   // particle parameters
   PyObject *py_initial_positions = NULL;
@@ -129,9 +131,6 @@ static PyObject * solve(PyObject *self, PyObject *args) {
   PyObject *py_heights = NULL;
   PyObject *py_angles = NULL;
 
-  PyObject *py_z0 = NULL;
-  PyObject *py_B_sigma = NULL;
-
   PyObject *py_steps = NULL;
 
   PyObject *py_trajectories = NULL;
@@ -142,13 +141,13 @@ static PyObject * solve(PyObject *self, PyObject *args) {
   PyObject *py_hit_pos = NULL;
 
   if (!PyArg_UnpackTuple(
-       args, "straw_solve", 20, 20,
+       args, "straw_solve", 19, 19,
        &py_initial_positions, &py_initial_momenta, &py_masses, &py_charges,
-       &py_B, &py_L,
-       &py_z0, &py_B_sigma,
+       &py_B, &py_B_z0, &py_B_sigma,
        &py_steps, &py_dt,
        &py_layers, &py_width, &py_heights, &py_angles,
-       &py_trajectories, &py_response, &py_edep, &py_r_mm, &py_t0, &py_hit_pos
+       &py_trajectories, &py_response,
+       &py_edep, &py_r_mm, &py_t0, &py_hit_pos
    )) {
        return NULL;
    }
@@ -185,7 +184,7 @@ static PyObject * solve(PyObject *self, PyObject *args) {
 
   if (!Py_IsNone(py_trajectories)) {
     if (!PyArray_Check(py_trajectories)) {
-      PyErr_SetString(PyExc_TypeError, "The trajectories buffer must be an float64 array.");
+      PyErr_SetString(PyExc_TypeError, "The trajectories buffer must be an float32 array.");
       return NULL;
     }
     trajectories_array = (PyArrayObject *) py_trajectories;
@@ -199,7 +198,7 @@ static PyObject * solve(PyObject *self, PyObject *args) {
       PyArray_DIM(trajectories_array, 2) == n_steps &&
       PyArray_DIM(trajectories_array, 3) == SPACE_DIM
     )) {
-      PyErr_SetString(PyExc_TypeError, "The trajectories buffer must be a (n, n_particles, n_t, 3) float64 array.");
+      PyErr_SetString(PyExc_TypeError, "The trajectories buffer must be a (n, n_particles, n_t, 3) float32 array.");
       return NULL;
     }
   } else {
@@ -208,31 +207,31 @@ static PyObject * solve(PyObject *self, PyObject *args) {
 
   const PyArrayObject * initial_positions_array = check_vector_array(py_initial_positions, n_batch, n_particles);
   if (initial_positions_array == NULL) {
-    PyErr_SetString(PyExc_TypeError, "initial_positions must be a (n, n_particles, 3) float64 array.");
+    PyErr_SetString(PyExc_TypeError, "initial_positions must be a (n, n_particles, 3) float32 array.");
     return NULL;
   }
 
   const PyArrayObject * initial_momenta_array = check_vector_array(py_initial_momenta, n_batch, n_particles);
   if (initial_momenta_array == NULL) {
-    PyErr_SetString(PyExc_TypeError, "Invalid value for initial momenta provided. Must be a (n, n_particles, 3) float64 array.");
+    PyErr_SetString(PyExc_TypeError, "Invalid value for initial momenta provided. Must be a (n, n_particles, 3) float32 array.");
     return NULL;
   }
 
   const PyArrayObject * masses_array = check_scalar_array(py_masses, n_batch, n_particles);
   if (masses_array == NULL) {
-    PyErr_SetString(PyExc_TypeError, "Invalid value for masses provided. Must be a (n, n_particles) float64 array.");
+    PyErr_SetString(PyExc_TypeError, "Invalid value for masses provided. Must be a (n, n_particles) float32 array.");
     return NULL;
   }
 
   const PyArrayObject * charges_array = check_scalar_array(py_charges, n_batch, n_particles);
   if (charges_array == NULL) {
-    PyErr_SetString(PyExc_TypeError, "Invalid value for charges provided. Must be a (n, n_particles) float64 array.");
+    PyErr_SetString(PyExc_TypeError, "Invalid value for charges provided. Must be a (n, n_particles) float32 array.");
     return NULL;
   }
 
   const PyArrayObject * layers_array = check_scalar_array(py_layers, n_batch, n_layers);
   if (layers_array == NULL) {
-    PyErr_SetString(PyExc_TypeError, "Invalid value for layers' z-positions provided. Must be a (n, n_layers, ) float64 array.");
+    PyErr_SetString(PyExc_TypeError, "Invalid value for layers' z-positions provided. Must be a (n, n_layers, ) float32 array.");
     return NULL;
   }
 
@@ -260,13 +259,8 @@ static PyObject * solve(PyObject *self, PyObject *args) {
     PyErr_SetString(PyExc_TypeError, "Invalid value for B provided. Must be a (n, ) float64 array.");
     return NULL;
   }
-  const PyArrayObject * L_array = check_design_array(py_L, n_batch);
-  if (L_array == NULL) {
-    PyErr_SetString(PyExc_TypeError, "Invalid value for L provided. Must be a (n, ) float64 array.");
-    return NULL;
-  }
-  const PyArrayObject * z0_array = check_design_array(py_z0, n_batch);
-  if (z0_array == NULL) {
+  const PyArrayObject * B_z0_array = check_design_array(py_B_z0, n_batch);
+  if (B_z0_array == NULL) {
     PyErr_SetString(PyExc_TypeError, "Invalid value for z0 provided. Must be a (n, ) float64 array.");
     return NULL;
   }
@@ -288,8 +282,7 @@ static PyObject * solve(PyObject *self, PyObject *args) {
   const npy_float * masses = PyArray_DATA(masses_array);
 
   const npy_float * Bs = PyArray_DATA(B_array);
-  const npy_float * Ls = PyArray_DATA(L_array);
-  const npy_float * z0s = PyArray_DATA(z0_array);
+  const npy_float * B_z0 = PyArray_DATA(B_z0_array);
   const npy_float * B_sigmas = PyArray_DATA(B_sigma_array);
 
   const npy_float * layers = PyArray_DATA(layers_array);
@@ -328,7 +321,8 @@ static PyObject * solve(PyObject *self, PyObject *args) {
 
 
   npy_intp Bs0 = PyArray_STRIDE(B_array, 0) / sizeof(npy_float);
-  npy_intp Ls0 = PyArray_STRIDE(L_array, 0) / sizeof(npy_float);
+  npy_intp B_z0s0 = PyArray_STRIDE(B_z0_array, 0) / sizeof(npy_float);
+  npy_intp B_sigma_s0 = PyArray_STRIDE(B_sigma_array, 0) / sizeof(npy_float);
 
   npy_intp ips0 = PyArray_STRIDE(initial_positions_array, 0) / sizeof(npy_float);
   npy_intp ips1 = PyArray_STRIDE(initial_positions_array, 1) / sizeof(npy_float);
@@ -361,17 +355,28 @@ static PyObject * solve(PyObject *self, PyObject *args) {
   npy_intp rs2 = PyArray_STRIDE(response_array, 2) / sizeof(npy_float);
   npy_intp rs3 = PyArray_STRIDE(response_array, 3) / sizeof(npy_float);
 
-  npy_intp trs0 = PyArray_STRIDE(trajectories_array, 0) / sizeof(npy_float);
-  npy_intp trs1 = PyArray_STRIDE(trajectories_array, 1) / sizeof(npy_float);
-  npy_intp trs2 = PyArray_STRIDE(trajectories_array, 2) / sizeof(npy_float);
-  npy_intp trs3 = PyArray_STRIDE(trajectories_array, 3) / sizeof(npy_float);
+  npy_intp trs0, trs1, trs2, trs3;
+
+  if (trajectories_array != NULL) {
+    trs0 = PyArray_STRIDE(trajectories_array, 0) / sizeof(npy_float);
+    trs1 = PyArray_STRIDE(trajectories_array, 1) / sizeof(npy_float);
+    trs2 = PyArray_STRIDE(trajectories_array, 2) / sizeof(npy_float);
+    trs3 = PyArray_STRIDE(trajectories_array, 3) / sizeof(npy_float);
+  } else {
+    trs0 = 0;
+    trs1 = 0;
+    trs2 = 0;
+    trs3 = 0;
+  }
 
 
   Py_BEGIN_ALLOW_THREADS
 
   for (int l = 0; l < n_batch; ++l) {
+    // magnetic field parameters
     const npy_float B = Bs[l * Bs0];
-    const npy_float L = Ls[l * Ls0];
+    const npy_float z0 = B_z0[l * B_z0s0];
+    const npy_float B_sigma = B_sigmas[l * B_sigma_s0];
 
     for (int i = 0; i < n_particles; ++i) {
       npy_float x = initial_positions[l * ips0 + i * ips1];
@@ -385,28 +390,37 @@ static PyObject * solve(PyObject *self, PyObject *args) {
       const npy_float charge = charges[l * chs0 + i * chs1];
       const npy_float mass = masses[l * ms0 + i * ms1];
 
+      if (mass <= 0.0) {
+        continue;
+      }
+
       npy_float p2 = px * px + py * py + pz * pz;
       const npy_float gamma = sqrtf(1.0f + p2 / (mass * mass));
-      npy_float vx = px / (gamma * mass);
+      npy_float vx = px / (gamma * mass); // v's are dimensionless, in units of c
       npy_float vy = py / (gamma * mass);
       npy_float vz = pz / (gamma * mass);
-      printf("gamma = %f mass = %f\n", gamma, mass);
-
+//      printf("gamma = %f mass = %f\n", gamma, mass);
+//      printf("v %f %f %f", vx, vy, vz);
+//      printf("charge %f", charge);
       if (f32_abs(vx) < SLOW && f32_abs(vy) < SLOW && f32_abs(vz) < SLOW) {
         // ghost particle
         continue;
       }
 
-      const npy_float c = 0.5 * dt * charge / mass / gamma;
-
+      const npy_float mass_MeV_kg = 1.78266192e-30f;
+      const npy_float charge_e_C = 1.602176634e-19f;
+      const npy_float c = 0.5 * (dt / 1e9) * (charge * charge_e_C) / (mass * mass_MeV_kg) / gamma;
+      // 1 / T = s * coulomb / kg / 1
+      // Convert mass from MeV/c^2 to kg, charge from e to Coulombs
+      // 1 MeV/c^2 = 1.78266192e-30 kg
+      // 1 e = 1.602176634e-19 C
+//      printf("\n\nc = %f\n", c);
       // Magnetic field parameters for this batch/event
-      const npy_float z0 = z0s[l];
-      const npy_float B_sigma = B_sigmas[l];
 
       for (int j = 0; j < n_steps; ++j) {
-        const npy_float Bx = B * exp(-square((z - z0) / B_sigma));
-        const npy_float tx = c * Bx;
-        const npy_float t_norm_sqr = tx * tx;
+        const npy_float Bx = B * exp(-square((z - z0) / B_sigma)); // T = T * exp(cm /cm)
+        const npy_float tx = c * Bx; // 1 = 1/T * T
+        const npy_float t_norm_sqr = tx * tx; // dim..less
 
         // rotated speed
         // const npy_float vx_m = vx + vy * tz - vz * ty;
@@ -421,10 +435,11 @@ static PyObject * solve(PyObject *self, PyObject *args) {
         vy = vy_m + vz_m * sx;
         vz = vz_m - vy_m * sx;
 
-        const npy_float dx = dt * vx;
-        const npy_float dy = dt * vy;
-        const npy_float dz = dt * vz;
-
+        const npy_float dx = dt * vx * SPEED_OF_LIGHT; //c*[ns] = 3 * 10^10 cm/s * 10^-9 s = 30 cm
+        const npy_float dy = dt * vy * SPEED_OF_LIGHT;
+        const npy_float dz = dt * vz * SPEED_OF_LIGHT;
+//        printf("\ndl = %f, %f, %f\n", dx, dy, dz);
+//        printf("\ndpos = %f, %f, %f\n", x, y, z);
         const npy_float x_ = x + dx;
         const npy_float y_ = y + dy;
         const npy_float z_ = z + dz;
@@ -485,7 +500,6 @@ static PyObject * solve(PyObject *self, PyObject *args) {
               }
             }
 
-
            // Store time of first hit (t0, in ns)
            if (t0) {
              npy_intp idx = l * rs0 + i * rs1 + k * rs2 + straw_i * rs3;
@@ -509,12 +523,12 @@ static PyObject * solve(PyObject *self, PyObject *args) {
             const npy_float me = 0.511;   // MeV/c^2
 
             // Compute beta, gamma from momentum and mass
-            npy_float p = sqrtf(px*px + py*py + pz*pz);
-            npy_float beta = p / sqrtf(p*p + mass*mass);
-            npy_float gamma_bethe = sqrtf(1.0f + (p*p) / (mass*mass));
+            npy_float p = sqrtf(px*px + py*py + pz*pz); // MeV
+            npy_float beta = p / sqrtf(p*p + mass*mass); // MeV / sqrt(Mev^2 + MeV^2) = 1
+            npy_float gamma_bethe = sqrtf(1.0f + (p*p) / (mass*mass)); // 1
             // Tmax for Bethe-Bloch
             npy_float Tmax = (2 * me * beta * beta * gamma_bethe * gamma_bethe) /
-              (1 + 2 * gamma_bethe * me / 0.938 + (me / 0.938) * (me / 0.938));
+              (1 + 2 * gamma_bethe * me / mass + (me / mass) * (me / mass));
             npy_float argument = (2 * me * beta * beta * gamma_bethe * gamma_bethe * Tmax) / (I_exc*I_exc);
             if (argument <= 0) argument = 1e-10;
             npy_float log_term = logf(argument);
@@ -522,7 +536,7 @@ static PyObject * solve(PyObject *self, PyObject *args) {
 
             // Path length in this step (cm)
             npy_float v = sqrtf(vx*vx + vy*vy + vz*vz);
-            npy_float path_cm = v * dt * 10.0f; // dt in ns, v in mm/ns, convert mm to cm
+            npy_float path_cm = v * dt * SPEED_OF_LIGHT; // c*[ns] = 3 * 10^10 cm/s * 10^-9 s = 30 cm
 
             npy_float Edep = dEdx * path_cm; // MeV deposited in this step
 

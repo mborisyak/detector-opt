@@ -8,92 +8,154 @@ import jax.numpy as jnp
 import jax.nn as jnn
 
 from flax import nnx
-
 from ..detector import Detector
-from .common import Model, Block, SiLU, LeakyTanh, bayes_aggregate
+from .common import Model, Block, SiLU, LeakyTanh, LeakyReLU, bayes_aggregate
 
 __all__ = [
-  'Discriminator',
-  'DeepSetLFI'
+  'DeepSetLFI',
+  'AlphaResLFI'
 ]
 
-class Discriminator(Model):
-  def __call__(self, X: jax.Array, design: jax.Array, ground_truth: jax.Array, *, deterministic: bool=True):
-    raise NotImplementedError()
+class DeepSetLFI(Model):
+  def condition_shape(self):
+    return (6,)
 
-class DeepSetLFI(Discriminator):
+  def output_shape(self):
+    return ()
+
   def __init__(
-    self, detector: Detector,
-    features: Sequence[Sequence[int]], p_dropout: float | None = None,
-    *, rngs: nnx.Rngs
+    self, detector: Detector, features: Sequence[Sequence[int]], p_dropout: float | None = None, *,
+    rngs: nnx.Rngs
   ):
     super().__init__(detector, rngs=rngs)
-    target_dim = 1
-    ground_truth_dim = math.prod(self.ground_truth_shape)
 
-    ### position + angle + B
-    n_design = 3 + ground_truth_dim
+    output_dim = math.prod(self.output_shape())
+    ### B, station z, view offset, view angle, layer offset, straw_offset, 6 labels
+    n_design = 6 + 6
 
-    n_layers, n_straws = self.input_shape
+    n_stations, n_views, n_layers, n_straws, n_f = self.input_shape()
+    self.blocks: list[Block] = []
 
-    dropout = lambda: () if p_dropout is None else (nnx.Dropout(rate=p_dropout, rngs=rngs), )
+    n_features = n_design + n_f
 
-    self.blocks: list[Block] =  []
+    dropout = lambda: () if p_dropout is None else (nnx.Dropout(rate=p_dropout, rngs=rngs),)
 
-    n_features = n_design + n_straws
     for block_def in features:
       units = (n_features, *block_def)
       self.blocks.append(
         Block(
           *(
-            Block(*dropout(), nnx.Linear(n_in, n_out, rngs=rngs), LeakyTanh(n_out, ))
+            Block(*dropout(), nnx.Linear(n_in, n_out, rngs=rngs), LeakyReLU())
             for n_in, n_out in zip(units[:-2], units[1:-1])
           ),
-          [
-            Block(*dropout(), nnx.Linear(units[-2], units[-1], rngs=rngs)),
-            Block(*dropout(), nnx.Linear(units[-2], units[-1], rngs=rngs))
-          ]
+          [nnx.Linear(units[-2], units[-1], rngs=rngs), nnx.Linear(units[-2], units[-1], rngs=rngs)]
         )
       )
-      n_features = 3 * units[-1]
+      n_features = 2 * units[-1]
 
     *_, last = features
     *_, n_latent = last
 
-    self.output = nnx.Linear(2 * n_latent, target_dim, rngs=rngs)
+    self.output = nnx.Linear(2 * n_latent, output_dim, rngs=rngs)
 
-  def combine(self, X, design, ground_truth):
-    n_b, n_l, n_s = X.shape
+  def combine(self, X, design, y):
+    n_b, n_s, n_v, n_l, n_straw, n_f = X.shape
     _, n_d = design.shape
-    n_gt = math.prod(ground_truth.shape[1:])
 
-    X = jnp.reshape(X, shape=(n_b, n_l, n_s))
-    ground_truth = jnp.reshape(ground_truth, shape=(n_b, n_gt))
-    ground_truth = jnp.broadcast_to(ground_truth[:, None, :], shape=(n_b, n_l, n_gt))
+    view_offset = jnp.linspace(-1, 1, num=n_v)
+    layer_offset = jnp.linspace(-1, 1, num=n_l)
+    straw_offset = jnp.linspace(-1, 1, num=n_straw)
 
-    positions, angles, magnetic_strength = design[:, :n_l], design[:, n_l:2 * n_l], design[:, -1]
-    positions = jnp.broadcast_to(positions[:, :, None], shape=(n_b, n_l, 1))
-    angles = jnp.broadcast_to(angles[:, :, None], shape=(n_b, n_l, 1))
-    magnetic_strength = jnp.broadcast_to(magnetic_strength[:, None, None], shape=(n_b, n_l, 1))
+    stations, angles, magnetic_strength = design[:, :n_s], design[:, n_s:-1], design[:, -1]
 
-    return jnp.concatenate([X, positions, angles, magnetic_strength, ground_truth], axis=-1)
+    shape = (n_b, n_s, n_v, n_l, n_straw, 1)
 
-  def __call__(self, X: jax.Array, design: jax.Array, ground_truth: jax.Array, *, deterministic: bool = True):
-    result = self.combine(X, design, ground_truth)
+    station_offset = jnp.broadcast_to(stations[:, :, None, None, None, None], shape=shape)
+    angles_br = jnp.reshape(angles, shape=(n_b, n_v, n_s))
+    angles_br = jnp.broadcast_to(angles_br[:, :, :, None, None, None], shape=shape)
+    view_offsets = jnp.broadcast_to(view_offset[None, None, :, None, None, None], shape=shape)
+    layer_offset = jnp.broadcast_to(layer_offset[None, None, None, :, None, None], shape=shape)
+    straw_offset = jnp.broadcast_to(straw_offset[None, None, None, None, :, None], shape=shape)
+    B = jnp.broadcast_to(magnetic_strength[:, None, None, None, None, None], shape=shape)
+    y_br = jnp.broadcast_to(y[:, None, None, None, None, :], shape=(n_b, n_s, n_v, n_l, n_straw, 6))
+
+    return jnp.concatenate([X, station_offset, angles_br, view_offsets, layer_offset, straw_offset, B, y_br], axis=-1)
+
+  def __call__(self, X: jax.Array, design: jax.Array, y: jax.Array, *, deterministic: bool = True):
+    result = self.combine(X, design, y)
 
     *rest, last = self.blocks
 
     for block in rest:
-      mus, sigmas = block(result)
-      mu, sigma = bayes_aggregate(mus, sigmas, keepdims=True, axis=(1, ))
-      mu = jnp.broadcast_to(mu, shape=mus.shape)
-      sigma = jnp.broadcast_to(sigma, shape=sigmas.shape)
-      result = jnp.concatenate([mus, mu, sigma], axis=-1)
+      mus, log_sigmas = block(result, deterministic=deterministic)
+      mu, sigma = bayes_aggregate(mus, log_sigmas, axis=-2, keepdims=False)
+      result = jnp.concatenate([mu, sigma], axis=-1)
 
-    mus, sigmas = last(result)
-    mu, sigma = bayes_aggregate(mus, sigmas, keepdims=False, axis=(1,))
+    mus, log_sigmas = last(result)
+    mu, sigma = bayes_aggregate(mus, log_sigmas, axis=-2, keepdims=False)
     result = jnp.concatenate([mu, sigma], axis=-1)
 
     result = self.output(result)
 
-    return jnp.reshape(result, shape=(result.shape[0], ))
+    return jnp.reshape(result, shape=(result.shape[0], *self.output_shape()))
+
+class AlphaResLFI(Model):
+  def __init__(
+    self, detector: Detector,
+    n_hidden: int, depth: int, p_dropout: float | None=0.2,
+    *, rngs: nnx.Rngs
+  ):
+    super().__init__(detector, rngs=rngs)
+    input_dim, design_dim = math.prod(detector.output_shape()), math.prod(detector.design_shape())
+    target_dim = math.prod(detector.target_shape())
+
+    n_in = input_dim + design_dim + target_dim
+    self.embedding = nnx.Linear(n_in, n_hidden, rngs=rngs)
+
+    self.hidden: list[list[nnx.Module]] = list()
+    self.alphas: list[nnx.Param[jax.Array]] = list()
+
+    for i in range(depth):
+      block: list[nnx.Module] = list()
+
+      block.append(LeakyReLU())
+      if p_dropout is not None:
+        block.append(
+          nnx.Dropout(p_dropout, rngs=rngs)
+        )
+      block.append(
+        nnx.Linear(n_hidden, n_hidden, rngs=rngs)
+      )
+      self.alphas.append(
+        nnx.Param(jnp.zeros(shape=(n_hidden, )), )
+      )
+
+    self.output: list[nnx.Module] = [
+      LeakyReLU(),
+      nnx.Linear(n_hidden, 1, rngs=rngs),
+    ]
+
+  def __call__(self, X: jax.Array, design: jax.Array, target: jax.Array, *, deterministic: bool=True):
+    n, *_ = X.shape
+
+    X = jnp.reshape(X, shape=(n, -1))
+    design = jnp.reshape(design, shape=(n, -1))
+    target = jnp.reshape(target, shape=(n , -1))
+
+    result = jnp.concatenate([X, design, target], axis=-1)
+    result = self.embedding(result)
+
+    for block, alpha in zip(self.hidden, self.alphas):
+      hidden = result
+      for layer in block:
+        if hasattr(layer, 'deterministic'):
+          hidden = layer(hidden, deterministic=deterministic)
+        else:
+          hidden = layer(hidden)
+
+      result = result + alpha.value * hidden
+
+    for layer in self.output:
+      result = layer(result)
+
+    return jnp.reshape(result, shape=(n, ))

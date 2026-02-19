@@ -1,0 +1,8 @@
+executable              = gen.sh
+arguments               = /afs/cern.ch/work/m/maborisy/public/randomized/ $(e) $(seed) 64 $(start) $(stop)
+output                  = /afs/cern.ch/work/m/maborisy/public/randomized/gen.$(e).$(seed).out
+error                   = /afs/cern.ch/work/m/maborisy/public/randomized/gen.$(e).$(seed).err
+log                     = /afs/cern.ch/work/m/maborisy/public/randomized/gen.$(ClusterId).log
++JobFlavour = "workday"
+getEnv = True
+queue e, start, stop, seed from generate-parameters.txt

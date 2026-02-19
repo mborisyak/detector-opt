@@ -1,0 +1,8 @@
+detector: straw
+
+regressor: deep-set-128
+
+batch: 8
+validation_batches: 1024
+
+bins: 20

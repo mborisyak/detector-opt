@@ -1,0 +1,21 @@
+detector: straw
+
+regressor: deep-set-128
+discriminator: resnet-64
+
+initial_design: data/design/default/straw.json
+trace: data/design/presubgradient-realistic/
+report: data/design/presubgradient-realistic/
+
+design_eps: 1.0
+optimizer:
+  adam:
+    learning_rate: 1.0e-3
+    b1: 0.95
+    b2: 0.99
+
+training:
+  batch: 8
+  epochs: 256
+  steps: 16384
+  validation_batches: 4096

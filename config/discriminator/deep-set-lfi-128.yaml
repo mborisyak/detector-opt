@@ -1,7 +1,7 @@
 model:
   deep-set-lfi:
-    features: [[128, 96], [64, 48]]
-    p_dropout: null
+    features: [[128, 64], [128, 64], [128, 64], [128, 64]]
+    p_dropout: 0.2
 
 optimizer:
   adam:

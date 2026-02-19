@@ -45,6 +45,12 @@ class Detector(object):
   def metric(self, target, predicted):
     return self.loss(target, predicted)
 
+  def metric_shape(self):
+    raise NotImplementedError()
+
+  def metric_names(self):
+    raise NotImplementedError()
+
   def encode_design(self, design):
     raise NotImplementedError()
 

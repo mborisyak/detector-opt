@@ -1,0 +1,11 @@
+detector: straw
+
+regressor: deep-set-128
+
+initial_design: data/design/default/straw.json
+
+batch: 32
+epochs: 128
+steps: 4096
+
+validation_batches: 1024

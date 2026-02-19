@@ -9,7 +9,7 @@ from . import straw_detector
 from .utils import load_events, pid_to_charge, pid_to_mass_MeV
 
 __all__ = [
-  'StrawDetector'
+  'SparseStrawDetector'
 ]
 
 SPEED_OF_LIGHT = 30 # cm / ns
@@ -26,12 +26,19 @@ NAME2PID = {
     "nu_mu": 14, "nu_mu_bar": -14,
 }
 
-class StrawDetector(Detector):
+ACTIVE_STATION = 0
+ACTIVE_VIEW = 1
+ACTIVE_LAYER = 2
+ACTIVE_TDC = 3
+ACTIVE_RESPONSE = 4
+
+class SparseStrawDetector(Detector):
   def __init__(
     self,
     event_path: str,
     # Geometry hierarchy
     # Real detector geometry
+    max_size: int=None,
     n_stations: int=4,
     n_views_per_station: int = 4,
     n_layers_per_view: int = 4,
@@ -50,6 +57,7 @@ class StrawDetector(Detector):
     straw_noise_rate: float=1.0e+5,
     straw_time_normalization: float=300.0,
     view_angle_bounds=(-0.2, 0.2),
+    charge_threshold: float=0.1,
     min_event_size: int | None=2,
     max_event_size: int | None=None,
     hnl_position_offset: Sequence[float | int] = (0.0, 0.0, 2000.0),
@@ -113,13 +121,19 @@ class StrawDetector(Detector):
     self.view_offsets = (np.arange(self.n_views_per_station)) * (self.view_z_gap + self.layer_z_gap)
     self.layer_offsets = (np.arange(self.n_layers_per_view)) * self.layer_z_gap
 
+    if max_size is None:
+      self.max_size = 4 * self.n_stations * self.n_views_per_station * self.n_layers_per_view
+    else:
+      self.max_size = max_size
+
   def design_shape(self):
     ### positions + angles + magnetic field strength
     shape = (self.n_stations + self.n_stations * self.n_views_per_station + 1, )
     return shape
 
   def output_shape(self):
-    shape = (self.n_stations, self.n_views_per_station, self.n_layers_per_view, self.n_straws, 2)
+    ### station, view, layer, tdc, signal
+    shape = (self.max_size, 5)
     return shape
 
   def target_shape(self):
@@ -243,29 +257,24 @@ class StrawDetector(Detector):
 
       offset += size
 
-    import matplotlib.pyplot as plt
-    plt.figure(figsize=(9, 6))
-    _ = plt.hist(edep.ravel(), histtype='step', bins=100, log=True)
-    plt.savefig('edep.png')
-    plt.close()
-
     ### no hits -> noisy signal
 
-    from .straw_signal import simplified_straw_response, simpified_TDC
-    straw_response = simplified_straw_response(rng, edep, dark_current=self.straw_noise_rate)
-    ### very simplified TDC
-    ### angles are small, wire time ~= width - hit_x
-    tdc = simpified_TDC(rng, t0_arr, r_mm, hit_pos[..., 0], self.layer_width)
-
-    ts = np.zeros(shape=(n, self.n_layers, self.n_straws), dtype=np.float32)
-    rs = np.zeros(shape=(n, self.n_layers, self.n_straws), dtype=np.float32)
+    activations = np.ndarray(shape=(n, self.max_size, 5))
 
     offset = 0
     for i, size in enumerate(sizes):
-      true_hits = t0_arr[offset:offset + size] > self.dt
-      tdc_last_hit = np.max(tdc[offset:offset + size], initial=0.0, where=true_hits)
-      tdc_first_hit = np.min(tdc[offset:offset + size], initial=tdc_last_hit, where=true_hits)
-      noise_ts = rng.uniform(low=tdc_first_hit - self.dt, high=tdc_last_hit + self.dt, size=true_hits.shape)
+      from .straw_signal import simplified_straw_response, simpified_TDC
+      ### very simplified TDC
+      ### angles are small, wire time ~= width - hit_x
+      tdc = simpified_TDC(rng, t0_arr, r_mm, hit_pos[..., 0], self.layer_width)
+
+      true_hits = np.where(t0_arr[offset:offset + size] > self.dt)
+
+      edep_true_hits = edep[offset:offset + size][true_hits]
+      straw_response = simplified_straw_response(rng, edep_true_hits, dark_current=self.straw_noise_rate)
+
+      tdc_true_hits = tdc[offset:offset + size][true_hits]
+      noise_ts = rng.uniform(low=tdc_first_hit - self.dt, high=tdc_last_hit + self.dt, size=self.max_size)
 
       tdc_ = np.where(true_hits, tdc[offset:offset + size] - tdc_first_hit, noise_ts)
 
