@@ -16,6 +16,7 @@ import glob
 from pathlib import Path
 from typing import Optional, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 from tqdm import tqdm
 
@@ -27,7 +28,7 @@ class HNLDataLoader:
     Fast sampling with no file I/O during training.
     """
 
-    def __init__(self, data_dir: str = "combined_tof", max_particles: int = 50):
+    def __init__(self, data_dir: str = "numpy_out", max_particles: int = 50):
         """
         Initialize data loader - loads ALL data into memory.
 
@@ -39,7 +40,7 @@ class HNLDataLoader:
         self.max_particles = max_particles
 
         # Try both naming conventions
-        files = sorted(glob.glob(str(self.data_dir / "combined_data_*.npz")))
+        files = sorted(glob.glob(str(self.data_dir / "numpy_*.npz")))
         if len(files) == 0:
             files = sorted(glob.glob(str(self.data_dir / "geom_*_combined_data.npz")))
 
@@ -56,6 +57,8 @@ class HNLDataLoader:
         all_times = []
         all_n_particles = []
         all_targets = []
+        all_pdgs = []
+
         cnt = 0
         cnt2 = 0
         # Load ALL files
@@ -94,6 +97,8 @@ class HNLDataLoader:
                     times[:n_parts] = data["prestraw_tof"][mask][:n_parts]
 
                 pdg_codes = data["prestraw_pdg"][mask][:n_parts]
+                pdgs = np.zeros(max_particles, dtype=np.int32)
+                pdgs[:n_parts] = pdg_codes.astype(np.int32)
 
                 # Map PDG codes to masses and charges
                 for i, pdg in enumerate(pdg_codes):
@@ -120,6 +125,8 @@ class HNLDataLoader:
                 all_times.append(times)
                 all_n_particles.append(n_parts)
                 all_targets.append(target)
+                all_pdgs.append(pdgs)
+
                 cnt += -n_parts + max_particles
                 cnt2 += 1
                 print(-n_parts + max_particles)
@@ -132,6 +139,7 @@ class HNLDataLoader:
         self.times = np.array(all_times, dtype=np.float32)
         self.n_particles = np.array(all_n_particles, dtype=np.int32)
         self.targets = np.array(all_targets, dtype=np.float32)
+        self.pdgs = np.array(all_pdgs, dtype=np.int32)
 
         self.n_events = len(self.n_particles)
         print(cnt / cnt2)
@@ -293,7 +301,7 @@ if __name__ == "__main__":
     print("=" * 70)
 
     try:
-        loader = HNLDataLoader()
+        loader = HNLDataLoader()  # "combined_tof"
 
         print("\nDataset Statistics:")
         stats = loader.get_statistics()
@@ -322,6 +330,33 @@ if __name__ == "__main__":
         print("\n" + "=" * 70)
         print("✅ Memory-optimized data loader working!")
         print("=" * 70)
+
+        P = loader.max_particles
+        mask = np.arange(P)[None, :] < loader.n_particles[:, None]
+        codes = loader.pdgs[mask]  # all real PDG entries across all events
+        u, c = np.unique(codes, return_counts=True)
+        mean_per_event = c / loader.n_events  # <-- "mean entries in events"
+        # sort by most frequent
+        order = np.argsort(mean_per_event)[::-1]
+        u = u[order]
+        mean_per_event = mean_per_event[order]
+        # print top few
+        print("\nTop PDG codes by mean entries/event:")
+        for pdg, m in zip(u[:20], mean_per_event[:20]):
+            print(f"  PDG {int(pdg):6d}: {m:.4f} per event")
+
+        # plot top N as a bar-histogram
+        topN = 30
+        N = min(topN, len(u))
+
+        plt.figure(figsize=(12, 6))
+        plt.bar(np.arange(N), mean_per_event[:N])
+        plt.xticks(np.arange(N), [str(int(x)) for x in u[:N]], rotation=45, ha="right")
+        plt.ylabel("Mean entries per event")
+        plt.title("PDG code frequency (mean per event)")
+        plt.tight_layout()
+        plt.savefig("output/pdg_mean_per_event.png", dpi=150)
+        plt.close()
 
     except Exception as e:
         print(f"\n❌ Error: {e}")

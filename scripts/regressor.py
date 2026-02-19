@@ -1,5 +1,9 @@
+import math
+import os
+
 import jax
 import jax.numpy as jnp
+import matplotlib.pyplot as plt
 import numpy as np
 from flax import nnx
 
@@ -7,12 +11,85 @@ import detopt
 from detopt.detector.straw import SparseHits
 
 
+def save_deepset_input_label_hists(
+    detector, model, design, seed: int, batch: int, n_batches: int, out_path: str
+):
+    rng = np.random.default_rng(seed)
+
+    X_list = []
+    y_list = []
+    hits_per_event_list = []
+
+    for k in range(n_batches):
+        _, info, y = detector(seed=(seed, k), configurations=design)
+
+        # Normalized per-hit features come from here:
+        hit_features, events = model.combine(
+            info, design
+        )  # hit_features: (n_hits, 8), events: (n_hits,)
+
+        X_list.append(np.asarray(hit_features))  # move from JAX to numpy
+        y_list.append(np.asarray(y))
+        hits_per_event_list.append(np.bincount(np.asarray(events), minlength=batch))
+
+    X = np.concatenate(X_list, axis=0)  # (total_hits, 8)
+    y = np.concatenate(y_list, axis=0)  # (n_batches*batch, ...) targets
+
+    target_mean = np.asarray(detector.target_mean)
+    target_std = np.asarray(detector.target_std)
+    y = (y - target_mean) / target_std
+    hits_per_event = np.concatenate(hits_per_event_list)  # (n_batches*batch,)
+
+    # (optional) cap number of hits to keep plots fast & memory sane
+    max_hits = 200_000
+    if X.shape[0] > max_hits:
+        X = X[:max_hits]
+
+    feature_names = [
+        "station_norm",
+        "view_norm",
+        "layer_norm",
+        "straw_norm",
+        "tdc_norm",
+        "pos_norm",
+        "angle_norm",
+        "B_norm",
+    ]
+
+    plots = [(f"x/{feature_names[i]}", X[:, i]) for i in range(X.shape[1])]
+    plots.append(("x/hits_per_event", hits_per_event))
+
+    if y.ndim == 2:
+        for i in range(y.shape[1]):
+            plots.append((f"y/{i}", y[:, i]))
+    else:
+        plots.append(("y", y))
+
+    ncols = 3
+    nrows = int(math.ceil(len(plots) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3 * nrows))
+    axes = np.asarray(axes).reshape(-1)
+
+    for ax, (name, data) in zip(axes, plots):
+        ax.hist(np.asarray(data).reshape(-1), bins=60)
+        ax.set_title(name)
+        ax.grid(True, alpha=0.2)
+
+    for ax in axes[len(plots) :]:
+        ax.axis("off")
+
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
 def regress(
     seed, output, progress=False, restore=True, trace=None, report=None, **config
 ):
     print(config)
     print(f"Report parameter: {report}")
-
+    input()
     rngs = nnx.Rngs(seed)
     np_rng = np.random.default_rng(seed=(seed, 0))
 
@@ -65,24 +142,36 @@ def regress(
     val_targets = []
 
     status = detopt.utils.progress.status_bar(disable=not progress)
+
+    save_deepset_input_label_hists(
+        detector,
+        regressor,
+        enc,
+        seed=seed,
+        batch=batch,
+        n_batches=3,
+        out_path="output/hists.png",
+    )
+
     # input("Waiting start")
     for i in status.epochs(epochs):
         for j in status.training(steps):
             _, measurements, target = detector(
-                seed=(seed, 1, 1, 0), configurations=design
+                seed=(seed, i, j, 0), configurations=design
             )
-            print(measurements[0])
+            # print(measurements[0])
+            print(design)
             # input("Waiting for step")
             training_losses[i, j] = step(
                 regressor, optimizer, measurements, design, target
             )
 
         for j in status.validation(validation_batches):
-            design = np_rng.normal(size=(batch, *detector.design_shape())).astype(
-                np.float32
-            )
+            # design = np_rng.normal(size=(batch, *detector.design_shape())).astype(
+            #     np.float32
+            # )
             _, measurements, target = detector(
-                seed=(seed, 1, 1, 1), configurations=design
+                seed=(seed, i, j, 1), configurations=design
             )
 
             # Get predictions for precision analysis (normalized outputs)

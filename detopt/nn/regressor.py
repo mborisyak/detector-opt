@@ -1,11 +1,13 @@
 import inspect
 import math
+from multiprocessing import Event
 from typing import Sequence
 
 import jax
 import jax.nn as jnn
 import jax.numpy as jnp
 from flax import nnx
+from numpy._core.umath import spacing
 
 from ..detector import Detector
 from .common import Block, LeakyReLU, LeakyTanh, Model, SiLU, bayes_aggregate
@@ -375,8 +377,7 @@ class DeepSet(Regressor):
         *,
         rngs: nnx.Rngs,
     ):
-        # FIXED: Don't call super().__init__ because detector.output_shape() needs batch_size
-        # Instead, manually set the shapes we need for sparse data
+
         self.input_shape = None  # Sparse data has variable length, no fixed input shape
         self.design_shape = detector.design_shape()
         self.target_shape = detector.target_shape()
@@ -390,14 +391,14 @@ class DeepSet(Regressor):
 
         # Input feature normalization statistics (estimated from data)
         # Feature order: [station, view, layer, straw, tdc_value, position, angle, B]
-        self.tdc_mean = 200.0  # ns (typical TDC time)
-        self.tdc_std = 100.0  # ns (typical spread)
-        self.position_mean = 9000.0  # cm (middle of detector)
+        self.tdc_mean = 440.0  # ns (typical TDC time)
+        self.tdc_std = 80.0  # ns (typical spread)
+        self.position_mean = 8950.0  # cm (middle of detector)
         self.position_std = 500.0  # cm (layer spread)
         self.angle_mean = 0.0  # radians
-        self.angle_std = 0.1  # radians (max stereo angle)
-        self.B_mean = 0.15  # T (typical field)
-        self.B_std = 0.1  # T (field range)
+        self.angle_std = 0.5  # radians (max stereo angle)
+        self.B_mean = 5  # T (typical field)
+        self.B_std = 10  # T (field range)
 
         # ADDED: Store detector geometry - use detector's parameters instead of hardcoding
         self.n_max_hits = n_max_hits
@@ -440,16 +441,15 @@ class DeepSet(Regressor):
 
         self.output = nnx.Linear(n_latent, target_dim, rngs=rngs)
 
-    # ADDED: proper indentation and class method
-    def combine(self, sparse_dict, design):
-        # Convert sparse hit dictionary to dense padded arrays with features
-        # Fully vectorized using JAX segment operations (no Python loops)
-        events = jnp.array(sparse_dict["events"])  # (n_hits,) event index per hit
-        layers = jnp.array(sparse_dict["layers"])  # (n_hits,) global layer index (0-31)
-        straws = jnp.array(sparse_dict["straws"])  # (n_hits,) straw index (0-199)
-        values = jnp.array(sparse_dict["values"])  # (n_hits,) TDC values
-
-        n_batch = design.shape[0]
+    def combine(self, info, design):
+        # input("wait for info")
+        # print(info)
+        # input("wait for ")
+        events, layers, straws, times = info
+        events = jnp.asarray(events, dtype=jnp.int32)
+        layers = jnp.asarray(layers, dtype=jnp.int32)
+        straws = jnp.asarray(straws, dtype=jnp.int32)
+        values = jnp.asarray(times, dtype=jnp.float32)
         n_layers_total = (
             self.n_stations * self.n_views_per_station * self.n_layers_per_view
         )  # Total number of layers (typically 32)
@@ -467,10 +467,12 @@ class DeepSet(Regressor):
         straw_norm = straws.astype(jnp.float32) / self.n_straws
 
         # Extract design parameters: [positions (n_layers), angles (n_layers), B (1)]
+        # print(design)
         positions = design[:, :n_layers_total]  # (batch, n_layers)
         angles = design[:, n_layers_total : 2 * n_layers_total]  # (batch, n_layers)
         magnetic_strength = design[:, -1]  # (batch,)
-
+        # print(magnetic_strength)
+        # input("magn")
         # Get design parameters for each hit using its layer index (vectorized indexing)
         batch_indices = events  # Which batch each hit belongs to
         layer_positions = positions[batch_indices, layers]  # (n_hits,)
@@ -479,10 +481,18 @@ class DeepSet(Regressor):
 
         # Normalize remaining features
         values_norm = (values - self.tdc_mean) / self.tdc_std
-        positions_norm = (layer_positions - self.position_mean) / self.position_std
+        # print(layer_positions)
+        # input("pos")
+        # positions_norm = (layer_positions - self.position_mean) / self.position_std
+        positions_norm = layer_positions
         angles_norm = (layer_angles - self.angle_mean) / self.angle_std
+        # print(layer_angles)
+        # input("angles")
         B_norm = (magnetic_strength_hits - self.B_mean) / self.B_std
-
+        # B_norm = magnetic_strength_hits
+        #
+        # print(B_norm)
+        # input("magn")
         # Stack all features per hit: (n_hits, 8) - all normalized to ~[-3, 3] range
         hit_features = jnp.stack(
             [
@@ -501,9 +511,8 @@ class DeepSet(Regressor):
         # Return hit features and event indices directly for segment operations
         return hit_features, events
 
-    # FIXED: Correct signature (removed extra mask parameter)
     def __call__(self, X: jax.Array, design: jax.Array, *, deterministic: bool = True):
-        if isinstance(X, dict):
+        if True:
             # Sparse format: use segment operations (no padding needed)
             hit_features, event_indices = self.combine(X, design)
             n_batch = design.shape[0]

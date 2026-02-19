@@ -26,13 +26,9 @@ straw:
   p_spawn_pair: 0.00
   E_sec_MeV: 0.01
   # Data loading
-  data_dir: "combined_tof"
+  data_dir: "numpy_out" # "combined_tof"
+
 
   # Loss function parameters for HNL reconstruction
   # NOTE: Normalization now uses target_mean and target_std computed from data
   # The scales below are kept for backward compatibility but not used in loss
-  loss:
-    position_scale: 1384.0 # cm - DEPRECATED: not used (proper normalization in loss)
-    momentum_scale: 21.2 # GeV/c - DEPRECATED: not used (proper normalization in loss)
-    position_weight: 1.0 # DEPRECATED: not used
-    momentum_weight: 1.0 # DEPRECATED: not used
