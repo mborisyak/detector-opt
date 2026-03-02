@@ -21,7 +21,7 @@ def save_deepset_input_label_hists(
     hits_per_event_list = []
 
     for k in range(n_batches):
-        _, info, y = detector(seed=(seed, k), configurations=design)
+        _, info, y, _, _ = detector(seed=(seed, k), configurations=design)
 
         # Normalized per-hit features come from here:
         hit_features, events = model.combine(
@@ -156,7 +156,7 @@ def regress(
     # input("Waiting start")
     for i in status.epochs(epochs):
         for j in status.training(steps):
-            _, measurements, target = detector(
+            _, measurements, target, _, _ = detector(
                 seed=(seed, i, j, 0), configurations=design
             )
             # print(measurements[0])
@@ -170,7 +170,7 @@ def regress(
             # design = np_rng.normal(size=(batch, *detector.design_shape())).astype(
             #     np.float32
             # )
-            _, measurements, target = detector(
+            _, measurements, target, _, _ = detector(
                 seed=(seed, i, j, 1), configurations=design
             )
 

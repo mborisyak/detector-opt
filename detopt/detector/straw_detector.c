@@ -153,7 +153,8 @@ static void track_particle(
     npy_intp trs0, npy_intp trs1, npy_intp trs2, npy_intp trs3,
     // Secondary production parameters
     float p_spawn_single, float p_spawn_pair, float E_sec_MeV,
-    int *next_secondary_idx  // Pointer to next available secondary index
+    int *next_secondary_idx,  // Pointer to next available secondary index
+    int max_particles
 );
 
 // Forward declaration for recursion
@@ -177,7 +178,7 @@ static void track_particle(
     npy_float *trajectories,
     npy_intp trs0, npy_intp trs1, npy_intp trs2, npy_intp trs3,
     float p_spawn_single, float p_spawn_pair, float E_sec_MeV,
-    int *next_secondary_idx
+    int *next_secondary_idx, int max_particles
 ) {
   // Initialize RNG state per particle
   uint32_t rng_state = RNG_SEED_BASE + (uint32_t)(event_idx * 10000 + particle_idx + depth * 1000);
@@ -244,20 +245,29 @@ static void track_particle(
       const npy_float layer = layers[event_idx * ls0 + k * ls1];
       const npy_float height = heights[event_idx * hs0 + k * hs1];
       const npy_float width = widths[event_idx * ws0 + k * ws1];
-      const npy_float r = height / n_straws;
-      const npy_float left = layer - r;
-      const npy_float right = layer + r;
+      const npy_float r = height / n_straws;  // Straw radius (height is half-height)
+      // Use larger acceptance window to prevent particles from stepping over layers
+      // Particles moving at ~c with dt=0.1ns move ~3cm per step, so need margin > straw diameter
+      const npy_float layer_half_thickness = 1.0f * r;  // 3x radius for safe margin
+      const npy_float left = layer - layer_half_thickness;
+      const npy_float right = layer + layer_half_thickness;
 
-
-      // if (j < 3 && particle_idx == 0 && k == 0) {
-      //   printf("    Layer %d: z=%.2f, left=%.2f, right=%.2f, particle z=%.2f->%.2f\n",
-      //          k, layer, left, right, z, z_);
+      // Debug output (disabled by default)
+      // if (event_idx == 0  && k == 8) {
+      //   printf("E%d P%d L%d Step%d: layer_z=%.2f, r=%.2f, bounds=[%.2f,%.2f], z=%.2f->%.2f\n",
+      //          event_idx, particle_idx, k, j, layer, r, left, right, z, z_);
       // }
 
       // check for potential hit
       if ((z < left && z_ < left) || (z > right && z_ > right)) {
+        // if (event_idx == 0 && particle_idx < 2 && k < 5 && j < 10) {
+        //   printf("  -> SKIP: both before or both after layer\n");
+        // }
         continue;
       }
+      // if (event_idx == 0 && particle_idx < 2 && k == 8) {
+      //   printf("  -> CROSSING layer %d at step %d!\n", k, j);
+      // }
 
       const npy_float angle = angles[event_idx * as0 + k * as1];
 
@@ -276,32 +286,77 @@ static void track_particle(
       if (!point_in_parallelogram(rx, ry, corners)) {
         continue;
       }
+      // if (event_idx == 0 && particle_idx < 2 && k == 8) {
+      //     printf("  -> PASSED POINTS\n");
+      // }
+      const npy_int straw_i_center = (npy_int)floor(0.5 * (ry + height) / r);
 
-      const npy_int straw_i = (npy_int)floor(0.5 * (ry + height) / r);
-      const npy_float straw_y = (2 * straw_i + 1) * r - height;
+      // Particle segment: from (x,y,z) to (x_,y_,z_)
+      const npy_float rx_ = nx * x_ + ny * y_;
+      const npy_float ry_ = -ny * x_ + nx * y_;
 
-      const npy_float sqr_distance_to_wire =
-          square(z - layer) + square(ry - straw_y);
+      // Particle direction vector AB
+      const npy_float drx = rx_ - rx;
+      const npy_float dry = ry_ - ry;
+      const npy_float dz = z_ - z;
 
-      if (sqr_distance_to_wire > r * r) {
+      npy_int best_straw_i = -1;
+      npy_float best_dist_sq = r * r + 1.0f;
+
+      for (int straw_offset = -2; straw_offset <= 2; straw_offset++) {
+        const npy_int straw_i = straw_i_center + straw_offset;
+        if (!(straw_i >= 0 && straw_i < n_straws)) {
+          continue;
+        }
+
+        const npy_float straw_y = (2 * straw_i + 1) * r - height;
+
+        // Wire direction: along x-axis, CD = (1, 0, 0)
+        // Vector from particle start to wire point: AC = (0, straw_y, layer) - (rx, ry, z)
+        const npy_float acx = -rx;
+        const npy_float acy = straw_y - ry;
+        const npy_float acz = layer - z;
+
+        // Cross product AB x CD where CD = (1, 0, 0)
+        const npy_float cross_x = 0.0f;
+        const npy_float cross_y = dz;
+        const npy_float cross_z = -dry;
+        const npy_float cross_norm = sqrtf(cross_y * cross_y + cross_z * cross_z);
+
+        npy_float sqr_distance_to_wire;
+        if (cross_norm < 1e-6f) {
+          // Lines are parallel, use perpendicular distance
+          sqr_distance_to_wire = acy * acy + acz * acz;
+        } else {
+          // Distance = |AC · (AB x CD)| / |AB x CD|
+          const npy_float dot = acx * cross_x + acy * cross_y + acz * cross_z;
+          const npy_float dist = fabsf(dot) / cross_norm;
+          sqr_distance_to_wire = dist * dist;
+        }
+
+        // if (event_idx == 0 && particle_idx < 2 && k == 8) {
+        //     printf(" DIST %f   r = %f straw=%d %f\n", sqr_distance_to_wire, r, straw_i, sqrtf(sqr_distance_to_wire));
+        // }
+
+        if (sqr_distance_to_wire < r * r && sqr_distance_to_wire < best_dist_sq) {
+          best_straw_i = straw_i;
+          best_dist_sq = sqr_distance_to_wire;
+        }
+      }
+
+      if (best_straw_i < 0) {
         continue;
       }
 
-      if (!(straw_i >= 0 && straw_i < n_straws)) {
-        // // printf("Warning: invalid straw %d: y'=%lf (x=%lf, y=%lf, theta=%lf), "
-        //        "H=%lf, r=%lf\n",
-        //        straw_i, ry, x, y, angle, height, r);
-        continue;
-      }
-
-      // Record hit to sparse arrays
-      int sparse_idx = sparse_count[0];
-      int is_first_hit_in_straw = 1;
+      // if (event_idx == 0 && particle_idx < 2 && k == 8) {
+      //     printf("  -> PASSED DIST %f\n", best_dist_sq);
+      // }
 
       // Check if this straw was already hit by this particle
+      int is_first_hit_in_straw = 1;
       for (int h = 0; h < sparse_count[0]; h++) {
         if (sparse_events[h] == event_idx && sparse_particles[h] == particle_idx &&
-            sparse_layers[h] == k && sparse_straws[h] == straw_i) {
+            sparse_layers[h] == k && sparse_straws[h] == best_straw_i) {
           is_first_hit_in_straw = 0;
           break;
         }
@@ -310,13 +365,19 @@ static void track_particle(
         continue;
       }
 
+      // if (event_idx == 0 && particle_idx < 2 && k == 8) {
+      //     printf("  -> STORED\n");
+      // }
+
+      // Record hit to sparse arrays
+      int sparse_idx = sparse_count[0];
       sparse_events[sparse_idx] = event_idx;
       sparse_particles[sparse_idx] = particle_idx;
       sparse_layers[sparse_idx] = k;
-      sparse_straws[sparse_idx] = straw_i;
+      sparse_straws[sparse_idx] = best_straw_i;
       sparse_values[sparse_idx] = dt;
-      sparse_r_mm[sparse_idx] = fabsf(ry - straw_y) * 10.0f;
-      sparse_t0[sparse_idx] = t_initial + j * dt;  // Absolute time: initial time + simulation time
+      sparse_r_mm[sparse_idx] = sqrtf(best_dist_sq) * 10.0f;
+      sparse_t0[sparse_idx] = t_initial + j * dt;
 
       sparse_hit_pos[sparse_idx * 3 + 0] = x;
       sparse_hit_pos[sparse_idx * 3 + 1] = y;
@@ -336,7 +397,11 @@ static void track_particle(
 
         // single electron first
         if (r_spawn < p_spawn_single) {
-          // Get next secondary index
+          // Get next secondary index - check bounds
+          if (*next_secondary_idx >= max_particles) {
+            // No more slots available for secondaries
+            continue;
+          }
           int e_idx = (*next_secondary_idx)++;
 
           // Random isotropic direction
@@ -370,12 +435,16 @@ static void track_particle(
               sparse_values, sparse_r_mm, sparse_t0, sparse_hit_pos, sparse_count,
               trajectories, trs0, trs1, trs2, trs3,
               p_spawn_single, p_spawn_pair, E_sec_MeV,
-              next_secondary_idx
+              next_secondary_idx, max_particles
           );
         }
         // e+e- pair production
         else if (r_spawn < (p_spawn_single + p_spawn_pair)) {
-          // Get indices for e- and e+
+          // Get indices for e- and e+ - check bounds
+          if (*next_secondary_idx + 1 >= max_particles) {
+            // Need 2 slots for pair, not enough available
+            continue;
+          }
           int e_minus_idx = (*next_secondary_idx)++;
           int e_plus_idx = (*next_secondary_idx)++;
 
@@ -416,7 +485,7 @@ static void track_particle(
             sparse_values, sparse_r_mm, sparse_t0, sparse_hit_pos, sparse_count,
             trajectories, trs0, trs1, trs2, trs3,
             p_spawn_single, p_spawn_pair, E_sec_MeV,
-            next_secondary_idx
+            next_secondary_idx, max_particles
           );
 
           // Recursively track e+
@@ -435,7 +504,7 @@ static void track_particle(
             sparse_values, sparse_r_mm, sparse_t0, sparse_hit_pos, sparse_count,
             trajectories, trs0, trs1, trs2, trs3,
             p_spawn_single, p_spawn_pair, E_sec_MeV,
-            next_secondary_idx
+            next_secondary_idx, max_particles
           );
         }
       }
@@ -445,7 +514,7 @@ static void track_particle(
     y = y_;
     z = z_;
 
-    if (trajectories != NULL && particle_idx < 100) {  // Limit trajectory storage
+    if (trajectories != NULL && particle_idx < max_particles) {  // Limit trajectory storage
       trajectories[event_idx * trs0 + particle_idx * trs1 + j * trs2] = x;
       trajectories[event_idx * trs0 + particle_idx * trs1 + j * trs2 + trs3] = y;
       trajectories[event_idx * trs0 + particle_idx * trs1 + j * trs2 + 2 * trs3] = z;
@@ -477,6 +546,7 @@ static PyObject *solve(PyObject *self, PyObject *args) {
   PyObject *py_steps = NULL;
   PyObject *py_n_batch = NULL;
   PyObject *py_n_particles = NULL;
+  PyObject *py_max_particles = NULL;
   PyObject *py_n_layers = NULL;
   PyObject *py_n_straws = NULL;
 
@@ -499,7 +569,7 @@ static PyObject *solve(PyObject *self, PyObject *args) {
   PyObject *py_E_sec = NULL;
 
   if (!PyArg_UnpackTuple(
-          args, "straw_solve", 31, 31, &py_initial_positions,
+          args, "straw_solve", 32, 32, &py_initial_positions,
           &py_initial_momenta, &py_masses, &py_charges, &py_initial_times,
           &py_B, &py_z0,
           &py_B_sigma, &py_steps, &py_dt, &py_n_batch, &py_n_particles,
@@ -507,7 +577,7 @@ static PyObject *solve(PyObject *self, PyObject *args) {
           &py_angles, &py_trajectories, &py_sparse_events, &py_sparse_particles,
           &py_sparse_layers, &py_sparse_straws, &py_sparse_values,
           &py_sparse_r_mm, &py_sparse_t0, &py_sparse_hit_pos, &py_sparse_count,
-          &py_p_spawn_single, &py_p_spawn_pair, &py_E_sec)) {
+          &py_p_spawn_single, &py_p_spawn_pair, &py_E_sec, &py_max_particles)) {
     return NULL;
   }
 
@@ -527,6 +597,7 @@ static PyObject *solve(PyObject *self, PyObject *args) {
   const npy_intp n_particles = PyLong_AsLong(py_n_particles);
   const npy_intp n_layers = PyLong_AsLong(py_n_layers);
   const npy_intp n_straws = PyLong_AsLong(py_n_straws);
+  const npy_intp max_particles = PyLong_AsLong(py_max_particles);
 
   // Get sparse array pointers
   int *sparse_events = (int *)PyArray_DATA((PyArrayObject *)py_sparse_events);
@@ -758,8 +829,17 @@ static PyObject *solve(PyObject *self, PyObject *args) {
 
     // printf("\nEvent %d: B=%.4f T\n", l, B);
 
+    // Count actual primary particles in this event (non-zero mass)
+    int n_primaries = 0;
+    for (int i = 0; i < n_particles; ++i) {
+      npy_float mass = masses[l * ms0 + i * ms1];
+      if (mass > SLOW) {
+        n_primaries = i + 1;  // Track highest valid particle index + 1
+      }
+    }
+
     // Track to keep secondary particle indices
-    int next_secondary_idx = n_particles;  // Secondaries start after primaries
+    int next_secondary_idx = n_primaries;  // Secondaries start after primaries
 
     for (int i = 0; i < n_particles; ++i) {
       // Extract scalar initial conditions for this particle
@@ -794,7 +874,7 @@ static PyObject *solve(PyObject *self, PyObject *args) {
           sparse_values, sparse_r_mm, sparse_t0, sparse_hit_pos, sparse_count,
           trajectories, trs0, trs1, trs2, trs3,
           p_spawn_single, p_spawn_pair, E_sec_MeV,
-          &next_secondary_idx
+          &next_secondary_idx, max_particles
       );
     }
   }

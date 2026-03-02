@@ -247,23 +247,23 @@ class StrawDetector(Detector):
         # Units: positions in cm, momenta in GeV/c
         self.target_mean = np.array(
             [
-                -2.4590519e01,
-                4.7251717e01,
-                5.5158970e03,
-                -2.0980914e-01,
-                2.1826500e-01,
-                2.6931271e01,
+                7.9546314e-01,
+                -7.2685266e-01,
+                6.3946289e03,
+                4.1835890e-03,
+                -1.1129675e-02,
+                5.0176453e01,
             ],
             dtype=np.float32,
         )
         self.target_std = np.array(
             [
-                1.2907193e02,
-                1.3767969e02,
-                1.6168958e03,
-                7.2272283e-01,
-                4.9576724e-01,
-                1.2292634e01,
+                7.4502007e01,
+                7.6979668e01,
+                1.3506592e03,
+                5.1641846e-01,
+                5.5257869e-01,
+                2.8627583e01,
             ],
             dtype=np.float32,
         )
@@ -281,7 +281,9 @@ class StrawDetector(Detector):
 
     def ground_truth_shape(self):
         # charges + positions + momenta (flattened)
-        return (self.max_particles + 3 * self.max_particles + 3 * self.max_particles,)
+        return (
+            2 * self.max_particles + 3 * self.max_particles + 3 * self.max_particles,
+        )
 
     def encode_ground_truth(self, masses, charges, initial_positions, initial_momentum):
         n, *_ = initial_positions.shape
@@ -289,9 +291,35 @@ class StrawDetector(Detector):
         normalized_positions = np.reshape(normalized_positions, shape=(n, -1))
         normalized_momenta = np.reshape(initial_momentum, shape=(n, -1))
         ground_truth = np.concatenate(
-            [charges, normalized_positions, normalized_momenta], axis=-1
+            [masses, charges, normalized_positions, normalized_momenta], axis=-1
         )
         return ground_truth
+
+    def decode_ground_truth(self, ground_truth):
+        # print(ground_truth.shape)
+
+        masses = ground_truth[:, : self.max_particles]
+        batch = masses.shape[0]
+        # print(masses.shape)
+        charges = ground_truth[
+            :, self.max_particles : self.max_particles + self.max_particles
+        ]
+        pos_flat = ground_truth[
+            :,
+            self.max_particles + self.max_particles : self.max_particles
+            + self.max_particles
+            + self.max_particles * 3,
+        ]
+        mom_flat = ground_truth[
+            :, self.max_particles + self.max_particles + self.max_particles * 3 :
+        ]
+
+        normalized_positions = pos_flat.reshape((batch, self.max_particles, 3))
+        initial_momentum = mom_flat.reshape((batch, self.max_particles, 3))
+
+        initial_positions = normalized_positions * self.origin_sigma + self.origin
+
+        return masses, charges, initial_positions, initial_momentum
 
     def get_design(self, design: np.ndarray):
         n = design.shape[0]
@@ -462,6 +490,7 @@ class StrawDetector(Detector):
             self.p_spawn_single,
             self.p_spawn_pair,
             self.E_sec_MeV,
+            self.max_particles,
         )
         # print("\n" * 5)
         # print(
@@ -479,7 +508,7 @@ class StrawDetector(Detector):
 
         n_hits = sparse_count[0]
         n_hits = int(sparse_count[0])
-        print("n_hits", n_hits, "max_hits", max_hits)
+        # print("n_hits", n_hits, "max_hits", max_hits)
         assert 0 <= n_hits <= max_hits, (n_hits, max_hits)
         # if n_hits >= max_hits:
         #     print("\n" + "!" * 80)
@@ -875,9 +904,9 @@ class StrawDetector(Detector):
             charges,
             initial_positions,
             initial_momentum,
-            _,  # traj
+            traj,  # traj
             sparse_hits,  # sparse_hits
-            _,  # fdigi_times (dict)
+            fdigi_times,  # fdigi_times (dict)
             times,
             _,  # mask
             target,
@@ -898,21 +927,39 @@ class StrawDetector(Detector):
         # print(events)
         # input("wait for events")
         # target is already (batch, 6) from simulate()
-        return ground_truth, info, target
+        # print(ground_truth)
+        return ground_truth, info, target, traj, fdigi_times
 
     def loss(self, target, predicted):
         # MSE on normalized targets
         # Network outputs normalized values, targets need to be normalized
         # target shape: (batch, 6) where [:3] is position (x,y,z) and [3:] is momentum (px,py,pz)
+        import jax
         import jax.numpy as jnp
 
-        # print(target, self.target_mean)
+        # print(target, target.shape)
+        # input("wait tar")
+        from jax import config
 
+        config.update("jax_disable_jit", True)
         # Normalize targets (predictions are already normalized from network)
         target_norm = (target - self.target_mean) / self.target_std
+        diff = target_norm - predicted
+        # mse_per_dim = jnp.mean(diff**2, axis=0)
+        # print("iii")
+        # print(diff**2)
 
+        # # print(target_norm, target_norm.shape)
+
+        # jax.debug.print("mse_per_dim {}", diff)
+        # input("wait tar")
+        # print(predicted, predicted.shape)
+        # input("wait pr")
         # MSE on normalized values (all dimensions have equal weight now)
-        mse = jnp.mean(jnp.square(target_norm - predicted), axis=-1)
+        mse = jnp.mean(jnp.square(diff), axis=-1)
+        # pos_mse = jnp.mean(diff[:, :3] ** 2)
+        # mom_mse = jnp.mean(diff[:, 3:] ** 2)
+        # jax.debug.print("pos_mse {} mom_mse {}", pos_mse, mom_mse)
 
         return mse  # Shape: (batch,)
 
