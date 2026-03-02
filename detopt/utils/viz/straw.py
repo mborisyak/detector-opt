@@ -11,10 +11,9 @@ def show(
     angles,
     width,
     height,
-    response,
+    hits,
+    masses,
     trajectories=None,
-    signal=None,
-    threshold=1.0,
     mask=None,
     n_particles=None,
     n_straws=None,
@@ -36,45 +35,70 @@ def show(
         (0, 1, 0),
     ]
 
-    # Handle sparse representation (import lazily to avoid circular import)
-    try:
-        from detopt.detector.straw import SparseHits
-
-        is_sparse_hits = isinstance(response, SparseHits)
-    except ImportError:
-        is_sparse_hits = False
-
-    if is_sparse_hits:
+    if True:
         if n_particles is None or n_straws is None:
             raise ValueError(
                 "n_particles and n_straws required when response is SparseHits"
             )
         n_layers = len(layers)
         # Convert sparse to dense for visualization
-        response_dense, _, _, _, _ = response.to_dense(
-            1, n_particles, n_layers, n_straws
-        )
-        # Sum over particles
-        combined_response = np.sum(response_dense[0], axis=0)  # (n_layers, n_straws)
-    elif isinstance(response, np.ndarray):
-        # Dense array - original logic
-        if response.ndim == 3:
-            _, n_layers, n_straws = response.shape
-            combined_response = np.sum(response, axis=0)
-        elif response.ndim == 2:
-            n_layers, n_straws = response.shape
-            combined_response = response
-        else:
-            raise ValueError(
-                "response must be either 3D (per-particle) or 2D (combined) array, or SparseHits"
-            )
-    else:
-        raise ValueError("response must be numpy array or SparseHits object")
+        # response_dense, _, _, _, _ = response.to_dense(
+        #     1, n_particles, n_layers, n_straws
+        # )
+        # # Sum over particles
+        # combined_response = np.sum(response_dense[0], axis=0)  # (n_layers, n_straws)
 
     # draw detector frames
     max_layers = len(layers)
     max_straws = 10  # just for quick visualization
+
+    print(hits)
+    print(len(hits))
+
+    hit_map = [[] for _ in range(len(layers))]
+
+    for key in hits.keys():  # hits is your dict
+        layer_idx = int(key[2])
+        straw = int(key[3])
+        hit_map[layer_idx].append(straw)
+    print(trajectories.shape)
+    input("wa")
+
+    # if masses.ndim == 2:
+    #     # assume (batch, n_particles)
+    #     mass_vec = masses[0]
+    # elif masses.ndim == 1:
+    #     # assume (n_particles,)
+    #     mass_vec = masses
+    # else:
+    #     raise ValueError("masses must be (n_particles,) or (batch, n_particles)")
+
+    # # round so nearly-equal float masses collapse to one particle type
+    # mass_keys = np.round(mass_vec.astype(float), 6)
+    # unique_masses = np.unique(mass_keys)
+
+    # palette = [
+    #     "red",
+    #     "dodgerblue",
+    #     "limegreen",
+    #     "gold",
+    #     "magenta",
+    #     "cyan",
+    #     "orange",
+    #     "white",
+    # ]
+
+    # mass_to_color = {
+    #     m: palette[j % len(palette)]
+    #     for j, m in enumerate(unique_masses)
+    # }
+
+    # optional: dedupe + sort
+    hit_map = [sorted(set(straws)) for straws in hit_map]
+    print(hit_map)
+    input("wait hit")
     for i, l_z in enumerate(layers[:max_layers]):
+        print(i, l_z)
         A = np.array(
             [
                 [np.cos(angles[i]), np.sin(angles[i]), 0],
@@ -85,6 +109,7 @@ def show(
 
         h, w = height[i], width[i]
         r = h / max_straws
+        r_hit = h / n_straws
 
         skew = h * np.tan(angles[i])
         verts = np.array(
@@ -122,59 +147,97 @@ def show(
                 show_edges=False,
                 opacity=1.0,
             )
+        if i < len(hit_map):
+            for k_hit in hit_map[i]:
+                if 0 <= k_hit < n_straws:
+                    hit_pts = np.array(
+                        [
+                            [-w, 2 * r_hit * k_hit - h + r_hit, l_z],
+                            [w, 2 * r_hit * k_hit - h + r_hit, l_z],
+                        ]
+                    )
+                    hit_pts = np.dot(hit_pts, A)
+
+                    hit_mesh = pv.lines_from_points(hit_pts).tube(
+                        radius=10 * r_hit,  # tune this
+                        n_sides=16,
+                    )
+                    plotter.add_mesh(
+                        hit_mesh,
+                        color="yellow",
+                        opacity=1.0,
+                        show_edges=False,
+                    )
 
     # normalize mask into shape (n_particles,)
     mask_vec = None
-    if mask is not None:
-        mask = np.asarray(mask)
-        if mask.ndim == 2:
-            # assume (batch, n_particles) -> take first batch
-            mask_vec = mask[0]
-        elif mask.ndim == 1:
-            mask_vec = mask
-        else:
-            raise ValueError("mask must be (n_particles,) or (batch, n_particles)")
+    mask = np.asarray(mask)
+    masses = np.asarray(masses)
+    all_mass_keys = np.round(masses.astype(float).ravel(), 6)
+    unique_masses = np.unique(all_mass_keys)
+
+    palette = [
+        "red",
+        "dodgerblue",
+        "limegreen",
+        "gold",
+        "magenta",
+        "cyan",
+        "orange",
+        "white",
+    ]
+
+    mass_to_color = {m: palette[j % len(palette)] for j, m in enumerate(unique_masses)}
+    print("mass_to_color:")
+    for m, c in mass_to_color.items():
+        print(f"  mass={m:.6f} -> {c}")
+
     # --- trajectories ---
     if trajectories is not None:
         # trajectories: (n_particles, n_steps, 3)
-        n_particles, n_steps, _ = trajectories.shape
+        print(trajectories.shape)
+        _, n_particles, n_steps, _ = trajectories.shape
 
-        if signal is None:
-            signal = 1.0
+        # if signal is None:
+        #     signal = 1.0
+        for ev in range(trajectories.shape[0]):
+            # mask_vec = mask[i]
+            # mass_vec = masses[i]
+            for i in range(n_particles):
+                traj = trajectories[ev][i]  # (n_steps, 3)
+                print(traj.shape)
+                # skip all-zero trajectories
+                norm = np.linalg.norm(traj, axis=1)
+                nonzero_idx = np.where(norm > 1e-6)[0]
+                if nonzero_idx.size == 0:
+                    continue
 
-        for i in range(n_particles):
-            traj = trajectories[i]  # (n_steps, 3)
+                start = nonzero_idx[0]
+                sub_traj = traj[start:]  # from first non-zero point to the end
 
-            # skip all-zero trajectories
-            norm = np.linalg.norm(traj, axis=1)
-            nonzero_idx = np.where(norm > 1e-6)[0]
-            if nonzero_idx.size == 0:
-                continue
+                # downsample
+                n_sub = sub_traj.shape[0]
+                n_samples = min(512, n_sub)
+                idx = np.linspace(0, n_sub - 1, n_samples).astype(int)
+                sub_traj_ds = sub_traj[idx]
 
-            start = nonzero_idx[0]
-            sub_traj = traj[start:]  # from first non-zero point to the end
+                # pick color: primary vs secondary
+                # if mask_vec is not None and i < mask_vec.shape[0]:
+                #     is_secondary = mask_vec[i] > 0.5
+                # else:
+                #     is_secondary = False
 
-            # downsample
-            n_sub = sub_traj.shape[0]
-            n_samples = min(512, n_sub)
-            idx = np.linspace(0, n_sub - 1, n_samples).astype(int)
-            sub_traj_ds = sub_traj[idx]
+                m = masses[ev, i]
+                m_key = np.round(float(m), 6)
+                color = mass_to_color.get(m_key, "white")
 
-            # pick color: primary vs secondary
-            if mask_vec is not None and i < mask_vec.shape[0]:
-                is_secondary = mask_vec[i] > 0.5
-            else:
-                is_secondary = False
-
-            color = "red" if not is_secondary else "dodgerblue"
-
-            spline = pv.Spline(sub_traj_ds)
-            plotter.add_mesh(
-                spline,
-                color=color,
-                line_width=4,
-                opacity=0.6,
-            )
+                spline = pv.Spline(sub_traj_ds)
+                plotter.add_mesh(
+                    spline,
+                    color=color,
+                    line_width=4,
+                    opacity=0.6,
+                )
 
     plotter.show_grid()
     plotter.reset_camera()

@@ -17,16 +17,16 @@ straw:
 
   # Physics parameters
   dt: 0.1 #ns
-  max_B: 0.0005 # Tesla (maximum magnetic field strength for optimization)
+  max_B: 0.15 # Tesla (maximum magnetic field strength for optimization)
   z0: 8957.0 # Center of magnetic field (cm)
   B_sigma: 300.0 # Sigma (width) of magnetic field (cm)
   layer_bounds: [8200., 9750.] # Valid range for layer z-positions (mm), should encompass all stations
   max_particles: 50 # Accommodate all daughter particles from HNL decay
   p_spawn_single: 0.0
-  p_spawn_pair: 0.00
+  p_spawn_pair: 0.0
   E_sec_MeV: 0.01
   # Data loading
-  data_dir: "numpy_out" # "combined_tof"
+  data_dir: "clean_data" # "combined_tof"
 
 
   # Loss function parameters for HNL reconstruction

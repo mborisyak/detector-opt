@@ -11,50 +11,29 @@ import detopt
 def viz(
     seed=123, design="data/design/default.json", use_root_particles=False, **config
 ):
-    n_batch = 1
-    n_layers = 64
-
+    batch = 2
     detector = detopt.detector.from_config(config["detector"])
-
-    root = os.path.dirname(os.path.dirname(__file__))
-
-    # Always load the design file for geometry
-    with open(os.path.join(root, design), "r") as f:
-        import json
-
-        design_vec = detector.encode_design(json.load(f))
+    enc = detector.get_encoded_current_design()
+    enc = enc.reshape(1, -1)
+    enc = np.tile(enc, (batch, 1))
+    print(enc.shape)
+    input("wait enc")
 
     if True:
-        print(f"Loading particles from numpy")
-        (
-            masses,
-            charges,
-            initial_positions,
-            initial_momentum,
-            trajectories,
-            sparse_hits,
-            signal,
-            waveforms,
-            fdigi_times,
-            mask,
-            hnl_targets,
-        ) = detector.simulate(
-            seed=seed,
-            configurations=design_vec[None],
-            use_sparse=True,
+        initial, measurements, target, trajectories, hits = detector(
+            seed=(seed, 1, 1, 0), configurations=enc
         )
+        print(initial.shape)
+        input("wait init")
+        print(detector.decode_ground_truth(initial))
+        masses, charges, initial_positions, initial_momentum = (
+            detector.decode_ground_truth(initial)
+        )
+        print(masses, masses.shape)
+        input("wait masses")
 
-        # Print loaded particle information
-        print(f"\n{'=' * 80}")
-        print(f"Loaded Particle Information")
-        print(f"{'=' * 80}")
-        print(f"Number of events: {masses.shape[0]}")
-        print(f"Max particles per event: {masses.shape[1]}")
-
-        for event_idx in range(masses.shape[0]):  # Show first 3 events
-            print(f"\n--- Event {event_idx} ---")
-            # Count non-zero mass particles (actual particles)
-            n_particles = np.sum(masses[event_idx] > 0)
+        for ev_idx in range(masses.shape[0]):  # Show first 3 events
+            n_particles = np.sum(masses[ev_idx] > 0)
             print(f"Number of particles: {n_particles}")
 
             if n_particles > 0:
@@ -63,11 +42,13 @@ def viz(
                 )
                 print("-" * 110)
                 for i in range(min(n_particles, 10)):  # Show first 10 particles
-                    mass = masses[event_idx, i]
-                    charge = charges[event_idx, i]
-                    pos = initial_positions[event_idx, i]
-                    mom = initial_momentum[event_idx, i]
-
+                    mass = masses[ev_idx][i]
+                    charge = charges[ev_idx][i]
+                    print(initial_positions.shape)
+                    # input("wait pos")
+                    pos = initial_positions[ev_idx][i]
+                    mom = initial_momentum[ev_idx][i]
+                    print(pos)
                     print(
                         f"{i:<4} {mass:<12.2f} {charge:+.1f}     ({pos[0] / 10:8.2f},{pos[1] / 10:8.2f},{pos[2] / 10:8.2f})  ({mom[0]:7.4f},{mom[1]:7.4f},{mom[2]:7.4f})"
                     )
@@ -77,26 +58,31 @@ def viz(
 
         print(f"\n{'=' * 80}\n")
 
-        layers, angles, widths, heights, Bs, Ls = detector.get_design(
-            design=design_vec[None]
-        )
+        layers, angles, widths, heights, Bs = detector.get_design(enc)
 
         # Debug: check sparse_hits type
-        print(f"DEBUG: sparse_hits type = {type(sparse_hits)}")
-        print(f"DEBUG: sparse_hits = {sparse_hits}")
-        from detopt.detector.straw import SparseHits
+        # print(f"DEBUG: sparse_hits type = {type(sparse_hits)}")
+        # print(f"DEBUG: sparse_hits = {sparse_hits}")
+        # from detopt.detector.straw import SparseHits
 
-        print(f"DEBUG: isinstance check = {isinstance(sparse_hits, SparseHits)}")
+        # print(f"DEBUG: isinstance check = {isinstance(sparse_hits, SparseHits)}")
 
+        # Visualize all events overlaid together
+        # print(f"\n{'=' * 80}")
+        # print(f"Visualizing ALL {masses.shape[0]} Events Overlaid")
+        # print(f"{'=' * 80}")
+
+        print(layers, trajectories.shape, masses.shape)
+        input("wait lay")
+        mask = [[]]
         detopt.utils.viz.straw.show(
             layers[0],
             angles[0],
             widths[0],
             heights[0],
-            sparse_hits,
-            trajectories[0],
-            signal[0] if hasattr(signal, "__getitem__") else signal,
-            threshold=0.3,
+            hits,
+            masses,
+            trajectories,  # Show first event's trajectories (or could show all)
             mask=mask[0],
             n_particles=detector.max_particles,
             n_straws=detector.n_straws,
@@ -125,11 +111,22 @@ def viz(
         #     plt.show()
 
         # --- Plot histogram of FairShip-style fdigi_times per station (stacked) ---
+        _, layers, straws, fdigi_times = measurements
+
+        plt.figure()
+        plt.hist(np.asarray(fdigi_times, dtype=float), bins=50, alpha=0.7)
+        plt.xlabel("TDC time [ns]")
+        plt.ylabel("Counts")
+        plt.title("Histogram of FairShip-style TDC times")
+        plt.show()
+
+        print(fdigi_times.shape)
+        input("f")
         tdc_by_station = [[] for _ in range(n_stations)]
-        for key, fdigi in fdigi_times.items():
-            layer = key[2]
+        for i in range(len(fdigi_times)):
+            layer = layers[i]
             station = layer // layers_per_station
-            tdc_by_station[station].append(fdigi)
+            tdc_by_station[station].append(fdigi_times[i])
         plt.figure()
         # Only include stations with hits
         tdc_data = [
@@ -142,7 +139,7 @@ def viz(
             for station in range(n_stations)
             if tdc_by_station[station]
         ]
-        plt.hist(tdc_data, bins=50, stacked=True, label=labels, alpha=0.7)
+        plt.hist(tdc_data, bins=50, stacked=True, label=labels, alpha=0.7)  #
         plt.xlabel("TDC time [ns]")
         plt.ylabel("Counts")
         plt.title("Stacked histogram of FairShip-style TDC times per station")
@@ -173,8 +170,7 @@ def viz(
         # plt.legend()
         # plt.show()
 
-    configs = np.broadcast_to(design_vec[None], (n_batch, *design_vec.shape))
-
+    # configs already defined above for visualization
     import time
 
     n_trials = 1
