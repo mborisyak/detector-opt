@@ -1,0 +1,65 @@
+import os
+
+import numpy as np
+
+import detopt
+
+
+def save_all_data(seed, output, chunk_size=1000, **config):
+
+    detector = detopt.detector.from_config(config["detector"])
+    enc = detector.get_encoded_current_design()
+    enc = enc.reshape(1, -1)
+
+    # Load data to get total number of events
+    if detector._data_loader is None:
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        from load_hnl_data import HNLDataLoader
+
+        detector._data_loader = HNLDataLoader(
+            detector.data_dir, max_particles=detector.max_particles
+        )
+
+    n_events = detector._data_loader.n_events
+    n_chunks = (n_events + chunk_size - 1) // chunk_size
+
+    base_dir = os.path.dirname(output) or "."
+    base_name = os.path.splitext(os.path.basename(output))[0]
+    os.makedirs(base_dir, exist_ok=True)
+
+    print(f"Processing {n_events} events in {n_chunks} chunks of {chunk_size}")
+
+    for chunk_idx in range(n_chunks):
+        start_idx = chunk_idx * chunk_size
+        end_idx = min(start_idx + chunk_size, n_events)
+        chunk_n_events = end_idx - start_idx
+
+        print(f"\nChunk {chunk_idx + 1}/{n_chunks}: events {start_idx}-{end_idx - 1}")
+
+        design = np.tile(enc, (chunk_n_events, 1))
+        seed_chunk = hash((seed, chunk_idx)) & 0xFFFFFFFF
+
+        _, measurements, target, _, _ = detector(seed=seed_chunk, configurations=design)
+
+        chunk_file = os.path.join(base_dir, f"{base_name}_chunk_{chunk_idx:04d}.npz")
+        print(f"  Saving to {chunk_file}")
+
+        np.savez_compressed(
+            chunk_file,
+            measurements=measurements,
+            targets=np.array(target),
+        )
+
+        file_size_mb = os.path.getsize(chunk_file) / (1024 * 1024)
+        print(f"  ✓ Saved {chunk_n_events} events: {file_size_mb:.2f} MB")
+
+    print(f"\n✓ Complete: {n_chunks} files saved")
+
+
+if __name__ == "__main__":
+    import gearup
+
+    gearup.gearup(save=save_all_data).with_config("config/regress.yaml")()

@@ -26,7 +26,7 @@ straw:
   p_spawn_pair: 0.0
   E_sec_MeV: 0.01
   # Data loading
-  data_dir: "clean_data" # "combined_tof"
+  data_dir: "selected_data" # "combined_tof"
 
 
   # Loss function parameters for HNL reconstruction

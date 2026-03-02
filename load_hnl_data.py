@@ -28,7 +28,7 @@ class HNLDataLoader:
     Fast sampling with no file I/O during training.
     """
 
-    def __init__(self, data_dir: str = "numpy_out", max_particles: int = 50):
+    def __init__(self, data_dir: str = "clean_data", max_particles: int = 50):
         """
         Initialize data loader - loads ALL data into memory.
 
@@ -40,7 +40,7 @@ class HNLDataLoader:
         self.max_particles = max_particles
 
         # Try both naming conventions
-        files = sorted(glob.glob(str(self.data_dir / "numpy_*.npz")))
+        files = sorted(glob.glob(str(self.data_dir / "*.npz")))
         if len(files) == 0:
             files = sorted(glob.glob(str(self.data_dir / "geom_*_combined_data.npz")))
 
@@ -61,19 +61,27 @@ class HNLDataLoader:
 
         cnt = 0
         cnt2 = 0
+        cnt3 = 0
+        cnt_ev = 0
         # Load ALL files
         for file_path in tqdm(files, desc="Loading data"):
             data = np.load(file_path, allow_pickle=True)
-
+            # cnt3 += 1
             # Get unique events in this file
             unique_events = np.unique(data["prestraw_ev"])
 
             for event_id in unique_events:
                 mask = data["prestraw_ev"] == event_id
                 n_parts = min(np.sum(mask), max_particles)
-
+                # if cnt_ev > 15:
+                #     break
                 if n_parts == 0:
                     continue
+                if n_parts != 2:
+                    continue
+                # if event_id >= 1:
+                #     continue
+                # cnt_ev += 1
 
                 # Initialize padded arrays for this event
                 masses = np.zeros(max_particles, dtype=np.float32)
@@ -130,7 +138,11 @@ class HNLDataLoader:
                 cnt += -n_parts + max_particles
                 cnt2 += 1
                 print(-n_parts + max_particles)
-
+                print(cnt3)
+            if cnt3 == 3:
+                break
+            if cnt_ev == 15:
+                break
         # Convert to arrays
         self.masses = np.array(all_masses, dtype=np.float32)
         self.charges = np.array(all_charges, dtype=np.float32)
@@ -173,12 +185,12 @@ class HNLDataLoader:
         rng: Optional[np.random.Generator] = None,
     ) -> Tuple[dict, np.ndarray]:
         """
-        Get a batch of events - samples from pre-loaded memory (FAST!).
+        Get a batch of events - returns ALL events sequentially (no random sampling).
 
         Args:
-            batch_size: Number of events to return
+            batch_size: Number of events to return (must equal n_events for full dataset)
             max_particles: Ignored (uses self.max_particles from init)
-            rng: Random number generator (optional)
+            rng: Ignored (no random sampling)
 
         Returns:
             daughter_data: Dict with daughter particle info
@@ -189,12 +201,9 @@ class HNLDataLoader:
                 - times: ns (time of flight)
             targets: (batch_size, 6) array of [dx, dy, dz in cm, px, py, pz in GeV/c]
         """
-        if rng is None:
-            rng = np.random.default_rng()
-
-        # Sample random event indices
-        indices = rng.choice(self.n_events, size=batch_size, replace=True)
-
+        # Return all events sequentially (no sampling)
+        indices = np.arange(min(batch_size, self.n_events))
+        # indices = rng.choice(self.n_events, size=batch_size, replace=True)
         # Return pre-loaded data (just indexing - super fast!)
         daughter_data = {
             "masses": self.masses[indices],
@@ -301,7 +310,7 @@ if __name__ == "__main__":
     print("=" * 70)
 
     try:
-        loader = HNLDataLoader()  # "combined_tof"
+        loader = HNLDataLoader("selected_data")  # "combined_tof"
 
         print("\nDataset Statistics:")
         stats = loader.get_statistics()
