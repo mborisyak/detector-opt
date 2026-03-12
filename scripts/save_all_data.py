@@ -39,17 +39,48 @@ def save_all_data(seed, output, chunk_size=1000, **config):
 
         print(f"\nChunk {chunk_idx + 1}/{n_chunks}: events {start_idx}-{end_idx - 1}")
 
+        # Load sequential batch from data loader (no random sampling)
+        # This ensures we process ALL events exactly once, in order
+        daughter_data, hnl_targets = detector._data_loader.get_sequential_batch(
+            start_idx, end_idx
+        )
+
         design = np.tile(enc, (chunk_n_events, 1))
         seed_chunk = hash((seed, chunk_idx)) & 0xFFFFFFFF
 
+        # Temporarily override get_batch to return our pre-loaded sequential data
+        # The detector's simulate() method internally calls get_batch(), so we
+        # intercept it to provide the exact sequential slice we want
+        original_get_batch = detector._data_loader.get_batch
+
+        def sequential_get_batch(batch_size, rng=None):
+            # Return the pre-loaded sequential chunk (ignores batch_size and rng)
+            return daughter_data, hnl_targets
+
+        detector._data_loader.get_batch = sequential_get_batch
+
+        # Run detector simulation on this sequential chunk
         _, measurements, target, _, _ = detector(seed=seed_chunk, configurations=design)
+
+        # Restore original get_batch method for next iteration
+        detector._data_loader.get_batch = original_get_batch
 
         chunk_file = os.path.join(base_dir, f"{base_name}_chunk_{chunk_idx:04d}.npz")
         print(f"  Saving to {chunk_file}")
 
+        # measurements is a tuple: (events, layers, straws, times)
+        # Save as separate arrays for proper loading
+        events, layers, straws, times, mask = measurements
+
+        print(len(events))
+
         np.savez_compressed(
             chunk_file,
-            measurements=measurements,
+            events=events,
+            layers=layers,
+            straws=straws,
+            times=times,
+            mask=mask,
             targets=np.array(target),
         )
 

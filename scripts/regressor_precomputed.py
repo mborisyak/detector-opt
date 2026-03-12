@@ -1,14 +1,20 @@
 import math
 import os
+import time
 
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
+import optax
 from flax import nnx
 
 import detopt
 from detopt.detector.straw import SparseHits
+
+# Enable JAX compilation logging to detect recompilations
+jax.config.update("jax_log_compiles", True)
+jax.config.update("jax_explain_cache_misses", True)
 
 
 def save_deepset_input_label_hists(
@@ -131,7 +137,8 @@ def regress(
         raise ValueError("precomputed_dir must be specified for regressor_precomputed")
 
     rngs = nnx.Rngs(seed)
-    np_rng = np.random.default_rng(seed=(seed, 0))
+    np_rng_train = np.random.default_rng(seed=(seed, 0))
+    np_rng_val = np.random.default_rng(seed=(seed, 1))  # Separate RNG for validation
 
     # Initialize detector (needed for design and normalization parameters)
     detector = detopt.detector.from_config(config["detector"])
@@ -150,13 +157,20 @@ def regress(
     from load_precomputed_data import PrecomputedDataLoader
 
     data_loader = PrecomputedDataLoader(precomputed_dir)
+    train_indices, val_indices = data_loader.get_train_val_split(
+        val_fraction=0.2, seed=seed
+    )
     print(f"\n✓ Loaded {data_loader.n_events} precomputed events")
 
     # Initialize regressor
     regressor = detopt.nn.from_config(detector, config=config["regressor"], rngs=rngs)
-    optimizer = nnx.Optimizer(
-        regressor, detopt.utils.config.optimizer(config["optimizer"]), wrt=nnx.Param
-    )
+
+    # Split model into static and dynamic parts for functional JIT
+    regressor_def, r_params, r_state = nnx.split(regressor, nnx.Param, nnx.Variable)
+
+    # Create optax optimizer directly for functional updates
+    optax_optimizer = detopt.utils.config.optimizer(config["optimizer"])
+    opt_state = optax_optimizer.init(r_params)
 
     epochs, steps = config["epochs"], config["steps"]
     print(f"Training: {epochs} epochs, {steps} steps per epoch")
@@ -164,39 +178,80 @@ def regress(
 
     design = np.tile(enc, (batch, 1))
 
-    @nnx.jit
-    def loss_f(model, x, c, t):
-        p = model(x, c)
-        return jnp.mean(detector.loss(t, p))
+    # Extract detector constants to avoid closure capture causing recompilation
+    target_mean = detector.target_mean
+    target_std = detector.target_std
 
-    @nnx.jit
-    def metric_f(model, x, c, t):
-        p = model(x, c)
-        return jnp.mean(detector.metric(t, p))
+    def loss_f(x, c, t, r_params, r_state):
+        regressor = nnx.merge(regressor_def, r_params, r_state)
+        p = regressor(x, c, deterministic=True)
 
-    @nnx.jit
-    def step(model, optimizer, x, c, t):
-        # x is a dictionary for sparse data, don't convert to array
+        # DCA
+        p_denorm = p * target_std + target_mean
+        t_denorm = t
+
+        # Extract position and momentum: [x, y, z, px, py, pz]
+        pos_pred = p_denorm[:, :3]  # (batch, 3)
+        mom_pred = p_denorm[:, 3:]  # (batch, 3)
+        pos_true = t_denorm[:, :3]
+        mom_true = t_denorm[:, 3:]
+
+        mom_pred_norm = jnp.linalg.norm(mom_pred, axis=1, keepdims=True)
+        mom_true_norm = jnp.linalg.norm(mom_true, axis=1, keepdims=True)
+
+        mom_pred_hat = mom_pred / jnp.clip(mom_pred_norm, min=1e-6)
+        mom_true_hat = mom_true / jnp.clip(mom_true_norm, min=1e-6)
+
+        dca_pred = jnp.linalg.norm(jnp.cross(pos_pred, mom_pred_hat), axis=1)
+        dca_true = jnp.linalg.norm(jnp.cross(pos_true, mom_true_hat), axis=1)
+
+        dca_loss = jnp.mean(jnp.square(dca_pred - dca_true))
+        # end DCA
+
+        # Standard MSE loss on normalized values
+        target_norm = (t - target_mean) / target_std
+        diff = target_norm - p
+        mse = jnp.mean(jnp.square(diff), axis=-1)
+        mse_loss = jnp.mean(mse)
+
+        # Combined loss: MSE + weighted DCA loss
+        # Scale DCA loss to be comparable to MSE
+        loss = mse_loss  # + 0.1 * dca_loss
+
+        _, _, r_state = nnx.split(regressor, nnx.Param, nnx.Variable)
+        return loss, r_state
+
+    def metric_f(x, c, t, r_params, r_state):
+        regressor = nnx.merge(regressor_def, r_params, r_state)
+        p = regressor(x, c, deterministic=True)
+        target_norm = (t - target_mean) / target_std
+        rmse = jnp.sqrt(jnp.mean(jnp.square(target_norm - p), axis=-1))
+        metric = jnp.mean(rmse)
+        return metric
+
+    @jax.jit
+    def step(x, c, t, r_params, r_state, opt_state):
         c, t = jnp.array(c), jnp.array(t)
-        loss, grad = nnx.value_and_grad(loss_f, argnums=0)(model, x, c, t)
-        optimizer.update(model, grad)
-        return loss
+        (loss, r_state), grad = jax.value_and_grad(loss_f, argnums=3, has_aux=True)(
+            x, c, t, r_params, r_state
+        )
+        updates, opt_state = optax_optimizer.update(grad, opt_state, r_params)
+        r_params = optax.apply_updates(r_params, updates)
+        return loss, r_params, r_state, opt_state
 
     training_losses = np.ndarray(shape=(epochs, steps))
     validation_losses = np.ndarray(shape=(epochs, validation_batches))
 
-    # Track predictions and targets for precision analysis
     val_predictions = []
     val_targets = []
 
     status = detopt.utils.progress.status_bar(disable=not progress)
 
-    # Generate histograms using first few batches of precomputed data
     print("\nGenerating input/label histograms...")
     hist_measurements = []
     hist_targets = []
     for i in range(3):
-        meas, targ = data_loader.get_batch(batch, rng=np_rng)
+        meas, targ = data_loader.get_batch(batch, rng=np_rng_train)
         hist_measurements.append(meas)
         hist_targets.append(targ)
 
@@ -210,28 +265,40 @@ def regress(
     )
     print("✓ Histograms saved to output/hists.png")
 
-    # Training loop
     print(f"\nStarting training...")
     for i in status.epochs(epochs):
+        epoch_start = time.time()
+        step_times = []
         for j in status.training(steps):
-            # Load precomputed batch
-            measurements, target = data_loader.get_batch(batch, rng=np_rng)
-
-            training_losses[i, j] = step(
-                regressor, optimizer, measurements, design, target
+            step_start = time.time()
+            measurements, target = data_loader.get_batch_from_indices(
+                train_indices, batch, rng=np_rng_train
             )
 
-        for j in status.validation(validation_batches):
-            # Load precomputed validation batch
-            measurements, target = data_loader.get_batch(batch, rng=np_rng)
+            measurements = tuple(jnp.asarray(m) for m in measurements)
+            loss, r_params, r_state, opt_state = step(
+                measurements, design, target, r_params, r_state, opt_state
+            )
+            training_losses[i, j] = loss
+            step_time = time.time() - step_start
+            step_times.append(step_time)
 
-            # Get predictions for precision analysis (normalized outputs)
-            predictions_norm = regressor(measurements, jnp.array(design))
+        for j in status.validation(validation_batches):
+            measurements, target = data_loader.get_batch_from_indices(
+                val_indices, batch, rng=np_rng_val
+            )
+
+            measurements = tuple(jnp.asarray(m) for m in measurements)
+
+            regressor_merged = nnx.merge(regressor_def, r_params, r_state)
+            predictions_norm = regressor_merged(measurements, jnp.array(design))
 
             # Denormalize predictions to raw units for visualization
             predictions = predictions_norm * detector.target_std + detector.target_mean
 
-            validation_losses[i, j] = metric_f(regressor, measurements, design, target)
+            validation_losses[i, j] = metric_f(
+                measurements, design, target, r_params, r_state
+            )
 
             # Debug: print first batch of first validation to check values
             if j == 0:
@@ -262,9 +329,13 @@ def regress(
         val_loss_mean = np.mean(validation_losses[i])
         train_loss_std = np.std(training_losses[i])
         val_loss_std = np.std(validation_losses[i])
+        epoch_time = time.time() - epoch_start
+        avg_step_time = np.mean(step_times)
+        first_step_time = step_times[0] if step_times else 0
         print(
             f"EPOCH: {i + 1}/{epochs} train_loss={train_loss_mean:.6f}±{train_loss_std:.4f} "
-            f"val_loss={val_loss_mean:.6f}±{val_loss_std:.4f}"
+            f"val_loss={val_loss_mean:.6f}±{val_loss_std:.4f} "
+            f"epoch_time={epoch_time:.2f}s avg_step={avg_step_time:.3f}s first_step={first_step_time:.3f}s"
         )
 
         # Save plot after each epoch
@@ -332,13 +403,12 @@ def regress(
         options=ocp.CheckpointManagerOptions(max_to_keep=1),
     )
 
-    _, parameters, state = nnx.split(regressor, nnx.Param, nnx.Variable)
-    parameters = nnx.to_pure_dict(parameters)
-    state = nnx.to_pure_dict(state)
+    # Use the updated params and state from training
+    parameters = nnx.to_pure_dict(r_params)
+    state = nnx.to_pure_dict(r_state)
 
-    # Create fresh optimizer state (can be reinitialized on load)
-    optax_optimizer = detopt.utils.config.optimizer(config["optimizer"])
-    optimizer_state = optax_optimizer.init(parameters)
+    # Use the optimizer state from training
+    optimizer_state = opt_state
 
     manager.save(
         0,

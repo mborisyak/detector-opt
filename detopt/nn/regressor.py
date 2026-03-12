@@ -445,11 +445,15 @@ class DeepSet(Regressor):
         # input("wait for info")
         # print(info)
         # input("wait for ")
-        events, layers, straws, times = info
+        events, layers, straws, times, mask = info
+
+        # Keep fixed-size arrays - DO NOT filter with mask
+        # This ensures consistent shapes for JIT compilation
         events = jnp.asarray(events, dtype=jnp.int32)
         layers = jnp.asarray(layers, dtype=jnp.int32)
         straws = jnp.asarray(straws, dtype=jnp.int32)
         values = jnp.asarray(times, dtype=jnp.float32)
+        mask_bool = jnp.asarray(mask, dtype=jnp.bool_)
         n_layers_total = (
             self.n_stations * self.n_views_per_station * self.n_layers_per_view
         )  # Total number of layers (typically 32)
@@ -508,12 +512,16 @@ class DeepSet(Regressor):
             axis=-1,
         )
 
+        # Zero out invalid hits by multiplying with mask
+        # This keeps fixed-size arrays while making invalid hits contribute 0
+        mask_expanded = mask_bool[:, jnp.newaxis]  # Shape: (n_hits, 1)
+        hit_features = hit_features * mask_expanded
+
         # Return hit features and event indices directly for segment operations
         return hit_features, events
 
     def __call__(self, X: jax.Array, design: jax.Array, *, deterministic: bool = True):
         if True:
-            # Sparse format: use segment operations (no padding needed)
             hit_features, event_indices = self.combine(X, design)
             n_batch = design.shape[0]
 

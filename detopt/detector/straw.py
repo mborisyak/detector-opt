@@ -145,7 +145,7 @@ class StrawDetector(Detector):
         B_sigma: float = 300.0,
         layer_bounds: tuple[float | int, float | int] = (8000.0, 10000.0),
         dt: float = 0.1,
-        max_particles=50,
+        max_particles=5,
         secondary_multiplier=5,
         angles_bounds=None,
         layer_width=None,
@@ -232,7 +232,6 @@ class StrawDetector(Detector):
         self._numpyfile_cache = None
         self._numpyfile_path = None
         self.data_dir = data_dir
-        self.max_particles_real = 10
         self._data_loader = None
 
         # Loss function parameters for position and momentum prediction
@@ -360,11 +359,14 @@ class StrawDetector(Detector):
         # print("\n\n\n\nSimulation started\n\n\n\n")
 
         n_events = configurations.shape[0]
+        # print(n_events)
+        # input("ev\n\n")
         # print(configurations.shape)
         rng = np.random.default_rng(seed)
 
         # Load real daughter particle data and HNL targets
         daughter_data, hnl_targets = self._load_real_data(n_events, rng)
+        print(len(hnl_targets))
 
         # print("\n\n\n\ndata loaded\n\n\n\n")
         # print(daughter_data)
@@ -375,6 +377,8 @@ class StrawDetector(Detector):
         initial_momentum = daughter_data["momenta"]  # (batch, max_particles, 3)
         initial_times = daughter_data["times"]  # (batch, max_particles)
         n_particles_per_event = daughter_data["n_particles"]
+        # print(masses.shape)
+        # input("ma\n\n")
 
         # Print loaded particle information
         # print(f"\n{'=' * 80}")
@@ -438,13 +442,14 @@ class StrawDetector(Detector):
         B_sigma_arr = np.full((n_events,), self.B_sigma, dtype=np.float32)
 
         # Estimate max hits for sparse arrays
-        max_hits = 200 * n_events * self.max_particles * self.n_layers
+        max_hits = 2 * n_events * self.max_particles * self.n_layers
+        print(max_hits)
 
         # print("max hits", max_hits, n_events, p_slots, self.n_t, self.n_layers)
         trajectories = np.zeros(
             (n_events, self.max_particles, self.n_t, 3), dtype=np.float32
         )
-        mask = np.zeros((n_events, self.max_particles), dtype=np.float32)
+        mask = np.zeros(max_hits, dtype=np.int32)
 
         # Pre-allocate sparse output arrays
         sparse_events = np.zeros(max_hits, dtype=np.int32)
@@ -492,41 +497,21 @@ class StrawDetector(Detector):
             self.E_sec_MeV,
             self.max_particles,
         )
-        # print("\n" * 5)
-        # print(
-        #     f"DEBUG: p_spawn_single = {self.p_spawn_single}, p_spawn_pair = {self.p_spawn_pair}, E_sec_MeV = {self.E_sec_MeV}"
-        # )
 
-        # print("Sim done")
-        # print(trajectories.shape)
-        # print(trajectories)
-        # print("\n" * 5)
-        # print(sparse_hit_pos.shape)
-        # print(sparse_hit_pos)
-
-        # Check for sparse array overflow
-
-        n_hits = sparse_count[0]
         n_hits = int(sparse_count[0])
-        # print("n_hits", n_hits, "max_hits", max_hits)
-        assert 0 <= n_hits <= max_hits, (n_hits, max_hits)
-        # if n_hits >= max_hits:
-        #     print("\n" + "!" * 80)
-        #     print("WARNING: Sparse array overflow detected!")
-        #     print(f"Allocated space: {max_hits} hits")
-        #     print(f"Hits recorded: {n_hits} (may be truncated)")
-        #     print("Consider increasing max_hits calculation in simulate()")
-        #     print("!" * 80 + "\n")
 
-        # Trim sparse arrays to actual hit count
-        events = sparse_events[:n_hits]
-        particles = sparse_particles[:n_hits]
-        layers_arr = sparse_layers[:n_hits]
-        straws = sparse_straws[:n_hits]
-        values = sparse_values[:n_hits]
-        r_mm_sparse = sparse_r_mm[:n_hits]
-        t0_sparse = sparse_t0[:n_hits]
-        hit_pos_sparse = sparse_hit_pos[:n_hits]
+        assert 0 <= n_hits <= max_hits, (n_hits, max_hits)
+
+        events = sparse_events  # [:n_hits]
+        particles = sparse_particles
+        layers_arr = sparse_layers
+        straws = sparse_straws
+        values = sparse_values
+        r_mm_sparse = sparse_r_mm
+        t0_sparse = sparse_t0
+        hit_pos_sparse = sparse_hit_pos
+
+        mask[:n_hits] = 1
 
         # Convert to SparseHits object
         sparse_hits = SparseHits(
@@ -540,173 +525,10 @@ class StrawDetector(Detector):
             hit_pos_sparse,
         )
 
-        # PRINT
-        # print(f"\n{'=' * 80}")
-        # print(f"Detector Hits Summary")
-        # print(f"{'=' * 80}")
-        # print(f"Total hits recorded: {len(sparse_hits)}")
-        # print(f"Sparse array capacity: {max_hits} hits")
-        # print(f"Utilization: {100.0 * len(sparse_hits) / max_hits:.2f}%")
-        # print(
-        #     f"Dense array size: {n_events * p_slots * self.n_layers * self.n_straws} elements"
-        # )
-
-        # if len(sparse_hits) > 0:  # Calculate spawn statistics
-        #     primary_particles = sparse_hits.particles[
-        #         sparse_hits.particles < self.max_particles
-        #     ]
-        #     secondary_particles = sparse_hits.particles[
-        #         sparse_hits.particles >= self.max_particles
-        #     ]
-        #     n_primary_hits = len(primary_particles)
-        #     n_secondary_hits = len(secondary_particles)
-        #     n_unique_secondaries = (
-        #         len(np.unique(secondary_particles))
-        #         if len(secondary_particles) > 0
-        #         else 0
-        #     )
-
-        #     # Show ALL unique particle indices that have hits
-        #     all_unique_particles = np.unique(sparse_hits.particles)
-        #     print(f"\n--- Particle Index Analysis ---")
-        #     print(f"max_particles setting: {self.max_particles}")
-        #     print(
-        #         f"Total unique particle indices with hits: {len(all_unique_particles)}"
-        #     )
-        #     print(f"Particle indices: {all_unique_particles}")
-        #     print(f"\nExpected particles from data: 2 (indices 0 and 1)")
-        #     print(
-        #         f"Unexpected particles (indices >= 2): {np.sum(all_unique_particles >= 2)}"
-        #     )
-
-        #     print(f"\n--- Hit Distribution ---")
-        #     for pidx in all_unique_particles[:20]:  # Show first 20
-        #         n_hits_for_particle = np.sum(sparse_hits.particles == pidx)
-        #         particle_type = "Expected" if pidx < 2 else "UNEXPECTED"
-        #         print(
-        #             f"  Particle {pidx:3d} ({particle_type}): {n_hits_for_particle:4d} hits"
-        #         )
-        #         if len(all_unique_particles) > 20:
-        #             print(f"  ... and {len(all_unique_particles) - 20} more particles")
-
-        #         # Analyze multiple hits per straw
-        #     print(f"\n--- Multiple Hits Per Straw Statistics ---")
-        #     # Create unique keys for each (event, particle, layer, straw) combination
-        #     unique_keys = np.column_stack(
-        #         [
-        #             sparse_hits.events,
-        #             sparse_hits.particles,
-        #             sparse_hits.layers,
-        #             sparse_hits.straws,
-        #         ]
-        #     )
-        #     # Count occurrences of each combination
-        #     from collections import Counter
-
-        #     key_tuples = [tuple(key) for key in unique_keys]
-        #     hit_counts = Counter(key_tuples)
-
-        #     # Statistics on hit multiplicity
-        #     multiplicities = list(hit_counts.values())
-        #     max_hits_per_straw = max(multiplicities)
-        #     avg_hits_per_straw = np.mean(multiplicities)
-        #     straws_with_multiple_hits = sum(1 for count in multiplicities if count > 1)
-
-        #     print(
-        #         f"Total unique (event,particle,layer,straw) combinations: {len(hit_counts)}"
-        #     )
-        #     print(f"Total hits recorded: {len(sparse_hits)}")
-        #     print(f"Average hits per unique straw: {avg_hits_per_straw:.2f}")
-        #     print(f"Max hits in a single straw: {max_hits_per_straw}")
-        #     print(
-        #         f"Straws with multiple hits: {straws_with_multiple_hits} ({100.0 * straws_with_multiple_hits / len(hit_counts):.1f}%)"
-        #     )
-
-        #     # Show histogram of hit multiplicities
-        #     mult_histogram = Counter(multiplicities)
-        #     print(f"\nHit multiplicity histogram:")
-        #     for mult in sorted(mult_histogram.keys())[
-        #         :10
-        #     ]:  # Show first 10 multiplicities
-        #         count = mult_histogram[mult]
-        #         print(
-        #             f"  {mult} hits: {count} straws ({100.0 * count / len(hit_counts):.1f}%)"
-        #         )
-        #     if len(mult_histogram) > 10:
-        #         print(f"  ... and {len(mult_histogram) - 10} more multiplicity values")
-
-        #     print(f"\n--- Spawn Statistics ---")
-        #     print(f"Particles < max_particles threshold: {n_primary_hits} hits")
-        #     print(f"Particles >= max_particles threshold: {n_secondary_hits} hits")
-        #     # print(f"Spawn probability (p_spawn): {self.p_spawn}")
-        #     # if self.p_spawn > 0 and n_primary_hits > 0:
-        #     #     expected_pairs = n_primary_hits * self.p_spawn
-        #     #     actual_pairs = n_unique_secondaries / 2
-        #     #     print(f"Expected pairs: ~{expected_pairs:.1f}")
-        #     #     print(f"Actual pairs: {actual_pairs:.0f}")
-
-        #     # Group hits by event and particle
-        #     print(f"\n--- Hits by Event and Particle ---")
-        #     for evt_idx in range(min(3, n_events)):  # Show first 3 events
-        #         evt_mask = sparse_hits.events == evt_idx
-        #         n_hits_evt = np.sum(evt_mask)
-        #         if n_hits_evt == 0:
-        #             continue
-
-        #         print(f"\nEvent {evt_idx}: {n_hits_evt} hits")
-
-        #         # Get unique particles that hit in this event
-        #         particles_in_evt = np.unique(sparse_hits.particles[evt_mask])
-        #         for part_idx in particles_in_evt[:10]:  # Show first 10 particles
-        #             part_mask = evt_mask & (sparse_hits.particles == part_idx)
-        #             n_hits_part = np.sum(part_mask)
-
-        #             # Determine if primary or secondary
-        #             particle_type = (
-        #                 "Primary" if part_idx < self.max_particles else "Secondary"
-        #             )
-        #             print(
-        #                 f"  Particle {part_idx} ({particle_type}): {n_hits_part} hits"
-        #             )
-
-        # END OF PRINT
-
-        # Detailed hit table
-        # print(f"\n--- First 20 Hits (Detailed) ---")
-        # print(
-        #     f"{'Event':<7} {'Particle':<10} {'Type':<10} {'Layer':<7} {'Straw':<7} "
-        #     f"{'Value(ns)':<11}  {'r_mm':<9} {'t0(ns)':<11} {'Position (x,y,z) [mm]'}"
-        # )
-        # # print("-" * 130)
-        # for i in range(min(20, len(sparse_hits))):
-        #     evt = sparse_hits.events[i]
-        #     part = sparse_hits.particles[i]
-        #     part_type = "Primary" if part < self.max_particles else "Secondary"
-        #     lay = sparse_hits.layers[i]
-        #     stw = sparse_hits.straws[i]
-        #     val = sparse_hits.values[i]
-        #     r = sparse_hits.r_mm[i]
-        #     t = sparse_hits.t0[i]
-        #     pos = sparse_hits.hit_pos[i]
-
-        #     print(
-        #         f"{evt:<7} {part:<10} {part_type:<10} {lay:<7} {stw:<7} "
-        #         f"{val:<11.4f} {r:<9.4f} {t:<11.4f} "
-        #         f"({pos[0]:7.2f},{pos[1]:7.2f},{pos[2]:7.2f})"
-        #     )
-
-        # if len(sparse_hits) > 20:
-        #     print(f"... and {len(sparse_hits) - 20} more hits")
-
-        # print(f"{'=' * 80}\n")
-        #     print("=" * 95 + "\n")
-        # print("mask shape:", mask.shape, "dtype:", mask.dtype)
-        # print(mask)
-        # print(trajectories)
-
         # Calculate fdigi from sparse hits (FairShip-style TDC)
         fdigi_times = {}
-        times = []
+        times = np.zeros(max_hits, dtype=np.int32)
+
         if sparse_hits is not None and len(sparse_hits) > 0:
             v_drift = 0.0033  # cm/ns (drift velocity)
             sigma_spatial = 0.012  # cm (spatial resolution)
@@ -736,7 +558,7 @@ class StrawDetector(Detector):
 
             n_straws = widths.shape[1] if len(widths.shape) > 1 else widths.shape[0]
 
-            for i in range(len(sparse_hits)):
+            for i in range(n_hits):
                 event = int(sparse_hits.events[i])
                 particle = int(sparse_hits.particles[i])
                 layer = int(sparse_hits.layers[i])
@@ -769,74 +591,7 @@ class StrawDetector(Detector):
 
                 key = (event, particle, layer, straw)
                 fdigi_times[key] = fdigi
-                times.append(fdigi)
-        times = np.array(times)
-        # print(times.mean())
-        # print(times.std())
-        # # input("wait for times")
-        # # Print TDC component breakdown for first few hits
-        # if len(fdigi_times) > 0:
-        #     print("\n" + "=" * 80)
-        #     print("TDC (fdigi) Component Breakdown - First 5 Hits")
-        #     print("=" * 80)
-        #     print(
-        #         f"{'Event':<7} {'Particle':<10} {'Layer':<7} {'Straw':<7} {'t_MC(ns)':<12} {'t_drift(ns)':<14} {'r_mm':<14} {'prop_time(ns)':<15} {'fdigi(ns)':<12}"
-        #     )
-        #     print("-" * 120)
-
-        #     for idx, (key, fdigi_val) in enumerate(list(fdigi_times.items())[:5]):
-        #         event, particle, layer, straw = key
-        #         # Recalculate components for display
-        #         hit_idx = None
-        #         for i in range(len(sparse_hits)):
-        #             if (
-        #                 sparse_hits.events[i] == event
-        #                 and sparse_hits.particles[i] == particle
-        #                 and sparse_hits.layers[i] == layer
-        #                 and sparse_hits.straws[i] == straw
-        #             ):
-        #                 hit_idx = i
-        #                 break
-
-        #         if hit_idx is not None:
-        #             t_MC = sparse_hits.t0[hit_idx]
-        #             r_mm = sparse_hits.r_mm[hit_idx]
-        #             hit_xyz = sparse_hits.hit_pos[hit_idx]
-
-        #             p0, p1 = get_straw_endpoints(
-        #                 layer,
-        #                 straw,
-        #                 layers[0],
-        #                 angles[0],
-        #                 widths[0],
-        #                 heights[0],
-        #                 n_straws,
-        #             )
-
-        #             dist_cm = r_mm / 10.0
-        #             t_drift = abs(np.random.normal(dist_cm, sigma_spatial)) / v_drift
-        #             propagation_time = (p1[0] - hit_xyz[0]) / c
-
-        #             print(
-        #                 f"{event:<7} {particle:<10} {layer:<7} {straw:<7} {t_MC:<12.4f} {t_drift:<14.6f}  {r_mm:<14.6f} {propagation_time:<15.6f} {fdigi_val:<12.4f}"
-        #             )
-
-        #     print("=" * 80)
-        #     print(f"\nTotal TDC values stored: {len(fdigi_times)}")
-        #     print(f"\nPhysics parameters:")
-        #     print(f"  v_drift = {v_drift} cm/ns (drift velocity)")
-        #     print(f"  sigma_spatial = {sigma_spatial} cm (spatial resolution)")
-        #     print(f"  c = {c} cm/ns (speed of light)")
-        #     print(f"\nNote: r_mm is drift distance to wire in mm")
-        #     print(f"      Expected t_drift ≈ (r_mm/10) / v_drift")
-        #     print()
-
-        # print("\n" * 5)
-        # print("Fdigi")
-        # print(len(fdigi_times))
-        # print(fdigi_times)
-        # print(initial_times)
-        # print(sparse_hits)
+                times[i] = fdigi
 
         # Return sparse_hits directly
         return (
@@ -908,7 +663,7 @@ class StrawDetector(Detector):
             sparse_hits,  # sparse_hits
             fdigi_times,  # fdigi_times (dict)
             times,
-            _,  # mask
+            mask,  # mask
             target,
         ) = self.simulate(seed, configurations)
         ground_truth = self.encode_ground_truth(
@@ -923,6 +678,7 @@ class StrawDetector(Detector):
             sparse_hits.layers,
             sparse_hits.straws,
             times,
+            mask,
         )
         # print(events)
         # input("wait for events")
