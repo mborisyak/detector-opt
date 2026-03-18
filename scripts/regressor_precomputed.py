@@ -41,7 +41,7 @@ def save_deepset_input_label_hists(
         design_batch = np.tile(design, (batch_size, 1))
 
         # Normalized per-hit features come from here:
-        hit_features, events = model.combine(
+        hit_features, events, _ = model.combine(
             measurements, design_batch
         )  # hit_features: (n_hits, 8), events: (n_hits,)
 
@@ -240,10 +240,31 @@ def regress(
         return loss, r_params, r_state, opt_state
 
     training_losses = np.ndarray(shape=(epochs, steps))
-    validation_losses = np.ndarray(shape=(epochs, validation_batches))
+    validation_losses = np.ndarray(
+        shape=(epochs, 1)
+    )  # Single validation score per epoch
 
     val_predictions = []
     val_targets = []
+
+    # Create fixed validation set (do this once before training loop)
+    print("\nCreating fixed validation set...")
+    fixed_val_measurements = []
+    fixed_val_targets = []
+    n_fixed_val_batches = max(
+        50, validation_batches
+    )  # At least 50 batches for stability
+
+    for _ in range(n_fixed_val_batches):
+        meas, targ = data_loader.get_batch_from_indices(
+            val_indices, batch, rng=np_rng_val
+        )
+        fixed_val_measurements.append(tuple(jnp.asarray(m) for m in meas))
+        fixed_val_targets.append(jnp.asarray(targ))
+
+    print(
+        f"✓ Fixed validation set: {n_fixed_val_batches} batches ({n_fixed_val_batches * batch} samples)"
+    )
 
     status = detopt.utils.progress.status_bar(disable=not progress)
 
@@ -283,46 +304,42 @@ def regress(
             step_time = time.time() - step_start
             step_times.append(step_time)
 
-        for j in status.validation(validation_batches):
-            measurements, target = data_loader.get_batch_from_indices(
-                val_indices, batch, rng=np_rng_val
-            )
+        # Validation on fixed set
+        val_loss_sum = 0.0
+        val_predictions_epoch = []
+        val_targets_epoch = []
 
-            measurements = tuple(jnp.asarray(m) for m in measurements)
-
+        for j, (measurements, target) in enumerate(
+            zip(fixed_val_measurements, fixed_val_targets)
+        ):
             regressor_merged = nnx.merge(regressor_def, r_params, r_state)
             predictions_norm = regressor_merged(measurements, jnp.array(design))
 
             # Denormalize predictions to raw units for visualization
             predictions = predictions_norm * detector.target_std + detector.target_mean
 
-            validation_losses[i, j] = metric_f(
-                measurements, design, target, r_params, r_state
-            )
+            val_loss = metric_f(measurements, design, target, r_params, r_state)
+            val_loss_sum += val_loss
 
-            # Debug: print first batch of first validation to check values
+            # Collect ALL predictions for this epoch
+            val_predictions_epoch.append(np.array(predictions))
+            val_targets_epoch.append(np.array(target))
+
+            # Debug: print first batch only
             if j == 0:
-                print(f"\nEpoch {i + 1} Validation:")
+                print(
+                    f"\nEpoch {i + 1} Validation (batch 0/{len(fixed_val_measurements)}):"
+                )
+                print(f"  Loss (first batch): {val_loss:.6f}")
                 print(f"  Target[0]: {target[0]}")
-                print(f"  Predicted[0] (normalized): {predictions_norm[0]}")
-                print(f"  Predicted[0] (denormalized): {predictions[0]}")
-                print(f"  Absolute diff: {np.abs(predictions[0] - target[0])}")
+                print(f"  Predicted[0]: {predictions[0]}")
 
-                t = target[0]  # physical
-                mu = detector.target_mean  # shape (6,)
-                sd = detector.target_std  # shape (6,)
+        # Average validation loss over all batches
+        validation_losses[i, 0] = val_loss_sum / len(fixed_val_measurements)
 
-                t_norm = (t - mu) / sd  # normalized target
-                p_norm = predictions_norm[0]  # normalized prediction
-
-                print(f"  Target_norm[0]: {t_norm}")
-                print(f"  Pred_norm[0]: {p_norm}")
-                print(f"  Diff_norm: {t_norm - p_norm}")
-
-            # Store predictions and targets for this epoch
-            if j == 0:  # Store only first validation batch per epoch
-                val_predictions.append(np.array(predictions))
-                val_targets.append(np.array(target))
+        # Store ALL validation predictions (not just first batch)
+        val_predictions.append(np.concatenate(val_predictions_epoch, axis=0))
+        val_targets.append(np.concatenate(val_targets_epoch, axis=0))
 
         # Print epoch summary (greppable format)
         train_loss_mean = np.mean(training_losses[i])
@@ -334,7 +351,7 @@ def regress(
         first_step_time = step_times[0] if step_times else 0
         print(
             f"EPOCH: {i + 1}/{epochs} train_loss={train_loss_mean:.6f}±{train_loss_std:.4f} "
-            f"val_loss={val_loss_mean:.6f}±{val_loss_std:.4f} "
+            f"val_loss={val_loss_mean:.6f} "
             f"epoch_time={epoch_time:.2f}s avg_step={avg_step_time:.3f}s first_step={first_step_time:.3f}s"
         )
 
