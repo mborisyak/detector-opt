@@ -15,6 +15,11 @@ straw:
   layer_z_gap: 1.732 # cm (between layers in a view)
   view_z_gap: 5.0 # cm (between consecutive views)
 
+  constrain_stereo_angles: true
+  optimize_stations: false # Freeze station positions
+  optimize_gaps: false # Freeze layer_z_gap and view_z_gap
+  optimize_bfield: false # Freeze max_B, B_sigma, z0
+
   # Physics parameters
   dt: 0.1 #ns
   max_B: 0.15 # Tesla (maximum magnetic field strength for optimization)

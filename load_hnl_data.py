@@ -1,17 +1,3 @@
-"""
-HNL Data Loader for Real Experimental Data - Memory-Optimized Version
-
-This loader reads ALL daughter particle data from combined_all/*.npz files
-into memory once at initialization for fast sampling during training.
-
-Data flow:
-1. Load ALL daughter particles at initialization
-2. Sample from memory during training (fast!)
-3. Pass to straw_detector.solve_sparse() to simulate detector response
-4. Use hits as input to neural network
-5. Target is HNL decay vertex (prestraw_hnl_dx, dy, dz, px, py, pz)
-"""
-
 import glob
 from pathlib import Path
 from typing import Optional, Tuple
@@ -22,22 +8,24 @@ from tqdm import tqdm
 
 
 class HNLDataLoader:
-    """
-    Loads ALL daughter particle data from HNL decay events into memory.
+    def __init__(
+        self,
+        data_dir: str = "clean_data",
+        max_particles: int = 50,
+        val_fraction: float = 0.2,
+        split_seed: int = 42,
+        shuffle_split: bool = True,
+    ):
 
-    Fast sampling with no file I/O during training.
-    """
-
-    def __init__(self, data_dir: str = "clean_data", max_particles: int = 50):
-        """
-        Initialize data loader - loads ALL data into memory.
-
-        Args:
-            data_dir: Directory containing combined_data_*.npz files
-            max_particles: Maximum particles per event (for padding)
-        """
         self.data_dir = Path(data_dir)
         self.max_particles = max_particles
+
+        if not (0.0 <= val_fraction < 1.0):
+            raise ValueError(f"val_fraction must be in [0, 1), got {val_fraction}")
+
+        self.val_fraction = float(val_fraction)
+        self.split_seed = int(split_seed)
+        self.shuffle_split = bool(shuffle_split)
 
         # Try both naming conventions
         files = sorted(glob.glob(str(self.data_dir / "*.npz")))
@@ -59,29 +47,18 @@ class HNLDataLoader:
         all_targets = []
         all_pdgs = []
 
-        cnt = 0
-        cnt2 = 0
-        cnt3 = 0
-        cnt_ev = 0
         # Load ALL files
         for file_path in tqdm(files, desc="Loading data"):
             data = np.load(file_path, allow_pickle=True)
-            # cnt3 += 1
             # Get unique events in this file
             unique_events = np.unique(data["prestraw_ev"])
 
             for event_id in unique_events:
                 mask = data["prestraw_ev"] == event_id
                 n_parts = min(np.sum(mask), max_particles)
-                # if cnt_ev > 15:
-                #     break
+
                 if n_parts == 0:
                     continue
-                if n_parts != 2:
-                    continue
-                # if event_id >= 1:
-                #     continue
-                # cnt_ev += 1
 
                 # Initialize padded arrays for this event
                 masses = np.zeros(max_particles, dtype=np.float32)
@@ -134,15 +111,6 @@ class HNLDataLoader:
                 all_n_particles.append(n_parts)
                 all_targets.append(target)
                 all_pdgs.append(pdgs)
-
-                cnt += -n_parts + max_particles
-                cnt2 += 1
-                print(-n_parts + max_particles)
-                print(cnt3)
-            if cnt3 == 3:
-                break
-            if cnt_ev == 15:
-                break
         # Convert to arrays
         self.masses = np.array(all_masses, dtype=np.float32)
         self.charges = np.array(all_charges, dtype=np.float32)
@@ -154,57 +122,66 @@ class HNLDataLoader:
         self.pdgs = np.array(all_pdgs, dtype=np.int32)
 
         self.n_events = len(self.n_particles)
-        print(cnt / cnt2)
-        print(self.n_events)
-        input("wait")
+        if self.n_events == 0:
+            raise ValueError("No events were loaded.")
 
-        # print(f"✓ Loaded {self.n_events} events into memory")
+        self._create_split()
+
+        print(f"✓ Loaded {self.n_events} events into memory")
         # print(f"  Memory usage: ~{self._estimate_memory_mb():.1f} MB")
-        # print(
-        #     f"  Particles per event: min={self.n_particles.min()}, "
-        #     f"max={self.n_particles.max()}, mean={self.n_particles.mean():.1f}"
-        # )
-
-    def _estimate_memory_mb(self) -> float:
-        """Estimate memory usage in MB."""
-        total_bytes = (
-            self.masses.nbytes
-            + self.charges.nbytes
-            + self.positions.nbytes
-            + self.momenta.nbytes
-            + self.times.nbytes
-            + self.n_particles.nbytes
-            + self.targets.nbytes
+        print(
+            f"  Particles per event: min={self.n_particles.min()}, "
+            f"max={self.n_particles.max()}, mean={self.n_particles.mean():.1f}"
         )
-        return total_bytes / (1024 * 1024)
 
-    def get_batch(
-        self,
-        batch_size: int,
-        max_particles: int = 50,  # Kept for API compatibility
-        rng: Optional[np.random.Generator] = None,
-    ) -> Tuple[dict, np.ndarray]:
-        """
-        Get a batch of events - returns ALL events sequentially (no random sampling).
+    def _create_split(self) -> None:
+        """Create a fixed train/val split over event indices."""
+        indices = np.arange(self.n_events, dtype=np.int32)
 
-        Args:
-            batch_size: Number of events to return (must equal n_events for full dataset)
-            max_particles: Ignored (uses self.max_particles from init)
-            rng: Ignored (no random sampling)
+        if self.shuffle_split:
+            split_rng = np.random.default_rng(self.split_seed)
+            split_rng.shuffle(indices)
 
-        Returns:
-            daughter_data: Dict with daughter particle info
-                - masses: MeV
-                - charges: e
-                - positions: cm
-                - momenta: MeV/c
-                - times: ns (time of flight)
-            targets: (batch_size, 6) array of [dx, dy, dz in cm, px, py, pz in GeV/c]
-        """
-        # Return all events sequentially (no sampling)
-        indices = np.arange(min(batch_size, self.n_events))
-        # indices = rng.choice(self.n_events, size=batch_size, replace=True)
-        # Return pre-loaded data (just indexing - super fast!)
+        n_val = int(round(self.n_events * self.val_fraction))
+
+        # keep both splits non-empty when possible
+        if self.val_fraction > 0.0 and self.n_events > 1:
+            n_val = max(1, min(n_val, self.n_events - 1))
+        else:
+            n_val = min(n_val, self.n_events)
+
+        self.val_indices = indices[:n_val]
+        self.train_indices = indices[n_val:]
+
+        self.n_train_events = len(self.train_indices)
+        self.n_val_events = len(self.val_indices)
+
+        if self.n_train_events == 0:
+            raise ValueError(
+                "Train split is empty. Reduce val_fraction or provide more events."
+            )
+        if self.val_fraction > 0.0 and self.n_val_events == 0:
+            raise ValueError(
+                "Validation split is empty. Increase val_fraction or provide more events."
+            )
+
+    def _get_split_indices(self, split: str) -> np.ndarray:
+        split = split.lower()
+        if split == "train":
+            return self.train_indices
+        if split == "val":
+            if self.n_val_events == 0:
+                raise ValueError(
+                    "Validation split is empty. Initialize with val_fraction > 0."
+                )
+            return self.val_indices
+        if split == "all":
+            return np.arange(self.n_events, dtype=np.int32)
+        raise ValueError(
+            f"Unknown split='{split}'. Expected: 'train', 'val', or 'all'."
+        )
+
+    def _build_batch_from_indices(self, indices: np.ndarray) -> Tuple[dict, np.ndarray]:
         daughter_data = {
             "masses": self.masses[indices],
             "charges": self.charges[indices],
@@ -213,10 +190,61 @@ class HNLDataLoader:
             "times": self.times[indices],
             "n_particles": self.n_particles[indices],
         }
-
         targets = self.targets[indices]
-
         return daughter_data, targets
+
+    def get_batch(
+        self,
+        batch_size: int,
+        max_particles: int = 50,  # kept for API compatibility
+        rng: Optional[np.random.Generator] = None,
+        split: str = "train",
+    ) -> Tuple[dict, np.ndarray]:
+        """
+        Get a batch of events with random sampling from a specific split.
+        Args:
+        batch_size: Number of events to return
+        max_particles: Ignored (uses self.max_particles from init)
+        rng: Random number generator for sampling
+        split: "train", "val", or "all"
+        """
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+
+        if rng is None:
+            rng = np.random.default_rng()
+
+        split_indices = self._get_split_indices(split)
+
+        sampled_positions = rng.choice(
+            len(split_indices), size=batch_size, replace=True
+        )
+        indices = split_indices[sampled_positions]
+
+        return self._build_batch_from_indices(indices)
+
+    def get_sequential_batch(
+        self,
+        start_idx: int,
+        end_idx: int,
+        split: str = "all",
+    ) -> Tuple[dict, np.ndarray]:
+        """
+        Get a sequential batch of events by index range within a split.
+        """
+        split_indices = self._get_split_indices(split)
+
+        start_idx = max(0, start_idx)
+        end_idx = min(len(split_indices), end_idx)
+
+        if start_idx >= end_idx:
+            raise ValueError(
+                f"Invalid range for split='{split}': "
+                f"start_idx={start_idx}, end_idx={end_idx}"
+            )
+
+        indices = split_indices[start_idx:end_idx]
+        return self._build_batch_from_indices(indices)
 
     def _pdg_to_mass_charge(self, pdg: int) -> Tuple[float, float]:
         """

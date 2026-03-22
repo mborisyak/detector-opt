@@ -161,6 +161,10 @@ class StrawDetector(Detector):
         origin_sigma=(1.2907193e02, 1.3767969e02, 1.6168958e03),
         momentum=(-2.0980914e-01, 2.1826500e-01, 2.6931271e01),
         momentum_sigma=(7.2272283e-01, 4.9576724e-01, 1.2292634e01),
+        constrain_stereo_angles: bool = False,  # If True, optimize single angle: [0, +α, -α, 0]
+        optimize_stations: bool = True,  # If False, freeze station positions
+        optimize_gaps: bool = True,  # If False, freeze layer_z_gap and view_z_gap
+        optimize_bfield: bool = True,  # If False, freeze max_B, B_sigma, z0
     ):
         """
         :param max_B: maximal strength of the magnetic field;
@@ -199,6 +203,10 @@ class StrawDetector(Detector):
         self.view_angles = view_angles
         self.layer_z_gap = layer_z_gap
         self.view_z_gap = view_z_gap
+        self.constrain_stereo_angles = constrain_stereo_angles
+        self.optimize_stations = optimize_stations
+        self.optimize_gaps = optimize_gaps
+        self.optimize_bfield = optimize_bfield
 
         self.n_layers = (
             self.n_stations * self.n_views_per_station * self.n_layers_per_view
@@ -355,7 +363,7 @@ class StrawDetector(Detector):
 
         return layers, angles, widths, heights, Bs
 
-    def simulate(self, seed, configurations, use_sparse=True):
+    def simulate(self, seed, configurations, use_sparse=True, split="train"):
         # print("\n\n\n\nSimulation started\n\n\n\n")
 
         n_events = configurations.shape[0]
@@ -365,7 +373,7 @@ class StrawDetector(Detector):
         rng = np.random.default_rng(seed)
 
         # Load real daughter particle data and HNL targets
-        daughter_data, hnl_targets = self._load_real_data(n_events, rng)
+        daughter_data, hnl_targets = self._load_real_data(n_events, rng, split=split)
         print(len(hnl_targets))
 
         # print("\n\n\n\ndata loaded\n\n\n\n")
@@ -607,7 +615,7 @@ class StrawDetector(Detector):
             hnl_targets,  # (batch, 6) = [dx, dy, dz, px, py, pz] in cm and GeV/c
         )
 
-    def _load_real_data(self, n_events, rng):
+    def _load_real_data(self, n_events, rng, split="train"):
         """
         Load real daughter particle data from NPZ files.
 
@@ -640,12 +648,12 @@ class StrawDetector(Detector):
             # print(f"Initialized HNL data loader from {self.data_dir}")
         # Load batch of events (data is already in memory - fast!)
         daughter_data, hnl_targets = self._data_loader.get_batch(
-            batch_size=n_events, rng=rng
+            batch_size=n_events, rng=rng, split=split
         )
 
         return daughter_data, hnl_targets
 
-    def __call__(self, seed: int, configurations: np.ndarray):
+    def __call__(self, seed: int, configurations: np.ndarray, split: str = "train"):
         """
         returns ground_truth, measurements, target
 
@@ -665,7 +673,7 @@ class StrawDetector(Detector):
             times,
             mask,  # mask
             target,
-        ) = self.simulate(seed, configurations)
+        ) = self.simulate(seed, configurations, split=split)
         ground_truth = self.encode_ground_truth(
             masses, charges, initial_positions, initial_momentum
         )
@@ -806,3 +814,279 @@ class StrawDetector(Detector):
         enc = self.encode_design(d)
         enc = np.asarray(enc, dtype=np.float32)
         return enc
+
+    def encode_yaml_design(self, yaml_params):
+        """
+        Encode YAML parameters for optimization.
+
+        This encodes high-level physical parameters instead of individual layer positions,
+        making the optimization space more interpretable and maintaining geometric structure.
+
+        Args:
+            yaml_params: dict with keys:
+                - station_z: list of station z-positions [z1, z2, z3, z4]
+                - view_angles: list of stereo angles [a1, a2, a3, a4] OR
+                - stereo_angle: single angle for constrained mode [0, +α, -α, 0]
+                - layer_z_gap: float, spacing between layers in a view
+                - view_z_gap: float, spacing between views
+                - max_B: float, maximum magnetic field strength
+                - B_sigma: float, sigma (width) of magnetic field (optional)
+                - z0: float, center of magnetic field (optional)
+
+        Returns:
+            encoded: 1D array of normalized parameters suitable for optimization
+        """
+        params = []
+
+        # Extract parameters with defaults
+        station_z = np.array(
+            yaml_params.get("station_z", self.station_z), dtype=np.float32
+        )
+
+        # Handle constrained stereo angle mode
+        if self.constrain_stereo_angles:
+            # Extract single stereo angle parameter
+            if "stereo_angle" in yaml_params:
+                stereo_angle = np.float32(yaml_params["stereo_angle"])
+            elif "view_angles" in yaml_params:
+                # If view_angles provided, extract the positive angle
+                angles = yaml_params["view_angles"]
+                stereo_angle = np.float32(angles[1]) if len(angles) > 1 else 0.0
+            else:
+                # Default: extract from current view_angles
+                stereo_angle = np.float32(self.view_angles[1])
+        else:
+            view_angles = np.array(
+                yaml_params.get("view_angles", self.view_angles), dtype=np.float32
+            )
+        layer_z_gap = np.float32(yaml_params.get("layer_z_gap", self.layer_z_gap))
+        view_z_gap = np.float32(yaml_params.get("view_z_gap", self.view_z_gap))
+        max_B = np.float32(yaml_params.get("max_B", self.max_B))
+        B_sigma = np.float32(yaml_params.get("B_sigma", self.B_sigma))
+        z0 = np.float32(yaml_params.get("z0", self.z0))
+
+        # Define reasonable bounds for each parameter and add only optimizable ones
+
+        # Station positions: within layer_bounds
+        if self.optimize_stations:
+            station_z_norm = uniform_to_normal(station_z, *self.layer_bounds)
+            params.append(station_z_norm)
+
+        # View angles: ±11 degrees (±0.2 radians) is reasonable for stereo
+        if self.constrain_stereo_angles:
+            # Only optimize single angle in range [0, 0.2] radians (0 to ~11 degrees)
+            stereo_angle_norm = uniform_to_normal(stereo_angle, 0.0, 0.2)
+            params.append([stereo_angle_norm])
+        else:
+            view_angles_norm = uniform_to_normal(view_angles, -0.2, 0.2)
+            params.append(view_angles_norm)
+
+        # Layer and view spacing
+        if self.optimize_gaps:
+            layer_z_gap_norm = uniform_to_normal(layer_z_gap, 0.5, 10.0)
+            view_z_gap_norm = uniform_to_normal(view_z_gap, 1.0, 20.0)
+            params.append([layer_z_gap_norm])
+            params.append([view_z_gap_norm])
+
+        # Magnetic field parameters
+        if self.optimize_bfield:
+            max_B_norm = uniform_to_normal(max_B, 0.0, 1.0)
+            B_sigma_norm = uniform_to_normal(B_sigma, 50.0, 1000.0)
+            z0_norm = uniform_to_normal(z0, *self.layer_bounds)
+            params.append([max_B_norm])
+            params.append([B_sigma_norm])
+            params.append([z0_norm])
+
+        # Concatenate all parameters
+        return np.concatenate(params, axis=0)
+
+    def decode_yaml_design(self, encoded):
+        """
+        Decode normalized parameters back to YAML format.
+
+        Args:
+            encoded: 1D array from encode_yaml_design
+
+        Returns:
+            yaml_params: dict with physical parameters in interpretable units
+        """
+        idx = 0
+
+        # Decode station positions (or use current values if frozen)
+        if self.optimize_stations:
+            n_stations = len(self.station_z)
+            station_z = normal_to_uniform(
+                encoded[idx : idx + n_stations], *self.layer_bounds
+            )
+            idx += n_stations
+        else:
+            station_z = np.array(self.station_z, dtype=np.float32)
+
+        # Decode view angles (or use current values if frozen)
+        if self.constrain_stereo_angles:
+            # Decode single stereo angle and expand to [0, +α, -α, 0]
+            stereo_angle = normal_to_uniform(encoded[idx], 0.0, 0.2)
+            idx += 1
+            view_angles = np.array(
+                [0.0, stereo_angle, -stereo_angle, 0.0], dtype=np.float32
+            )
+        else:
+            n_angles = len(self.view_angles)
+            view_angles = normal_to_uniform(encoded[idx : idx + n_angles], -0.2, 0.2)
+            idx += n_angles
+
+        # Decode layer spacing (or use current values if frozen)
+        if self.optimize_gaps:
+            layer_z_gap = normal_to_uniform(encoded[idx], 0.5, 10.0)
+            idx += 1
+            view_z_gap = normal_to_uniform(encoded[idx], 1.0, 20.0)
+            idx += 1
+        else:
+            layer_z_gap = np.float32(self.layer_z_gap)
+            view_z_gap = np.float32(self.view_z_gap)
+
+        # Decode magnetic field parameters (or use current values if frozen)
+        if self.optimize_bfield:
+            max_B = normal_to_uniform(encoded[idx], 0.0, 1.0)
+            idx += 1
+            B_sigma = normal_to_uniform(encoded[idx], 50.0, 1000.0)
+            idx += 1
+            z0 = normal_to_uniform(encoded[idx], *self.layer_bounds)
+        else:
+            max_B = np.float32(self.max_B)
+            B_sigma = np.float32(self.B_sigma)
+            z0 = np.float32(self.z0)
+
+        result = {
+            "station_z": [float(z) for z in station_z],
+            "view_angles": [float(a) for a in view_angles],
+            "layer_z_gap": float(layer_z_gap),
+            "view_z_gap": float(view_z_gap),
+            "max_B": float(max_B),
+            "B_sigma": float(B_sigma),
+            "z0": float(z0),
+        }
+
+        # If in constrained mode, also include the single stereo angle
+        if self.constrain_stereo_angles:
+            result["stereo_angle"] = float(view_angles[1])
+
+        return result
+
+    def yaml_to_layer_design(self, yaml_params):
+        """
+        Convert YAML parameters to layer-level design.
+
+        This computes the actual layer positions and angles from the high-level
+        YAML parameters, following the detector hierarchy:
+        stations -> views -> layers
+
+        Args:
+            yaml_params: dict with YAML-level parameters
+
+        Returns:
+            layer_design: dict with positions, angles, and magnetic_strength
+        """
+        positions = []
+        angles = []
+
+        station_z = yaml_params["station_z"]
+        view_angles = yaml_params["view_angles"]
+        layer_z_gap = yaml_params["layer_z_gap"]
+        view_z_gap = yaml_params["view_z_gap"]
+
+        # Generate layer positions following detector hierarchy
+        for z_station in station_z:
+            for v in range(self.n_views_per_station):
+                view_base_z = z_station + v * view_z_gap
+                ang = view_angles[v] if v < len(view_angles) else view_angles[-1]
+                for l in range(self.n_layers_per_view):
+                    positions.append(view_base_z + l * layer_z_gap)
+                    angles.append(ang)
+
+        if len(positions) != self.n_layers:
+            raise RuntimeError(
+                f"yaml_to_layer_design produced {len(positions)} layers, "
+                f"expected {self.n_layers}"
+            )
+
+        return {
+            "positions": positions,
+            "angles": angles,
+            "magnetic_strength": yaml_params["max_B"],
+        }
+
+    def get_current_yaml_design(self):
+        """
+        Get current detector configuration as YAML parameters.
+
+        Returns:
+            yaml_params: dict with current YAML-level parameters
+        """
+        return {
+            "station_z": list(self.station_z),
+            "view_angles": list(self.view_angles),
+            "layer_z_gap": float(self.layer_z_gap),
+            "view_z_gap": float(self.view_z_gap),
+            "max_B": float(self.max_B),
+            "B_sigma": float(self.B_sigma),
+            "z0": float(self.z0),
+        }
+
+    def get_encoded_current_yaml_design(self):
+        """
+        Get current detector configuration as encoded YAML parameters.
+
+        Returns:
+            encoded: 1D array of normalized YAML parameters
+        """
+        yaml_params = self.get_current_yaml_design()
+        enc = self.encode_yaml_design(yaml_params)
+        enc = np.asarray(enc, dtype=np.float32)
+        return enc
+
+    def update_from_yaml_design(self, yaml_params):
+        """
+        Update detector geometry from YAML parameters.
+
+        This modifies the detector's internal state to reflect the new design.
+
+        Args:
+            yaml_params: dict with YAML-level parameters
+        """
+        self.station_z = yaml_params["station_z"]
+        self.view_angles = yaml_params["view_angles"]
+        self.layer_z_gap = yaml_params["layer_z_gap"]
+        self.view_z_gap = yaml_params["view_z_gap"]
+        self.max_B = yaml_params["max_B"]
+        self.B_sigma = yaml_params.get("B_sigma", self.B_sigma)
+        self.z0 = yaml_params.get("z0", self.z0)
+
+    def yaml_design_shape(self):
+        """
+        Get the shape of the YAML design parameter vector.
+
+        Returns:
+            tuple: (n_params,) where n_params is the total number of YAML parameters
+        """
+        n_params = 0
+
+        # Count stations (if optimizable)
+        if self.optimize_stations:
+            n_params += len(self.station_z)
+
+        # Count angles (1 if constrained, 4 if not)
+        if self.constrain_stereo_angles:
+            n_params += 1  # Single stereo angle
+        else:
+            n_params += len(self.view_angles)  # All view angles
+
+        # Count gaps (if optimizable)
+        if self.optimize_gaps:
+            n_params += 2  # layer_z_gap + view_z_gap
+
+        # Count B-field parameters (if optimizable)
+        if self.optimize_bfield:
+            n_params += 3  # max_B + B_sigma + z0
+
+        return (n_params,)

@@ -3,9 +3,10 @@ detector: straw
 regressor: deep-set-128
 
 initial_design: data/design/default.json
-trace: data/design/subgradient/
-report: data/design/subgradient/
+trace: data/design/subgradient/10/
+report: data/design/subgradient/10/
 
+# Physical parameter optimization (13 params: station positions, angles, spacings, B-field)
 design_eps: 1.0e-1
 optimizer:
   adam:
@@ -13,8 +14,8 @@ optimizer:
     b1: 0.99
     b2: 0.998
 
-batch: 8
-epochs: 256
-steps: 1024
-substeps: 1
-validation_batches: 1024
+batch: 10
+epochs: 100
+steps: 1000
+substeps: 10
+validation_batches: 20
