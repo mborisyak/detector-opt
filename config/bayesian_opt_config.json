@@ -1,0 +1,55 @@
+{
+  "detector": {
+    "straw": {
+      "station_z": [8407.0, 8607.0, 9307.0, 9507.0],
+      "n_views_per_station": 4,
+      "n_layers_per_view": 2,
+      "n_straws_per_layer": 100,
+      "straw_pitch": 2.0,
+      "straw_length": 400.0,
+      "layer_x_offset": 1.0,
+      "view_angles": [0.0, 0.0798, -0.0798, 0.0],
+      "layer_z_gap": 1.732,
+      "view_z_gap": 5.0,
+      "max_B": 0.0005,
+      "z0": 8957.0,
+      "B_sigma": 300.0,
+      "layer_bounds": [8200.0, 9750.0],
+      "dt": 0.1,
+      "max_particles": 2,
+      "secondary_multiplier": 3,
+      "p_spawn_single": 0.0,
+      "p_spawn_pair": 0.0,
+      "E_sec_MeV": 0.01,
+      "origin": [-24.590519, 47.251717, 5515.897],
+      "origin_sigma": [129.07193, 137.67969, 1616.8958],
+      "momentum": [-0.2098091, 0.218265, 26.931271],
+      "momentum_sigma": [0.7227228, 0.4957672, 12.292634],
+      "constrain_stereo_angles": true,
+      "optimize_stations": true,
+      "optimize_gaps": true,
+      "optimize_bfield": true
+    }
+  },
+  "regressor": {
+    "deep-set": {
+      "features": [
+        [64, 128],
+        [128, 64]
+      ],
+      "p_dropout": 0.1
+    }
+  },
+  "optimizer": {
+    "adam": {
+      "learning_rate": 0.0001,
+      "b1": 0.9,
+      "b2": 0.999,
+      "eps": 1e-8
+    }
+  },
+  "epochs": 10,
+  "steps": 10000,
+  "batch": 16,
+  "validation_batches": 5
+}
