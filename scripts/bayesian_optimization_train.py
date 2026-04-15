@@ -1,82 +1,23 @@
 #!/usr/bin/env python3
-"""Bayesian Optimization for Detector Geometry"""
 
 import argparse
 import json
 import time
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import torch
+from botorch.acquisition import ExpectedImprovement
+from botorch.fit import fit_gpytorch_mll
+from botorch.models import SingleTaskGP
+from botorch.optim import optimize_acqf
 from flax import nnx
-from scipy.optimize import minimize
-from scipy.stats import norm
+from gpytorch.mlls import ExactMarginalLogLikelihood
 
 import detopt
-
-
-class BayesianOptimizer:
-    def __init__(self, bounds, noise=0.01, xi=0.01, length_scale=1.0):
-        self.bounds = np.array(bounds)
-        self.noise = noise
-        self.xi = xi
-        self.length_scale = length_scale
-        self.X = []
-        self.y = []
-
-    def kernel(self, X1, X2):
-        """RBF kernel"""
-        X1_n = (X1 - self.bounds[:, 0]) / (self.bounds[:, 1] - self.bounds[:, 0])
-        X2_n = (X2 - self.bounds[:, 0]) / (self.bounds[:, 1] - self.bounds[:, 0])
-        sqdist = (
-            np.sum(X1_n**2, 1).reshape(-1, 1) + np.sum(X2_n**2, 1) - 2 * X1_n @ X2_n.T
-        )
-        return np.exp(-0.5 * sqdist / self.length_scale**2)
-
-    def predict(self, X_test):
-        if len(self.X) == 0:
-            return np.zeros(len(X_test)), np.ones(len(X_test))
-
-        X_train = np.array(self.X)
-        y_train = np.array(self.y)
-        K = self.kernel(X_train, X_train) + self.noise * np.eye(len(X_train))
-        K_s = self.kernel(X_train, X_test)
-        K_ss = self.kernel(X_test, X_test)
-        K_inv = np.linalg.inv(K)
-        mu = K_s.T @ K_inv @ y_train
-        sigma = np.sqrt(np.maximum(np.diag(K_ss - K_s.T @ K_inv @ K_s), 1e-10))
-        return mu, sigma
-
-    def acquisition(self, X):
-        """Expected Improvement"""
-        if len(self.y) == 0:
-            return np.ones(len(X))
-        mu, sigma = self.predict(X)
-        y_best = np.max(self.y)
-        Z = (mu - y_best - self.xi) / sigma
-        ei = (mu - y_best - self.xi) * norm.cdf(Z) + sigma * norm.pdf(Z)
-        ei[sigma == 0] = 0
-        return ei
-
-    def propose(self):
-        best_x, best_acq = None, -np.inf
-        for _ in range(10):
-            x0 = np.random.uniform(self.bounds[:, 0], self.bounds[:, 1])
-            res = minimize(
-                lambda x: -self.acquisition(x.reshape(1, -1))[0],
-                x0,
-                bounds=self.bounds,
-                method="L-BFGS-B",
-            )
-            if -res.fun > best_acq:
-                best_acq, best_x = -res.fun, res.x
-        return best_x
-
-    def add(self, x, y):
-        """Add observation to GP"""
-        self.X.append(x.copy())
-        self.y.append(y)
 
 
 def train_and_evaluate(detector, config, design_params, seed):
@@ -112,9 +53,19 @@ def train_and_evaluate(detector, config, design_params, seed):
         params = optax.apply_updates(params, updates)
         return loss, params, state, opt_state
 
-    # Training with progress bar
+    # Training with early stopping
     status = detopt.utils.progress.status_bar(disable=False)
+
+    patience = config.get("patience", 5)  # Stop after N epochs without improvement
+    min_delta = config.get("min_delta", 1e-4)  # Minimum change to consider improvement
+    tol_ratio = config.get("tol_ratio", 1.05)  # val/train ratio tolerance
+
+    best_train_loss = float("inf")
+    epochs_without_improvement = 0
+    train_losses_history = []
+
     for epoch in status.epochs(config["epochs"]):
+        epoch_train_losses = []
         for step_i in status.training(config["steps"]):
             _, measurements, target, _, _ = detector(
                 seed=(seed, epoch, step_i, 0), configurations=design_array
@@ -122,8 +73,48 @@ def train_and_evaluate(detector, config, design_params, seed):
             loss, r_params, r_state, opt_state = step(
                 measurements, design_array, target, r_params, r_state, opt_state
             )
+            epoch_train_losses.append(float(loss))
 
-    # Validation with progress bar
+        mean_train_loss = np.mean(epoch_train_losses)
+        train_losses_history.append(mean_train_loss)
+
+        # Check for plateau (no significant improvement)
+        if mean_train_loss < best_train_loss - min_delta:
+            best_train_loss = mean_train_loss
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
+        # Early stopping criterion 1: Training loss plateau
+        if epochs_without_improvement >= patience:
+            print(f"\nEarly stop: training loss plateau ({patience} epochs)")
+            break
+
+        # Check validation every few epochs
+        if (epoch + 1) % max(1, config["epochs"] // 5) == 0 or epoch == config[
+            "epochs"
+        ] - 1:
+            val_losses_check = []
+            for i in range(config.get("validation_batches", 10)):
+                _, measurements, target, _, _ = detector(
+                    seed=(seed + 1000, i, 1), configurations=design_array
+                )
+                reg = nnx.merge(regressor_def, r_params, r_state)
+                pred = reg(measurements, jnp.array(design_array), deterministic=True)
+                target_norm = (target - target_mean) / target_std
+                rmse = jnp.sqrt(jnp.mean(jnp.square(target_norm - pred), axis=-1))
+                val_losses_check.append(float(jnp.mean(rmse)))
+
+            mean_val_loss = np.mean(val_losses_check)
+
+            # Early stopping criterion 2: val_loss ≈ train_loss
+            if mean_val_loss <= mean_train_loss * tol_ratio:
+                print(
+                    f"\nEarly stop: val_loss ≈ train_loss ({mean_val_loss:.6f} ≈ {mean_train_loss:.6f})"
+                )
+                break
+
+    # Final validation
     val_losses = []
     for i in status.validation(config.get("validation_batches", 10)):
         _, measurements, target, _, _ = detector(
@@ -138,57 +129,79 @@ def train_and_evaluate(detector, config, design_params, seed):
     return np.mean(val_losses)
 
 
-def optimize(config, output_dir, n_iter=50, n_init=10, seed=42, length_scale=1.0):
-    """Run Bayesian optimization"""
+def optimize(config, output_dir, n_iter=50, n_init=10, seed=42):
+    """Run Bayesian optimization using BoTorch"""
     detector = detopt.detector.from_config(config["detector"])
 
     # Define parameter bounds
-    bounds = [
-        (8300, 8500),
-        (8500, 8700),
-        (9200, 9400),
-        (9400, 9600),  # station_z
-        (0.05, 0.12),  # stereo_angle
-        (1.0, 3.0),
-        (3.0, 7.0),  # gaps
-        (0.0002, 0.001),
-        (8800, 9100),
-        (200, 400),  # B-field
-    ]
+    bounds = torch.tensor(
+        [
+            [8300, 8500, 9200, 9400, 0.05, 1.0, 3.0, 0.0002, 8800, 200],  # Lower
+            [8500, 8700, 9400, 9600, 0.12, 3.0, 7.0, 0.001, 9100, 400],  # Upper
+        ],
+        dtype=torch.float64,
+    )
 
-    bo = BayesianOptimizer(bounds, length_scale=length_scale)
+    # Storage
+    train_X = torch.empty((0, bounds.shape[1]), dtype=torch.float64)
+    train_Y = torch.empty((0, 1), dtype=torch.float64)
     results = []
     best_obj, best_design = -np.inf, None
 
-    print(f"\nBayesian Optimization: {n_iter} iterations")
+    print(f"\nBayesian Optimization with BoTorch: {n_iter} iterations")
     print(f"Output directory: {output_dir}")
     print("=" * 80)
 
     for i in range(n_iter):
         iter_start = time.time()
+
         # Propose design
         if i < n_init:
-            params = np.random.uniform(bo.bounds[:, 0], bo.bounds[:, 1])
+            # Random initialization
+            params = (
+                torch.rand(1, bounds.shape[1], dtype=torch.float64)
+                * (bounds[1] - bounds[0])
+                + bounds[0]
+            )
         else:
-            params = bo.propose()
+            # BoTorch: Fit GP and optimize acquisition
+            gp = SingleTaskGP(train_X, train_Y)
+            mll = ExactMarginalLogLikelihood(gp.likelihood, gp)
+            fit_gpytorch_mll(mll)
 
-        # Convert params to design dict with view_angles computed from stereo_angle
-        stereo_angle = float(params[4])
+            # Expected Improvement
+            EI = ExpectedImprovement(gp, best_f=train_Y.max())
+
+            # Optimize acquisition function
+            params, acq_value = optimize_acqf(
+                EI,
+                bounds=bounds,
+                q=1,
+                num_restarts=10,
+                raw_samples=20,
+            )
+
+        # Convert to design dict
+        params_np = params.squeeze().numpy()
+        stereo_angle = float(params_np[4])
         design = {
-            "station_z": params[:4].tolist(),
+            "station_z": params_np[:4].tolist(),
             "view_angles": [0.0, stereo_angle, -stereo_angle, 0.0],
-            "layer_z_gap": float(params[5]),
-            "view_z_gap": float(params[6]),
-            "max_B": float(params[7]),
-            "z0": float(params[8]),
-            "B_sigma": float(params[9]),
+            "layer_z_gap": float(params_np[5]),
+            "view_z_gap": float(params_np[6]),
+            "max_B": float(params_np[7]),
+            "z0": float(params_np[8]),
+            "B_sigma": float(params_np[9]),
         }
 
         # Evaluate
         print(f"\n[Iteration {i + 1}/{n_iter}] Evaluating design...")
         val_loss = train_and_evaluate(detector, config, design, seed + i)
         objective = -val_loss  # Higher is better
-        bo.add(params, objective)
+
+        # Update BoTorch data
+        train_X = torch.cat([train_X, params])
+        train_Y = torch.cat([train_Y, torch.tensor([[objective]], dtype=torch.float64)])
 
         iter_time = time.time() - iter_start
 
@@ -221,7 +234,7 @@ def optimize(config, output_dir, n_iter=50, n_init=10, seed=42, length_scale=1.0
                 indent=2,
             )
 
-        # Save cumulative results every iteration
+        # Save cumulative results
         with open(f"{output_dir}/results.json", "w") as f:
             json.dump(
                 {
@@ -229,7 +242,7 @@ def optimize(config, output_dir, n_iter=50, n_init=10, seed=42, length_scale=1.0
                     "best_objective": float(best_obj),
                     "best_design": best_design,
                     "n_iterations_completed": i + 1,
-                    "length_scale": length_scale,
+                    "method": "BoTorch",
                 },
                 f,
                 indent=2,
@@ -243,7 +256,7 @@ def optimize(config, output_dir, n_iter=50, n_init=10, seed=42, length_scale=1.0
     print("OPTIMIZATION COMPLETE")
     print("=" * 80)
     print(f"\nBest objective: {best_obj:.6f} (validation loss: {-best_obj:.6f})")
-    print(f"Improvement: {best_obj - (-results[0]['objective']):.6f}")
+    print(f"Improvement: {best_obj - results[0]['objective']:.6f}")
     print(f"\nBest design:")
     print(json.dumps(best_design, indent=2))
     print(f"\nResults saved to: {output_dir}/results.json")
@@ -257,9 +270,6 @@ if __name__ == "__main__":
     parser.add_argument("--n-iterations", type=int, default=50)
     parser.add_argument("--n-initial", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--length-scale", type=float, default=1.0, help="GP kernel length scale"
-    )
     args = parser.parse_args()
 
     import os
@@ -269,11 +279,4 @@ if __name__ == "__main__":
     with open(args.config) as f:
         config = json.load(f)
 
-    optimize(
-        config,
-        args.output,
-        args.n_iterations,
-        args.n_initial,
-        args.seed,
-        args.length_scale,
-    )
+    optimize(config, args.output, args.n_iterations, args.n_initial, args.seed)
