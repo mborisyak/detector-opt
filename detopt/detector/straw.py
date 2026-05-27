@@ -152,7 +152,6 @@ class StrawDetector(Detector):
         layer_height=None,
         n_layers=None,
         n_straws=None,
-        data_dir="combined_tof",
         loss=None,
         p_spawn_single=0.0,
         p_spawn_pair=0.0,
@@ -235,12 +234,6 @@ class StrawDetector(Detector):
         self.n_t = int(flight_distance / (dt * 29.9792))  #
         # self.n_t = 500
         # print("para", flight_distance, self.n_t, self.dt)
-
-        # NPZ data loading support
-        self._numpyfile_cache = None
-        self._numpyfile_path = None
-        self.data_dir = data_dir
-        self._data_loader = None
 
         # Loss function parameters for position and momentum prediction
         if loss is None:
@@ -363,18 +356,15 @@ class StrawDetector(Detector):
 
         return layers, angles, widths, heights, Bs
 
-    def simulate(self, seed, configurations, use_sparse=True, split="train"):
-        # print("\n\n\n\nSimulation started\n\n\n\n")
-
+    def simulate(
+        self,
+        seed,
+        daughter_data,
+        hnl_targets,
+        configurations,
+        use_sparse=True,
+    ):
         n_events = configurations.shape[0]
-        # print(n_events)
-        # input("ev\n\n")
-        # print(configurations.shape)
-        rng = np.random.default_rng(seed)
-
-        # Load real daughter particle data and HNL targets
-        daughter_data, hnl_targets = self._load_real_data(n_events, rng, split=split)
-        print(len(hnl_targets))
 
         # print("\n\n\n\ndata loaded\n\n\n\n")
         # print(daughter_data)
@@ -451,7 +441,7 @@ class StrawDetector(Detector):
 
         # Estimate max hits for sparse arrays
         max_hits = 2 * n_events * self.max_particles * self.n_layers
-        print(max_hits)
+        # print(max_hits)
 
         # print("max hits", max_hits, n_events, p_slots, self.n_t, self.n_layers)
         trajectories = np.zeros(
@@ -615,51 +605,26 @@ class StrawDetector(Detector):
             hnl_targets,  # (batch, 6) = [dx, dy, dz, px, py, pz] in cm and GeV/c
         )
 
-    def _load_real_data(self, n_events, rng, split="train"):
-        """
-        Load real daughter particle data from NPZ files.
-
-        Args:
-            n_events: Number of events to load
-            rng: Random number generator
-
-        Returns:
-            daughter_data: Dict with particle info
-                - masses: MeV (for C code)
-                - charges: e (elementary charge)
-                - positions: cm
-                - momenta: MeV/c (converted from GeV/c for C code compatibility)
-                - times: ns (time of flight to prestraw detector)
-            hnl_targets: (n_events, 6) HNL decay vertex targets [dx, dy, dz in cm, px, py, pz in GeV/c]
-        """
-        # Initialize data loader if not already done
-        if self._data_loader is None:
-            import sys
-            from pathlib import Path
-
-            sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-            from load_hnl_data import HNLDataLoader
-
-            # Pass max_particles to loader so it loads data with correct padding
-            # max_particles = getattr(self, "max_particles_real", 50)
-            self._data_loader = HNLDataLoader(
-                self.data_dir, max_particles=self.max_particles
-            )
-            # print(f"Initialized HNL data loader from {self.data_dir}")
-        # Load batch of events (data is already in memory - fast!)
-        daughter_data, hnl_targets = self._data_loader.get_batch(
-            batch_size=n_events, rng=rng, split=split
-        )
-
-        return daughter_data, hnl_targets
-
-    def __call__(self, seed: int, configurations: np.ndarray, split: str = "train"):
+    def __call__(
+        self,
+        seed: int,
+        daughter_data: dict,
+        hnl_targets: np.ndarray,
+        configurations: np.ndarray,
+    ):
         """
         returns ground_truth, measurements, target
 
+        Args:
+            seed: simulation RNG seed.
+            daughter_data: pre-fetched daughter particle batch as returned by
+                ``HNLDataLoader._build_batch_from_indices``.
+            hnl_targets: (n_events, 6) HNL decay vertex targets.
+            configurations: (n_events, design_dim) per-event design array.
+
         Returns:
             ground_truth: (batch, 14) encoded daughter particle info
-            measurements: SparseHits object or dense array
+            measurements: SparseHits info tuple
             target: (batch, 6) HNL decay vertex [x, y, z, px, py, pz]
         """
         (
@@ -667,13 +632,13 @@ class StrawDetector(Detector):
             charges,
             initial_positions,
             initial_momentum,
-            traj,  # traj
-            sparse_hits,  # sparse_hits
-            fdigi_times,  # fdigi_times (dict)
+            traj,
+            sparse_hits,
+            fdigi_times,
             times,
-            mask,  # mask
+            mask,
             target,
-        ) = self.simulate(seed, configurations, split=split)
+        ) = self.simulate(seed, daughter_data, hnl_targets, configurations)
         ground_truth = self.encode_ground_truth(
             masses, charges, initial_positions, initial_momentum
         )
@@ -735,10 +700,10 @@ class StrawDetector(Detector):
         # Normalize targets (predictions are already normalized from network)
         target_norm = (target - self.target_mean) / self.target_std
 
-        # RMSE on normalized values
-        rmse = jnp.sqrt(jnp.mean(jnp.square(target_norm - predicted), axis=-1))
+        # MSE on normalized values
+        mse = jnp.mean(jnp.square(target_norm - predicted), axis=-1)
 
-        return rmse  # Shape: (batch,)
+        return mse  # Shape: (batch,)
 
     def encode_design(self, design):
         positions = np.array(design["positions"], dtype=np.float32)

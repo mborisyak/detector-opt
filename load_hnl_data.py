@@ -35,7 +35,9 @@ class HNLDataLoader:
         if len(files) == 0:
             raise FileNotFoundError(f"No NPZ files found in {data_dir}")
 
-        print(f"HNLDataLoader: Loading {len(files)} files into memory...")
+        print(
+            f"HNLDataLoader: Loading {len(files)} files into memory... from {data_dir}"
+        )
 
         # Pre-allocate lists
         all_masses = []
@@ -155,6 +157,14 @@ class HNLDataLoader:
 
         self.n_train_events = len(self.train_indices)
         self.n_val_events = len(self.val_indices)
+        # Permanent snapshot of the full train pool size; never mutated.
+        self._n_train_events_total = int(self.n_train_events)
+
+        # Optional per-iteration partition that overrides the default split.
+        # When set (via set_iteration_partition), 'train' and 'val' sample from
+        # these arrays instead of the global train_indices / val_indices.
+        self._iter_train_indices: Optional[np.ndarray] = None
+        self._iter_val_indices: Optional[np.ndarray] = None
 
         if self.n_train_events == 0:
             raise ValueError(
@@ -168,8 +178,12 @@ class HNLDataLoader:
     def _get_split_indices(self, split: str) -> np.ndarray:
         split = split.lower()
         if split == "train":
+            if self._iter_train_indices is not None:
+                return self._iter_train_indices
             return self.train_indices
         if split == "val":
+            if self._iter_val_indices is not None:
+                return self._iter_val_indices
             if self.n_val_events == 0:
                 raise ValueError(
                     "Validation split is empty. Initialize with val_fraction > 0."
@@ -180,6 +194,53 @@ class HNLDataLoader:
         raise ValueError(
             f"Unknown split='{split}'. Expected: 'train', 'val', or 'all'."
         )
+
+    def set_iteration_partition(
+        self,
+        iter_train_indices: np.ndarray,
+        iter_val_indices: np.ndarray,
+    ) -> None:
+        """Install a per-iteration train/val partition that overrides the
+        global split for both ``get_batch`` and ``get_sequential_batch``.
+
+        The two index arrays must be disjoint and contain valid event indices.
+        Pass through :meth:`clear_iteration_partition` to restore defaults.
+        """
+        iter_train_indices = np.asarray(iter_train_indices, dtype=np.int32)
+        iter_val_indices = np.asarray(iter_val_indices, dtype=np.int32)
+        if iter_train_indices.ndim != 1 or iter_val_indices.ndim != 1:
+            raise ValueError("iteration partition arrays must be 1-D")
+        if iter_train_indices.size == 0:
+            raise ValueError("iteration train partition cannot be empty")
+        if iter_val_indices.size == 0:
+            raise ValueError("iteration val partition cannot be empty")
+        overlap = np.intersect1d(
+            iter_train_indices, iter_val_indices, assume_unique=False
+        )
+        if overlap.size > 0:
+            raise ValueError(
+                f"iteration partition train/val overlap on {overlap.size} "
+                "events; train and val must be disjoint."
+            )
+        max_idx = int(max(iter_train_indices.max(), iter_val_indices.max()))
+        if max_idx >= self.n_events:
+            raise ValueError(
+                f"iteration partition contains out-of-range index {max_idx} "
+                f"(dataset has {self.n_events} events)."
+            )
+        self._iter_train_indices = iter_train_indices
+        self._iter_val_indices = iter_val_indices
+
+    def clear_iteration_partition(self) -> None:
+        """Discard the per-iteration partition and revert to the global split."""
+        self._iter_train_indices = None
+        self._iter_val_indices = None
+
+    def get_iteration_partition(
+        self,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """Return the active iteration partition, or ``(None, None)``."""
+        return self._iter_train_indices, self._iter_val_indices
 
     def _build_batch_from_indices(self, indices: np.ndarray) -> Tuple[dict, np.ndarray]:
         daughter_data = {
@@ -199,14 +260,20 @@ class HNLDataLoader:
         max_particles: int = 50,  # kept for API compatibility
         rng: Optional[np.random.Generator] = None,
         split: str = "train",
+        n_train_events: Optional[int] = None,
     ) -> Tuple[dict, np.ndarray]:
         """
         Get a batch of events with random sampling from a specific split.
+
         Args:
-        batch_size: Number of events to return
-        max_particles: Ignored (uses self.max_particles from init)
-        rng: Random number generator for sampling
-        split: "train", "val", or "all"
+            batch_size: Number of events to return.
+            max_particles: Ignored (uses ``self.max_particles`` from init).
+            rng: Random number generator for sampling.
+            split: "train", "val", or "all".
+            n_train_events: Optional cap on the train pool size. When the
+                split is "train" (or "all") and this is given, only the first
+                ``n_train_events`` indices of the split are used. Ignored for
+                "val". Does not mutate loader state.
         """
         if batch_size <= 0:
             raise ValueError(f"batch_size must be positive, got {batch_size}")
@@ -216,12 +283,23 @@ class HNLDataLoader:
 
         split_indices = self._get_split_indices(split)
 
+        if n_train_events is not None and split.lower() in ("train", "all"):
+            n_train_events = int(n_train_events)
+            if n_train_events < 1:
+                raise ValueError(f"n_train_events must be >= 1, got {n_train_events}")
+            split_indices = split_indices[:n_train_events]
+
         sampled_positions = rng.choice(
             len(split_indices), size=batch_size, replace=True
         )
         indices = split_indices[sampled_positions]
 
         return self._build_batch_from_indices(indices)
+
+    @property
+    def n_train_events_total(self) -> int:
+        """Total number of training events available (regardless of any cap)."""
+        return int(self._n_train_events_total)
 
     def get_sequential_batch(
         self,

@@ -2,11 +2,14 @@
 
 import argparse
 import json
+import os
+import sys
 import time
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+import matplotlib
 import numpy as np
 import optax
 import torch
@@ -17,24 +20,260 @@ from botorch.optim import optimize_acqf
 from flax import nnx
 from gpytorch.mlls import ExactMarginalLogLikelihood
 
+matplotlib.use("AGG")
+
 import detopt
 
+# Make load_hnl_data importable when running this script from the repo root.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from load_hnl_data import HNLDataLoader
 
-def train_and_evaluate(detector, config, design_params, seed):
-    """Train regressor on design and return validation loss"""
-    detector.update_from_yaml_design(design_params)
-    design = detector.get_encoded_current_design()
+VALID_INIT_STRATEGIES = ("from_scratch", "continue", "closest")
 
+
+# ----------------------------- statistics ---------------------------------- #
+
+
+def check_loss_mean_agreement(train_losses, val_losses, max_mean_difference, z=1.96):
+    """Two-sample equivalence test on the difference of means."""
+    train_losses = np.asarray(train_losses, dtype=np.float64)
+    val_losses = np.asarray(val_losses, dtype=np.float64)
+
+    train_mean = np.mean(train_losses)
+    val_mean = np.mean(val_losses)
+
+    train_std = np.std(train_losses, ddof=1)
+    val_std = np.std(val_losses, ddof=1)
+
+    n_train = len(train_losses)
+    n_val = len(val_losses)
+
+    delta_mu = val_mean - train_mean
+    sigma_delta_mu = np.sqrt(train_std**2 / n_train + val_std**2 / n_val)
+
+    lower = delta_mu - z * sigma_delta_mu
+    upper = delta_mu + z * sigma_delta_mu
+
+    agrees = lower >= -max_mean_difference and upper <= max_mean_difference
+    return agrees, delta_mu, sigma_delta_mu
+
+
+# ------------------------------ data layer --------------------------------- #
+
+
+def _load_data_loader(config):
+    """Build the HNL data loader from the top-level ``data`` config block."""
+    data_cfg = config.get("data", {})
+    data_dir = data_cfg.get("data_dir", "selected_data")
+    max_particles = int(
+        data_cfg.get(
+            "max_particles", config["detector"]["straw"].get("max_particles", 2)
+        )
+    )
+    val_fraction = float(data_cfg.get("val_fraction", 0.2))
+    split_seed = int(data_cfg.get("split_seed", 42))
+    return HNLDataLoader(
+        data_dir=data_dir,
+        max_particles=max_particles,
+        val_fraction=val_fraction,
+        split_seed=split_seed,
+    )
+
+
+def _random_batch(loader, indices, batch_size, rng):
+    """Random batch (with replacement) drawn from ``indices``."""
+    sampled = rng.choice(len(indices), size=batch_size, replace=True)
+    return loader._build_batch_from_indices(indices[sampled])
+
+
+def _sequential_batches(loader, indices, batch_size):
+    """Yield ``(daughter_data, hnl_targets)`` chunks covering ``indices`` once."""
+    n = len(indices)
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        yield loader._build_batch_from_indices(indices[start:end])
+
+
+class IterationPool:
+    """Per-BO-iteration event pool with stable train/val partitioning.
+
+    Events are drawn without replacement from a global shuffle, partitioned
+    80/20 (or whatever ``val_fraction``) into train and val. ``grow`` appends
+    new events to either side; events never change partitions.
+    """
+
+    def __init__(
+        self, n_total_events: int, val_fraction: float, rng: np.random.Generator
+    ):
+        self.n_total = int(n_total_events)
+        self.val_fraction = float(val_fraction)
+        self._order = rng.permutation(self.n_total).astype(np.int32)
+        self._consumed = 0
+        self.train_indices = np.empty(0, dtype=np.int32)
+        self.val_indices = np.empty(0, dtype=np.int32)
+
+    def grow_to(self, n_events: int) -> tuple[int, int]:
+        """Ensure the pool contains at least ``n_events`` distinct events."""
+        n_events = int(min(max(2, n_events), self.n_total))
+        n_to_add = n_events - self._consumed
+        if n_to_add > 0:
+            new_events = self._order[self._consumed : self._consumed + n_to_add]
+            n_new_val = max(0, min(n_to_add, int(round(n_to_add * self.val_fraction))))
+            self.val_indices = np.concatenate(
+                [self.val_indices, new_events[:n_new_val]]
+            )
+            self.train_indices = np.concatenate(
+                [self.train_indices, new_events[n_new_val:]]
+            )
+            self._consumed += n_to_add
+        return int(len(self.train_indices)), int(len(self.val_indices))
+
+    @property
+    def size(self) -> int:
+        return int(self._consumed)
+
+    def exhausted(self) -> bool:
+        return self._consumed >= self.n_total
+
+
+# ----------------------------- plotting ------------------------------------ #
+
+
+def _plot_iteration_losses(history, iteration, design, val_loss, plots_dir):
+    """Save a per-epoch training/validation loss plot for one BO iteration."""
+    import matplotlib.pyplot as plt
+
+    os.makedirs(plots_dir, exist_ok=True)
+
+    train_loss_per_epoch = history["train_loss_per_epoch"]
+    val_loss_per_epoch = history["val_loss_per_epoch"]
+    train_budget_per_epoch = history.get("train_budget_per_epoch")
+    final_train_budget = history.get("final_train_budget")
+    data_extensions_used = history.get("data_extensions_used", 0)
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    epochs = np.arange(1, train_loss_per_epoch.shape[0] + 1)
+
+    ax.plot(epochs, train_loss_per_epoch, marker="o", label="train", color="tab:blue")
+    if val_loss_per_epoch.size > 0:
+        ax.plot(
+            epochs[: val_loss_per_epoch.shape[0]],
+            val_loss_per_epoch,
+            marker="s",
+            label="val",
+            color="tab:orange",
+        )
+
+    if train_budget_per_epoch is not None and train_budget_per_epoch.size > 1:
+        diffs = np.diff(train_budget_per_epoch)
+        growth_epochs = np.where(diffs > 0)[0] + 1
+        for k, idx in enumerate(growth_epochs):
+            ax.axvline(
+                epochs[idx],
+                color="tab:green",
+                linestyle="--",
+                alpha=0.5,
+                label=(
+                    f"data grew to {int(train_budget_per_epoch[idx])}"
+                    if k == 0
+                    else None
+                ),
+            )
+
+    title_suffix = f"final val_loss={val_loss:.4f}"
+    if final_train_budget is not None:
+        title_suffix += (
+            f" | n_train={final_train_budget} (+{data_extensions_used} growth)"
+        )
+    ax.set_title(f"Iter {iteration} - Train/Val convergence ({title_suffix})")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("MSE (normalized)")
+    ax.set_yscale("log")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+
+    out_path = os.path.join(plots_dir, f"iter_{iteration:03d}.png")
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+
+    design_path = os.path.join(plots_dir, f"iter_{iteration:03d}_design.json")
+    with open(design_path, "w") as f:
+        json.dump(design, f, indent=2, default=float)
+
+    return out_path
+
+
+# ------------------------------ regressor ---------------------------------- #
+
+
+def _init_regressor_state(detector, config, seed):
+    """Create a fresh regressor and matching optimizer state."""
     rngs = nnx.Rngs(seed)
     regressor = detopt.nn.from_config(detector, config=config["regressor"], rngs=rngs)
     regressor_def, r_params, r_state = nnx.split(regressor, nnx.Param, nnx.Variable)
 
     optimizer = detopt.utils.config.optimizer(config["optimizer"])
     opt_state = optimizer.init(r_params)
+    return regressor_def, r_params, r_state, opt_state, optimizer
 
-    batch = config["batch"]
+
+# --------------------------- train & evaluate ------------------------------ #
+
+
+def train_and_evaluate(
+    detector,
+    loader,
+    config,
+    design_params,
+    seed,
+    init_state=None,
+    on_epoch=None,
+):
+    """Train regressor on ``design_params`` and return (val_loss, final_state, history).
+
+    The BO script owns all data fetching. This function:
+      * builds an :class:`IterationPool` of size ``n0`` (from config), with an
+        80/20 train/val split;
+      * trains by sampling random batches from the pool's train partition;
+      * monitors per-epoch val MSE on random batches from the pool's val
+        partition (cheap);
+      * runs a sliding-window train/val agreement test every epoch;
+      * if training plateaus without agreement, grows the pool by
+        ``n_increment`` and runs another ``epochs`` block; raises if the
+        dataset is exhausted in that state;
+      * at the end, computes the BO objective as the exact MSE over **every
+        event** in the pool's final val partition (sequential, no random).
+    """
+    detector.update_from_yaml_design(design_params)
+    design = detector.get_encoded_current_design()
+
+    if init_state is None:
+        regressor_def, r_params, r_state, opt_state, optimizer = _init_regressor_state(
+            detector, config, seed
+        )
+    else:
+        regressor_def, r_params, r_state, opt_state = init_state
+        optimizer = detopt.utils.config.optimizer(config["optimizer"])
+
+    # --- per-iteration data pool ---
+    n0 = int(config.get("n0", 1000))
+    n_increment = int(config.get("n_increment", 500))
+    val_fraction = float(config.get("data", {}).get("val_fraction", 0.2))
+    n_total = int(loader.n_events)
+    pool_rng = np.random.default_rng((seed, 0xBEEF))
+    pool = IterationPool(n_total, val_fraction, pool_rng)
+    pool.grow_to(n0)
+    current_train_budget = pool.size
+    data_extensions_used = 0
+
+    # --- training plumbing ---
+    batch = int(config["batch"])
     design_array = np.tile(design.reshape(1, -1), (batch, 1))
     target_mean, target_std = detector.target_mean, detector.target_std
+
+    train_rng = np.random.default_rng((seed, 0xC0DE, 0))
+    val_rng = np.random.default_rng((seed, 0xC0DE, 1))
 
     def loss_fn(x, c, t, params, state):
         reg = nnx.merge(regressor_def, params, state)
@@ -53,103 +292,281 @@ def train_and_evaluate(detector, config, design_params, seed):
         params = optax.apply_updates(params, updates)
         return loss, params, state, opt_state
 
-    # Training with early stopping
     status = detopt.utils.progress.status_bar(disable=False)
 
-    patience = config.get("patience", 5)  # Stop after N epochs without improvement
-    min_delta = config.get("min_delta", 1e-4)  # Minimum change to consider improvement
-    tol_ratio = config.get("tol_ratio", 1.05)  # val/train ratio tolerance
+    patience = int(config.get("patience", 5))
+    min_delta = float(config.get("min_delta", 1e-4))
+    min_delta_relative = float(config.get("min_delta_relative", 0.01))
+    agreement_window = int(config.get("agreement_window", 20))
+    max_mean_difference_relative = float(
+        config.get("max_mean_difference_relative", 0.10)
+    )
+    z_value = float(config.get("z_value", 1.96))
+    min_epochs = int(config.get("min_epochs", 3))
+    growth_cooldown = int(config.get("growth_cooldown", agreement_window))
+    cooldown_remaining = 0
 
     best_train_loss = float("inf")
     epochs_without_improvement = 0
     train_losses_history = []
+    train_losses_history_steps = []
+    val_losses_history = []
+    train_budget_history = []
 
-    for epoch in status.epochs(config["epochs"]):
-        epoch_train_losses = []
-        for step_i in status.training(config["steps"]):
+    def eval_val_mse(epoch_idx):
+        """Per-epoch val MSE on random batches from the iteration's val pool."""
+        reg = nnx.merge(regressor_def, r_params, r_state)
+        n_val_batches = int(config.get("validation_batches", 10))
+        batch_mses = []
+        for vb in range(n_val_batches):
+            dd, tg = _random_batch(loader, pool.val_indices, batch, val_rng)
             _, measurements, target, _, _ = detector(
-                seed=(seed, epoch, step_i, 0), configurations=design_array
+                seed=(seed + 1000, epoch_idx, vb),
+                daughter_data=dd,
+                hnl_targets=tg,
+                configurations=design_array,
             )
-            loss, r_params, r_state, opt_state = step(
-                measurements, design_array, target, r_params, r_state, opt_state
-            )
-            epoch_train_losses.append(float(loss))
+            pred = reg(measurements, jnp.array(design_array), deterministic=True)
+            target_norm = (target - target_mean) / target_std
+            mse = jnp.mean(jnp.square(target_norm - pred))
+            batch_mses.append(float(mse))
+        return float(np.mean(batch_mses))
 
-        mean_train_loss = np.mean(epoch_train_losses)
-        train_losses_history.append(mean_train_loss)
+    early_stopped = False
+    last_agrees = None
+    last_training_plateaued = False
+    global_epoch = 0
 
-        # Check for plateau (no significant improvement)
-        if mean_train_loss < best_train_loss - min_delta:
-            best_train_loss = mean_train_loss
-            epochs_without_improvement = 0
-        else:
-            epochs_without_improvement += 1
+    def _emit_epoch():
+        """Push the current history snapshot to ``on_epoch`` (if given)."""
+        if on_epoch is None:
+            return
+        snapshot = {
+            "train_losses": np.asarray(train_losses_history_steps, dtype=np.float64),
+            "train_loss_per_epoch": np.asarray(train_losses_history, dtype=np.float64),
+            "val_loss_per_epoch": np.asarray(val_losses_history, dtype=np.float64),
+            "train_budget_per_epoch": np.asarray(train_budget_history, dtype=np.int64),
+            "val_losses": np.empty(0, dtype=np.float64),
+            "data_extensions_used": int(data_extensions_used),
+            "final_train_budget": int(current_train_budget),
+            "final_val_pool_size": int(len(pool.val_indices)),
+            "early_stopped": False,
+        }
+        try:
+            on_epoch(snapshot)
+        except Exception as exc:
+            # Plotting failures should never abort training.
+            print(f"[on_epoch] callback raised {type(exc).__name__}: {exc}")
 
-        # Early stopping criterion 1: Training loss plateau
-        if epochs_without_improvement >= patience:
-            print(f"\nEarly stop: training loss plateau ({patience} epochs)")
+    while True:
+        for epoch in status.epochs(config["epochs"]):
+            epoch_train_losses = []
+            for step_i in status.training(config["steps"]):
+                dd, tg = _random_batch(loader, pool.train_indices, batch, train_rng)
+                _, measurements, target, _, _ = detector(
+                    seed=(seed, global_epoch, step_i, 0),
+                    daughter_data=dd,
+                    hnl_targets=tg,
+                    configurations=design_array,
+                )
+                loss, r_params, r_state, opt_state = step(
+                    measurements,
+                    design_array,
+                    target,
+                    r_params,
+                    r_state,
+                    opt_state,
+                )
+                epoch_train_losses.append(float(loss))
+
+            train_losses_history_steps.append(epoch_train_losses)
+            mean_train_loss = np.mean(epoch_train_losses)
+            train_losses_history.append(mean_train_loss)
+            train_budget_history.append(current_train_budget)
+            val_losses_history.append(eval_val_mse(global_epoch))
+            _emit_epoch()
+
+            # Plateau bookkeeping (relative OR absolute improvement counts).
+            abs_threshold = best_train_loss - min_delta
+            rel_threshold = best_train_loss * (1.0 - min_delta_relative)
+            improvement_threshold = min(abs_threshold, rel_threshold)
+            if mean_train_loss < improvement_threshold:
+                best_train_loss = mean_train_loss
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+            training_plateaued = epochs_without_improvement >= patience
+            last_training_plateaued = training_plateaued
+
+            # Sliding-window agreement test over the last K epochs.
+            grow_now = False
+            grow_delta_mu = 0.0
+            grow_sigma = 0.0
+            grow_tau = 0.0
+            if cooldown_remaining > 0:
+                cooldown_remaining -= 1
+            elif len(train_losses_history) >= agreement_window:
+                train_window = train_losses_history[-agreement_window:]
+                val_window = val_losses_history[-agreement_window:]
+                # Relative equivalence band: tau scales with current loss.
+                scale = 0.5 * (
+                    float(np.mean(train_window)) + float(np.mean(val_window))
+                )
+                tau = max_mean_difference_relative * max(scale, 1e-12)
+                agrees, delta_mu, sigma_delta_mu = check_loss_mean_agreement(
+                    train_window,
+                    val_window,
+                    max_mean_difference=tau,
+                    z=z_value,
+                )
+                last_agrees = agrees
+                if epoch + 1 >= min_epochs and agrees and training_plateaued:
+                    print(
+                        f"\nEarly stop: train/val agree over last "
+                        f"{agreement_window} epochs | tau={tau:.6f} | "
+                        f"delta_mu={delta_mu:.6f}, "
+                        f"sigma_delta_mu={sigma_delta_mu:.6f}"
+                    )
+                    early_stopped = True
+                    break
+
+                # Grow mid-block when train/val disagree, even if training
+                # has not plateaued yet.
+                if not agrees and epoch + 1 >= min_epochs:
+                    grow_now = True
+                    grow_delta_mu = float(delta_mu)
+                    grow_sigma = float(sigma_delta_mu)
+                    grow_tau = float(tau)
+
+            global_epoch += 1
+
+            if grow_now:
+                if n_increment <= 0:
+                    continue
+                if pool.exhausted():
+                    raise RuntimeError(
+                        f"Dataset exhausted: train/val disagree at the full "
+                        f"pool ({n_total} events) after "
+                        f"{data_extensions_used} extensions. Add more data "
+                        f"or relax convergence criteria."
+                    )
+                new_budget = min(current_train_budget + n_increment, n_total)
+                print(
+                    f"\n[data growth] disagreement mid-block at epoch "
+                    f"{global_epoch}: {current_train_budget} -> {new_budget} "
+                    f"pool events (ext {data_extensions_used + 1}) | "
+                    f"delta_mu={grow_delta_mu:.6f}, sigma={grow_sigma:.6f}, "
+                    f"tau={grow_tau:.6f}"
+                )
+                pool.grow_to(new_budget)
+                current_train_budget = pool.size
+                data_extensions_used += 1
+                best_train_loss = float("inf")
+                epochs_without_improvement = 0
+                last_agrees = None
+                last_training_plateaued = False
+                cooldown_remaining = growth_cooldown
+
+        if early_stopped:
             break
 
-        # Check validation every few epochs
-        if (epoch + 1) % max(1, config["epochs"] // 5) == 0 or epoch == config[
-            "epochs"
-        ] - 1:
-            val_losses_check = []
-            for i in range(config.get("validation_batches", 10)):
-                _, measurements, target, _, _ = detector(
-                    seed=(seed + 1000, i, 1), configurations=design_array
-                )
-                reg = nnx.merge(regressor_def, r_params, r_state)
-                pred = reg(measurements, jnp.array(design_array), deterministic=True)
-                target_norm = (target - target_mean) / target_std
-                rmse = jnp.sqrt(jnp.mean(jnp.square(target_norm - pred), axis=-1))
-                val_losses_check.append(float(jnp.mean(rmse)))
+        # End of an epochs block without convergence.
+        overfit_like = bool(last_training_plateaued) and (last_agrees is False)
+        if not overfit_like:
+            break
 
-            mean_val_loss = np.mean(val_losses_check)
+        if n_increment <= 0:
+            break
 
-            # Early stopping criterion 2: val_loss ≈ train_loss
-            if mean_val_loss <= mean_train_loss * tol_ratio:
-                print(
-                    f"\nEarly stop: val_loss ≈ train_loss ({mean_val_loss:.6f} ≈ {mean_train_loss:.6f})"
-                )
-                break
+        if pool.exhausted():
+            raise RuntimeError(
+                f"Dataset exhausted: training plateaued without train/val "
+                f"agreement at the full pool ({n_total} events) after "
+                f"{data_extensions_used} extensions. Add more data or relax "
+                f"convergence criteria."
+            )
 
-    # Final validation
-    val_losses = []
-    for i in status.validation(config.get("validation_batches", 10)):
-        _, measurements, target, _, _ = detector(
-            seed=(seed + 1000, i, 1), configurations=design_array
+        new_budget = min(current_train_budget + n_increment, n_total)
+        print(
+            f"\n[data growth] plateaued without agreement: "
+            f"{current_train_budget} -> {new_budget} pool events "
+            f"(ext {data_extensions_used + 1})"
         )
-        reg = nnx.merge(regressor_def, r_params, r_state)
-        pred = reg(measurements, jnp.array(design_array), deterministic=True)
-        target_norm = (target - target_mean) / target_std
-        rmse = jnp.sqrt(jnp.mean(jnp.square(target_norm - pred), axis=-1))
-        val_losses.append(float(jnp.mean(rmse)))
+        pool.grow_to(new_budget)
+        current_train_budget = pool.size
+        data_extensions_used += 1
+        best_train_loss = float("inf")
+        epochs_without_improvement = 0
+        last_agrees = None
+        last_training_plateaued = False
 
-    return np.mean(val_losses)
+    # --- final validation: exact MSE over the entire iteration val pool ---
+    reg = nnx.merge(regressor_def, r_params, r_state)
+    val_per_sample = []
+    for dd, tg in _sequential_batches(loader, pool.val_indices, batch):
+        n_evt = tg.shape[0]
+        c = np.tile(design.reshape(1, -1), (n_evt, 1))
+        _, measurements, target, _, _ = detector(
+            seed=(seed + 1000, 1, n_evt),
+            daughter_data=dd,
+            hnl_targets=tg,
+            configurations=c,
+        )
+        pred = reg(measurements, jnp.array(c), deterministic=True)
+        target_norm = (target - target_mean) / target_std
+        mse_per_event = jnp.mean(jnp.square(target_norm - pred), axis=-1)
+        val_per_sample.extend(np.asarray(mse_per_event).tolist())
+    val_loss = float(np.mean(val_per_sample))
+
+    final_state = (regressor_def, r_params, r_state, opt_state)
+    history = {
+        "train_losses": np.asarray(train_losses_history_steps, dtype=np.float64),
+        "train_loss_per_epoch": np.asarray(train_losses_history, dtype=np.float64),
+        "val_loss_per_epoch": np.asarray(val_losses_history, dtype=np.float64),
+        "train_budget_per_epoch": np.asarray(train_budget_history, dtype=np.int64),
+        "val_losses": np.asarray(val_per_sample, dtype=np.float64),
+        "data_extensions_used": int(data_extensions_used),
+        "final_train_budget": int(current_train_budget),
+        "final_val_pool_size": int(len(pool.val_indices)),
+        "early_stopped": bool(early_stopped),
+    }
+    return val_loss, final_state, history
+
+
+# ---------------------------------- BO ------------------------------------- #
 
 
 def optimize(config, output_dir, n_iter=50, n_init=10, seed=42):
-    """Run Bayesian optimization using BoTorch"""
+    nn_init_strategy = config["nn_init_strategy"]
+    if nn_init_strategy not in VALID_INIT_STRATEGIES:
+        raise ValueError(
+            f"Unknown nn_init_strategy: {nn_init_strategy!r}. "
+            f"Must be one of {VALID_INIT_STRATEGIES}."
+        )
+
     detector = detopt.detector.from_config(config["detector"])
+    loader = _load_data_loader(config)
 
     # Define parameter bounds
-    bounds = torch.tensor(
+    n_design_params = detector.yaml_design_shape()[0]
+    bounds = torch.stack(
         [
-            [8300, 8500, 9200, 9400, 0.05, 1.0, 3.0, 0.0002, 8800, 200],  # Lower
-            [8500, 8700, 9400, 9600, 0.12, 3.0, 7.0, 0.001, 9100, 400],  # Upper
-        ],
-        dtype=torch.float64,
+            torch.zeros(n_design_params, dtype=torch.float64),
+            torch.ones(n_design_params, dtype=torch.float64),
+        ]
     )
 
-    # Storage
     train_X = torch.empty((0, bounds.shape[1]), dtype=torch.float64)
     train_Y = torch.empty((0, 1), dtype=torch.float64)
     results = []
     best_obj, best_design = -np.inf, None
 
+    running_state = None
+    state_history: list = []
+
     print(f"\nBayesian Optimization with BoTorch: {n_iter} iterations")
     print(f"Output directory: {output_dir}")
+    print(f"NN init strategy: {nn_init_strategy}")
     print("=" * 80)
 
     for i in range(n_iter):
@@ -157,23 +574,17 @@ def optimize(config, output_dir, n_iter=50, n_init=10, seed=42):
 
         # Propose design
         if i < n_init:
-            # Random initialization
             params = (
                 torch.rand(1, bounds.shape[1], dtype=torch.float64)
                 * (bounds[1] - bounds[0])
                 + bounds[0]
             )
         else:
-            # BoTorch: Fit GP and optimize acquisition
             gp = SingleTaskGP(train_X, train_Y)
             mll = ExactMarginalLogLikelihood(gp.likelihood, gp)
             fit_gpytorch_mll(mll)
-
-            # Expected Improvement
             EI = ExpectedImprovement(gp, best_f=train_Y.max())
-
-            # Optimize acquisition function
-            params, acq_value = optimize_acqf(
+            params, _ = optimize_acqf(
                 EI,
                 bounds=bounds,
                 q=1,
@@ -181,25 +592,64 @@ def optimize(config, output_dir, n_iter=50, n_init=10, seed=42):
                 raw_samples=20,
             )
 
-        # Convert to design dict
-        params_np = params.squeeze().numpy()
-        stereo_angle = float(params_np[4])
-        design = {
-            "station_z": params_np[:4].tolist(),
-            "view_angles": [0.0, stereo_angle, -stereo_angle, 0.0],
-            "layer_z_gap": float(params_np[5]),
-            "view_z_gap": float(params_np[6]),
-            "max_B": float(params_np[7]),
-            "z0": float(params_np[8]),
-            "B_sigma": float(params_np[9]),
-        }
+        params_np = params.detach().cpu().squeeze().numpy()
+        design = detector.decode_yaml_design(params_np)
 
-        # Evaluate
+        init_state = None
+        closest_idx = None
+        if nn_init_strategy == "continue":
+            init_state = running_state
+        elif nn_init_strategy == "closest" and len(state_history) > 0:
+            dists = torch.linalg.norm(train_X - params, dim=-1)
+            closest_idx = int(torch.argmin(dists).item())
+            init_state = state_history[closest_idx]
+            print(
+                f"[closest] Warm-starting from iteration {closest_idx} "
+                f"(distance={float(dists[closest_idx]):.4f})"
+            )
+
         print(f"\n[Iteration {i + 1}/{n_iter}] Evaluating design...")
-        val_loss = train_and_evaluate(detector, config, design, seed + i)
-        objective = -val_loss  # Higher is better
 
-        # Update BoTorch data
+        plots_dir = os.path.join(output_dir, "plots")
+
+        def _on_epoch(snapshot, _i=i, _design=design):
+            # Use the most recent per-epoch val MSE as a live proxy in the
+            # title; the real BO objective is the exact full-val MSE we
+            # compute at the end of train_and_evaluate.
+            vlp = snapshot["val_loss_per_epoch"]
+            live_val = float(vlp[-1]) if vlp.size > 0 else float("nan")
+            _plot_iteration_losses(
+                snapshot,
+                iteration=_i,
+                design=_design,
+                val_loss=live_val,
+                plots_dir=plots_dir,
+            )
+
+        val_loss, final_state, history = train_and_evaluate(
+            detector,
+            loader,
+            config,
+            design,
+            seed + i,
+            init_state=init_state,
+            on_epoch=_on_epoch,
+        )
+        objective = -val_loss
+
+        plot_path = _plot_iteration_losses(
+            history,
+            iteration=i,
+            design=design,
+            val_loss=val_loss,
+            plots_dir=plots_dir,
+        )
+
+        if nn_init_strategy == "continue":
+            running_state = final_state
+        elif nn_init_strategy == "closest":
+            state_history.append(final_state)
+
         train_X = torch.cat([train_X, params])
         train_Y = torch.cat([train_Y, torch.tensor([[objective]], dtype=torch.float64)])
 
@@ -208,18 +658,28 @@ def optimize(config, output_dir, n_iter=50, n_init=10, seed=42):
         if objective > best_obj:
             best_obj, best_design = objective, design
             print(
-                f"✓ Iter {i + 1}/{n_iter} | Loss: {val_loss:.6f} | Time: {iter_time:.1f}s | BEST ★"
+                f"✓ Iter {i + 1}/{n_iter} | Loss: {val_loss:.6f} | "
+                f"Time: {iter_time:.1f}s | BEST ★"
             )
         else:
             print(
-                f"✓ Iter {i + 1}/{n_iter} | Loss: {val_loss:.6f} | Time: {iter_time:.1f}s"
+                f"✓ Iter {i + 1}/{n_iter} | Loss: {val_loss:.6f} | "
+                f"Time: {iter_time:.1f}s"
             )
 
-        results.append(
-            {"iteration": i, "design": design, "objective": float(objective)}
-        )
+        result_entry = {
+            "iteration": i,
+            "design": design,
+            "objective": float(objective),
+            "nn_init_strategy": nn_init_strategy,
+            "warm_start_from": closest_idx,
+            "final_train_budget": int(history.get("final_train_budget", 0)),
+            "final_val_pool_size": int(history.get("final_val_pool_size", 0)),
+            "data_extensions_used": int(history.get("data_extensions_used", 0)),
+            "early_stopped": bool(history.get("early_stopped", False)),
+        }
+        results.append(result_entry)
 
-        # Save intermediate checkpoint
         checkpoint_path = f"{output_dir}/checkpoint_iter_{i:03d}.json"
         with open(checkpoint_path, "w") as f:
             json.dump(
@@ -229,12 +689,17 @@ def optimize(config, output_dir, n_iter=50, n_init=10, seed=42):
                     "objective": float(objective),
                     "val_loss": float(val_loss),
                     "time": iter_time,
+                    "nn_init_strategy": nn_init_strategy,
+                    "warm_start_from": closest_idx,
+                    "final_train_budget": int(history.get("final_train_budget", 0)),
+                    "final_val_pool_size": int(history.get("final_val_pool_size", 0)),
+                    "data_extensions_used": int(history.get("data_extensions_used", 0)),
+                    "early_stopped": bool(history.get("early_stopped", False)),
                 },
                 f,
                 indent=2,
             )
 
-        # Save cumulative results
         with open(f"{output_dir}/results.json", "w") as f:
             json.dump(
                 {
@@ -243,21 +708,22 @@ def optimize(config, output_dir, n_iter=50, n_init=10, seed=42):
                     "best_design": best_design,
                     "n_iterations_completed": i + 1,
                     "method": "BoTorch",
+                    "nn_init_strategy": nn_init_strategy,
                 },
                 f,
                 indent=2,
             )
 
         print(f"Saved: {checkpoint_path}")
+        print(f"Saved: {plot_path}")
         print("-" * 80)
 
-    # Final summary
     print("\n" + "=" * 80)
     print("OPTIMIZATION COMPLETE")
     print("=" * 80)
     print(f"\nBest objective: {best_obj:.6f} (validation loss: {-best_obj:.6f})")
     print(f"Improvement: {best_obj - results[0]['objective']:.6f}")
-    print(f"\nBest design:")
+    print("\nBest design:")
     print(json.dumps(best_design, indent=2))
     print(f"\nResults saved to: {output_dir}/results.json")
     print("=" * 80)
@@ -271,8 +737,6 @@ if __name__ == "__main__":
     parser.add_argument("--n-initial", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
-
-    import os
 
     os.makedirs(args.output, exist_ok=True)
 
