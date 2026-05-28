@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import time
+from functools import partial
 from pathlib import Path
 
 import jax
@@ -29,6 +30,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from load_hnl_data import HNLDataLoader
 
 VALID_INIT_STRATEGIES = ("from_scratch", "continue", "closest")
+
+
+def _resolve_device(name):
+    """Resolve a backend string (``"cpu"`` / ``"gpu"`` / ``"tpu"``) to a JAX device.
+
+    ``None`` falls back to JAX's default (no explicit placement).
+    """
+    if name is None:
+        return None
+    name = str(name).lower()
+    try:
+        devices = jax.devices(name)
+    except RuntimeError as exc:
+        raise RuntimeError(f"JAX backend {name!r} not available: {exc}") from exc
+    if not devices:
+        raise RuntimeError(f"No JAX devices found for backend {name!r}")
+    return devices[0]
 
 
 # ----------------------------- statistics ---------------------------------- #
@@ -84,6 +102,69 @@ def _random_batch(loader, indices, batch_size, rng):
     """Random batch (with replacement) drawn from ``indices``."""
     sampled = rng.choice(len(indices), size=batch_size, replace=True)
     return loader._build_batch_from_indices(indices[sampled])
+
+
+def _chunk_sparse_hits(
+    events,
+    layers,
+    straws,
+    times,
+    mask,
+    targets,
+    n_chunks: int,
+    batch_size: int,
+    max_hits_per_chunk: int,
+):
+    """Bucket flat sparse-hit arrays from a single simulator call into
+    ``n_chunks`` fixed-shape chunks of ``batch_size`` events each.
+
+    The simulator emits one flat array of length ``2 * (n_chunks * batch_size)
+    * max_particles * n_layers`` for each per-hit field, plus a contiguous
+    ``targets`` array of shape ``(n_chunks * batch_size, 6)``. We bucket hits
+    by ``events // batch_size`` and pad each chunk to ``max_hits_per_chunk``.
+
+    Returns six leading-axis-batched ``np.ndarray``s suitable for
+    ``device_put`` then ``jax.lax.scan``.
+    """
+    valid = mask.astype(bool)
+    v_chunk_id = (events[valid] // batch_size).astype(np.int32)
+    v_event_local = (events[valid] % batch_size).astype(np.int32)
+    v_layers = layers[valid].astype(np.int32)
+    v_straws = straws[valid].astype(np.int32)
+    v_times = times[valid].astype(np.float32)
+
+    # Sort hits by chunk index so each chunk's hits are contiguous.
+    order = np.argsort(v_chunk_id, kind="stable")
+    v_chunk_id = v_chunk_id[order]
+    v_event_local = v_event_local[order]
+    v_layers = v_layers[order]
+    v_straws = v_straws[order]
+    v_times = v_times[order]
+
+    starts = np.searchsorted(v_chunk_id, np.arange(n_chunks), side="left")
+    ends = np.searchsorted(v_chunk_id, np.arange(n_chunks), side="right")
+
+    ce = np.zeros((n_chunks, max_hits_per_chunk), dtype=np.int32)
+    cl = np.zeros((n_chunks, max_hits_per_chunk), dtype=np.int32)
+    cs = np.zeros((n_chunks, max_hits_per_chunk), dtype=np.int32)
+    ct = np.zeros((n_chunks, max_hits_per_chunk), dtype=np.float32)
+    cm = np.zeros((n_chunks, max_hits_per_chunk), dtype=np.int32)
+
+    for c in range(n_chunks):
+        s, e = int(starts[c]), int(ends[c])
+        n_hits = min(e - s, max_hits_per_chunk)
+        if n_hits <= 0:
+            continue
+        ce[c, :n_hits] = v_event_local[s : s + n_hits]
+        cl[c, :n_hits] = v_layers[s : s + n_hits]
+        cs[c, :n_hits] = v_straws[s : s + n_hits]
+        ct[c, :n_hits] = v_times[s : s + n_hits]
+        cm[c, :n_hits] = 1
+
+    chunked_targets = np.asarray(targets, dtype=np.float32).reshape(
+        n_chunks, batch_size, -1
+    )
+    return ce, cl, cs, ct, cm, chunked_targets
 
 
 def _sequential_batches(loader, indices, batch_size):
@@ -269,8 +350,20 @@ def train_and_evaluate(
 
     # --- training plumbing ---
     batch = int(config["batch"])
+    steps = int(config["steps"])
+    n_val_batches = int(config.get("validation_batches", 10))
+    device = _resolve_device(config.get("device"))
     design_array = np.tile(design.reshape(1, -1), (batch, 1))
+    design_array_j = jax.device_put(jnp.asarray(design_array), device=device)
     target_mean, target_std = detector.target_mean, detector.target_std
+
+    # Co-locate model params/state and optimizer state with the kernels.
+    r_params = jax.device_put(r_params, device=device)
+    r_state = jax.device_put(r_state, device=device)
+    opt_state = jax.device_put(opt_state, device=device)
+
+    # Hits-per-call upper bound used both by the simulator and by chunking.
+    max_hits_per_chunk = 2 * batch * detector.max_particles * detector.n_layers
 
     train_rng = np.random.default_rng((seed, 0xC0DE, 0))
     val_rng = np.random.default_rng((seed, 0xC0DE, 1))
@@ -283,14 +376,70 @@ def train_and_evaluate(
         _, _, state = nnx.split(reg, nnx.Param, nnx.Variable)
         return mse, state
 
-    @jax.jit
-    def step(x, c, t, params, state, opt_state):
-        (loss, state), grad = jax.value_and_grad(loss_fn, argnums=3, has_aux=True)(
-            x, c, t, params, state
+    @partial(jax.jit, device=device)
+    def train_epoch_kernel(chunked_meas, chunked_targets, params, state, opt_state):
+        """Run one epoch's worth of SGD steps in a single fused XLA call.
+
+        ``chunked_meas`` is a tuple of five ``(n_steps, max_hits_per_chunk)``
+        arrays (events, layers, straws, times, mask). ``chunked_targets`` has
+        shape ``(n_steps, batch, target_dim)``.
+        """
+
+        def step_body(carry, inputs):
+            params, state, opt_state = carry
+            info, tgt = inputs
+            (loss, state), grad = jax.value_and_grad(loss_fn, argnums=3, has_aux=True)(
+                info, design_array_j, tgt, params, state
+            )
+            updates, opt_state = optimizer.update(grad, opt_state, params)
+            params = optax.apply_updates(params, updates)
+            return (params, state, opt_state), loss
+
+        (params, state, opt_state), losses = jax.lax.scan(
+            step_body,
+            init=(params, state, opt_state),
+            xs=(chunked_meas, chunked_targets),
         )
-        updates, opt_state = optimizer.update(grad, opt_state, params)
-        params = optax.apply_updates(params, updates)
-        return loss, params, state, opt_state
+        return params, state, opt_state, losses
+
+    @partial(jax.jit, device=device)
+    def val_epoch_kernel(chunked_meas, chunked_targets, params, state):
+        """Compute per-batch MSE for all validation chunks in one fused call."""
+
+        def body(_, inputs):
+            info, tgt = inputs
+            reg = nnx.merge(regressor_def, params, state)
+            pred = reg(info, design_array_j, deterministic=True)
+            target_norm = (tgt - target_mean) / target_std
+            mse = jnp.mean(jnp.square(target_norm - pred))
+            return None, mse
+
+        _, mses = jax.lax.scan(body, init=None, xs=(chunked_meas, chunked_targets))
+        return mses
+
+    def _collect_and_chunk(indices, n_chunks, rng, sim_seed):
+        """One simulator call for ``n_chunks * batch`` events; chunked for JIT."""
+        total = n_chunks * batch
+        dd, tg = _random_batch(loader, indices, total, rng)
+        big_design = np.tile(design.reshape(1, -1), (total, 1))
+        _, info, target, _, _ = detector(
+            seed=sim_seed,
+            daughter_data=dd,
+            hnl_targets=tg,
+            configurations=big_design,
+        )
+        events, layers, straws, times, mask = info
+        return _chunk_sparse_hits(
+            np.asarray(events),
+            np.asarray(layers),
+            np.asarray(straws),
+            np.asarray(times),
+            np.asarray(mask),
+            np.asarray(target),
+            n_chunks=n_chunks,
+            batch_size=batch,
+            max_hits_per_chunk=max_hits_per_chunk,
+        )
 
     status = detopt.utils.progress.status_bar(disable=False)
 
@@ -314,23 +463,28 @@ def train_and_evaluate(
     train_budget_history = []
 
     def eval_val_mse(epoch_idx):
-        """Per-epoch val MSE on random batches from the iteration's val pool."""
-        reg = nnx.merge(regressor_def, r_params, r_state)
-        n_val_batches = int(config.get("validation_batches", 10))
-        batch_mses = []
-        for vb in range(n_val_batches):
-            dd, tg = _random_batch(loader, pool.val_indices, batch, val_rng)
-            _, measurements, target, _, _ = detector(
-                seed=(seed + 1000, epoch_idx, vb),
-                daughter_data=dd,
-                hnl_targets=tg,
-                configurations=design_array,
-            )
-            pred = reg(measurements, jnp.array(design_array), deterministic=True)
-            target_norm = (target - target_mean) / target_std
-            mse = jnp.mean(jnp.square(target_norm - pred))
-            batch_mses.append(float(mse))
-        return float(np.mean(batch_mses))
+        """Per-epoch val MSE: one simulator call + one fused JIT kernel."""
+        if len(pool.val_indices) == 0 or n_val_batches <= 0:
+            return float("nan")
+        ce, cl, cs, ct, cm, ctargets = _collect_and_chunk(
+            pool.val_indices,
+            n_chunks=n_val_batches,
+            rng=val_rng,
+            sim_seed=(seed + 1000, epoch_idx),
+        )
+        mses = val_epoch_kernel(
+            (
+                jax.device_put(ce, device=device),
+                jax.device_put(cl, device=device),
+                jax.device_put(cs, device=device),
+                jax.device_put(ct, device=device),
+                jax.device_put(cm, device=device),
+            ),
+            jax.device_put(ctargets, device=device),
+            r_params,
+            r_state,
+        )
+        return float(jnp.mean(mses))
 
     early_stopped = False
     last_agrees = None
@@ -360,27 +514,31 @@ def train_and_evaluate(
 
     while True:
         for epoch in status.epochs(config["epochs"]):
-            epoch_train_losses = []
-            for step_i in status.training(config["steps"]):
-                dd, tg = _random_batch(loader, pool.train_indices, batch, train_rng)
-                _, measurements, target, _, _ = detector(
-                    seed=(seed, global_epoch, step_i, 0),
-                    daughter_data=dd,
-                    hnl_targets=tg,
-                    configurations=design_array,
-                )
-                loss, r_params, r_state, opt_state = step(
-                    measurements,
-                    design_array,
-                    target,
-                    r_params,
-                    r_state,
-                    opt_state,
-                )
-                epoch_train_losses.append(float(loss))
+            # One simulator call for the whole epoch's training data; one
+            # fused JIT'd scan for all SGD steps.
+            ce, cl, cs, ct, cm, ctargets = _collect_and_chunk(
+                pool.train_indices,
+                n_chunks=steps,
+                rng=train_rng,
+                sim_seed=(seed, global_epoch),
+            )
+            r_params, r_state, opt_state, losses = train_epoch_kernel(
+                (
+                    jax.device_put(ce, device=device),
+                    jax.device_put(cl, device=device),
+                    jax.device_put(cs, device=device),
+                    jax.device_put(ct, device=device),
+                    jax.device_put(cm, device=device),
+                ),
+                jax.device_put(ctargets, device=device),
+                r_params,
+                r_state,
+                opt_state,
+            )
+            epoch_train_losses = np.asarray(losses).tolist()
 
             train_losses_history_steps.append(epoch_train_losses)
-            mean_train_loss = np.mean(epoch_train_losses)
+            mean_train_loss = float(np.mean(epoch_train_losses))
             train_losses_history.append(mean_train_loss)
             train_budget_history.append(current_train_budget)
             val_losses_history.append(eval_val_mse(global_epoch))

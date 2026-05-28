@@ -53,6 +53,7 @@
       "eps": 1e-8
     }
   },
+  "device": "gpu",
   "epochs": 1000,
   "steps": 100,
   "batch": 10,
