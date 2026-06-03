@@ -43,14 +43,18 @@ def check_loss_mean_agreement(train_losses, val_losses, max_mean_difference, z=1
     train_mean = np.mean(train_losses)
     val_mean = np.mean(val_losses)
 
-    train_std = np.std(train_losses, ddof=1)
-    val_std = np.std(val_losses, ddof=1)
+    if len(train_losses) > 1:
+        train_std = np.std(train_losses, ddof=1)
+        val_std = np.std(val_losses, ddof=1)
 
     n_train = len(train_losses)
     n_val = len(val_losses)
 
     delta_mu = val_mean - train_mean
-    sigma_delta_mu = np.sqrt(train_std**2 / n_train + val_std**2 / n_val)
+    if n_train > 1:
+        sigma_delta_mu = np.sqrt(train_std**2 / n_train + val_std**2 / n_val)
+    else:
+        sigma_delta_mu = 0
 
     lower = delta_mu - z * sigma_delta_mu
     upper = delta_mu + z * sigma_delta_mu
@@ -174,11 +178,7 @@ def _plot_iteration_losses(history, iteration, design, val_loss, plots_dir):
                 color="tab:green",
                 linestyle="--",
                 alpha=0.5,
-                label=(
-                    f"data grew to {int(train_budget_per_epoch[idx])}"
-                    if k == 0
-                    else None
-                ),
+                label=("data grew" if k == 0 else None),
             )
 
     title_suffix = f"final val_loss={val_loss:.4f}"
@@ -283,7 +283,7 @@ def train_and_evaluate(
         params = optax.apply_updates(params, updates)
         return loss, params, state, opt_state
 
-    design_array_j = jnp.asarray(design_array)
+    design_array_j = jax.device_put(jnp.asarray(design_array), device=device)
 
     # --- per-event cache, sized to the whole dataset ---
     # Simulator's `info` is an opaque pytree of flat per-hit arrays. We
@@ -336,9 +336,15 @@ def train_and_evaluate(
 
     def _empty_cache(N):
         info_c = jax.tree.map(
-            lambda x: jnp.zeros((N, *x.shape[1:]), dtype=x.dtype), _sample_info
+            lambda x: jax.device_put(
+                jnp.zeros((N, *x.shape[1:]), dtype=x.dtype), device=device
+            ),
+            _sample_info,
         )
-        target_c = jnp.zeros((N, _sample_target.shape[-1]), dtype=_sample_target.dtype)
+        target_c = jax.device_put(
+            jnp.zeros((N, _sample_target.shape[-1]), dtype=_sample_target.dtype),
+            device=device,
+        )
         return info_c, target_c
 
     # Cache size = n0 + n_increment * max_growths.
@@ -362,11 +368,15 @@ def train_and_evaluate(
         if info_new is None or target_new is None:
             return info_cache, target_cache, n_active
         n_new = int(target_new.shape[0])
-        idx = jnp.arange(n_active, n_active + n_new)
+        idx = jax.device_put(jnp.arange(n_active, n_active + n_new), device=device)
         info_cache = jax.tree.map(
-            lambda c, x: c.at[idx].set(jnp.asarray(x)), info_cache, info_new
+            lambda c, x: c.at[idx].set(jax.device_put(jnp.asarray(x), device=device)),
+            info_cache,
+            info_new,
         )
-        target_cache = target_cache.at[idx].set(jnp.asarray(target_new))
+        target_cache = target_cache.at[idx].set(
+            jax.device_put(jnp.asarray(target_new), device=device)
+        )
         return info_cache, target_cache, n_active + n_new
 
     def _grow_caches_to(
@@ -437,11 +447,14 @@ def train_and_evaluate(
     def train_epoch_kernel(
         info_cache, target_cache, n_active, key, params, state, opt_state
     ):
+        # n_active arrives as shape (1,); unwrap to a 0-D scalar for randint.
+        n_active_scalar = n_active[0]
+
         def body(carry, _):
             key, params, state, opt_state = carry
             key, key_b = jax.random.split(key)
 
-            ev_idx = jax.random.randint(key_b, (batch,), 0, n_active)
+            ev_idx = jax.random.randint(key_b, (batch,), 0, n_active_scalar)
             info_b = jax.tree.map(lambda c: c[ev_idx], info_cache)
             target_b = target_cache[ev_idx]
 
@@ -461,10 +474,28 @@ def train_and_evaluate(
         )
         return params, state, opt_state, losses, key
 
+    # Broadcasted design for a full-cache forward pass.
+    design_full_cache = jax.device_put(
+        jnp.broadcast_to(design_array_j[0:1], (cache_size, design_array_j.shape[-1])),
+        device=device,
+    )
+
+    @partial(jax.jit, device=device)
+    def full_val_kernel(info_cache, target_cache, params, state):
+        """Per-event MSE over the entire cache (cache_size events) in one call."""
+        events_flat = jnp.repeat(jnp.arange(cache_size), max_hits_per_evt)
+        measurements = (events_flat, *(x.reshape(-1) for x in info_cache[1:]))
+        reg = nnx.merge(regressor_def, params, state)
+        pred = reg(measurements, design_full_cache, deterministic=True)
+        target_norm = (target_cache - target_mean) / target_std
+        return jnp.mean(jnp.square(target_norm - pred), axis=-1)
+
     @partial(jax.jit, device=device)
     def val_epoch_kernel(info_cache, target_cache, n_active, key, params, state):
+        n_active_scalar = n_active[0]
+
         def per_batch(k):
-            ev_idx = jax.random.randint(k, (batch,), 0, n_active)
+            ev_idx = jax.random.randint(k, (batch,), 0, n_active_scalar)
             info_b = jax.tree.map(lambda c: c[ev_idx], info_cache)
             target_b = target_cache[ev_idx]
 
@@ -479,7 +510,9 @@ def train_and_evaluate(
         keys = jax.random.split(key, n_val_batches)
         return jax.vmap(per_batch)(keys)
 
-    kernel_key = jax.random.PRNGKey(int(seed) & 0xFFFFFFFF)
+    kernel_key = jax.device_put(
+        jax.random.PRNGKey(int(seed) & 0xFFFFFFFF), device=device
+    )
 
     status = detopt.utils.progress.status_bar(disable=False)
 
@@ -535,7 +568,9 @@ def train_and_evaluate(
             r_params, r_state, opt_state, losses, _ = train_epoch_kernel(
                 train_info,
                 train_target,
-                jnp.asarray(n_active_train, dtype=jnp.int32),
+                jax.device_put(
+                    jnp.asarray([n_active_train], dtype=jnp.int32), device=device
+                ),
                 k_train,
                 r_params,
                 r_state,
@@ -550,7 +585,9 @@ def train_and_evaluate(
             val_mses = val_epoch_kernel(
                 val_info,
                 val_target,
-                jnp.asarray(n_active_val, dtype=jnp.int32),
+                jax.device_put(
+                    jnp.asarray([n_active_val], dtype=jnp.int32), device=device
+                ),
                 k_val,
                 r_params,
                 r_state,
@@ -570,7 +607,8 @@ def train_and_evaluate(
             training_plateaued = epochs_without_improvement >= patience
             last_training_plateaued = training_plateaued
 
-            # Sliding-window agreement test over the last K epochs.
+            # Single-epoch agreement test: use this epoch's per-step train
+            # losses and per-batch val MSEs as the two samples.
             grow_now = False
             grow_delta_mu = 0.0
             grow_sigma = 0.0
@@ -578,32 +616,31 @@ def train_and_evaluate(
             if cooldown_remaining > 0:
                 cooldown_remaining -= 1
             elif len(train_losses_history) >= agreement_window:
-                train_window = train_losses_history[-agreement_window:]
-                val_window = val_losses_history[-agreement_window:]
-                # Relative equivalence band: tau scales with current loss.
+                train_samples = train_losses_history[-agreement_window:]
+                val_samples = val_losses_history[-agreement_window:]
+                # train_samples = np.asarray(losses)
+                # val_samples = np.asarray(val_mses)
                 scale = 0.5 * (
-                    float(np.mean(train_window)) + float(np.mean(val_window))
+                    float(np.mean(train_samples)) + float(np.mean(val_samples))
                 )
                 tau = max_mean_difference_relative * max(scale, 1e-12)
                 agrees, delta_mu, sigma_delta_mu = check_loss_mean_agreement(
-                    train_window,
-                    val_window,
+                    train_samples,
+                    val_samples,
                     max_mean_difference=tau,
                     z=z_value,
                 )
                 last_agrees = agrees
                 if epoch + 1 >= min_epochs and agrees and training_plateaued:
                     print(
-                        f"\nEarly stop: train/val agree over last "
-                        f"{agreement_window} epochs | tau={tau:.6f} | "
+                        f"\nEarly stop: train/val agree | tau={tau:.6f} | "
                         f"delta_mu={delta_mu:.6f}, "
                         f"sigma_delta_mu={sigma_delta_mu:.6f}"
                     )
                     early_stopped = True
                     break
 
-                # Grow mid-block when train/val disagree, even if training
-                # has not plateaued yet.
+                # Grow when train/val disagree.
                 if not agrees and epoch + 1 >= min_epochs:
                     grow_now = True
                     grow_delta_mu = float(delta_mu)
@@ -704,22 +741,12 @@ def train_and_evaluate(
         last_agrees = None
         last_training_plateaued = False
 
-    # --- final validation: exact MSE over the entire iteration val pool ---
-    reg = nnx.merge(regressor_def, r_params, r_state)
-    val_per_sample = []
-    for dd, tg in _sequential_batches(loader, pool.val_indices, batch):
-        n_evt = tg.shape[0]
-        c = np.tile(design.reshape(1, -1), (n_evt, 1))
-        _, measurements, target, _, _ = detector(
-            seed=(seed + 1000, 1, n_evt),
-            daughter_data=dd,
-            hnl_targets=tg,
-            configurations=c,
-        )
-        pred = reg(measurements, jnp.array(c), deterministic=True)
-        target_norm = (target - target_mean) / target_std
-        mse_per_event = jnp.mean(jnp.square(target_norm - pred), axis=-1)
-        val_per_sample.extend(np.asarray(mse_per_event).tolist())
+    # --- final validation: exact MSE over the entire iteration val cache ---
+    # One JIT kernel call over all cache_size events; we keep only the
+    # first n_active_val rows (the rest are padded zeros and their MSEs
+    # are meaningless).
+    per_event_mse = full_val_kernel(val_info, val_target, r_params, r_state)
+    val_per_sample = np.asarray(per_event_mse[:n_active_val], dtype=np.float64)
     val_loss = float(np.mean(val_per_sample))
 
     final_state = (regressor_def, r_params, r_state, opt_state)
