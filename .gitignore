@@ -130,3 +130,8 @@ release/
 *.html
 
 data/
+output/
+
+*.md
+!README.md
+!CHANGELOG.md

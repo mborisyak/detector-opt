@@ -7,11 +7,14 @@ from . import straw
 
 from .. import utils
 from .straw import StrawDetector
+from .debug import DebugDetector
 
 __detectors__: dict[str, type[Detector]] = {
-  'straw': StrawDetector
+    "straw": StrawDetector,
+    "debug": DebugDetector,
 }
 
+
 def from_config(config: dict[str, Any]):
-  clazz, arguments = utils.config.extract(config, library=__detectors__)
-  return clazz.from_config(config=arguments)
+    clazz, arguments = utils.config.extract(config, library=__detectors__)
+    return clazz.from_config(config=arguments)

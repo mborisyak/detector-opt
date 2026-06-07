@@ -1,3 +1,6 @@
+# NOTE: ragged-layout model (own combine + segment_sum over event_indices).
+# NOT YET PORTED to the new Detector padded (B, M, F) contract; superseded
+# by detopt/nn/set_regressor.py for the supervised path.
 import inspect
 import math
 from multiprocessing import Event
@@ -24,6 +27,23 @@ __all__ = [
 
 
 class Regressor(Model):
+    @classmethod
+    def from_config(cls, detector: Detector, config, *, rngs: nnx.Rngs):
+        return cls(detector, rngs=rngs, **config)
+
+    def __init__(self, detector: Detector, *, rngs: nnx.Rngs):
+        # Bridge the detector onto the Model contract. These dense regressors
+        # flatten the masked (M, F) event tensor and concatenate the physical
+        # design, so they take the raw event_shape as input and keep the design
+        # shape for the concat path.
+        super().__init__(
+            input_shape=detector.event_shape(),
+            target_shape=detector.target_shape(),
+            ground_truth_shape=detector.ground_truth_shape(),
+            rngs=rngs,
+        )
+        self.design_shape = detector.design_shape()
+
     def __call__(self, X: jax.Array, design: jax.Array, *, deterministic: bool = True):
         raise NotImplementedError()
 
@@ -97,26 +117,23 @@ class AlphaResNet(Regressor):
         n_in = input_dim + design_dim
         self.embedding = nnx.Linear(n_in, n_hidden, rngs=rngs)
 
-        self.hidden: list[list[nnx.Module]] = list()
-        self.alphas: list[nnx.Param[jax.Array]] = list()
+        self.hidden = nnx.List([])
+        self.alphas = nnx.List([])
 
         for i in range(depth):
-            block: list[nnx.Module] = list()
-
-            block.append(SiLU())
+            block = nnx.List([SiLU()])
             if p_dropout:
-                block.append(nnx.Dropout(n_hidden, rngs=rngs))
+                block.append(nnx.Dropout(rate=p_dropout, rngs=rngs))
             block.append(nnx.Linear(n_hidden, n_hidden, rngs=rngs))
-            self.alphas.append(
-                nnx.Param(
-                    jnp.zeros(shape=(n_hidden,)),
-                )
-            )
+            self.hidden.append(block)
+            self.alphas.append(nnx.Param(jnp.zeros(shape=(n_hidden,))))
 
-        self.output: list[nnx.Module] = [
-            SiLU(),
-            nnx.Linear(n_hidden, target_dim, rngs=rngs),
-        ]
+        self.output = nnx.List(
+            [
+                SiLU(),
+                nnx.Linear(n_hidden, target_dim, rngs=rngs),
+            ]
+        )
 
     def __call__(self, X: jax.Array, design: jax.Array, *, deterministic: bool = True):
         n, *_ = X.shape
@@ -134,7 +151,7 @@ class AlphaResNet(Regressor):
                 else:
                     hidden = layer(hidden)
 
-            result = result + alpha.value * hidden
+            result = result + alpha[...] * hidden
 
         for layer in self.output:
             result = layer(jax.nn.celu(result))
@@ -143,9 +160,7 @@ class AlphaResNet(Regressor):
 
 
 class CNN(Regressor):
-    def __init__(
-        self, detector: Detector, features, p_dropout: float = 0.1, *, rngs: nnx.Rngs
-    ):
+    def __init__(self, detector: Detector, features, p_dropout: float = 0.1, *, rngs: nnx.Rngs):
         super().__init__(detector, rngs=rngs)
         input_dim, design_dim = (
             math.prod(self.input_shape),
@@ -182,9 +197,7 @@ class CNN(Regressor):
                         SiLU(),
                     ),
                     Block(
-                        nnx.Conv(
-                            n_f, n_f, kernel_size=(1, 1), padding="VALID", rngs=rngs
-                        ),
+                        nnx.Conv(n_f, n_f, kernel_size=(1, 1), padding="VALID", rngs=rngs),
                         nnx.Dropout(rate=p_dropout, rngs=rngs),
                         nnx.Conv(
                             n_f,
@@ -245,31 +258,21 @@ class CNN(Regressor):
             design[:, n_l : 2 * n_l],
             design[:, -1],
         )
-        positions = jnp.broadcast_to(
-            positions[:, :, None, None], shape=(n_b, n_l, n_s, 1)
-        )
+        positions = jnp.broadcast_to(positions[:, :, None, None], shape=(n_b, n_l, n_s, 1))
         angles = jnp.broadcast_to(angles[:, :, None, None], shape=(n_b, n_l, n_s, 1))
-        magnetic_strength = jnp.broadcast_to(
-            magnetic_strength[:, None, None, None], shape=(n_b, n_l, n_s, 1)
-        )
+        magnetic_strength = jnp.broadcast_to(magnetic_strength[:, None, None, None], shape=(n_b, n_l, n_s, 1))
 
         X = jnp.concatenate([X, positions, angles, magnetic_strength], axis=-1)
         hidden = X
 
         for block_straw_wise, block_layer_wise in self.blocks:
             hidden_straw_wise = block_straw_wise(hidden, deterministic=deterministic)
-            hidden_layer_wise = block_layer_wise(
-                hidden_straw_wise, deterministic=deterministic
-            )
+            hidden_layer_wise = block_layer_wise(hidden_straw_wise, deterministic=deterministic)
 
             *_, h_sw_c = hidden_straw_wise.shape
-            hidden_straw_wise = jnp.broadcast_to(
-                hidden_straw_wise, (n_b, n_l, n_s, h_sw_c)
-            )
+            hidden_straw_wise = jnp.broadcast_to(hidden_straw_wise, (n_b, n_l, n_s, h_sw_c))
             *_, h_lw_c = hidden_layer_wise.shape
-            hidden_layer_wise = jnp.broadcast_to(
-                hidden_layer_wise, (n_b, n_l, n_s, h_lw_c)
-            )
+            hidden_layer_wise = jnp.broadcast_to(hidden_layer_wise, (n_b, n_l, n_s, h_lw_c))
             hidden = jnp.concatenate([X, hidden_straw_wise, hidden_layer_wise], axis=-1)
 
         hidden = self.final_block(hidden, deterministic=deterministic)
@@ -304,9 +307,7 @@ class HyperResNet(Regressor):
         )
         target_dim = math.prod(self.target_shape)
 
-        dropout = lambda: (
-            [] if p_dropout is None else [nnx.Dropout(rate=p_dropout, rngs=rngs)]
-        )
+        dropout = lambda: ([] if p_dropout is None else [nnx.Dropout(rate=p_dropout, rngs=rngs)])
         self.initial_embeddings = (
             nnx.Linear(input_dim, n_hidden, rngs=rngs),
             nnx.Linear(design_dim, n_hidden, rngs=rngs),
@@ -403,12 +404,8 @@ class DeepSet(Regressor):
         # ADDED: Store detector geometry - use detector's parameters instead of hardcoding
         self.n_max_hits = n_max_hits
         self.n_stations = detector.n_stations  # From StrawDetector.n_stations
-        self.n_views_per_station = (
-            detector.n_views_per_station
-        )  # From StrawDetector.n_views_per_station
-        self.n_layers_per_view = (
-            detector.n_layers_per_view
-        )  # From StrawDetector.n_layers_per_view
+        self.n_views_per_station = detector.n_views_per_station  # From StrawDetector.n_views_per_station
+        self.n_layers_per_view = detector.n_layers_per_view  # From StrawDetector.n_layers_per_view
         self.n_straws = detector.n_straws  # From StrawDetector.n_straws
 
         # CHANGED: Feature dimension is now 8 per hit (4 indices + TDC + position + angle + B)
@@ -448,9 +445,7 @@ class DeepSet(Regressor):
         hit_mask = mask_bool.astype(jnp.float32)[:, None]  # (n_hits, 1)
 
         n_batch = design.shape[0]
-        n_layers_total = (
-            self.n_stations * self.n_views_per_station * self.n_layers_per_view
-        )
+        n_layers_total = self.n_stations * self.n_views_per_station * self.n_layers_per_view
 
         # Make padded entries safe for indexing/segment ops
         events = jnp.asarray(events, dtype=jnp.int32)
@@ -526,12 +521,8 @@ class DeepSet(Regressor):
         def masked_segment_mean(values):
             # values: (n_hits, d)
             values = values * hit_mask
-            sum_per_event = jax.ops.segment_sum(
-                values, event_indices, num_segments=n_batch
-            )
-            count_per_event = jax.ops.segment_sum(
-                hit_mask, event_indices, num_segments=n_batch
-            )  # (n_batch, 1)
+            sum_per_event = jax.ops.segment_sum(values, event_indices, num_segments=n_batch)
+            count_per_event = jax.ops.segment_sum(hit_mask, event_indices, num_segments=n_batch)  # (n_batch, 1)
             return sum_per_event / jnp.clip(count_per_event, min=1.0)
 
         result = hit_features
@@ -584,9 +575,7 @@ class SparseBayesBlock(nnx.Module):
         rngs: nnx.Rngs,
     ):
         if len(block_def) < 1:
-            raise ValueError(
-                "Each block_def must contain at least one output dimension."
-            )
+            raise ValueError("Each block_def must contain at least one output dimension.")
 
         hidden_dims = tuple(block_def[:-1])
         out_dim = block_def[-1]
@@ -640,9 +629,7 @@ def masked_bayes_segment_aggregate(
     weighted_mu = precision * mu
 
     precision_sum = jax.ops.segment_sum(precision, event_indices, num_segments=n_batch)
-    weighted_mu_sum = jax.ops.segment_sum(
-        weighted_mu, event_indices, num_segments=n_batch
-    )
+    weighted_mu_sum = jax.ops.segment_sum(weighted_mu, event_indices, num_segments=n_batch)
 
     mu_event = weighted_mu_sum / jnp.clip(precision_sum, min=eps)
     sigma_event = jnp.sqrt(1.0 / jnp.clip(precision_sum, min=eps))
@@ -732,9 +719,7 @@ class BayesDeepSet(Regressor):
         hit_mask = mask_bool.astype(jnp.float32)[:, None]  # (n_hits, 1)
 
         n_batch = design.shape[0]
-        n_layers_total = (
-            self.n_stations * self.n_views_per_station * self.n_layers_per_view
-        )
+        n_layers_total = self.n_stations * self.n_views_per_station * self.n_layers_per_view
 
         # Convert to arrays
         events = jnp.asarray(events, dtype=jnp.int32)

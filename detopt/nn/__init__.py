@@ -7,24 +7,23 @@ from .. import utils
 from .regressor import *
 from .generator import *
 from .discriminator import *
+from .set_regressor import SetRegressor, SetEnsembleRegressor
 
 __models__: dict[str, type[Regressor]] = {
-  'mlp': MLP,
-  'resnet': AlphaResNet,
-  'hyper-resnet': HyperResNet,
-  'deep-set': DeepSet,
-  'bayes-deep-set': BayesDeepSet,
-
-  'deep-set-vae': DeepSetVAE,
-  'cvae': CVAE,
-  'mlp-vae': MLPVAE,
-
-  'deep-set-lfi': DeepSetLFI
+    "mlp": MLP,
+    "resnet": AlphaResNet,
+    "hyper-resnet": HyperResNet,
+    "deep-set": DeepSet,
+    "bayes-deep-set": BayesDeepSet,
+    "set-regressor": SetRegressor,
+    "set-ensemble-regressor": SetEnsembleRegressor,
+    "deep-set-vae": DeepSetVAE,
+    "cvae": CVAE,
+    "mlp-vae": MLPVAE,
+    "deep-set-lfi": DeepSetLFI,
 }
 
-def from_config(
-  detector: Detector,
-  config: dict[str, Any], *, rngs: nnx.Rngs
-):
-  model, arguments = utils.config.extract(config, library=__models__)
-  return model.from_config(detector, config=arguments, rngs=rngs)
+
+def from_config(detector: Detector, config: dict[str, Any], *, rngs: nnx.Rngs):
+    model, arguments = utils.config.extract(config, library=__models__)
+    return model.from_config(detector, config=arguments, rngs=rngs)

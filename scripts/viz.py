@@ -7,10 +7,13 @@ import numpy as np
 
 import detopt
 
+# NOTE: partially ported to the new Detector contract (detector-spec.md).
+# Event generation now goes through detector.sample_events(seed, design) ->
+# {ground_truth, X, mask, targets, trajectories, sparse_hits}. Visualisation that
+# assumed the old ragged per-hit layout may still need adjustment.
 
-def viz(
-    seed=123, design="data/design/default.json", use_root_particles=False, **config
-):
+
+def viz(seed=123, design="data/design/default.json", use_root_particles=False, **config):
     batch = 2
     detector = detopt.detector.from_config(config["detector"])
     enc = detector.get_encoded_current_design()
@@ -20,15 +23,16 @@ def viz(
     input("wait enc")
 
     if True:
-        initial, measurements, target, trajectories, hits = detector(
-            seed=(seed, 1, 1, 0), configurations=enc
-        )
+        _ev = detector.sample_events((seed, 1, 1, 0), enc)
+        initial = _ev["ground_truth"]
+        measurements = _ev["X"]
+        target = _ev["targets"]
+        trajectories = _ev["trajectories"]
+        hits = _ev["sparse_hits"]
         print(initial.shape)
         input("wait init")
         print(detector.decode_ground_truth(initial))
-        masses, charges, initial_positions, initial_momentum = (
-            detector.decode_ground_truth(initial)
-        )
+        masses, charges, initial_positions, initial_momentum = detector.decode_ground_truth(initial)
         print(masses, masses.shape)
         input("wait masses")
 
@@ -129,16 +133,8 @@ def viz(
             tdc_by_station[station].append(fdigi_times[i])
         plt.figure()
         # Only include stations with hits
-        tdc_data = [
-            tdc_by_station[station]
-            for station in range(n_stations)
-            if tdc_by_station[station]
-        ]
-        labels = [
-            f"Station {station + 1}"
-            for station in range(n_stations)
-            if tdc_by_station[station]
-        ]
+        tdc_data = [tdc_by_station[station] for station in range(n_stations) if tdc_by_station[station]]
+        labels = [f"Station {station + 1}" for station in range(n_stations) if tdc_by_station[station]]
         plt.hist(tdc_data, bins=50, stacked=True, label=labels, alpha=0.7)  #
         plt.xlabel("TDC time [ns]")
         plt.ylabel("Counts")
@@ -176,7 +172,7 @@ def viz(
     n_trials = 1
     start_time = time.perf_counter()
     for i in range(n_trials):
-        _ = detector(seed=1, configurations=configs)
+        _ = detector(1, configs)
     runtime = time.perf_counter() - start_time
     events_per_second_single_core = n_trials * n_batch / runtime
     print(f"events per second: {events_per_second_single_core}")
@@ -186,10 +182,7 @@ def viz(
     n_cores = 1  # os.cpu_count()
     start_time = time.perf_counter()
     with ThreadPoolExecutor(max_workers=n_cores) as executor:
-        futures = [
-            executor.submit(detector, seed=1, configurations=configs)
-            for _ in range(n_trials)
-        ]
+        futures = [executor.submit(detector, 1, configs) for _ in range(n_trials)]
 
         for future in futures:
             _ = future.result()
@@ -204,9 +197,7 @@ def viz(
     v0s = list()
     ys = list()
     for i in range(1):
-        _, _, _, v0, trajectories, response, signal = detector.sample(
-            seed=i, design=configs
-        )
+        _, _, _, v0, trajectories, response, signal = detector.sample(seed=i, design=configs)
         v0s.append(v0)
         ys.append(signal)
         # print(i, end='\n')
@@ -217,17 +208,13 @@ def viz(
 
     ns = np.sum(np.sum(np.square(v0s), axis=-1) > 1.0e-3, axis=-1)
 
-    plt.hist(
-        [ns[ys > 0.5], ns[ys < 0.5]], bins=7, label=["signal", "noise"], histtype="step"
-    )
+    plt.hist([ns[ys > 0.5], ns[ys < 0.5]], bins=7, label=["signal", "noise"], histtype="step")
     plt.title("Number of trajectories per event")
     plt.legend()
     plt.savefig("straw-events.png")
     plt.close()
 
-    _, _, _, _, trajectories, response, signal = detector.sample(
-        seed=seed, design=configs
-    )
+    _, _, _, _, trajectories, response, signal = detector.sample(seed=seed, design=configs)
     layers, angles, widths, heights, Bs, Ls = detector.get_design(design=configs)
 
     # print(layers, angles, widths, heights, Bs, Ls, sep='  \n\n')
@@ -265,9 +252,7 @@ def compare(
 
     import matplotlib.pyplot as plt
 
-    detector: detopt.detector.StrawDetector = detopt.detector.from_config(
-        config["detector"]
-    )
+    detector: detopt.detector.StrawDetector = detopt.detector.from_config(config["detector"])
     L = detector.L
     W = detector.layer_width
     H = detector.layer_height
@@ -300,9 +285,7 @@ def compare(
     def sample(d, n):
         encoded = detector.encode_design(d)
         configs = np.broadcast_to(encoded[None], shape=(n, *encoded.shape))
-        _, _, _, _, trajectories, response, signal = detector.sample(
-            seed=seed, design=configs
-        )
+        _, _, _, _, trajectories, response, signal = detector.sample(seed=seed, design=configs)
         return trajectories
 
     fig = plt.figure(figsize=(12, 6))
@@ -361,9 +344,7 @@ def compare(
     ax.set_xlabel("z-axis")
 
     ax = axes[1, 1]
-    ax.bar(
-        pos, angles + np.pi / 3, width=0.05, color=plt.cm.tab10(1), bottom=-np.pi / 3
-    )
+    ax.bar(pos, angles + np.pi / 3, width=0.05, color=plt.cm.tab10(1), bottom=-np.pi / 3)
     ax.plot([-6.0, 6.0], [0.0, 0.0], color="black", linestyle="--")
     ax.set_ylim([-np.pi / 3, np.pi / 3])
     ax.set_xlim([-6.0, 6.0])

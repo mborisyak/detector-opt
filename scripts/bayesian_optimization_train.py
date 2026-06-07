@@ -83,11 +83,7 @@ def _load_data_loader(config):
     """Build the HNL data loader from the top-level ``data`` config block."""
     data_cfg = config.get("data", {})
     data_dir = data_cfg.get("data_dir", "selected_data")
-    max_particles = int(
-        data_cfg.get(
-            "max_particles", config["detector"]["straw"].get("max_particles", 2)
-        )
-    )
+    max_particles = int(data_cfg.get("max_particles", config["detector"]["straw"].get("max_particles", 2)))
     val_fraction = float(data_cfg.get("val_fraction", 0.2))
     split_seed = int(data_cfg.get("split_seed", 42))
     return HNLDataLoader(
@@ -161,9 +157,7 @@ def _chunk_sparse_hits(
         ct[c, :n_hits] = v_times[s : s + n_hits]
         cm[c, :n_hits] = 1
 
-    chunked_targets = np.asarray(targets, dtype=np.float32).reshape(
-        n_chunks, batch_size, -1
-    )
+    chunked_targets = np.asarray(targets, dtype=np.float32).reshape(n_chunks, batch_size, -1)
     return ce, cl, cs, ct, cm, chunked_targets
 
 
@@ -183,9 +177,7 @@ class IterationPool:
     new events to either side; events never change partitions.
     """
 
-    def __init__(
-        self, n_total_events: int, val_fraction: float, rng: np.random.Generator
-    ):
+    def __init__(self, n_total_events: int, val_fraction: float, rng: np.random.Generator):
         self.n_total = int(n_total_events)
         self.val_fraction = float(val_fraction)
         self._order = rng.permutation(self.n_total).astype(np.int32)
@@ -200,12 +192,8 @@ class IterationPool:
         if n_to_add > 0:
             new_events = self._order[self._consumed : self._consumed + n_to_add]
             n_new_val = max(0, min(n_to_add, int(round(n_to_add * self.val_fraction))))
-            self.val_indices = np.concatenate(
-                [self.val_indices, new_events[:n_new_val]]
-            )
-            self.train_indices = np.concatenate(
-                [self.train_indices, new_events[n_new_val:]]
-            )
+            self.val_indices = np.concatenate([self.val_indices, new_events[:n_new_val]])
+            self.train_indices = np.concatenate([self.train_indices, new_events[n_new_val:]])
             self._consumed += n_to_add
         return int(len(self.train_indices)), int(len(self.val_indices))
 
@@ -254,18 +242,12 @@ def _plot_iteration_losses(history, iteration, design, val_loss, plots_dir):
                 color="tab:green",
                 linestyle="--",
                 alpha=0.5,
-                label=(
-                    f"data grew to {int(train_budget_per_epoch[idx])}"
-                    if k == 0
-                    else None
-                ),
+                label=(f"data grew to {int(train_budget_per_epoch[idx])}" if k == 0 else None),
             )
 
     title_suffix = f"final val_loss={val_loss:.4f}"
     if final_train_budget is not None:
-        title_suffix += (
-            f" | n_train={final_train_budget} (+{data_extensions_used} growth)"
-        )
+        title_suffix += f" | n_train={final_train_budget} (+{data_extensions_used} growth)"
     ax.set_title(f"Iter {iteration} - Train/Val convergence ({title_suffix})")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("MSE (normalized)")
@@ -330,9 +312,7 @@ def train_and_evaluate(
     design = detector.get_encoded_current_design()
 
     if init_state is None:
-        regressor_def, r_params, r_state, opt_state, optimizer = _init_regressor_state(
-            detector, config, seed
-        )
+        regressor_def, r_params, r_state, opt_state, optimizer = _init_regressor_state(detector, config, seed)
     else:
         regressor_def, r_params, r_state, opt_state = init_state
         optimizer = detopt.utils.config.optimizer(config["optimizer"])
@@ -388,9 +368,7 @@ def train_and_evaluate(
         def step_body(carry, inputs):
             params, state, opt_state = carry
             info, tgt = inputs
-            (loss, state), grad = jax.value_and_grad(loss_fn, argnums=3, has_aux=True)(
-                info, design_array_j, tgt, params, state
-            )
+            (loss, state), grad = jax.value_and_grad(loss_fn, argnums=3, has_aux=True)(info, design_array_j, tgt, params, state)
             updates, opt_state = optimizer.update(grad, opt_state, params)
             params = optax.apply_updates(params, updates)
             return (params, state, opt_state), loss
@@ -447,9 +425,7 @@ def train_and_evaluate(
     min_delta = float(config.get("min_delta", 1e-4))
     min_delta_relative = float(config.get("min_delta_relative", 0.01))
     agreement_window = int(config.get("agreement_window", 20))
-    max_mean_difference_relative = float(
-        config.get("max_mean_difference_relative", 0.10)
-    )
+    max_mean_difference_relative = float(config.get("max_mean_difference_relative", 0.10))
     z_value = float(config.get("z_value", 1.96))
     min_epochs = int(config.get("min_epochs", 3))
     growth_cooldown = int(config.get("growth_cooldown", agreement_window))
@@ -567,9 +543,7 @@ def train_and_evaluate(
                 train_window = train_losses_history[-agreement_window:]
                 val_window = val_losses_history[-agreement_window:]
                 # Relative equivalence band: tau scales with current loss.
-                scale = 0.5 * (
-                    float(np.mean(train_window)) + float(np.mean(val_window))
-                )
+                scale = 0.5 * (float(np.mean(train_window)) + float(np.mean(val_window)))
                 tau = max_mean_difference_relative * max(scale, 1e-12)
                 agrees, delta_mu, sigma_delta_mu = check_loss_mean_agreement(
                     train_window,
@@ -697,10 +671,7 @@ def train_and_evaluate(
 def optimize(config, output_dir, n_iter=50, n_init=10, seed=42):
     nn_init_strategy = config["nn_init_strategy"]
     if nn_init_strategy not in VALID_INIT_STRATEGIES:
-        raise ValueError(
-            f"Unknown nn_init_strategy: {nn_init_strategy!r}. "
-            f"Must be one of {VALID_INIT_STRATEGIES}."
-        )
+        raise ValueError(f"Unknown nn_init_strategy: {nn_init_strategy!r}. " f"Must be one of {VALID_INIT_STRATEGIES}.")
 
     detector = detopt.detector.from_config(config["detector"])
     loader = _load_data_loader(config)
@@ -732,11 +703,7 @@ def optimize(config, output_dir, n_iter=50, n_init=10, seed=42):
 
         # Propose design
         if i < n_init:
-            params = (
-                torch.rand(1, bounds.shape[1], dtype=torch.float64)
-                * (bounds[1] - bounds[0])
-                + bounds[0]
-            )
+            params = torch.rand(1, bounds.shape[1], dtype=torch.float64) * (bounds[1] - bounds[0]) + bounds[0]
         else:
             gp = SingleTaskGP(train_X, train_Y)
             mll = ExactMarginalLogLikelihood(gp.likelihood, gp)
@@ -761,10 +728,7 @@ def optimize(config, output_dir, n_iter=50, n_init=10, seed=42):
             dists = torch.linalg.norm(train_X - params, dim=-1)
             closest_idx = int(torch.argmin(dists).item())
             init_state = state_history[closest_idx]
-            print(
-                f"[closest] Warm-starting from iteration {closest_idx} "
-                f"(distance={float(dists[closest_idx]):.4f})"
-            )
+            print(f"[closest] Warm-starting from iteration {closest_idx} " f"(distance={float(dists[closest_idx]):.4f})")
 
         print(f"\n[Iteration {i + 1}/{n_iter}] Evaluating design...")
 
@@ -815,15 +779,9 @@ def optimize(config, output_dir, n_iter=50, n_init=10, seed=42):
 
         if objective > best_obj:
             best_obj, best_design = objective, design
-            print(
-                f"✓ Iter {i + 1}/{n_iter} | Loss: {val_loss:.6f} | "
-                f"Time: {iter_time:.1f}s | BEST ★"
-            )
+            print(f"✓ Iter {i + 1}/{n_iter} | Loss: {val_loss:.6f} | " f"Time: {iter_time:.1f}s | BEST ★")
         else:
-            print(
-                f"✓ Iter {i + 1}/{n_iter} | Loss: {val_loss:.6f} | "
-                f"Time: {iter_time:.1f}s"
-            )
+            print(f"✓ Iter {i + 1}/{n_iter} | Loss: {val_loss:.6f} | " f"Time: {iter_time:.1f}s")
 
         result_entry = {
             "iteration": i,

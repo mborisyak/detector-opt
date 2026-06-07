@@ -10,10 +10,14 @@ from flax import nnx
 import detopt
 from detopt.detector.straw import SparseHits
 
+# NOTE: NOT YET PORTED to the new Detector contract (detector-spec.md).
+# The ragged-layout BayesDeepSet regressor (model.combine) is incompatible with
+# the padded (B, M, F) events from the new detector. Call sites are updated
+# mechanically; this script will not run end-to-end until the regressor is
+# ported to the padded layout (see detopt/nn/set_regressor.py).
 
-def save_deepset_input_label_hists(
-    detector, model, design, seed: int, batch: int, n_batches: int, out_path: str
-):
+
+def save_deepset_input_label_hists(detector, model, design, seed: int, batch: int, n_batches: int, out_path: str):
     rng = np.random.default_rng(seed)
 
     X_list = []
@@ -21,12 +25,10 @@ def save_deepset_input_label_hists(
     hits_per_event_list = []
 
     for k in range(n_batches):
-        _, info, y, _, _ = detector(seed=(seed, k), configurations=design)
+        _gt, info, _mask, y = detector((seed, k), design)
 
         # Normalized per-hit features come from here:
-        hit_features, events = model.combine(
-            info, design
-        )  # hit_features: (n_hits, 8), events: (n_hits,)
+        hit_features, events = model.combine(info, design)  # hit_features: (n_hits, 8), events: (n_hits,)
 
         X_list.append(np.asarray(hit_features))  # move from JAX to numpy
         y_list.append(np.asarray(y))
@@ -84,9 +86,7 @@ def save_deepset_input_label_hists(
     plt.close(fig)
 
 
-def regress(
-    seed, output, progress=False, restore=True, trace=None, report=None, **config
-):
+def regress(seed, output, progress=False, restore=True, trace=None, report=None, **config):
     print(config)
     print(f"Report parameter: {report}")
     input()
@@ -103,9 +103,7 @@ def regress(
     # input("Waiting ")
     print(detector.p_spawn_single)
     regressor = detopt.nn.from_config(detector, config=config["regressor"], rngs=rngs)
-    optimizer = nnx.Optimizer(
-        regressor, detopt.utils.config.optimizer(config["optimizer"]), wrt=nnx.Param
-    )
+    optimizer = nnx.Optimizer(regressor, detopt.utils.config.optimizer(config["optimizer"]), wrt=nnx.Param)
     # input("Waiting 1")
     epochs, steps = config["epochs"], config["steps"]
     print(epochs, steps)
@@ -119,12 +117,12 @@ def regress(
     @nnx.jit
     def loss_f(model, x, c, t):
         p = model(x, c)
-        return jnp.mean(detector.loss(t, p))
+        return jnp.mean(detector.loss(p, t))
 
     @nnx.jit
     def metric_f(model, x, c, t):
         p = model(x, c)
-        return jnp.mean(detector.metric(t, p))
+        return jnp.mean(detector.metric(p, t))
 
     @nnx.jit
     def step(model, optimizer, x, c, t):
@@ -156,23 +154,17 @@ def regress(
     # input("Waiting start")
     for i in status.epochs(epochs):
         for j in status.training(steps):
-            _, measurements, target, _, _ = detector(
-                seed=(seed, i, j, 0), configurations=design
-            )
+            _gt, measurements, _mask, target = detector((seed, i, j, 0), design)
             # print(measurements[0])
             print(design)
             # input("Waiting for step")
-            training_losses[i, j] = step(
-                regressor, optimizer, measurements, design, target
-            )
+            training_losses[i, j] = step(regressor, optimizer, measurements, design, target)
 
         for j in status.validation(validation_batches):
             # design = np_rng.normal(size=(batch, *detector.design_shape())).astype(
             #     np.float32
             # )
-            _, measurements, target, _, _ = detector(
-                seed=(seed, i, j, 1), configurations=design
-            )
+            _gt, measurements, _mask, target = detector((seed, i, j, 1), design)
 
             # Get predictions for precision analysis (normalized outputs)
             predictions_norm = regressor(measurements, jnp.array(design))
@@ -234,15 +226,11 @@ def regress(
 
                 # Position errors (x, y, z) - first 3 components
                 pos_errors = pred_array[:, :, :3] - targ_array[:, :, :3]
-                pos_rmse = np.sqrt(
-                    np.mean(pos_errors**2, axis=(1, 2))
-                )  # RMSE per epoch
+                pos_rmse = np.sqrt(np.mean(pos_errors**2, axis=(1, 2)))  # RMSE per epoch
 
                 # Momentum errors (px, py, pz) - last 3 components
                 mom_errors = pred_array[:, :, 3:] - targ_array[:, :, 3:]
-                mom_rmse = np.sqrt(
-                    np.mean(mom_errors**2, axis=(1, 2))
-                )  # RMSE per epoch
+                mom_rmse = np.sqrt(np.mean(mom_errors**2, axis=(1, 2)))  # RMSE per epoch
 
                 # Plot position precision
                 epochs_so_far = np.arange(len(pos_rmse))
@@ -289,11 +277,7 @@ def regress(
 
     manager.save(
         0,
-        args=ocp.args.Composite(
-            model=ocp.args.PyTreeSave(
-                detopt.utils.io.save_model(parameters, state, optimizer_state)
-            )
-        ),
+        args=ocp.args.Composite(model=ocp.args.PyTreeSave(detopt.utils.io.save_model(parameters, state, optimizer_state))),
     )
 
 

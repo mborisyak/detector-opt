@@ -35,3 +35,6 @@ Homepage = 'https://github.com/mborisyak/detector-opt'
 
 [tool.setuptools.packages.find]
 exclude = ['contrib', 'examples', 'docs', 'tests']
+
+[tool.black]
+line-length = 128

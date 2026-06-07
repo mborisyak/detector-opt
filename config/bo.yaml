@@ -1,0 +1,55 @@
+# Extended-budget BO run on the self-generating debug detector, warm-starting
+# each design's network from the nearest previously trained design.
+detector:
+  debug: {}
+
+regressor:
+  set-ensemble-regressor:
+    features: [[24, 32], [32, 24]]
+    n_models: 8
+    p_dropout: 0.1
+
+device: cuda
+
+training:
+  n0: 2048
+  n_increment: 1024
+  batch: 128
+  # Gradient-free evaluation batch for the sequential train+val loss passes
+  # (no backprop, so it can exceed the training batch).
+  eval_batch: 2048
+  # Mandatory unconditional epochs after every data addition.
+  warmup_epochs: 32
+  # Extended shared detector-call budget for the whole BO run.
+  budget: 524288
+  # Per-design upper limit on data (also sets epoch = iteration_limit / batch).
+  iteration_limit: 65536
+
+  val_fraction: 0.25
+  # Convergence: per-epoch-slope flatness tol, target loss precision, plateau window.
+  flatness_tol: 1.0
+  loss_precision: 2.0e-2
+  patience: 32
+  optimizer:
+    adamw:
+      learning_rate: 2.0e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-3
+
+bo:
+  # No fixed iteration count -- the run continues until the shared detector-call
+  # `budget` is exhausted. Initial random proposals = gp.n_folds (set in bo.py).
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds: [-6.0, 1.5]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+  ei:
+    n_restarts: 32
+    n_steps: 100
+
+# Warm-start each network from the nearest previously trained design.
+nn_init_strategy: closest

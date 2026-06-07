@@ -10,7 +10,13 @@ try:
 except ImportError:
     uproot = None
 
-from ..utils.encoding import normal_to_uniform, uniform_to_normal
+from ..utils.encoding import (
+    normal_to_uniform,
+    uniform_to_normal,
+    normal_to_uniform_jax,
+    uniform_to_normal_jax,
+)
+from ..data import HNLDataLoader
 from . import straw_detector
 from .common import Detector
 
@@ -81,9 +87,7 @@ def sparse_to_dense(
     edep_dense = np.zeros((n_events, n_particles, n_layers, n_straws), dtype=np.float32)
     r_mm_dense = np.zeros((n_events, n_particles, n_layers, n_straws), dtype=np.float32)
     t0_dense = np.zeros((n_events, n_particles, n_layers, n_straws), dtype=np.float32)
-    hit_pos_dense = np.zeros(
-        (n_events, n_particles, n_layers, n_straws, 3), dtype=np.float32
-    )
+    hit_pos_dense = np.zeros((n_events, n_particles, n_layers, n_straws, 3), dtype=np.float32)
 
     events = np.asarray(events, dtype=np.int32)
     particles = np.asarray(particles, dtype=np.int32)
@@ -109,18 +113,10 @@ def sparse_to_dense(
     )
 
     if np.any(valid):
-        response[events[valid], particles[valid], layers[valid], straws[valid]] = (
-            values[valid]
-        )
-        r_mm_dense[events[valid], particles[valid], layers[valid], straws[valid]] = (
-            r_mm[valid]
-        )
-        t0_dense[events[valid], particles[valid], layers[valid], straws[valid]] = t0[
-            valid
-        ]
-        hit_pos_dense[events[valid], particles[valid], layers[valid], straws[valid]] = (
-            hit_pos[valid]
-        )
+        response[events[valid], particles[valid], layers[valid], straws[valid]] = values[valid]
+        r_mm_dense[events[valid], particles[valid], layers[valid], straws[valid]] = r_mm[valid]
+        t0_dense[events[valid], particles[valid], layers[valid], straws[valid]] = t0[valid]
+        hit_pos_dense[events[valid], particles[valid], layers[valid], straws[valid]] = hit_pos[valid]
 
     return response, r_mm_dense, t0_dense, hit_pos_dense
 
@@ -164,13 +160,18 @@ class StrawDetector(Detector):
         optimize_stations: bool = True,  # If False, freeze station positions
         optimize_gaps: bool = True,  # If False, freeze layer_z_gap and view_z_gap
         optimize_bfield: bool = True,  # If False, freeze max_B, B_sigma, z0
+        data_dir=None,  # event-source location (detector config; the only data the detector owns)
+        val_fraction: float = 0.2,  # held-out fraction of the finite event source
+        split_seed: int = 42,  # seed defining the train/val partition
     ):
         """
         :param max_B: maximal strength of the magnetic field;
-        :param L: length parameter of the magnetic field;
         :param origin: the mean point of particles' origin;
         :param layer_bounds: restrictions on the layers' positions;
         :param dt: time increment for the ODE solver;
+        :param data: optional data-source config; the detector owns its event
+            source (see :meth:`__call__`). Lazily constructs an
+            :class:`HNLDataLoader` on first use.
         """
 
         self.max_B = max_B
@@ -207,14 +208,10 @@ class StrawDetector(Detector):
         self.optimize_gaps = optimize_gaps
         self.optimize_bfield = optimize_bfield
 
-        self.n_layers = (
-            self.n_stations * self.n_views_per_station * self.n_layers_per_view
-        )
+        self.n_layers = self.n_stations * self.n_views_per_station * self.n_layers_per_view
 
         # Layer height/width for visualization/hit logic
-        self.layer_height = (
-            self.straw_pitch * self.n_straws / 2.0
-        )  # half-length for +/- y
+        self.layer_height = self.straw_pitch * self.n_straws / 2.0  # half-length for +/- y
         self.layer_width = self.straw_length / 2.0  # half-length for +/- x
 
         # Angle bounds
@@ -231,9 +228,7 @@ class StrawDetector(Detector):
             self.secondary_multiplier = 1
 
         flight_distance = layer_bounds[1] - layer_bounds[0]
-        self.n_t = int(flight_distance / (dt * 29.9792))  #
-        # self.n_t = 500
-        # print("para", flight_distance, self.n_t, self.dt)
+        self.n_t = int(flight_distance / (dt * 29.9792))
 
         # Loss function parameters for position and momentum prediction
         if loss is None:
@@ -268,51 +263,88 @@ class StrawDetector(Detector):
             dtype=np.float32,
         )
 
+        # Owned event source: only the *location*. The train/val split below is
+        # part of the detector's own event-source config (not injected by the
+        # optimiser): the loader partitions the finite dataset on first use.
+        self._data_dir = data_dir
+        self._val_fraction = float(val_fraction)
+        self._split_seed = int(split_seed)
+        self._loader = None
+
+    # ------------------------------------------------------------------ #
+    # Event source
+    # ------------------------------------------------------------------ #
+    @property
+    def loader(self) -> HNLDataLoader:
+        if self._loader is None:
+            if self._data_dir is None:
+                raise RuntimeError(
+                    "StrawDetector has no event source configured; pass `data_dir` "
+                    "in the detector config to generate events."
+                )
+            self._loader = HNLDataLoader(
+                data_dir=self._data_dir,
+                max_particles=self.max_particles,
+                val_fraction=self._val_fraction,
+                split_seed=self._split_seed,
+            )
+        return self._loader
+
+    @property
+    def n_events(self) -> int:
+        return int(self.loader.n_events)
+
+    # ------------------------------------------------------------------ #
+    # Shapes
+    # ------------------------------------------------------------------ #
+    @property
+    def max_hits_per_event(self) -> int:
+        """``M`` in the per-event padded layout."""
+        return 2 * self.max_particles * self.n_layers
+
     def design_shape(self):
         # positions + angles + magnetic field strength
         return (self.n_layers + self.n_layers + 1,)
 
     def output_shape(self):
+        """Legacy dense output grid shape (kept for older code)."""
         return (self.n_layers, self.n_straws)
 
     def target_shape(self):
-        # Return shape for decay vertex reconstruction: [x, y, z, px, py, pz]
+        # decay vertex + HNL momentum: [x, y, z, px, py, pz]
         return (6,)
+
+    def event_shape(self):
+        # per-hit raw features: [station, view, layer_in_view, straw, time]
+        return (self.max_hits_per_event, 5)
+
+    def combined_event_shape(self):
+        return (self.max_hits_per_event, self.event_shape()[-1] + self.design_dim())
 
     def ground_truth_shape(self):
         # charges + positions + momenta (flattened)
-        return (
-            2 * self.max_particles + 3 * self.max_particles + 3 * self.max_particles,
-        )
+        return (2 * self.max_particles + 3 * self.max_particles + 3 * self.max_particles,)
 
+    # ------------------------------------------------------------------ #
+    # Ground-truth encoding (daughter particles)
+    # ------------------------------------------------------------------ #
     def encode_ground_truth(self, masses, charges, initial_positions, initial_momentum):
         n, *_ = initial_positions.shape
         normalized_positions = (initial_positions - self.origin) / self.origin_sigma
         normalized_positions = np.reshape(normalized_positions, shape=(n, -1))
         normalized_momenta = np.reshape(initial_momentum, shape=(n, -1))
-        ground_truth = np.concatenate(
-            [masses, charges, normalized_positions, normalized_momenta], axis=-1
-        )
+        ground_truth = np.concatenate([masses, charges, normalized_positions, normalized_momenta], axis=-1)
         return ground_truth
 
     def decode_ground_truth(self, ground_truth):
-        # print(ground_truth.shape)
-
         masses = ground_truth[:, : self.max_particles]
         batch = masses.shape[0]
-        # print(masses.shape)
-        charges = ground_truth[
-            :, self.max_particles : self.max_particles + self.max_particles
-        ]
+        charges = ground_truth[:, self.max_particles : self.max_particles + self.max_particles]
         pos_flat = ground_truth[
             :,
-            self.max_particles + self.max_particles : self.max_particles
-            + self.max_particles
-            + self.max_particles * 3,
+            self.max_particles + self.max_particles : self.max_particles + self.max_particles + self.max_particles * 3,
         ]
-        mom_flat = ground_truth[
-            :, self.max_particles + self.max_particles + self.max_particles * 3 :
-        ]
+        mom_flat = ground_truth[:, self.max_particles + self.max_particles + self.max_particles * 3 :]
 
         normalized_positions = pos_flat.reshape((batch, self.max_particles, 3))
         initial_momentum = mom_flat.reshape((batch, self.max_particles, 3))
@@ -321,135 +353,68 @@ class StrawDetector(Detector):
 
         return masses, charges, initial_positions, initial_momentum
 
-    def get_design(self, design: np.ndarray):
-        n = design.shape[0]
+    # ------------------------------------------------------------------ #
+    # Geometry from a physical (un-encoded) design array
+    # ------------------------------------------------------------------ #
+    def _design_to_geometry(self, design):
+        """Split a *physical* design ``[positions(n), angles(n), B]`` into the
+        per-layer geometry arrays the C solver expects.
+
+        Returns ``(layers, angles, widths, heights, Bs)`` with batch dim ``n``.
+        """
+        design = np.asarray(design, dtype=np.float32)
+        if design.ndim == 1:
+            design = design[None, :]
+        n_batch = design.shape[0]
         m = self.n_layers
 
-        design_decoded = self._decode_design(design)
+        layers = design[:, :m].astype(np.float32)
+        angles = design[:, m : 2 * m].astype(np.float32)
+        Bs = design[:, 2 * m].astype(np.float32)
 
-        # Use decoded positions and angles from the design
-        layers = design_decoded["positions"]
-        layers = layers.astype(np.float32)
-
-        angles = design_decoded["angles"]
-        angles = angles.astype(np.float32)
-
-        # Ensure layers and angles have correct shape (n, m)
-        if layers.ndim == 1:
-            layers = np.tile(layers[None, :], (n, 1))
-        if angles.ndim == 1:
-            angles = np.tile(angles[None, :], (n, 1))
-
-        # If angles has fewer columns than layers, pad with zeros
-        if angles.shape[1] < m:
-            angles = np.pad(angles, ((0, 0), (0, m - angles.shape[1])), mode="edge")
-        elif angles.shape[1] > m:
-            angles = angles[:, :m]
-
-        widths = np.full((n, m), self.layer_width, dtype=np.float32)
-        heights = np.full((n, m), self.layer_height, dtype=np.float32)
-
-        # Ensure Bs is array of shape (n,) for consistency with C code expectations
-        Bs = np.asarray(design_decoded["magnetic_strength"], dtype=np.float32)
-        if Bs.ndim == 0:
-            Bs = np.full((n,), Bs, dtype=np.float32)
-
+        widths = np.full((n_batch, m), self.layer_width, dtype=np.float32)
+        heights = np.full((n_batch, m), self.layer_height, dtype=np.float32)
         return layers, angles, widths, heights, Bs
 
-    def simulate(
-        self,
-        seed,
-        daughter_data,
-        hnl_targets,
-        configurations,
-        use_sparse=True,
-    ):
-        n_events = configurations.shape[0]
+    def layer_design_to_array(self, layer_design):
+        """Flatten a ``{positions, angles, magnetic_strength}`` dict into the
+        physical design array ``[positions(n), angles(n), B]``."""
+        positions = np.asarray(layer_design["positions"], dtype=np.float32)
+        angles = np.asarray(layer_design["angles"], dtype=np.float32)
+        B = np.float32(layer_design["magnetic_strength"])
+        return np.concatenate([positions, angles, np.array([B], np.float32)]).astype(np.float32)
 
-        # print("\n\n\n\ndata loaded\n\n\n\n")
-        # print(daughter_data)
-        # Extract daughter particle arrays
-        masses = daughter_data["masses"]  # (batch, max_particles)
-        charges = daughter_data["charges"]  # (batch, max_particles)
-        initial_positions = daughter_data["positions"]  # (batch, max_particles, 3)
-        initial_momentum = daughter_data["momenta"]  # (batch, max_particles, 3)
-        initial_times = daughter_data["times"]  # (batch, max_particles)
-        n_particles_per_event = daughter_data["n_particles"]
-        # print(masses.shape)
-        # input("ma\n\n")
+    # ------------------------------------------------------------------ #
+    # Event generation
+    # ------------------------------------------------------------------ #
+    def _sample_daughters(self, seed, n, split):
+        rng = np.random.default_rng(seed)
+        daughter_data, targets = self.loader.get_batch(batch_size=int(n), rng=rng, split=(split or "all"))
+        return daughter_data, np.asarray(targets, dtype=np.float32)
 
-        # Print loaded particle information
-        # print(f"\n{'=' * 80}")
-        # print(f"Loaded Particle Information")
-        # print(f"{'=' * 80}")
-        # print(f"Number of events: {masses.shape[0]}")
-        # print(f"Max particles per event: {masses.shape[1]}")
+    def _run_solver(self, daughter_data, design):
+        """Run the C straw solver for a physical ``design`` and ``daughter_data``.
 
-        # for event_idx in range(min(3, masses.shape[0])):  # Show first 3 events
-        #     print(f"\n--- Event {event_idx} ---")
-        #     # Count non-zero mass particles (actual particles)
-        #     n_particles = np.sum(masses[event_idx] > 0)
-        #     print(f"Number of particles: {n_particles}")
+        Returns ``(sparse_hits, fdigi_times, n_hits, trajectories)``.
+        """
+        masses = daughter_data["masses"]
+        charges = daughter_data["charges"]
+        initial_positions = daughter_data["positions"]
+        initial_momentum = daughter_data["momenta"]
+        initial_times = daughter_data["times"]
 
-        #     if n_particles > 0:
-        #         print(
-        #             f"\n{'Idx':<4} {'Mass (MeV)':<12} {'Charge':<8} {'Position (x,y,z) [cm]':<35} {'Momentum (px,py,pz) [GeV/c]'}"
-        #         )
-        #         print("-" * 110)
-        #         for i in range(min(int(n_particles), 10)):  # Show first 10 particles
-        #             mass = masses[event_idx, i]
-        #             charge = charges[event_idx, i]
-        #             pos = initial_positions[event_idx, i]
-        #             mom = initial_momentum[event_idx, i]
+        layers, angles, widths, heights, Bs = self._design_to_geometry(design)
 
-        #             print(
-        #                 f"{i:<4} {mass:<12.2f} {charge:+.1f}     ({pos[0] / 10:8.2f},{pos[1] / 10:8.2f},{pos[2] / 10:8.2f})  ({mom[0]:7.4f},{mom[1]:7.4f},{mom[2]:7.4f})"
-        #             )
-
-        #         if n_particles > 10:
-        #             print(f"... and {n_particles - 10} more particles")
-
-        # print(f"\n{'=' * 80}\n")
-
-        # Get detector design parameters
-        layers, angles, widths, heights, Bs = self.get_design(configurations)
-
-        # Prepare arrays for solve_sparse
-
-        n_events = configurations.shape[0]
+        n_events = layers.shape[0]
         p_slots = initial_momentum.shape[1]
-        # print(initial_positions.shape)
-        # print(configurations.shape)
-        # input("Wait")
 
-        # print("\n" * 5)
-        # print("Design obtained")
-        # print(f"layers.shape: {layers.shape}, dtype: {layers.dtype}")
-        # print(f"angles.shape: {angles.shape}, dtype: {angles.dtype}")
-        # print(f"widths.shape: {widths.shape}, dtype: {widths.dtype}")
-        # print(f"heights.shape: {heights.shape}, dtype: {heights.dtype}")
-        # print(f"Bs type: {type(Bs)}, value: {Bs}")
-        # print(f"n_batch: {n_events}, n_particles: {p_slots}")
-        # print("\n" * 5)
-
-        # Allocate output arrays with p_slots
-
-        # Magnetic field parameters for the batch
         Bs_arr = Bs.astype(np.float32)
         z0_arr = np.full((n_events,), self.z0, dtype=np.float32)
         B_sigma_arr = np.full((n_events,), self.B_sigma, dtype=np.float32)
 
-        # Estimate max hits for sparse arrays
         max_hits = 2 * n_events * self.max_particles * self.n_layers
-        # print(max_hits)
+        trajectories = np.zeros((n_events, self.max_particles, self.n_t, 3), dtype=np.float32)
 
-        # print("max hits", max_hits, n_events, p_slots, self.n_t, self.n_layers)
-        trajectories = np.zeros(
-            (n_events, self.max_particles, self.n_t, 3), dtype=np.float32
-        )
-        mask = np.zeros(max_hits, dtype=np.int32)
-
-        # Pre-allocate sparse output arrays
         sparse_events = np.zeros(max_hits, dtype=np.int32)
         sparse_particles = np.zeros(max_hits, dtype=np.int32)
         sparse_layers = np.zeros(max_hits, dtype=np.int32)
@@ -460,7 +425,6 @@ class StrawDetector(Detector):
         sparse_hit_pos = np.zeros((max_hits, 3), dtype=np.float32)
         sparse_count = np.zeros(1, dtype=np.int32)
 
-        # Call solve with sparse arrays - dimensions passed directly
         straw_detector.solve(
             initial_positions,
             initial_momentum,
@@ -497,252 +461,222 @@ class StrawDetector(Detector):
         )
 
         n_hits = int(sparse_count[0])
-
         assert 0 <= n_hits <= max_hits, (n_hits, max_hits)
 
-        events = sparse_events  # [:n_hits]
-        particles = sparse_particles
-        layers_arr = sparse_layers
-        straws = sparse_straws
-        values = sparse_values
-        r_mm_sparse = sparse_r_mm
-        t0_sparse = sparse_t0
-        hit_pos_sparse = sparse_hit_pos
-
-        mask[:n_hits] = 1
-
-        # Convert to SparseHits object
         sparse_hits = SparseHits(
-            events,
-            particles,
-            layers_arr,
-            straws,
-            values,
-            r_mm_sparse,
-            t0_sparse,
-            hit_pos_sparse,
+            sparse_events,
+            sparse_particles,
+            sparse_layers,
+            sparse_straws,
+            sparse_values,
+            sparse_r_mm,
+            sparse_t0,
+            sparse_hit_pos,
         )
 
-        # Calculate fdigi from sparse hits (FairShip-style TDC)
-        fdigi_times = {}
-        times = np.zeros(max_hits, dtype=np.int32)
-
-        if sparse_hits is not None and len(sparse_hits) > 0:
-            v_drift = 0.0033  # cm/ns (drift velocity)
-            sigma_spatial = 0.012  # cm (spatial resolution)
-            c = 29.9792  # cm/ns (speed of light)
-
-            def get_straw_endpoints(
-                layer, straw, layers, angles, widths, heights, n_straws
-            ):
-                l_z = layers[layer]
-                angle = angles[layer]
-                w = widths[layer]
-                h = heights[layer]
-                r = h / n_straws
-                y_local = 2 * r * straw - h + r
-                p0_local = np.array([-w, y_local, l_z])
-                p1_local = np.array([w, y_local, l_z])
-                A = np.array(
-                    [
-                        [np.cos(angle), np.sin(angle), 0],
-                        [-np.sin(angle), np.cos(angle), 0],
-                        [0, 0, 1],
-                    ]
-                )
-                p0 = np.dot(p0_local, A)
-                p1 = np.dot(p1_local, A)
-                return p0, p1
-
-            n_straws = widths.shape[1] if len(widths.shape) > 1 else widths.shape[0]
+        # FairShip-style TDC (fdigi) times per hit.
+        fdigi_times = np.zeros(max_hits, dtype=np.float32)
+        if n_hits > 0:
+            v_drift = 0.0033  # cm/ns
+            sigma_spatial = 0.012  # cm
+            c = 29.9792  # cm/ns
 
             for i in range(n_hits):
-                event = int(sparse_hits.events[i])
-                particle = int(sparse_hits.particles[i])
-                layer = int(sparse_hits.layers[i])
-                straw = int(sparse_hits.straws[i])
+                r_mm_val = float(sparse_hits.r_mm[i])
+                t_MC_val = float(sparse_hits.t0[i])
+                hit_xyz = sparse_hits.hit_pos[i]
 
-                # Get hit information
-                r_mm_val = float(sparse_hits.r_mm[i])  # distance to wire in mm
-                t_MC_val = float(sparse_hits.t0[i])  # MC time in ns
-                hit_xyz = sparse_hits.hit_pos[i]  # hit position (x, y, z)
-
-                # Get straw endpoints
-                p0, p1 = get_straw_endpoints(
-                    layer, straw, layers[0], angles[0], widths[0], heights[0], n_straws
-                )
-
-                # Calculate drift time with Gaussian smearing
-                # t_drift = |Gaus(dist2Wire, sigma_spatial)| / v_drift
-                dist_cm = r_mm_val / 10.0  # convert mm to cm
+                dist_cm = r_mm_val / 10.0
                 dist_smeared = abs(np.random.normal(dist_cm, sigma_spatial))
                 t_drift = dist_smeared / v_drift
 
-                # Calculate signal propagation time along wire
-                propagation_time = (p1[0] - hit_xyz[0]) / c
+                # signal propagation along the (x-oriented) wire to its +x end
+                propagation_time = (self.layer_width - hit_xyz[0]) / c
+                fdigi_times[i] = t_MC_val + t_drift + propagation_time
 
-                # FairShip formula: fdigi = t_MC + t_drift + propagation_time
-                # t_MC already includes t_initial (from C code)
-                # t_drift: drift time from hit point to wire
-                # propagation_time: signal propagation time along the wire
-                fdigi = t_MC_val + t_drift + propagation_time
+        return sparse_hits, fdigi_times, n_hits, trajectories
 
-                key = (event, particle, layer, straw)
-                fdigi_times[key] = fdigi
-                times[i] = fdigi
+    def _bucket_hits(self, sparse_hits, fdigi_times, n_hits, n_events):
+        """Bucket flat hits into per-event padded ``X (B, M, 5)`` + ``mask (B, M)``.
 
-        # Return sparse_hits directly
-        return (
-            masses,
-            charges,
-            initial_positions,
-            initial_momentum,
-            trajectories,
-            sparse_hits,
-            fdigi_times,
-            times,
-            mask,
-            hnl_targets,  # (batch, 6) = [dx, dy, dz, px, py, pz] in cm and GeV/c
-        )
-
-    def __call__(
-        self,
-        seed: int,
-        daughter_data: dict,
-        hnl_targets: np.ndarray,
-        configurations: np.ndarray,
-    ):
+        Raw per-hit features: ``[station, view, layer_in_view, straw, time]``.
         """
-        returns ground_truth, measurements, target
+        M = self.max_hits_per_event
+        per_station = self.n_views_per_station * self.n_layers_per_view
 
-        Args:
-            seed: simulation RNG seed.
-            daughter_data: pre-fetched daughter particle batch as returned by
-                ``HNLDataLoader._build_batch_from_indices``.
-            hnl_targets: (n_events, 6) HNL decay vertex targets.
-            configurations: (n_events, design_dim) per-event design array.
+        X = np.zeros((n_events, M, 5), dtype=np.float32)
+        mask = np.zeros((n_events, M), dtype=np.int32)
 
-        Returns:
-            ground_truth: (batch, 14) encoded daughter particle info
-            measurements: SparseHits info tuple
-            target: (batch, 6) HNL decay vertex [x, y, z, px, py, pz]
+        if n_hits > 0:
+            ev = sparse_hits.events[:n_hits].astype(np.int32)
+            la = sparse_hits.layers[:n_hits].astype(np.int32)
+            st = sparse_hits.straws[:n_hits].astype(np.int32)
+            ti = fdigi_times[:n_hits].astype(np.float32)
+
+            valid = (ev >= 0) & (ev < n_events)
+            ev, la, st, ti = ev[valid], la[valid], st[valid], ti[valid]
+
+            order = np.argsort(ev, kind="stable")
+            ev, la, st, ti = ev[order], la[order], st[order], ti[order]
+
+            starts = np.searchsorted(ev, np.arange(n_events), side="left")
+            ends = np.searchsorted(ev, np.arange(n_events), side="right")
+            for e in range(n_events):
+                s, t = int(starts[e]), int(ends[e])
+                k = min(t - s, M)
+                if k <= 0:
+                    continue
+                layer = la[s : s + k]
+                station = layer // per_station
+                rem = layer % per_station
+                view = rem // self.n_layers_per_view
+                layer_in_view = rem % self.n_layers_per_view
+                X[e, :k, 0] = station
+                X[e, :k, 1] = view
+                X[e, :k, 2] = layer_in_view
+                X[e, :k, 3] = st[s : s + k]
+                X[e, :k, 4] = ti[s : s + k]
+                mask[e, :k] = 1
+
+        return X, mask
+
+    def sample_events(self, seed, design, split=None):
+        """Generate events and return a rich dict.
+
+        ``design`` is the *physical* (un-encoded) design ``(B, design_dim)`` (or
+        ``(design_dim,)`` for a single event). Batch size ``B`` is inferred.
+        Used by visualisation / likelihood-free / generative scripts that need
+        the daughter ground truth or trajectories.
         """
-        (
-            masses,
-            charges,
-            initial_positions,
-            initial_momentum,
-            traj,
-            sparse_hits,
-            fdigi_times,
-            times,
-            mask,
-            target,
-        ) = self.simulate(seed, daughter_data, hnl_targets, configurations)
+        design = np.asarray(design, dtype=np.float32)
+        if design.ndim == 1:
+            design = design[None, :]
+        n_events = design.shape[0]
+
+        daughter_data, targets = self._sample_daughters(seed, n_events, split)
+        sparse_hits, fdigi_times, n_hits, trajectories = self._run_solver(daughter_data, design)
+        X, mask = self._bucket_hits(sparse_hits, fdigi_times, n_hits, n_events)
+
         ground_truth = self.encode_ground_truth(
-            masses, charges, initial_positions, initial_momentum
+            daughter_data["masses"],
+            daughter_data["charges"],
+            daughter_data["positions"],
+            daughter_data["momenta"],
         )
-        events = sparse_hits.events
-        # offset = events[0]
-        # for i in range(len(events)):
-        #     events[i] -= offset
-        info = (
-            events,
-            sparse_hits.layers,
-            sparse_hits.straws,
-            times,
-            mask,
-        )
-        # print(events)
-        # input("wait for events")
-        # target is already (batch, 6) from simulate()
-        # print(ground_truth)
-        return ground_truth, info, target, traj, fdigi_times
+        return {
+            "X": X,
+            "mask": mask,
+            "targets": targets,
+            "ground_truth": ground_truth,
+            "trajectories": trajectories,
+            "sparse_hits": sparse_hits,
+        }
 
-    def loss(self, target, predicted):
-        # MSE on normalized targets
-        # Network outputs normalized values, targets need to be normalized
-        # target shape: (batch, 6) where [:3] is position (x,y,z) and [3:] is momentum (px,py,pz)
-        import jax
-        import jax.numpy as jnp
+    def __call__(self, seed, design, split=None):
+        """Generate events for an un-encoded ``design`` ``(B, design_dim)``.
 
-        # print(target, target.shape)
-        # input("wait tar")
-        from jax import config
+        Returns ``(ground_truth (B, G), measurements (B, M, 5), mask (B, M),
+        target (B, 6))``.
+        """
+        out = self.sample_events(seed, design, split=split)
+        return out["ground_truth"], out["X"], out["mask"], out["targets"]
 
-        config.update("jax_disable_jit", True)
-        # Normalize targets (predictions are already normalized from network)
-        target_norm = (target - self.target_mean) / self.target_std
-        diff = target_norm - predicted
-        # mse_per_dim = jnp.mean(diff**2, axis=0)
-        # print("iii")
-        # print(diff**2)
-
-        # # print(target_norm, target_norm.shape)
-
-        # jax.debug.print("mse_per_dim {}", diff)
-        # input("wait tar")
-        # print(predicted, predicted.shape)
-        # input("wait pr")
-        # MSE on normalized values (all dimensions have equal weight now)
-        mse = jnp.mean(jnp.square(diff), axis=-1)
-        # pos_mse = jnp.mean(diff[:, :3] ** 2)
-        # mom_mse = jnp.mean(diff[:, 3:] ** 2)
-        # jax.debug.print("pos_mse {} mom_mse {}", pos_mse, mom_mse)
-
-        return mse  # Shape: (batch,)
-
-    def metric(self, target, predicted):
-        # RMSE on normalized targets (same as loss but with sqrt)
-        # Network outputs normalized values, targets need to be normalized
-        import jax.numpy as jnp
-
-        # Normalize targets (predictions are already normalized from network)
-        target_norm = (target - self.target_mean) / self.target_std
-
-        # MSE on normalized values
-        mse = jnp.mean(jnp.square(target_norm - predicted), axis=-1)
-
-        return mse  # Shape: (batch,)
-
+    # ------------------------------------------------------------------ #
+    # Design encoding (constrained <-> unconstrained), differentiable
+    # ------------------------------------------------------------------ #
     def encode_design(self, design):
-        positions = np.array(design["positions"], dtype=np.float32)
-        positions = uniform_to_normal(positions, *self.layer_bounds)
-        angles = np.array(design["angles"], dtype=np.float32)
-        angles = uniform_to_normal(angles, *self.angle_bounds)
-        magnetic_strength = np.float32(design["magnetic_strength"])
-        magnetic_strength = uniform_to_normal(magnetic_strength, 0.0, self.max_B)
+        """Physical design ``[positions(n), angles(n), B]`` -> ``N(0,1)`` space.
 
-        return np.concatenate([positions, angles, [magnetic_strength]], axis=0)
+        JAX/jittable; accepts ``(design_dim,)`` or ``(B, design_dim)``.
+        """
+        import jax.numpy as jnp
 
-    def _decode_design(self, encoded_design):
+        design = jnp.asarray(design, dtype=jnp.float32)
         n = self.n_layers
-        positions = normal_to_uniform(encoded_design[..., :n], *self.layer_bounds)
-        angles = normal_to_uniform(encoded_design[..., n:-1], *self.angle_bounds)
-        magnetic_strength = normal_to_uniform(encoded_design[..., -1], 0.0, self.max_B)
+        pos = design[..., :n]
+        ang = design[..., n : 2 * n]
+        B = design[..., 2 * n : 2 * n + 1]
 
-        # Ensure float32 for consistency
-        positions = np.asarray(positions, dtype=np.float32)
-        angles = np.asarray(angles, dtype=np.float32)
-        # magnetic_strength is already a scalar, just ensure it's float32
-        magnetic_strength = np.float32(magnetic_strength)
-
-        return dict(
-            positions=positions, angles=angles, magnetic_strength=magnetic_strength
-        )
+        pos_e = uniform_to_normal_jax(pos, *self.layer_bounds)
+        ang_e = uniform_to_normal_jax(ang, *self.angle_bounds)
+        B_e = uniform_to_normal_jax(B, 0.0, self.max_B)
+        return jnp.concatenate([pos_e, ang_e, B_e], axis=-1)
 
     def decode_design(self, encoded_design):
-        decoded = self._decode_design(encoded_design)
-        # Handle both scalar and array magnetic_strength
-        mag_strength = decoded["magnetic_strength"]
-        mag_strength_val = float(mag_strength)
+        """Inverse of :meth:`encode_design` (JAX/jittable)."""
+        import jax.numpy as jnp
 
-        return dict(
-            positions=[float(p) for p in decoded["positions"]],
-            angles=[float(a) for a in decoded["angles"]],
-            magnetic_strength=mag_strength_val,
+        enc = jnp.asarray(encoded_design, dtype=jnp.float32)
+        n = self.n_layers
+        pos = enc[..., :n]
+        ang = enc[..., n : 2 * n]
+        B = enc[..., 2 * n : 2 * n + 1]
+
+        pos_d = normal_to_uniform_jax(pos, *self.layer_bounds)
+        ang_d = normal_to_uniform_jax(ang, *self.angle_bounds)
+        B_d = normal_to_uniform_jax(B, 0.0, self.max_B)
+        return jnp.concatenate([pos_d, ang_d, B_d], axis=-1)
+
+    # ------------------------------------------------------------------ #
+    # Event normalisation
+    # ------------------------------------------------------------------ #
+    # Continuous-feature standardisation constants.
+    _TDC_MEAN = 440.0
+    _TDC_STD = 80.0
+
+    def _feature_scales(self):
+        """Per-column ``(mean, std)`` for the 5 raw event features."""
+        means = np.array([0.0, 0.0, 0.0, 0.0, self._TDC_MEAN], dtype=np.float32)
+        stds = np.array(
+            [
+                max(self.n_stations - 1, 1),
+                max(self.n_views_per_station - 1, 1),
+                max(self.n_layers_per_view - 1, 1),
+                max(self.n_straws - 1, 1),
+                self._TDC_STD,
+            ],
+            dtype=np.float32,
         )
+        return means, stds
 
+    def normalize(self, X):
+        """``(B, M, 5)`` raw event features -> standardised ~[-1, 1]."""
+        import jax.numpy as jnp
+
+        means, stds = self._feature_scales()
+        return (jnp.asarray(X, dtype=jnp.float32) - means) / stds
+
+    def denormalize(self, X_norm):
+        import jax.numpy as jnp
+
+        means, stds = self._feature_scales()
+        return jnp.asarray(X_norm, dtype=jnp.float32) * stds + means
+
+    # ------------------------------------------------------------------ #
+    # Combine
+    # ------------------------------------------------------------------ #
+    def combine(self, X_norm, encoded_design):
+        """Broadcast-concatenate an encoded design onto each normalised hit.
+
+        ``X_norm (B, M, 5)`` + ``encoded_design (design_dim,) | (B, design_dim)``
+        -> ``features (B, M, 5 + design_dim)``. Differentiable w.r.t. both.
+        The hit ``mask`` is applied downstream by the model.
+        """
+        import jax.numpy as jnp
+
+        X_norm = jnp.asarray(X_norm, dtype=jnp.float32)
+        B, M, _ = X_norm.shape
+
+        d_enc = jnp.asarray(encoded_design, dtype=jnp.float32)
+        if d_enc.ndim == 1:
+            d_enc = jnp.broadcast_to(d_enc[None, :], (B, d_enc.shape[0]))
+        d_per_hit = jnp.broadcast_to(d_enc[:, None, :], (B, M, d_enc.shape[-1]))
+
+        return jnp.concatenate([X_norm, d_per_hit], axis=-1)
+
+    # ------------------------------------------------------------------ #
+    # Current design helpers
+    # ------------------------------------------------------------------ #
     def get_current_design(self):
         positions = []
         angles = []
@@ -751,19 +685,13 @@ class StrawDetector(Detector):
         for z_station in self.station_z:
             for v in range(self.n_views_per_station):
                 view_base_z = z_station + v * self.view_z_gap
-                ang = (
-                    self.view_angles[v]
-                    if v < len(self.view_angles)
-                    else self.view_angles[-1]
-                )
+                ang = self.view_angles[v] if v < len(self.view_angles) else self.view_angles[-1]
                 for l in range(self.n_layers_per_view):
                     positions.append(view_base_z + l * self.layer_z_gap)
                     angles.append(ang)
 
         if len(positions) != self.n_layers:
-            raise RuntimeError(
-                f"current_design_dict produced {len(positions)} layers, expected {self.n_layers}"
-            )
+            raise RuntimeError(f"current_design_dict produced {len(positions)} layers, expected {self.n_layers}")
 
         return {
             "positions": positions,
@@ -771,89 +699,54 @@ class StrawDetector(Detector):
             "magnetic_strength": float(self.max_B),
         }
 
+    def get_current_design_array(self):
+        return self.layer_design_to_array(self.get_current_design())
+
     def get_encoded_current_design(self):
-        d = self.get_current_design()
-        B = float(d["magnetic_strength"])
-        B = max(0.0, min(B, float(self.max_B)))
-        d["magnetic_strength"] = B
-        enc = self.encode_design(d)
-        enc = np.asarray(enc, dtype=np.float32)
-        return enc
+        return np.asarray(self.encode_design(self.get_current_design_array()), dtype=np.float32)
 
+    # ------------------------------------------------------------------ #
+    # YAML (high-level) design space -- used by the BO outer loop
+    # ------------------------------------------------------------------ #
     def encode_yaml_design(self, yaml_params):
-        """
-        Encode YAML parameters for optimization.
-
-        This encodes high-level physical parameters instead of individual layer positions,
-        making the optimization space more interpretable and maintaining geometric structure.
-
-        Args:
-            yaml_params: dict with keys:
-                - station_z: list of station z-positions [z1, z2, z3, z4]
-                - view_angles: list of stereo angles [a1, a2, a3, a4] OR
-                - stereo_angle: single angle for constrained mode [0, +α, -α, 0]
-                - layer_z_gap: float, spacing between layers in a view
-                - view_z_gap: float, spacing between views
-                - max_B: float, maximum magnetic field strength
-                - B_sigma: float, sigma (width) of magnetic field (optional)
-                - z0: float, center of magnetic field (optional)
-
-        Returns:
-            encoded: 1D array of normalized parameters suitable for optimization
-        """
+        """Encode YAML parameters into the normalized BO search space."""
         params = []
 
-        # Extract parameters with defaults
-        station_z = np.array(
-            yaml_params.get("station_z", self.station_z), dtype=np.float32
-        )
+        station_z = np.array(yaml_params.get("station_z", self.station_z), dtype=np.float32)
 
-        # Handle constrained stereo angle mode
         if self.constrain_stereo_angles:
-            # Extract single stereo angle parameter
             if "stereo_angle" in yaml_params:
                 stereo_angle = np.float32(yaml_params["stereo_angle"])
             elif "view_angles" in yaml_params:
-                # If view_angles provided, extract the positive angle
                 angles = yaml_params["view_angles"]
                 stereo_angle = np.float32(angles[1]) if len(angles) > 1 else 0.0
             else:
-                # Default: extract from current view_angles
                 stereo_angle = np.float32(self.view_angles[1])
         else:
-            view_angles = np.array(
-                yaml_params.get("view_angles", self.view_angles), dtype=np.float32
-            )
+            view_angles = np.array(yaml_params.get("view_angles", self.view_angles), dtype=np.float32)
         layer_z_gap = np.float32(yaml_params.get("layer_z_gap", self.layer_z_gap))
         view_z_gap = np.float32(yaml_params.get("view_z_gap", self.view_z_gap))
         max_B = np.float32(yaml_params.get("max_B", self.max_B))
         B_sigma = np.float32(yaml_params.get("B_sigma", self.B_sigma))
         z0 = np.float32(yaml_params.get("z0", self.z0))
 
-        # Define reasonable bounds for each parameter and add only optimizable ones
-
-        # Station positions: within layer_bounds
         if self.optimize_stations:
             station_z_norm = uniform_to_normal(station_z, *self.layer_bounds)
             params.append(station_z_norm)
 
-        # View angles: ±11 degrees (±0.2 radians) is reasonable for stereo
         if self.constrain_stereo_angles:
-            # Only optimize single angle in range [0, 0.2] radians (0 to ~11 degrees)
             stereo_angle_norm = uniform_to_normal(stereo_angle, 0.0, 0.2)
             params.append([stereo_angle_norm])
         else:
             view_angles_norm = uniform_to_normal(view_angles, -0.2, 0.2)
             params.append(view_angles_norm)
 
-        # Layer and view spacing
         if self.optimize_gaps:
             layer_z_gap_norm = uniform_to_normal(layer_z_gap, 0.5, 10.0)
             view_z_gap_norm = uniform_to_normal(view_z_gap, 1.0, 20.0)
             params.append([layer_z_gap_norm])
             params.append([view_z_gap_norm])
 
-        # Magnetic field parameters
         if self.optimize_bfield:
             max_B_norm = uniform_to_normal(max_B, 0.0, 1.0)
             B_sigma_norm = uniform_to_normal(B_sigma, 50.0, 1000.0)
@@ -862,45 +755,28 @@ class StrawDetector(Detector):
             params.append([B_sigma_norm])
             params.append([z0_norm])
 
-        # Concatenate all parameters
         return np.concatenate(params, axis=0)
 
     def decode_yaml_design(self, encoded):
-        """
-        Decode normalized parameters back to YAML format.
-
-        Args:
-            encoded: 1D array from encode_yaml_design
-
-        Returns:
-            yaml_params: dict with physical parameters in interpretable units
-        """
+        """Decode normalized BO parameters back to YAML physical parameters."""
         idx = 0
 
-        # Decode station positions (or use current values if frozen)
         if self.optimize_stations:
             n_stations = len(self.station_z)
-            station_z = normal_to_uniform(
-                encoded[idx : idx + n_stations], *self.layer_bounds
-            )
+            station_z = normal_to_uniform(encoded[idx : idx + n_stations], *self.layer_bounds)
             idx += n_stations
         else:
             station_z = np.array(self.station_z, dtype=np.float32)
 
-        # Decode view angles (or use current values if frozen)
         if self.constrain_stereo_angles:
-            # Decode single stereo angle and expand to [0, +α, -α, 0]
             stereo_angle = normal_to_uniform(encoded[idx], 0.0, 0.2)
             idx += 1
-            view_angles = np.array(
-                [0.0, stereo_angle, -stereo_angle, 0.0], dtype=np.float32
-            )
+            view_angles = np.array([0.0, stereo_angle, -stereo_angle, 0.0], dtype=np.float32)
         else:
             n_angles = len(self.view_angles)
             view_angles = normal_to_uniform(encoded[idx : idx + n_angles], -0.2, 0.2)
             idx += n_angles
 
-        # Decode layer spacing (or use current values if frozen)
         if self.optimize_gaps:
             layer_z_gap = normal_to_uniform(encoded[idx], 0.5, 10.0)
             idx += 1
@@ -910,7 +786,6 @@ class StrawDetector(Detector):
             layer_z_gap = np.float32(self.layer_z_gap)
             view_z_gap = np.float32(self.view_z_gap)
 
-        # Decode magnetic field parameters (or use current values if frozen)
         if self.optimize_bfield:
             max_B = normal_to_uniform(encoded[idx], 0.0, 1.0)
             idx += 1
@@ -931,27 +806,12 @@ class StrawDetector(Detector):
             "B_sigma": float(B_sigma),
             "z0": float(z0),
         }
-
-        # If in constrained mode, also include the single stereo angle
         if self.constrain_stereo_angles:
             result["stereo_angle"] = float(view_angles[1])
-
         return result
 
     def yaml_to_layer_design(self, yaml_params):
-        """
-        Convert YAML parameters to layer-level design.
-
-        This computes the actual layer positions and angles from the high-level
-        YAML parameters, following the detector hierarchy:
-        stations -> views -> layers
-
-        Args:
-            yaml_params: dict with YAML-level parameters
-
-        Returns:
-            layer_design: dict with positions, angles, and magnetic_strength
-        """
+        """Expand YAML parameters into a per-layer ``{positions, angles, B}`` dict."""
         positions = []
         angles = []
 
@@ -960,7 +820,6 @@ class StrawDetector(Detector):
         layer_z_gap = yaml_params["layer_z_gap"]
         view_z_gap = yaml_params["view_z_gap"]
 
-        # Generate layer positions following detector hierarchy
         for z_station in station_z:
             for v in range(self.n_views_per_station):
                 view_base_z = z_station + v * view_z_gap
@@ -970,10 +829,7 @@ class StrawDetector(Detector):
                     angles.append(ang)
 
         if len(positions) != self.n_layers:
-            raise RuntimeError(
-                f"yaml_to_layer_design produced {len(positions)} layers, "
-                f"expected {self.n_layers}"
-            )
+            raise RuntimeError(f"yaml_to_layer_design produced {len(positions)} layers, " f"expected {self.n_layers}")
 
         return {
             "positions": positions,
@@ -981,13 +837,11 @@ class StrawDetector(Detector):
             "magnetic_strength": yaml_params["max_B"],
         }
 
-    def get_current_yaml_design(self):
-        """
-        Get current detector configuration as YAML parameters.
+    def yaml_to_design_array(self, yaml_params):
+        """YAML parameters -> physical design array ``[positions(n), angles(n), B]``."""
+        return self.layer_design_to_array(self.yaml_to_layer_design(yaml_params))
 
-        Returns:
-            yaml_params: dict with current YAML-level parameters
-        """
+    def get_current_yaml_design(self):
         return {
             "station_z": list(self.station_z),
             "view_angles": list(self.view_angles),
@@ -999,59 +853,21 @@ class StrawDetector(Detector):
         }
 
     def get_encoded_current_yaml_design(self):
-        """
-        Get current detector configuration as encoded YAML parameters.
-
-        Returns:
-            encoded: 1D array of normalized YAML parameters
-        """
         yaml_params = self.get_current_yaml_design()
         enc = self.encode_yaml_design(yaml_params)
-        enc = np.asarray(enc, dtype=np.float32)
-        return enc
-
-    def update_from_yaml_design(self, yaml_params):
-        """
-        Update detector geometry from YAML parameters.
-
-        This modifies the detector's internal state to reflect the new design.
-
-        Args:
-            yaml_params: dict with YAML-level parameters
-        """
-        self.station_z = yaml_params["station_z"]
-        self.view_angles = yaml_params["view_angles"]
-        self.layer_z_gap = yaml_params["layer_z_gap"]
-        self.view_z_gap = yaml_params["view_z_gap"]
-        self.max_B = yaml_params["max_B"]
-        self.B_sigma = yaml_params.get("B_sigma", self.B_sigma)
-        self.z0 = yaml_params.get("z0", self.z0)
+        return np.asarray(enc, dtype=np.float32)
 
     def yaml_design_shape(self):
-        """
-        Get the shape of the YAML design parameter vector.
-
-        Returns:
-            tuple: (n_params,) where n_params is the total number of YAML parameters
-        """
+        """Shape of the YAML (BO) design parameter vector."""
         n_params = 0
-
-        # Count stations (if optimizable)
         if self.optimize_stations:
             n_params += len(self.station_z)
-
-        # Count angles (1 if constrained, 4 if not)
         if self.constrain_stereo_angles:
-            n_params += 1  # Single stereo angle
+            n_params += 1
         else:
-            n_params += len(self.view_angles)  # All view angles
-
-        # Count gaps (if optimizable)
+            n_params += len(self.view_angles)
         if self.optimize_gaps:
-            n_params += 2  # layer_z_gap + view_z_gap
-
-        # Count B-field parameters (if optimizable)
+            n_params += 2
         if self.optimize_bfield:
-            n_params += 3  # max_B + B_sigma + z0
-
+            n_params += 3
         return (n_params,)

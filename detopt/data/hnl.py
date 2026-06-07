@@ -2,9 +2,10 @@ import glob
 from pathlib import Path
 from typing import Optional, Tuple
 
-import matplotlib.pyplot as plt
 import numpy as np
 from tqdm import tqdm
+
+__all__ = ["HNLDataLoader"]
 
 
 class HNLDataLoader:
@@ -411,6 +412,8 @@ class HNLDataLoader:
 
 # Test the loader
 if __name__ == "__main__":
+    import matplotlib.pyplot as plt
+
     print("=" * 70)
     print("Testing HNL Data Loader (Memory-Optimized)")
     print("=" * 70)

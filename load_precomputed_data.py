@@ -41,9 +41,7 @@ class PrecomputedDataLoader:
         files = sorted(glob.glob(str(self.data_dir / file_pattern)))
 
         if len(files) == 0:
-            raise FileNotFoundError(
-                f"No chunk files found in {data_dir} matching pattern {file_pattern}"
-            )
+            raise FileNotFoundError(f"No chunk files found in {data_dir} matching pattern {file_pattern}")
 
         print(f"PrecomputedDataLoader: Loading {len(files)} chunk files into memory...")
 
@@ -120,9 +118,7 @@ class PrecomputedDataLoader:
         # Find where each event starts (events are sorted and contiguous)
         if len(self.events) > 0:
             # Find boundaries where event ID changes
-            change_points = np.concatenate(
-                [[0], np.where(np.diff(self.events) != 0)[0] + 1, [len(self.events)]]
-            )
+            change_points = np.concatenate([[0], np.where(np.diff(self.events) != 0)[0] + 1, [len(self.events)]])
 
             # Map each unique event to its start/end index
             for i in range(len(change_points) - 1):
@@ -223,15 +219,9 @@ class PrecomputedDataLoader:
             if n_event_hits > 0:
                 # Copy hits directly into output arrays
                 padded_events[write_pos : write_pos + n_event_hits] = new_idx
-                padded_layers[write_pos : write_pos + n_event_hits] = self.layers[
-                    start:end
-                ]
-                padded_straws[write_pos : write_pos + n_event_hits] = self.straws[
-                    start:end
-                ]
-                padded_times[write_pos : write_pos + n_event_hits] = self.times[
-                    start:end
-                ]
+                padded_layers[write_pos : write_pos + n_event_hits] = self.layers[start:end]
+                padded_straws[write_pos : write_pos + n_event_hits] = self.straws[start:end]
+                padded_times[write_pos : write_pos + n_event_hits] = self.times[start:end]
                 padded_mask[write_pos : write_pos + n_event_hits] = self.mask[start:end]
                 write_pos += n_event_hits
 
@@ -329,15 +319,9 @@ class PrecomputedDataLoader:
             if n_event_hits > 0:
                 # Copy hits directly into output arrays
                 padded_events[write_pos : write_pos + n_event_hits] = new_idx
-                padded_layers[write_pos : write_pos + n_event_hits] = self.layers[
-                    start:end
-                ]
-                padded_straws[write_pos : write_pos + n_event_hits] = self.straws[
-                    start:end
-                ]
-                padded_times[write_pos : write_pos + n_event_hits] = self.times[
-                    start:end
-                ]
+                padded_layers[write_pos : write_pos + n_event_hits] = self.layers[start:end]
+                padded_straws[write_pos : write_pos + n_event_hits] = self.straws[start:end]
+                padded_times[write_pos : write_pos + n_event_hits] = self.times[start:end]
                 padded_mask[write_pos : write_pos + n_event_hits] = self.mask[start:end]
                 write_pos += n_event_hits
 
@@ -389,16 +373,12 @@ if __name__ == "__main__":
     try:
         # Try loading from a precomputed directory
         # Use detector config values: max_particles=4, n_layers=32
-        loader = PrecomputedDataLoader(
-            "precomputed_data3", max_particles=2, n_layers=32
-        )
+        loader = PrecomputedDataLoader("precomputed_data3", max_particles=2, n_layers=32)
 
         print("\nDataset Statistics:")
         stats = loader.get_statistics()
         print(f"  Total events: {stats['n_events']}")
-        print(
-            f"  max_particles: {stats['max_particles']}, n_layers: {stats['n_layers']}"
-        )
+        print(f"  max_particles: {stats['max_particles']}, n_layers: {stats['n_layers']}")
         print(f"  Avg hits per event: {stats['avg_hits_per_event']:.1f}")
         print(f"\n  Target statistics:")
         print(f"    Mean: {stats['target_stats']['mean']}")
@@ -418,15 +398,11 @@ if __name__ == "__main__":
         import time
 
         start = time.time()
-        measurements, targets = loader.get_batch(
-            batch_size=128, rng=np.random.default_rng(42)
-        )
+        measurements, targets = loader.get_batch(batch_size=128, rng=np.random.default_rng(42))
         elapsed = time.time() - start
 
         print(f"✓ Loaded 128 events in {elapsed * 1000:.2f} ms")
-        print(
-            f"  Measurements type: tuple of 5 arrays (events, layers, straws, times, mask)"
-        )
+        print(f"  Measurements type: tuple of 5 arrays (events, layers, straws, times, mask)")
         events, layers, straws, times, mask = measurements
         print(f"  Events shape: {events.shape}")
         print(f"  Layers shape: {layers.shape}")

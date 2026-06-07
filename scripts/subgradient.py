@@ -10,6 +10,11 @@ from flax import nnx
 
 import detopt
 
+# NOTE: NOT YET PORTED to the new Detector contract (detector-spec.md).
+# The ragged-layout regressor is incompatible with the padded (B, M, F)
+# events from the new detector. Call sites updated mechanically; will not
+# run end-to-end until the regressor is ported (see nn/set_regressor.py).
+
 matplotlib.use("AGG")
 
 MAX_INT = 9223372036854775807
@@ -19,9 +24,7 @@ jax.config.update("jax_log_compiles", True)
 jax.config.update("jax_explain_cache_misses", True)
 
 
-def optimize(
-    seed, output, progress=True, restore=True, trace=None, report=None, **config
-):
+def optimize(seed, output, progress=True, restore=True, trace=None, report=None, **config):
     print(f"using {config.get('regressor')} as regressor")
     print("Design optimization mode: Physical parameters (13 params)")
 
@@ -30,10 +33,7 @@ def optimize(
     rng = jax.random.PRNGKey(get_seed())
 
     checkpointer = detopt.utils.io.get_checkpointer(output)
-    if (
-        checkpointer.latest_step() is not None
-        and checkpointer.latest_step() >= config["epochs"]
-    ):
+    if checkpointer.latest_step() is not None and checkpointer.latest_step() >= config["epochs"]:
         return
 
     detector = detopt.detector.from_config(config["detector"])
@@ -41,9 +41,7 @@ def optimize(
     print(detector.yaml_to_layer_design(detector.get_current_yaml_design()))
 
     rng, key_init = jax.random.split(rng, num=2)
-    restored = detopt.utils.io.restore_state(
-        checkpointer, detector, config, rngs=nnx.Rngs(key_init), restore=restore
-    )
+    restored = detopt.utils.io.restore_state(checkpointer, detector, config, rngs=nnx.Rngs(key_init), restore=restore)
 
     starting_epoch = restored["starting_epoch"]
 
@@ -66,9 +64,7 @@ def optimize(
 
     # Reinitialize optimizer state with correct shape for physical parameters
     design_optimizer_state = design_optimizer.init(design)
-    print(
-        f"Initialized design optimizer for physical parameters (shape: {design.shape})"
-    )
+    print(f"Initialized design optimizer for physical parameters (shape: {design.shape})")
 
     regressor_def, regressor_optimizer = (
         restored["regressor"]["model"],
@@ -103,11 +99,7 @@ def optimize(
         mse_loss = jnp.mean(mse)
 
         # Regularization
-        reg_loss = (
-            reg_coef * regressor.regularization()
-            if hasattr(regressor, "regularization")
-            else 0.0
-        )
+        reg_loss = reg_coef * regressor.regularization() if hasattr(regressor, "regularization") else 0.0
 
         loss = mse_loss + reg_loss + 1.0e-2 * jnp.mean(jnp.square(p))
 
@@ -146,9 +138,7 @@ def optimize(
 
     @jax.jit
     def step_regressor(x, c, t, r_params, r_state, opt_state):
-        (loss, r_state), grad = jax.value_and_grad(loss_f, argnums=3, has_aux=True)(
-            x, c, t, r_params, r_state
-        )
+        (loss, r_state), grad = jax.value_and_grad(loss_f, argnums=3, has_aux=True)(x, c, t, r_params, r_state)
         updates, opt_state = regressor_optimizer.update(grad, opt_state)
         r_params = optax.apply_updates(r_params, updates)
         grad_check = jax.tree.map(lambda g: jnp.all(jnp.isfinite(g)), grad)
@@ -164,13 +154,11 @@ def optimize(
         # Convert current design parameters to explicit design (layer-level)
         design_params = detector.decode_yaml_design(np.array(design))
         explicit_design = detector.yaml_to_layer_design(design_params)
-        explicit_enc = detector.encode_design(explicit_design)
+        explicit_enc = detector.layer_design_to_array(explicit_design)
         c_base = jnp.broadcast_to(explicit_enc[None, :], (batch, explicit_enc.shape[0]))
 
         # Compute gradient at explicit design level
-        (loss_val, _), explicit_grad = jax.value_and_grad(
-            loss_f, argnums=1, has_aux=True
-        )(x, c_base, t, r_params, r_state)
+        (loss_val, _), explicit_grad = jax.value_and_grad(loss_f, argnums=1, has_aux=True)(x, c_base, t, r_params, r_state)
         explicit_grad = jnp.mean(explicit_grad, axis=0)
 
         # Approximate design parameter gradient using finite differences
@@ -184,7 +172,7 @@ def optimize(
 
             design_params_pert = detector.decode_yaml_design(design_pert)
             explicit_design_pert = detector.yaml_to_layer_design(design_params_pert)
-            explicit_enc_pert = detector.encode_design(explicit_design_pert)
+            explicit_enc_pert = detector.layer_design_to_array(explicit_design_pert)
 
             # Compute derivative of explicit design w.r.t. design parameter
             d_explicit_d_design = (explicit_enc_pert - explicit_enc) / eps
@@ -201,29 +189,19 @@ def optimize(
 
     regressor_losses = np.ndarray(shape=(epochs, steps, substeps))
     regressor_validation = np.ndarray(shape=(epochs, validation_batches))
-    regressor_validation_per_component = np.ndarray(
-        shape=(epochs, validation_batches, 6)
-    )
+    regressor_validation_per_component = np.ndarray(shape=(epochs, validation_batches, 6))
 
     if aux is not None:
-        regressor_losses[:starting_epoch] = aux["regressor"]["training"][
-            :starting_epoch
-        ]
-        regressor_validation[:starting_epoch] = aux["regressor"]["validation"][
-            :starting_epoch
-        ]
+        regressor_losses[:starting_epoch] = aux["regressor"]["training"][:starting_epoch]
+        regressor_validation[:starting_epoch] = aux["regressor"]["validation"][:starting_epoch]
         if "validation_per_component" in aux["regressor"]:
-            regressor_validation_per_component[:starting_epoch] = aux["regressor"][
-                "validation_per_component"
-            ][:starting_epoch]
+            regressor_validation_per_component[:starting_epoch] = aux["regressor"]["validation_per_component"][:starting_epoch]
 
     status = detopt.utils.progress.status_bar(disable=not progress)
 
     @jax.jit
     def check(params, state):
-        return jnp.all(
-            jnp.array([jnp.all(jnp.isfinite(x)) for x in jax.tree.leaves(params)])
-        )
+        return jnp.all(jnp.array([jnp.all(jnp.isfinite(x)) for x in jax.tree.leaves(params)]))
 
     for i in status.epochs(starting_epoch, epochs):
         epoch_start = time.time()
@@ -234,22 +212,18 @@ def optimize(
             for k in range(substeps):
                 # Perturb design parameters for exploration
                 design_shape = detector.yaml_design_shape()
-                design_batch_params = design[None, :] + design_eps * np_rng.normal(
-                    size=(batch, *design_shape)
-                ).astype(np.float32)
+                design_batch_params = design[None, :] + design_eps * np_rng.normal(size=(batch, *design_shape)).astype(
+                    np.float32
+                )
 
                 # Convert to explicit design (layer-level) for detector simulation
-                design_batch_explicit = np.zeros(
-                    (batch, *detector.design_shape()), dtype=np.float32
-                )
+                design_batch_explicit = np.zeros((batch, *detector.design_shape()), dtype=np.float32)
                 for b in range(batch):
                     design_params = detector.decode_yaml_design(design_batch_params[b])
                     explicit_design = detector.yaml_to_layer_design(design_params)
-                    design_batch_explicit[b] = detector.encode_design(explicit_design)
+                    design_batch_explicit[b] = detector.layer_design_to_array(explicit_design)
 
-                _, measurements, target, _, _ = detector(
-                    seed=get_seed(), configurations=design_batch_explicit, split="train"
-                )
+                _gt, measurements, _mask, target = detector(get_seed(), design_batch_explicit, split="train")
 
                 (
                     regressor_losses[i, j, k],
@@ -269,28 +243,18 @@ def optimize(
                 if not check(regressor_parameters, regressor_state):
                     print("measurements", np.min(measurements), np.max(measurements))
                     print("target", np.min(target), np.max(target))
-                    print(
-                        jax.tree.map(
-                            lambda x: jnp.all(jnp.isfinite(x)), regressor_parameters
-                        )
-                    )
+                    print(jax.tree.map(lambda x: jnp.all(jnp.isfinite(x)), regressor_parameters))
                     print(grad_check)
                     raise ValueError("NaN/Inf detected in regressor parameters")
 
             # Generate data for design gradient computation
             # Use exact current design parameters (no perturbation)
             design_params_current = detector.decode_yaml_design(design)
-            explicit_design_current = detector.yaml_to_layer_design(
-                design_params_current
-            )
-            explicit_encoded = detector.encode_design(explicit_design_current)
-            design_batch_explicit = np.broadcast_to(
-                explicit_encoded[None], shape=(batch, *detector.design_shape())
-            )
+            explicit_design_current = detector.yaml_to_layer_design(design_params_current)
+            explicit_encoded = detector.layer_design_to_array(explicit_design_current)
+            design_batch_explicit = np.broadcast_to(explicit_encoded[None], shape=(batch, *detector.design_shape()))
 
-            _, measurements, target, _, _ = detector(
-                seed=get_seed(), configurations=design_batch_explicit, split="train"
-            )
+            _gt, measurements, _mask, target = detector(get_seed(), design_batch_explicit, split="train")
 
             # Update design parameters
             _, design_updated, design_optimizer_state = step_design(
@@ -323,23 +287,19 @@ def optimize(
         for j in status.validation(validation_batches):
             # Perturb current design for validation
             design_shape = detector.yaml_design_shape()
-            design_batch_params = design[None, :] + design_eps * val_rng.normal(
-                size=(batch, *design_shape)
-            ).astype(np.float32)
+            design_batch_params = design[None, :] + design_eps * val_rng.normal(size=(batch, *design_shape)).astype(np.float32)
 
             # Convert to explicit design
-            design_batch_explicit = np.zeros(
-                (batch, *detector.design_shape()), dtype=np.float32
-            )
+            design_batch_explicit = np.zeros((batch, *detector.design_shape()), dtype=np.float32)
             for b in range(batch):
                 design_params = detector.decode_yaml_design(design_batch_params[b])
                 explicit_design = detector.yaml_to_layer_design(design_params)
-                design_batch_explicit[b] = detector.encode_design(explicit_design)
+                design_batch_explicit[b] = detector.layer_design_to_array(explicit_design)
 
             # Generate validation data with separate seed
-            _, measurements, target, _, _ = detector(
-                seed=(seed + 999, i, j, 0),
-                configurations=design_batch_explicit,
+            _gt, measurements, _mask, target = detector(
+                (seed + 999, i, j, 0),
+                design_batch_explicit,
                 split="val",
             )
 
@@ -410,7 +370,7 @@ def optimize(
 
             # Also save converted explicit design for visualization compatibility
             explicit_design = detector.yaml_to_layer_design(design_params_display)
-            explicit_design_encoded = detector.encode_design(explicit_design)
+            explicit_design_encoded = detector.layer_design_to_array(explicit_design)
             detopt.utils.io.save_design(
                 detector,
                 os.path.join(trace, f"design-{i:05d}.json"),
@@ -452,9 +412,7 @@ def plot(aux):
     return fig
 
 
-def report(
-    seed, output, progress=True, restore=True, trace=None, report=None, **config
-):
+def report(seed, output, progress=True, restore=True, trace=None, report=None, **config):
     import matplotlib.pyplot as plt
 
     # Use 'output' as checkpoint directory, 'report' as output directory for plots
@@ -468,9 +426,7 @@ def report(
     checkpointer = detopt.utils.io.get_checkpointer(checkpoint_dir)
     detector = detopt.detector.from_config(config["detector"])
 
-    restored = detopt.utils.io.restore_state(
-        checkpointer, detector, config, rngs=nnx.Rngs(rng), restore=True
-    )
+    restored = detopt.utils.io.restore_state(checkpointer, detector, config, rngs=nnx.Rngs(rng), restore=True)
 
     aux = restored["aux"]
 
@@ -482,6 +438,4 @@ def report(
 if __name__ == "__main__":
     import gearup
 
-    gearup.gearup(optimize=optimize, report=report).with_config(
-        "config/subgradient.yaml"
-    )()
+    gearup.gearup(optimize=optimize, report=report).with_config("config/subgradient.yaml")()

@@ -12,108 +12,119 @@ from .. import utils
 
 from .common import Optimizer
 
-__all__ = [
-  'Subgradient'
-]
+__all__ = ["Subgradient"]
+
 
 class Subgradient(Optimizer):
-  @classmethod
-  def from_config(cls, detector: Detector, config, *, rngs: nnx.Rngs):
-    if 'optimizer_regressor' in config:
-      config['optimizer_regressor'] = utils.config.optimizer(config['optimizer_regressor'])
+    @classmethod
+    def from_config(cls, detector: Detector, config, *, rngs: nnx.Rngs):
+        if "optimizer_regressor" in config:
+            config["optimizer_regressor"] = utils.config.optimizer(config["optimizer_regressor"])
 
-    if 'optimizer_design' in config:
-      config['optimizer_design'] = utils.config.optimizer(config['optimizer_design'])
+        if "optimizer_design" in config:
+            config["optimizer_design"] = utils.config.optimizer(config["optimizer_design"])
 
-    config['regressor'] = nn.from_config(
-      input_shape=detector.output_shape(), design_shape=detector.design_shape(),
-      target_shape=detector.target_shape(),
-      rngs=rngs, config=config['regressor'],
-    )
+        config["regressor"] = nn.from_config(detector, config["regressor"], rngs=rngs)
 
-    return cls(detector=detector, **config)
+        return cls(detector=detector, **config)
 
-  def __init__(
-    self, detector: Detector, regressor: nn.Regressor,
-    batch_size: int, n_steps_regressor: int,
-    design_eps: float=0.1,
-    optimizer_regressor=optax.adabelief(learning_rate=1.0e-3),
-    optimizer_design=optax.nadam(learning_rate=1.0e-2),
-  ):
-    self.detector = detector
-    self.regressor = regressor
+    def __init__(
+        self,
+        detector: Detector,
+        regressor: nn.Regressor,
+        batch_size: int,
+        n_steps_regressor: int,
+        design_eps: float = 0.1,
+        optimizer_regressor=optax.adabelief(learning_rate=1.0e-3),
+        optimizer_design=optax.nadam(learning_rate=1.0e-2),
+    ):
+        self.detector = detector
+        self.batch_size = batch_size
+        self.design_eps = design_eps
+        self.n_steps_regressor = n_steps_regressor
 
-    self.optimizer_regressor = nnx.Optimizer(regressor, optimizer_regressor)
-    self.optimizer_design = optimizer_design
-    self.optimizer_design_state = None
+        # Functional handle on the regressor: a static graphdef plus a params
+        # pytree we optimise with plain optax. We avoid nnx.Optimizer/nnx.jit and
+        # merge the model back inside the jitted steps. The non-param state is fixed
+        # (the regressor runs deterministically here), so we close over it.
+        graphdef, params, nonparams = nnx.split(regressor, nnx.Param, ...)
+        self.graphdef = graphdef
+        self.params = params
 
-    self.batch_size = batch_size
-    self.design_eps = design_eps
-    self.n_steps_regressor = n_steps_regressor
+        self.optimizer_regressor = optimizer_regressor
+        self.opt_regressor_state = optimizer_regressor.init(params)
+        self.optimizer_design = optimizer_design
+        self.opt_design_state = None
 
-    @nnx.jit
-    def loss_f(model, measurements, design, target):
-      pred = model(measurements, design)
-      return jnp.mean(
-        detector.loss(target, pred)
-      )
+        def loss_f(params, measurements, design, target):
+            model = nnx.merge(graphdef, params, nonparams)
+            pred = model(measurements, design)
+            return jnp.mean(detector.loss(pred, target))
 
-    self.loss_f = loss_f
+        @jax.jit
+        def step_regressor(params, opt_state, measurements, design, target):
+            value, grad = jax.value_and_grad(loss_f)(params, measurements, design, target)
+            updates, opt_state = optimizer_regressor.update(grad, opt_state, params)
+            params = optax.apply_updates(params, updates)
+            return value, params, opt_state
 
-    @nnx.jit
-    def step_regressor(state, measurements, design, target):
-      value, grad = nnx.value_and_grad(loss_f, argnums=0)(state.model, measurements, design, target)
-      state.update(grad)
-      return value
+        self.step_regressor = step_regressor
 
-    self.step_regressor = step_regressor
+        @jax.jit
+        def step_design(params, opt_state, measurements, design, target):
+            value, grad = jax.value_and_grad(loss_f, argnums=2)(params, measurements, design, target)
+            updates, opt_state = optimizer_design.update(grad, opt_state, design)
+            design = optax.apply_updates(design, updates)
+            return value, design, opt_state
 
+        self.step_design = step_design
 
-    @nnx.jit
-    def step_design(model, measurements, design, target, opt_state):
-      value, grad = nnx.value_and_grad(loss_f, argnums=2)(model, measurements, design, target)
-      updates, opt_state = self.optimizer_design.update(grad, opt_state)
-      design = optax.apply_updates(design, updates)
-      return value, design, opt_state
+        @jax.jit
+        def metric_f(params, measurements, design, target):
+            model = nnx.merge(graphdef, params, nonparams)
+            pred = model(measurements, design)
+            return detector.metric(pred, target)
 
-    self.step_design = step_design
+        self.metric_f = metric_f
 
-    @nnx.jit
-    def metric_f(model, measurements, design, target):
-      pred = model(measurements, design)
-      return detector.metric(target, pred)
+    def step(self, seed: int | np.random.SeedSequence, design: jax.Array):
+        design = jnp.asarray(design)
+        training_losses = list()
 
-    self.metric_f = metric_f
+        for i in range(self.n_steps_regressor):
+            ss_design, ss_generator, _ss_step = np.random.SeedSequence((seed, i)).spawn(3)
+            noise = (
+                np.random.default_rng(ss_design)
+                .normal(
+                    size=(self.batch_size, *design.shape),
+                )
+                .astype(np.float32)
+            )
+            perturbed_design = np.asarray(design)[None] + self.design_eps * noise
 
-  def step(self, seed: int | np.random.SeedSequence, design: jax.Array):
-    training_losses = list()
+            _gt, measurements, _mask, target = self.detector(ss_generator.entropy, perturbed_design)
+            value, self.params, self.opt_regressor_state = self.step_regressor(
+                self.params,
+                self.opt_regressor_state,
+                measurements,
+                perturbed_design,
+                target,
+            )
+            training_losses.append(value)
 
-    for i in range(self.n_steps_regressor):
-      ss_design, ss_generator, ss_step = np.random.SeedSequence((seed, i)).spawn(3)
-      perturbed_design = design[None] + self.design_eps * np.random.default_rng(ss_design).normal(
-        size=(self.batch_size, *design.shape),
-      ).astype(design.dtype)
+        ss_generator = np.random.SeedSequence((seed, self.n_steps_regressor))
+        _gt, measurements, _mask, target = self.detector(ss_generator.entropy, np.asarray(design)[None])
 
-      measurements, target = self.detector(ss_generator.entropy, perturbed_design)
-      step_losses = self.step_regressor(
-        self.optimizer_regressor, measurements, perturbed_design, target
-      )
-      training_losses.append(step_losses)
+        if self.opt_design_state is None:
+            self.opt_design_state = self.optimizer_design.init(design)
 
-    ss_generator = np.random.SeedSequence((seed, self.n_steps_regressor))
-    measurements, target = self.detector(ss_generator.entropy, design[None])
+        loss, design, self.opt_design_state = self.step_design(self.params, self.opt_design_state, measurements, design, target)
 
-    if self.optimizer_design_state is None:
-      self.optimizer_design_state = self.optimizer_design.init(design)
+        self.last_loss = loss
+        self.last_training_losses = np.stack(training_losses, axis=0)
+        return design
 
-    loss, updated_design, self.optimizer_design_state = self.step_design(
-      self.regressor, measurements, design, target, self.optimizer_design_state
-    )
-
-    return loss, np.stack(training_losses, axis=0), updated_design
-
-  def validate(self, seed: int | np.random.SeedSequence, design):
-    ss_generator = np.random.SeedSequence(seed)
-    measurements, target = self.detector(ss_generator.entropy, design[None])
-    return self.metric_f(self.regressor, measurements, design[None], target)
-
+    def validate(self, seed: int | np.random.SeedSequence, design):
+        ss_generator = np.random.SeedSequence(seed)
+        _gt, measurements, _mask, target = self.detector(ss_generator.entropy, np.asarray(design)[None])
+        return self.metric_f(self.params, measurements, np.asarray(design)[None], target)

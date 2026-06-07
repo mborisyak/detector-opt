@@ -99,9 +99,7 @@ def fairship_fdigi(
     return t_full
 
 
-def compute_tdc_times(
-    waveforms, t0_arr, r_mm, straw_length=400.0, v_wire=0.2, t0_event=0.0, rng=np.random
-):
+def compute_tdc_times(waveforms, t0_arr, r_mm, straw_length=400.0, v_wire=0.2, t0_event=0.0, rng=np.random):
     """
     Compute FairShip-style TDC times (fdigi) for each hit.
     Args:

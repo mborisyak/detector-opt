@@ -12,14 +12,17 @@ from flax import nnx
 import detopt
 from detopt.detector.straw import SparseHits
 
+# NOTE: NOT YET PORTED to the new Detector contract (detector-spec.md).
+# Uses the ragged-layout model.combine; incompatible with the padded (B, M, F)
+# events from the new detector. Will not run end-to-end until the model is
+# ported to the padded layout (see detopt/nn/set_regressor.py).
+
 # Enable JAX compilation logging to detect recompilations
 jax.config.update("jax_log_compiles", True)
 jax.config.update("jax_explain_cache_misses", True)
 
 
-def save_deepset_input_label_hists(
-    measurements_list, targets_list, design, model, detector, out_path: str
-):
+def save_deepset_input_label_hists(measurements_list, targets_list, design, model, detector, out_path: str):
     """
     Save histograms using precomputed measurements and targets.
 
@@ -41,16 +44,12 @@ def save_deepset_input_label_hists(
         design_batch = np.tile(design, (batch_size, 1))
 
         # Normalized per-hit features come from here:
-        hit_features, events, _ = model.combine(
-            measurements, design_batch
-        )  # hit_features: (n_hits, 8), events: (n_hits,)
+        hit_features, events, _ = model.combine(measurements, design_batch)  # hit_features: (n_hits, 8), events: (n_hits,)
 
         X_list.append(np.asarray(hit_features))  # move from JAX to numpy
         y_list.append(np.asarray(y))
 
-        hits_per_event_list.append(
-            np.bincount(np.asarray(events), minlength=batch_size)
-        )
+        hits_per_event_list.append(np.bincount(np.asarray(events), minlength=batch_size))
 
     X = np.concatenate(X_list, axis=0)  # (total_hits, 8)
     y = np.concatenate(y_list, axis=0)  # (n_batches*batch, ...) targets
@@ -157,9 +156,7 @@ def regress(
     from load_precomputed_data import PrecomputedDataLoader
 
     data_loader = PrecomputedDataLoader(precomputed_dir)
-    train_indices, val_indices = data_loader.get_train_val_split(
-        val_fraction=0.2, seed=seed
-    )
+    train_indices, val_indices = data_loader.get_train_val_split(val_fraction=0.2, seed=seed)
     print(f"\n✓ Loaded {data_loader.n_events} precomputed events")
 
     # Initialize regressor
@@ -232,17 +229,13 @@ def regress(
     @jax.jit
     def step(x, c, t, r_params, r_state, opt_state):
         c, t = jnp.array(c), jnp.array(t)
-        (loss, r_state), grad = jax.value_and_grad(loss_f, argnums=3, has_aux=True)(
-            x, c, t, r_params, r_state
-        )
+        (loss, r_state), grad = jax.value_and_grad(loss_f, argnums=3, has_aux=True)(x, c, t, r_params, r_state)
         updates, opt_state = optax_optimizer.update(grad, opt_state, r_params)
         r_params = optax.apply_updates(r_params, updates)
         return loss, r_params, r_state, opt_state
 
     training_losses = np.ndarray(shape=(epochs, steps))
-    validation_losses = np.ndarray(
-        shape=(epochs, 1)
-    )  # Single validation score per epoch
+    validation_losses = np.ndarray(shape=(epochs, 1))  # Single validation score per epoch
 
     val_predictions = []
     val_targets = []
@@ -251,20 +244,14 @@ def regress(
     print("\nCreating fixed validation set...")
     fixed_val_measurements = []
     fixed_val_targets = []
-    n_fixed_val_batches = max(
-        50, validation_batches
-    )  # At least 50 batches for stability
+    n_fixed_val_batches = max(50, validation_batches)  # At least 50 batches for stability
 
     for _ in range(n_fixed_val_batches):
-        meas, targ = data_loader.get_batch_from_indices(
-            val_indices, batch, rng=np_rng_val
-        )
+        meas, targ = data_loader.get_batch_from_indices(val_indices, batch, rng=np_rng_val)
         fixed_val_measurements.append(tuple(jnp.asarray(m) for m in meas))
         fixed_val_targets.append(jnp.asarray(targ))
 
-    print(
-        f"✓ Fixed validation set: {n_fixed_val_batches} batches ({n_fixed_val_batches * batch} samples)"
-    )
+    print(f"✓ Fixed validation set: {n_fixed_val_batches} batches ({n_fixed_val_batches * batch} samples)")
 
     status = detopt.utils.progress.status_bar(disable=not progress)
 
@@ -292,14 +279,10 @@ def regress(
         step_times = []
         for j in status.training(steps):
             step_start = time.time()
-            measurements, target = data_loader.get_batch_from_indices(
-                train_indices, batch, rng=np_rng_train
-            )
+            measurements, target = data_loader.get_batch_from_indices(train_indices, batch, rng=np_rng_train)
 
             measurements = tuple(jnp.asarray(m) for m in measurements)
-            loss, r_params, r_state, opt_state = step(
-                measurements, design, target, r_params, r_state, opt_state
-            )
+            loss, r_params, r_state, opt_state = step(measurements, design, target, r_params, r_state, opt_state)
             training_losses[i, j] = loss
             step_time = time.time() - step_start
             step_times.append(step_time)
@@ -309,9 +292,7 @@ def regress(
         val_predictions_epoch = []
         val_targets_epoch = []
 
-        for j, (measurements, target) in enumerate(
-            zip(fixed_val_measurements, fixed_val_targets)
-        ):
+        for j, (measurements, target) in enumerate(zip(fixed_val_measurements, fixed_val_targets)):
             regressor_merged = nnx.merge(regressor_def, r_params, r_state)
             predictions_norm = regressor_merged(measurements, jnp.array(design))
 
@@ -327,9 +308,7 @@ def regress(
 
             # Debug: print first batch only
             if j == 0:
-                print(
-                    f"\nEpoch {i + 1} Validation (batch 0/{len(fixed_val_measurements)}):"
-                )
+                print(f"\nEpoch {i + 1} Validation (batch 0/{len(fixed_val_measurements)}):")
                 print(f"  Loss (first batch): {val_loss:.6f}")
                 print(f"  Target[0]: {target[0]}")
                 print(f"  Predicted[0]: {predictions[0]}")
@@ -377,15 +356,11 @@ def regress(
 
                 # Position errors (x, y, z) - first 3 components
                 pos_errors = pred_array[:, :, :3] - targ_array[:, :, :3]
-                pos_rmse = np.sqrt(
-                    np.mean(pos_errors**2, axis=(1, 2))
-                )  # RMSE per epoch
+                pos_rmse = np.sqrt(np.mean(pos_errors**2, axis=(1, 2)))  # RMSE per epoch
 
                 # Momentum errors (px, py, pz) - last 3 components
                 mom_errors = pred_array[:, :, 3:] - targ_array[:, :, 3:]
-                mom_rmse = np.sqrt(
-                    np.mean(mom_errors**2, axis=(1, 2))
-                )  # RMSE per epoch
+                mom_rmse = np.sqrt(np.mean(mom_errors**2, axis=(1, 2)))  # RMSE per epoch
 
                 # Plot position precision
                 epochs_so_far = np.arange(len(pos_rmse))
@@ -429,11 +404,7 @@ def regress(
 
     manager.save(
         0,
-        args=ocp.args.Composite(
-            model=ocp.args.PyTreeSave(
-                detopt.utils.io.save_model(parameters, state, optimizer_state)
-            )
-        ),
+        args=ocp.args.Composite(model=ocp.args.PyTreeSave(detopt.utils.io.save_model(parameters, state, optimizer_state))),
     )
 
     print(f"\n✓ Model saved to {output}")

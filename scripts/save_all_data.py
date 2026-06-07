@@ -4,6 +4,12 @@ import numpy as np
 
 import detopt
 
+# NOTE: NOT YET PORTED to the new Detector contract (detector-spec.md).
+# This script monkey-patches the loader and unpacks the old ragged measurements
+# tuple (events, layers, straws, times, mask); the new detector returns a padded
+# (B, M, 5) tensor via sample_events. It will not run end-to-end until reworked
+# for the padded layout.
+
 
 def save_all_data(seed, output, chunk_size=1000, **config):
 
@@ -17,11 +23,9 @@ def save_all_data(seed, output, chunk_size=1000, **config):
         from pathlib import Path
 
         sys.path.insert(0, str(Path(__file__).parent.parent))
-        from load_hnl_data import HNLDataLoader
+        from detopt.data import HNLDataLoader
 
-        detector._data_loader = HNLDataLoader(
-            detector.data_dir, max_particles=detector.max_particles
-        )
+        detector._data_loader = HNLDataLoader(detector.data_dir, max_particles=detector.max_particles)
 
     n_events = detector._data_loader.n_events
     n_chunks = (n_events + chunk_size - 1) // chunk_size
@@ -41,9 +45,7 @@ def save_all_data(seed, output, chunk_size=1000, **config):
 
         # Load sequential batch from data loader (no random sampling)
         # This ensures we process ALL events exactly once, in order
-        daughter_data, hnl_targets = detector._data_loader.get_sequential_batch(
-            start_idx, end_idx
-        )
+        daughter_data, hnl_targets = detector._data_loader.get_sequential_batch(start_idx, end_idx)
 
         design = np.tile(enc, (chunk_n_events, 1))
         seed_chunk = hash((seed, chunk_idx)) & 0xFFFFFFFF
@@ -60,7 +62,8 @@ def save_all_data(seed, output, chunk_size=1000, **config):
         detector._data_loader.get_batch = sequential_get_batch
 
         # Run detector simulation on this sequential chunk
-        _, measurements, target, _, _ = detector(seed=seed_chunk, configurations=design)
+        _ev = detector.sample_events(seed_chunk, design)
+        measurements, target = _ev["X"], _ev["targets"]
 
         # Restore original get_batch method for next iteration
         detector._data_loader.get_batch = original_get_batch

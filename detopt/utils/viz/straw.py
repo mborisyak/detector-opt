@@ -37,9 +37,7 @@ def show(
 
     if True:
         if n_particles is None or n_straws is None:
-            raise ValueError(
-                "n_particles and n_straws required when response is SparseHits"
-            )
+            raise ValueError("n_particles and n_straws required when response is SparseHits")
         n_layers = len(layers)
         # Convert sparse to dense for visualization
         # response_dense, _, _, _, _ = response.to_dense(
