@@ -37,9 +37,7 @@ def save_deepset_input_label_hists(detector, model, design, seed: int, batch: in
     X = np.concatenate(X_list, axis=0)  # (total_hits, 8)
     y = np.concatenate(y_list, axis=0)  # (n_batches*batch, ...) targets
 
-    target_mean = np.asarray(detector.target_mean)
-    target_std = np.asarray(detector.target_std)
-    y = (y - target_mean) / target_std
+    y = np.asarray(detector.normalize_target(y))
     hits_per_event = np.concatenate(hits_per_event_list)  # (n_batches*batch,)
 
     # (optional) cap number of hits to keep plots fast & memory sane
@@ -170,7 +168,7 @@ def regress(seed, output, progress=False, restore=True, trace=None, report=None,
             predictions_norm = regressor(measurements, jnp.array(design))
 
             # Denormalize predictions to raw units for visualization
-            predictions = predictions_norm * detector.target_std + detector.target_mean
+            predictions = detector.denormalize_predictions(predictions_norm)
 
             validation_losses[i, j] = metric_f(regressor, measurements, design, target)
 
@@ -182,10 +180,7 @@ def regress(seed, output, progress=False, restore=True, trace=None, report=None,
                 print(f"  Predicted[0] (denormalized): {predictions[0]}")
                 print(f"  Diff: {np.abs(predictions[0] - target[0])}")
                 t = target[0]  # physical
-                mu = detector.target_mean  # shape (6,)
-                sd = detector.target_std  # shape (6,)
-
-                t_norm = (t - mu) / sd  # normalized target
+                t_norm = detector.normalize_target(t)  # normalized target
                 p_norm = predictions_norm[0]  # normalized prediction
 
                 print("Target_norm[0]:", t_norm)

@@ -11,158 +11,82 @@ except ImportError:
     uproot = None
 
 from ..utils.encoding import (
-    normal_to_uniform,
-    uniform_to_normal,
     normal_to_uniform_jax,
     uniform_to_normal_jax,
 )
-from ..data import HNLDataLoader
+from ..data import load_ship2numpy_events
 from . import straw_detector
 from .common import Detector
 
-__all__ = ["StrawDetector", "SparseHits", "sparse_to_dense"]
+__all__ = ["StrawDetector", "MATERIALS", "material_constants"]
 
 
-class SparseHits:
-    """Container for sparse hit representation."""
+# Energy-independent material constants for secondary production (PDG values).
+# Per material: (Z/A, density [g/cm^3], radiation length X0 [cm]). The straw wall
+# in FairShip is Kapton (strawtubes media), so it is the default; the support
+# frame is aluminium. From these:
+#   delta_const = (K/2)(Z/A) rho  [MeV/cm]   -- material part of the delta-ray rate
+#   lambda_conv = (9/7) X0        [cm]       -- photon / pair conversion length
+# with K = 0.307075 MeV mol^-1 cm^2. The per-hit probabilities (energy-dependent
+# for delta-rays via z^2/beta^2, energy-independent for pair) are built in the C
+# solver; here we only precompute the constants.
+# Backstop on the C physics-loop iteration count. The loop really terminates on the
+# max_time flight-time break (every step advances time by dt_step > 0); this is just a
+# guard against a pathological non-advancing step, decoupled from n_t.
+_MAX_SOLVER_STEPS = 200_000
 
-    def __init__(self, events, particles, layers, straws, values, r_mm, t0, hit_pos):
-        self.events = np.asarray(events, dtype=np.int32)
-        self.particles = np.asarray(particles, dtype=np.int32)
-        self.layers = np.asarray(layers, dtype=np.int32)
-        self.straws = np.asarray(straws, dtype=np.int32)
-        self.values = np.asarray(values, dtype=np.float32)
-        self.r_mm = np.asarray(r_mm, dtype=np.float32)
-        self.t0 = np.asarray(t0, dtype=np.float32)
-        self.hit_pos = np.asarray(hit_pos, dtype=np.float32)
-        if self.hit_pos.ndim == 1:
-            self.hit_pos = self.hit_pos.reshape(-1, 3)
-
-    def __len__(self):
-        return len(self.events)
-
-    def to_dense(self, n_events, n_particles, n_layers, n_straws):
-        """Convert sparse hits to dense arrays."""
-        return sparse_to_dense(
-            self.events,
-            self.particles,
-            self.layers,
-            self.straws,
-            self.values,
-            self.r_mm,
-            self.t0,
-            self.hit_pos,
-            n_events,
-            n_particles,
-            n_layers,
-            n_straws,
-        )
+_K_HALF = 0.307075 / 2.0  # MeV mol^-1 cm^2
+MATERIALS = {
+    "kapton": (0.51264, 1.42, 28.56),  # polyimide film -- FairShip straw wall (default)
+    "mylar": (0.52037, 1.40, 28.54),  # polyethylene terephthalate
+    "aluminium": (0.48181, 2.699, 8.897),  # support frame
+}
 
 
-def sparse_to_dense(
-    events,
-    particles,
-    layers,
-    straws,
-    values,
-    r_mm,
-    t0,
-    hit_pos,
-    n_events,
-    n_particles,
-    n_layers,
-    n_straws,
-):
-    """
-    Convert sparse hit representation to dense arrays.
-
-    Returns:
-        response: (n_events, n_particles, n_layers, n_straws) array
-        edep: (n_events, n_particles, n_layers, n_straws) array
-        r_mm: (n_events, n_particles, n_layers, n_straws) array
-        t0: (n_events, n_particles, n_layers, n_straws) array
-        hit_pos: (n_events, n_particles, n_layers, n_straws, 3) array
-    """
-    response = np.zeros((n_events, n_particles, n_layers, n_straws), dtype=np.float32)
-    edep_dense = np.zeros((n_events, n_particles, n_layers, n_straws), dtype=np.float32)
-    r_mm_dense = np.zeros((n_events, n_particles, n_layers, n_straws), dtype=np.float32)
-    t0_dense = np.zeros((n_events, n_particles, n_layers, n_straws), dtype=np.float32)
-    hit_pos_dense = np.zeros((n_events, n_particles, n_layers, n_straws, 3), dtype=np.float32)
-
-    events = np.asarray(events, dtype=np.int32)
-    particles = np.asarray(particles, dtype=np.int32)
-    layers = np.asarray(layers, dtype=np.int32)
-    straws = np.asarray(straws, dtype=np.int32)
-    values = np.asarray(values, dtype=np.float32)
-    r_mm = np.asarray(r_mm, dtype=np.float32)
-    t0 = np.asarray(t0, dtype=np.float32)
-    hit_pos = np.asarray(hit_pos, dtype=np.float32)
-    if hit_pos.ndim == 1:
-        hit_pos = hit_pos.reshape(-1, 3)
-
-    # Filter valid indices
-    valid = (
-        (events >= 0)
-        & (events < n_events)
-        & (particles >= 0)
-        & (particles < n_particles)
-        & (layers >= 0)
-        & (layers < n_layers)
-        & (straws >= 0)
-        & (straws < n_straws)
-    )
-
-    if np.any(valid):
-        response[events[valid], particles[valid], layers[valid], straws[valid]] = values[valid]
-        r_mm_dense[events[valid], particles[valid], layers[valid], straws[valid]] = r_mm[valid]
-        t0_dense[events[valid], particles[valid], layers[valid], straws[valid]] = t0[valid]
-        hit_pos_dense[events[valid], particles[valid], layers[valid], straws[valid]] = hit_pos[valid]
-
-    return response, r_mm_dense, t0_dense, hit_pos_dense
+def material_constants(material):
+    """Return ``(delta_const [MeV/cm], lambda_conv [cm])`` for a named material."""
+    z_over_a, rho, x0_cm = MATERIALS[material]
+    return _K_HALF * z_over_a * rho, (9.0 / 7.0) * x0_cm
 
 
 class StrawDetector(Detector):
     def __init__(
         self,
-        # Geometry hierarchy
-        station_z: list = [8407.0, 8607.0, 9307.0, 9507.0],
+        # Geometry hierarchy (structural counts + fixed hardware; NO nominal design)
+        n_stations: int = 4,
         n_views_per_station: int = 4,
         n_layers_per_view: int = 2,
         n_straws_per_layer: int = 200,
-        straw_pitch: float = 2.0,
+        straw_pitch: float = 2.0,  # cm; centre-to-centre straw spacing (FairShip strawtubes_config.yaml)
         straw_length: float = 400.0,
-        layer_x_offset: float = 1.0,
-        view_angles: tuple = (0.0, 0.0798, -0.0798, 0.0),  # X, U, X', V
-        layer_z_gap: float = 1.732,
-        view_z_gap: float = 5.0,
+        layer_y_offset: float = 1.0,  # cm; half-pitch y-stagger between the two layers in a view
         # Physics parameters
-        max_B: float = 0.0005,
-        z0: float = 8957.0,
-        B_sigma: float = 300.0,
+        max_B: float = 0.20,  # T; peak |Bx| of FairShip V13_3500 spectrometer field map (on-axis)
+        z0: float = 8957.0,  # cm; magnet centre (FairShip geometry_config c.z = 89.57 m, map z_local=0)
+        B_sigma: float = 286.0,  # cm; our-form width from a Gaussian fit to the V13_3500 Bx(z) on-axis profile
+        # Design-space bounds (the design itself is supplied per-call, not stored)
         layer_bounds: tuple[float | int, float | int] = (8000.0, 10000.0),
-        dt: float = 0.1,
-        max_particles=5,
-        secondary_multiplier=5,
         angles_bounds=None,
-        layer_width=None,
-        layer_height=None,
-        n_layers=None,
-        n_straws=None,
-        loss=None,
-        p_spawn_single=0.0,
-        p_spawn_pair=0.0,
-        E_sec_MeV=0.01,
-        origin=(-2.4590519e01, 4.7251717e01, 5.5158970e03),
-        origin_sigma=(1.2907193e02, 1.3767969e02, 1.6168958e03),
-        momentum=(-2.0980914e-01, 2.1826500e-01, 2.6931271e01),
-        momentum_sigma=(7.2272283e-01, 4.9576724e-01, 1.2292634e01),
-        constrain_stereo_angles: bool = False,  # If True, optimize single angle: [0, +α, -α, 0]
-        optimize_stations: bool = True,  # If False, freeze station positions
-        optimize_gaps: bool = True,  # If False, freeze layer_z_gap and view_z_gap
-        optimize_bfield: bool = True,  # If False, freeze max_B, B_sigma, z0
-        data_dir=None,  # event-source location (detector config; the only data the detector owns)
-        val_fraction: float = 0.2,  # held-out fraction of the finite event source
-        split_seed: int = 42,  # seed defining the train/val partition
+        dt=None,  # fixed step (ns); None -> adaptive per-step dt (sagitta-bounded), capped by max_dt
+        max_dt=1.0,  # upper clamp (ns) on the adaptive step; bounds the field-free Bx->0 region
+        max_time=200.0,  # total integration-time cap (ns) per particle; trapped/curling tracks stop here
+        max_particles=5,
+        material="kapton",  # straw-wall material (FairShip default); sets delta_const + lambda_conv
+        wall_thickness=0.0036,  # straw wall thickness (cm); FairShip strawtubes_config.yaml
+        delta_Tcut=0.5,  # delta-ray tracking threshold (MeV): production cut for knock-on electrons
+        lambda_conv_cm=None,  # photon/pair conversion length (cm); None -> 9/7 * X0 of `material`
+        enable_decay=False,  # charged pi/K decay-in-flight
+        noise_rate=0.0,  # mean uncorrelated noise hits per event; <=0 disables
+        scatter_xX0=0.0,  # Highland multiple-scattering material budget x/X0 per layer crossing; <=0 disables
+        # Target (6-vec) normalization: decay vertex (cm) + HNL momentum (GeV).
+        # Defaults computed from data/mc (180,672 events); None -> derive from the
+        # loaded `targets` at construction.
+        decay_mean=(-0.2423, 0.2345, 6205.60),
+        decay_sigma=(76.11, 101.06, 1365.96),
+        momentum_mean=(-0.0027, 0.0021, 46.686),
+        momentum_sigma=(0.5421, 0.6479, 28.203),
+        data_dir=None,  # ship2numpy event file, preloaded once (None = no event source)
+        boundary_z=None,  # crossing-plane z (cm); None -> read from the file
     ):
         """
         :param max_B: maximal strength of the magnetic field;
@@ -178,35 +102,38 @@ class StrawDetector(Detector):
         self.z0 = z0
         self.B_sigma = B_sigma
 
-        self.origin = np.array(origin, dtype=np.float32)
-        self.origin_sigma = np.array(origin_sigma, np.float32)
-        self.momentum = np.array(momentum, dtype=np.float32)
-        self.momentum_sigma = np.array(momentum_sigma, dtype=np.float32)
+        # Target-normalization constants (resolved after the event pool is loaded;
+        # any left None are derived from the data's `targets`). See _resolve_target_norm.
+        self._decay_mean_arg = decay_mean
+        self._decay_sigma_arg = decay_sigma
+        self._momentum_mean_arg = momentum_mean
+        self._momentum_sigma_arg = momentum_sigma
 
-        # Secondary particle parameters
-        self.p_spawn_single = p_spawn_single  # Probability of single e- emission
-        self.p_spawn_pair = p_spawn_pair  # Probability of e+e- pair production
-        self.E_sec_MeV = E_sec_MeV
+        # Secondary production is material-driven: the C solver builds the per-hit
+        # delta-ray / pair probabilities from these energy-independent constants and
+        # the track's (z, beta, gamma). The wall material sets delta_const and the
+        # photon/pair conversion length; the track crosses 2 walls per hit.
+        self.material = material
+        self.wall_thickness = float(wall_thickness)
+        self.delta_Tcut = float(delta_Tcut)
+        self.delta_const, _lambda_default = material_constants(material)
+        self.lambda_conv_cm = float(lambda_conv_cm) if lambda_conv_cm is not None else _lambda_default
+        self.enable_decay = int(bool(enable_decay))
+        self.noise_rate = float(noise_rate)
+        # Highland multiple scattering: angular kick per layer crossing, scaled by
+        # the layer material budget x/X0 (straw walls + gas + frame). 0 -> clean tracks.
+        self.scatter_xX0 = float(scatter_xX0)
 
         self.layer_bounds = layer_bounds
-        self.dt = dt
 
-        # Real detector geometry
-        self.station_z = station_z
-        self.n_stations = len(station_z)
-        self.n_views_per_station = n_views_per_station
-        self.n_layers_per_view = n_layers_per_view
-        self.n_straws = n_straws_per_layer
-        self.straw_pitch = straw_pitch
-        self.straw_length = straw_length
-        self.layer_x_offset = layer_x_offset
-        self.view_angles = view_angles
-        self.layer_z_gap = layer_z_gap
-        self.view_z_gap = view_z_gap
-        self.constrain_stereo_angles = constrain_stereo_angles
-        self.optimize_stations = optimize_stations
-        self.optimize_gaps = optimize_gaps
-        self.optimize_bfield = optimize_bfield
+        # Real detector geometry (structural counts + fixed hardware only)
+        self.n_stations = int(n_stations)
+        self.n_views_per_station = int(n_views_per_station)
+        self.n_layers_per_view = int(n_layers_per_view)
+        self.n_straws = int(n_straws_per_layer)
+        self.straw_pitch = float(straw_pitch)
+        self.straw_length = float(straw_length)
+        self.layer_y_offset = float(layer_y_offset)
 
         self.n_layers = self.n_stations * self.n_views_per_station * self.n_layers_per_view
 
@@ -220,79 +147,66 @@ class StrawDetector(Detector):
         else:
             self.angle_bounds = (-0.1, 0.1)
 
-        # primary/secondary bookkeeping
         assert max_particles > 1, "signal events produce at least 2 particles"
         self.max_particles = int(max_particles)
-        self.secondary_multiplier = int(secondary_multiplier)
-        if self.secondary_multiplier < 1:
-            self.secondary_multiplier = 1
 
-        flight_distance = layer_bounds[1] - layer_bounds[0]
-        self.n_t = int(flight_distance / (dt * 29.9792))
+        # Integration step is adaptive per-step in the C solver: each step is 0.9x
+        # the sagitta-bounded ceiling (chord-vs-arc error < straw resolution),
+        # clamped to max_dt. A fixed `dt` (not None) overrides it. The trajectory
+        # buffer is sampled evenly in time, decoupled from the physics step: n_t
+        # samples over [0, max_time], so step_t = max_time / n_t ~ max_dt.
+        self.dt_fixed = float(dt) if dt is not None else 0.0  # 0 -> adaptive
+        self.max_dt = float(max_dt)
+        self.max_time = float(max_time)
+        self.n_t = max(int(self.max_time / self.max_dt) + 1, 2)  # trajectory viz samples
+        # Physics-loop iteration backstop passed to the C solver. The loop's real
+        # termination is the `max_time` flight-time break (every step advances time
+        # by dt_step > 0); this is just a guard, decoupled from n_t.
+        self.max_steps = _MAX_SOLVER_STEPS
 
-        # Loss function parameters for position and momentum prediction
-        if loss is None:
-            loss = {}
-        self.position_scale = loss.get("position_scale", 100.0)  # cm
-        self.momentum_scale = loss.get("momentum_scale", 10.0)  # GeV/c
-        self.position_weight = loss.get("position_weight", 1.0)
-        self.momentum_weight = loss.get("momentum_weight", 1.0)
+        # Event source: preload the file once into immutable per-event arrays and
+        # sample from them by seed. No train/val split, no mutable loader state --
+        # that does not belong to the detector. Mirrors DebugDetector, which
+        # generates events on demand from a seed (here drawn from a preloaded pool).
+        self._events = None
+        self._n_events = 0
+        self.boundary_z = float(boundary_z) if boundary_z is not None else None
+        if data_dir is not None:
+            self._events = load_ship2numpy_events(data_dir, self.max_particles, boundary_z=boundary_z)
+            self._n_events = self._events["n_events"]
+            self.boundary_z = self._events["boundary_z"]
 
-        # Target normalization: calculated from actual data (combined_all_100)
-        # Units: positions in cm, momenta in GeV/c
-        self.target_mean = np.array(
-            [
-                7.9546314e-01,
-                -7.2685266e-01,
-                6.3946289e03,
-                4.1835890e-03,
-                -1.1129675e-02,
-                5.0176453e01,
-            ],
-            dtype=np.float32,
-        )
-        self.target_std = np.array(
-            [
-                7.4502007e01,
-                7.6979668e01,
-                1.3506592e03,
-                5.1641846e-01,
-                5.5257869e-01,
-                2.8627583e01,
-            ],
-            dtype=np.float32,
-        )
+        # Resolve target-normalization constants (derive any left None from data).
+        self._resolve_target_norm()
 
-        # Owned event source: only the *location*. The train/val split below is
-        # part of the detector's own event-source config (not injected by the
-        # optimiser): the loader partitions the finite dataset on first use.
-        self._data_dir = data_dir
-        self._val_fraction = float(val_fraction)
-        self._split_seed = int(split_seed)
-        self._loader = None
+    @classmethod
+    def from_config(cls, config):
+        """Build the detector from a (yaml-parsed) ``config`` dict, passing its
+        entries straight into ``__init__``. Unlike the base blind-splat, this
+        validates the keys against the constructor signature(s) so an unknown or
+        mistyped key raises instead of being silently ignored."""
+        import inspect
+
+        allowed = set()
+        for klass in cls.__mro__:
+            init = klass.__dict__.get("__init__")
+            if init is None:
+                continue
+            for name, p in inspect.signature(init).parameters.items():
+                if name == "self" or p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
+                    continue
+                allowed.add(name)
+        unknown = set(config) - allowed
+        if unknown:
+            raise ValueError(f"unknown {cls.__name__} config key(s): {sorted(unknown)}")
+        return cls(**config)
 
     # ------------------------------------------------------------------ #
     # Event source
     # ------------------------------------------------------------------ #
     @property
-    def loader(self) -> HNLDataLoader:
-        if self._loader is None:
-            if self._data_dir is None:
-                raise RuntimeError(
-                    "StrawDetector has no event source configured; pass `data_dir` "
-                    "in the detector config to generate events."
-                )
-            self._loader = HNLDataLoader(
-                data_dir=self._data_dir,
-                max_particles=self.max_particles,
-                val_fraction=self._val_fraction,
-                split_seed=self._split_seed,
-            )
-        return self._loader
-
-    @property
     def n_events(self) -> int:
-        return int(self.loader.n_events)
+        return int(self._n_events)
 
     # ------------------------------------------------------------------ #
     # Shapes
@@ -303,12 +217,8 @@ class StrawDetector(Detector):
         return 2 * self.max_particles * self.n_layers
 
     def design_shape(self):
-        # positions + angles + magnetic field strength
-        return (self.n_layers + self.n_layers + 1,)
-
-    def output_shape(self):
-        """Legacy dense output grid shape (kept for older code)."""
-        return (self.n_layers, self.n_straws)
+        # The base carries no design scheme -- subclasses define the design space.
+        raise NotImplementedError("design_shape is defined by the design subclass")
 
     def target_shape(self):
         # decay vertex + HNL momentum: [x, y, z, px, py, pz]
@@ -319,111 +229,145 @@ class StrawDetector(Detector):
         return (self.max_hits_per_event, 5)
 
     def combined_event_shape(self):
-        return (self.max_hits_per_event, self.event_shape()[-1] + self.design_dim())
+        # combine() -> [time, norm_layer_z, norm_straw_y, norm_angle, norm_B]
+        return (self.max_hits_per_event, 5)
 
     def ground_truth_shape(self):
         # charges + positions + momenta (flattened)
         return (2 * self.max_particles + 3 * self.max_particles + 3 * self.max_particles,)
 
     # ------------------------------------------------------------------ #
-    # Ground-truth encoding (daughter particles)
+    # Ground-truth encoding (daughter particles) -- unimplemented for the sparse
+    # pool. Only generators/LFI consume it (as conditioning); to be reworked.
     # ------------------------------------------------------------------ #
     def encode_ground_truth(self, masses, charges, initial_positions, initial_momentum):
-        n, *_ = initial_positions.shape
-        normalized_positions = (initial_positions - self.origin) / self.origin_sigma
-        normalized_positions = np.reshape(normalized_positions, shape=(n, -1))
-        normalized_momenta = np.reshape(initial_momentum, shape=(n, -1))
-        ground_truth = np.concatenate([masses, charges, normalized_positions, normalized_momenta], axis=-1)
-        return ground_truth
+        raise NotImplementedError("ground-truth encoding is not implemented for the sparse pool (to be reworked)")
 
     def decode_ground_truth(self, ground_truth):
-        masses = ground_truth[:, : self.max_particles]
-        batch = masses.shape[0]
-        charges = ground_truth[:, self.max_particles : self.max_particles + self.max_particles]
-        pos_flat = ground_truth[
-            :,
-            self.max_particles + self.max_particles : self.max_particles + self.max_particles + self.max_particles * 3,
-        ]
-        mom_flat = ground_truth[:, self.max_particles + self.max_particles + self.max_particles * 3 :]
-
-        normalized_positions = pos_flat.reshape((batch, self.max_particles, 3))
-        initial_momentum = mom_flat.reshape((batch, self.max_particles, 3))
-
-        initial_positions = normalized_positions * self.origin_sigma + self.origin
-
-        return masses, charges, initial_positions, initial_momentum
+        raise NotImplementedError("ground-truth decoding is not implemented for the sparse pool (to be reworked)")
 
     # ------------------------------------------------------------------ #
-    # Geometry from a physical (un-encoded) design array
+    # Target normalization (6-vec [decay_vertex(3, cm), HNL_momentum(3, GeV)])
+    # ------------------------------------------------------------------ #
+    def _resolve_target_norm(self):
+        """Set ``decay_mean/sigma`` + ``momentum_mean/sigma``, deriving any passed
+        as ``None`` from the loaded data's ``targets`` (vertex ``[:, :3]``,
+        momentum ``[:, 3:]``). Sigmas are floored to avoid divide-by-zero."""
+        args = (self._decay_mean_arg, self._decay_sigma_arg, self._momentum_mean_arg, self._momentum_sigma_arg)
+        if any(a is None for a in args):
+            if self._events is None:
+                raise ValueError(
+                    "target normalization has None entries but no data source to derive them from; "
+                    "pass `data_dir` or supply decay_mean/decay_sigma/momentum_mean/momentum_sigma."
+                )
+            t = self._events["targets"]  # (N, 6)
+            d_mean, d_std, m_mean, m_std = t[:, :3].mean(0), t[:, :3].std(0), t[:, 3:].mean(0), t[:, 3:].std(0)
+        else:
+            d_mean = d_std = m_mean = m_std = None
+
+        pick = lambda arg, derived: np.asarray(derived if arg is None else arg, dtype=np.float32)
+        self.decay_mean = pick(self._decay_mean_arg, d_mean)
+        self.decay_sigma = np.maximum(pick(self._decay_sigma_arg, d_std), 1e-3)
+        self.momentum_mean = pick(self._momentum_mean_arg, m_mean)
+        self.momentum_sigma = np.maximum(pick(self._momentum_sigma_arg, m_std), 1e-3)
+
+    def _target_norm_arrays(self):
+        import jax.numpy as jnp
+
+        mean = jnp.concatenate([jnp.asarray(self.decay_mean), jnp.asarray(self.momentum_mean)])
+        std = jnp.concatenate([jnp.asarray(self.decay_sigma), jnp.asarray(self.momentum_sigma)])
+        return mean, std
+
+    def normalize_target(self, target):
+        """Physical 6-vec target -> standardised; vertex by decay_*, momentum by momentum_*."""
+        import jax.numpy as jnp
+
+        mean, std = self._target_norm_arrays()
+        return (jnp.asarray(target, dtype=jnp.float32) - mean) / std
+
+    def denormalize_predictions(self, normalised):
+        """Inverse of :meth:`normalize_target`: back to physical units (cm, GeV)."""
+        import jax.numpy as jnp
+
+        mean, std = self._target_norm_arrays()
+        return jnp.asarray(normalised, dtype=jnp.float32) * std + mean
+
+    # ------------------------------------------------------------------ #
+    # Design -> geometry (abstract; the design scheme lives in subclasses)
     # ------------------------------------------------------------------ #
     def _design_to_geometry(self, design):
-        """Split a *physical* design ``[positions(n), angles(n), B]`` into the
-        per-layer geometry arrays the C solver expects.
-
-        Returns ``(layers, angles, widths, heights, Bs)`` with batch dim ``n``.
-        """
-        design = np.asarray(design, dtype=np.float32)
-        if design.ndim == 1:
-            design = design[None, :]
-        n_batch = design.shape[0]
-        m = self.n_layers
-
-        layers = design[:, :m].astype(np.float32)
-        angles = design[:, m : 2 * m].astype(np.float32)
-        Bs = design[:, 2 * m].astype(np.float32)
-
-        widths = np.full((n_batch, m), self.layer_width, dtype=np.float32)
-        heights = np.full((n_batch, m), self.layer_height, dtype=np.float32)
-        return layers, angles, widths, heights, Bs
-
-    def layer_design_to_array(self, layer_design):
-        """Flatten a ``{positions, angles, magnetic_strength}`` dict into the
-        physical design array ``[positions(n), angles(n), B]``."""
-        positions = np.asarray(layer_design["positions"], dtype=np.float32)
-        angles = np.asarray(layer_design["angles"], dtype=np.float32)
-        B = np.float32(layer_design["magnetic_strength"])
-        return np.concatenate([positions, angles, np.array([B], np.float32)]).astype(np.float32)
+        """Map a *physical* design into per-layer ``(layers, angles, widths,
+        heights, Bs)`` for the C solver. Defined by the design subclass."""
+        raise NotImplementedError("_design_to_geometry is defined by the design subclass")
 
     # ------------------------------------------------------------------ #
     # Event generation
     # ------------------------------------------------------------------ #
-    def _sample_daughters(self, seed, n, split):
-        rng = np.random.default_rng(seed)
-        daughter_data, targets = self.loader.get_batch(batch_size=int(n), rng=rng, split=(split or "all"))
-        return daughter_data, np.asarray(targets, dtype=np.float32)
+    def generate_events(self, rng, n):
+        """Sample ``n`` events (with replacement) from the preloaded sparse pool.
 
-    def _run_solver(self, daughter_data, design):
+        Returns ``(daughter_data, targets)``: the flat per-particle arrays + CSR
+        ``offsets`` the C solver consumes and the 6-vector regression targets.
+        Mirrors :meth:`DebugDetector.generate_events` (seed -> events), but events
+        are drawn (ragged-gathered) from the preloaded file's flat pool.
+        """
+        if self._events is None:
+            raise RuntimeError("StrawDetector has no event source; pass `data_dir` in the detector config.")
+        ev = self._events
+        offsets = ev["offsets"]  # (n_events+1,)
+        idx = rng.choice(self._n_events, size=int(n), replace=True)
+
+        counts = (offsets[1:] - offsets[:-1])  # particles per event
+        sel_counts = counts[idx].astype(np.int64)  # (n,)
+        batch_offsets = np.zeros(int(n) + 1, dtype=np.int32)
+        batch_offsets[1:] = np.cumsum(sel_counts)
+        total = int(batch_offsets[-1])
+
+        # Ragged gather: map each batch slot back to its source flat row.
+        src_start = np.repeat(offsets[idx].astype(np.int64), sel_counts)  # (total,)
+        dst_start = np.repeat(batch_offsets[:-1].astype(np.int64), sel_counts)  # (total,)
+        gather = src_start + (np.arange(total, dtype=np.int64) - dst_start)
+
+        daughter_data = {
+            "masses": ev["masses"][gather],
+            "charges": ev["charges"][gather],
+            "positions": ev["positions"][gather],
+            "momenta": ev["momenta"][gather],
+            "times": ev["times"][gather],
+            "offsets": batch_offsets,
+        }
+        return daughter_data, ev["targets"][idx]
+
+    def _run_solver(self, daughter_data, design, rng):
         """Run the C straw solver for a physical ``design`` and ``daughter_data``.
 
-        Returns ``(sparse_hits, fdigi_times, n_hits, trajectories)``.
+        The C solver writes the padded dense ``X (B, M, 5)`` + ``mask (B, M)``
+        directly (no sparse intermediate); ``counts`` is the per-event write
+        cursor. Returns ``(X, mask, trajectories)``.
         """
         masses = daughter_data["masses"]
         charges = daughter_data["charges"]
         initial_positions = daughter_data["positions"]
         initial_momentum = daughter_data["momenta"]
         initial_times = daughter_data["times"]
+        offsets = daughter_data["offsets"]
 
         layers, angles, widths, heights, Bs = self._design_to_geometry(design)
 
         n_events = layers.shape[0]
-        p_slots = initial_momentum.shape[1]
 
         Bs_arr = Bs.astype(np.float32)
         z0_arr = np.full((n_events,), self.z0, dtype=np.float32)
         B_sigma_arr = np.full((n_events,), self.B_sigma, dtype=np.float32)
 
-        max_hits = 2 * n_events * self.max_particles * self.n_layers
         trajectories = np.zeros((n_events, self.max_particles, self.n_t, 3), dtype=np.float32)
 
-        sparse_events = np.zeros(max_hits, dtype=np.int32)
-        sparse_particles = np.zeros(max_hits, dtype=np.int32)
-        sparse_layers = np.zeros(max_hits, dtype=np.int32)
-        sparse_straws = np.zeros(max_hits, dtype=np.int32)
-        sparse_values = np.zeros(max_hits, dtype=np.float32)
-        sparse_r_mm = np.zeros(max_hits, dtype=np.float32)
-        sparse_t0 = np.zeros(max_hits, dtype=np.float32)
-        sparse_hit_pos = np.zeros((max_hits, 3), dtype=np.float32)
-        sparse_count = np.zeros(1, dtype=np.int32)
+        # Dense output: the C solver writes the padded (B, M, 5) hit array + mask
+        # directly; ``counts`` is the per-event write cursor (M is the hard cap).
+        M = self.max_hits_per_event
+        X = np.zeros((n_events, M, 5), dtype=np.float32)
+        mask = np.zeros((n_events, M), dtype=np.int32)
+        counts = np.zeros((n_events,), dtype=np.int32)
 
         straw_detector.solve(
             initial_positions,
@@ -434,10 +378,10 @@ class StrawDetector(Detector):
             Bs_arr,
             z0_arr,
             B_sigma_arr,
-            self.n_t,
-            self.dt,
+            self.max_steps,
+            self.dt_fixed,
             n_events,
-            p_slots,
+            offsets,
             self.n_layers,
             self.n_straws,
             layers,
@@ -445,102 +389,28 @@ class StrawDetector(Detector):
             heights,
             angles,
             trajectories,
-            sparse_events,
-            sparse_particles,
-            sparse_layers,
-            sparse_straws,
-            sparse_values,
-            sparse_r_mm,
-            sparse_t0,
-            sparse_hit_pos,
-            sparse_count,
-            self.p_spawn_single,
-            self.p_spawn_pair,
-            self.E_sec_MeV,
+            self.delta_const,
+            self.wall_thickness,
+            self.delta_Tcut,
             self.max_particles,
+            self.lambda_conv_cm,
+            self.enable_decay,
+            self.noise_rate,
+            X,
+            mask,
+            counts,
+            self.n_views_per_station,
+            self.n_layers_per_view,
+            int(rng.integers(1, 2**32)),  # propagate the caller's seed into the C RNG
+            self.max_dt,
+            self.max_time,
+            self.scatter_xX0,
+            self.layer_y_offset,
         )
 
-        n_hits = int(sparse_count[0])
-        assert 0 <= n_hits <= max_hits, (n_hits, max_hits)
+        return X, mask, trajectories
 
-        sparse_hits = SparseHits(
-            sparse_events,
-            sparse_particles,
-            sparse_layers,
-            sparse_straws,
-            sparse_values,
-            sparse_r_mm,
-            sparse_t0,
-            sparse_hit_pos,
-        )
-
-        # FairShip-style TDC (fdigi) times per hit.
-        fdigi_times = np.zeros(max_hits, dtype=np.float32)
-        if n_hits > 0:
-            v_drift = 0.0033  # cm/ns
-            sigma_spatial = 0.012  # cm
-            c = 29.9792  # cm/ns
-
-            for i in range(n_hits):
-                r_mm_val = float(sparse_hits.r_mm[i])
-                t_MC_val = float(sparse_hits.t0[i])
-                hit_xyz = sparse_hits.hit_pos[i]
-
-                dist_cm = r_mm_val / 10.0
-                dist_smeared = abs(np.random.normal(dist_cm, sigma_spatial))
-                t_drift = dist_smeared / v_drift
-
-                # signal propagation along the (x-oriented) wire to its +x end
-                propagation_time = (self.layer_width - hit_xyz[0]) / c
-                fdigi_times[i] = t_MC_val + t_drift + propagation_time
-
-        return sparse_hits, fdigi_times, n_hits, trajectories
-
-    def _bucket_hits(self, sparse_hits, fdigi_times, n_hits, n_events):
-        """Bucket flat hits into per-event padded ``X (B, M, 5)`` + ``mask (B, M)``.
-
-        Raw per-hit features: ``[station, view, layer_in_view, straw, time]``.
-        """
-        M = self.max_hits_per_event
-        per_station = self.n_views_per_station * self.n_layers_per_view
-
-        X = np.zeros((n_events, M, 5), dtype=np.float32)
-        mask = np.zeros((n_events, M), dtype=np.int32)
-
-        if n_hits > 0:
-            ev = sparse_hits.events[:n_hits].astype(np.int32)
-            la = sparse_hits.layers[:n_hits].astype(np.int32)
-            st = sparse_hits.straws[:n_hits].astype(np.int32)
-            ti = fdigi_times[:n_hits].astype(np.float32)
-
-            valid = (ev >= 0) & (ev < n_events)
-            ev, la, st, ti = ev[valid], la[valid], st[valid], ti[valid]
-
-            order = np.argsort(ev, kind="stable")
-            ev, la, st, ti = ev[order], la[order], st[order], ti[order]
-
-            starts = np.searchsorted(ev, np.arange(n_events), side="left")
-            ends = np.searchsorted(ev, np.arange(n_events), side="right")
-            for e in range(n_events):
-                s, t = int(starts[e]), int(ends[e])
-                k = min(t - s, M)
-                if k <= 0:
-                    continue
-                layer = la[s : s + k]
-                station = layer // per_station
-                rem = layer % per_station
-                view = rem // self.n_layers_per_view
-                layer_in_view = rem % self.n_layers_per_view
-                X[e, :k, 0] = station
-                X[e, :k, 1] = view
-                X[e, :k, 2] = layer_in_view
-                X[e, :k, 3] = st[s : s + k]
-                X[e, :k, 4] = ti[s : s + k]
-                mask[e, :k] = 1
-
-        return X, mask
-
-    def sample_events(self, seed, design, split=None):
+    def sample_events(self, seed, design):
         """Generate events and return a rich dict.
 
         ``design`` is the *physical* (un-encoded) design ``(B, design_dim)`` (or
@@ -553,69 +423,41 @@ class StrawDetector(Detector):
             design = design[None, :]
         n_events = design.shape[0]
 
-        daughter_data, targets = self._sample_daughters(seed, n_events, split)
-        sparse_hits, fdigi_times, n_hits, trajectories = self._run_solver(daughter_data, design)
-        X, mask = self._bucket_hits(sparse_hits, fdigi_times, n_hits, n_events)
+        rng = np.random.default_rng(seed)
+        daughter_data, targets = self.generate_events(rng, n_events)
+        X, mask, trajectories = self._run_solver(daughter_data, design, rng)
 
-        ground_truth = self.encode_ground_truth(
-            daughter_data["masses"],
-            daughter_data["charges"],
-            daughter_data["positions"],
-            daughter_data["momenta"],
-        )
+        # ground_truth (daughter conditioning for generators/LFI) is unimplemented
+        # for the sparse pool -- to be reworked. The regression/BO path uses only
+        # X, mask, targets, so it is unaffected.
         return {
             "X": X,
             "mask": mask,
             "targets": targets,
-            "ground_truth": ground_truth,
+            "ground_truth": None,
             "trajectories": trajectories,
-            "sparse_hits": sparse_hits,
         }
 
-    def __call__(self, seed, design, split=None):
+    def __call__(self, seed, design):
         """Generate events for an un-encoded ``design`` ``(B, design_dim)``.
 
         Returns ``(ground_truth (B, G), measurements (B, M, 5), mask (B, M),
         target (B, 6))``.
         """
-        out = self.sample_events(seed, design, split=split)
+        out = self.sample_events(seed, design)
         return out["ground_truth"], out["X"], out["mask"], out["targets"]
 
     # ------------------------------------------------------------------ #
-    # Design encoding (constrained <-> unconstrained), differentiable
+    # Design encoding (constrained <-> unconstrained) -- abstract; the design
+    # subclass owns the bounds and the encode/decode to N(0,1).
     # ------------------------------------------------------------------ #
     def encode_design(self, design):
-        """Physical design ``[positions(n), angles(n), B]`` -> ``N(0,1)`` space.
-
-        JAX/jittable; accepts ``(design_dim,)`` or ``(B, design_dim)``.
-        """
-        import jax.numpy as jnp
-
-        design = jnp.asarray(design, dtype=jnp.float32)
-        n = self.n_layers
-        pos = design[..., :n]
-        ang = design[..., n : 2 * n]
-        B = design[..., 2 * n : 2 * n + 1]
-
-        pos_e = uniform_to_normal_jax(pos, *self.layer_bounds)
-        ang_e = uniform_to_normal_jax(ang, *self.angle_bounds)
-        B_e = uniform_to_normal_jax(B, 0.0, self.max_B)
-        return jnp.concatenate([pos_e, ang_e, B_e], axis=-1)
+        """Physical design -> ``N(0,1)`` space (defined by the design subclass)."""
+        raise NotImplementedError("encode_design is defined by the design subclass")
 
     def decode_design(self, encoded_design):
-        """Inverse of :meth:`encode_design` (JAX/jittable)."""
-        import jax.numpy as jnp
-
-        enc = jnp.asarray(encoded_design, dtype=jnp.float32)
-        n = self.n_layers
-        pos = enc[..., :n]
-        ang = enc[..., n : 2 * n]
-        B = enc[..., 2 * n : 2 * n + 1]
-
-        pos_d = normal_to_uniform_jax(pos, *self.layer_bounds)
-        ang_d = normal_to_uniform_jax(ang, *self.angle_bounds)
-        B_d = normal_to_uniform_jax(B, 0.0, self.max_B)
-        return jnp.concatenate([pos_d, ang_d, B_d], axis=-1)
+        """``N(0,1)`` -> physical design (defined by the design subclass)."""
+        raise NotImplementedError("decode_design is defined by the design subclass")
 
     # ------------------------------------------------------------------ #
     # Event normalisation
@@ -656,218 +498,61 @@ class StrawDetector(Detector):
     # Combine
     # ------------------------------------------------------------------ #
     def combine(self, X_norm, encoded_design):
-        """Broadcast-concatenate an encoded design onto each normalised hit.
+        """Per-hit design-informed features (all *normalised*, not encoded):
 
-        ``X_norm (B, M, 5)`` + ``encoded_design (design_dim,) | (B, design_dim)``
-        -> ``features (B, M, 5 + design_dim)``. Differentiable w.r.t. both.
-        The hit ``mask`` is applied downstream by the model.
+            [time, norm(layer z), norm(straw y), norm(layer angle), norm(B)]
+
+        Each hit's layer z and view angle are gathered from the **decoded**
+        design at the hit's own (station, view, layer-in-view) -> global layer
+        index; straw y is the hit straw's transverse position. Mirrors
+        :meth:`DebugDetector.combine`: a compact fixed width, differentiable
+        w.r.t. the encoded design through the decode + gather. The hit ``mask``
+        is threaded separately by the caller.
         """
         import jax.numpy as jnp
 
         X_norm = jnp.asarray(X_norm, dtype=jnp.float32)
         B, M, _ = X_norm.shape
 
+        # Recover the raw integer indices that normalize() standardised.
+        means, stds = self._feature_scales()
+        raw = X_norm * jnp.asarray(stds) + jnp.asarray(means)  # [station, view, layer_in_view, straw, time]
+        per_station = self.n_views_per_station * self.n_layers_per_view
+        station = jnp.clip(jnp.round(raw[..., 0]).astype(jnp.int32), 0, self.n_stations - 1)
+        view = jnp.clip(jnp.round(raw[..., 1]).astype(jnp.int32), 0, self.n_views_per_station - 1)
+        layer_in_view = jnp.clip(jnp.round(raw[..., 2]).astype(jnp.int32), 0, self.n_layers_per_view - 1)
+        straw = raw[..., 3]
+        time = X_norm[..., 4]  # the (already standardised) measurement feature
+        layer = station * per_station + view * self.n_layers_per_view + layer_in_view  # (B, M) global layer idx
+
+        # Decode design and gather each hit's own layer geometry.
         d_enc = jnp.asarray(encoded_design, dtype=jnp.float32)
         if d_enc.ndim == 1:
             d_enc = jnp.broadcast_to(d_enc[None, :], (B, d_enc.shape[0]))
-        d_per_hit = jnp.broadcast_to(d_enc[:, None, :], (B, M, d_enc.shape[-1]))
+        positions, angles, B_field = self._decode_to_layer_geometry(d_enc)  # (B,n),(B,n),(B,)
 
-        return jnp.concatenate([X_norm, d_per_hit], axis=-1)
+        z_hit = jnp.take_along_axis(positions, layer, axis=1)  # (B, M)
+        angle_hit = jnp.take_along_axis(angles, layer, axis=1)  # (B, M)
+        # Half-pitch stagger: even layer-in-view -> -h, odd -> +h (matches the C solver).
+        y_stagger = jnp.where((layer_in_view & 1) == 1, 0.5 * self.layer_y_offset, -0.5 * self.layer_y_offset)
+        straw_y = (straw + 0.5) * self.straw_pitch - self.layer_height + y_stagger
 
-    # ------------------------------------------------------------------ #
-    # Current design helpers
-    # ------------------------------------------------------------------ #
-    def get_current_design(self):
-        positions = []
-        angles = []
+        z_mid = 0.5 * (self.layer_bounds[0] + self.layer_bounds[1])
+        z_half = max(0.5 * (self.layer_bounds[1] - self.layer_bounds[0]), 1e-6)
+        a_mid = 0.5 * (self.angle_bounds[0] + self.angle_bounds[1])
+        a_half = max(0.5 * (self.angle_bounds[1] - self.angle_bounds[0]), 1e-6)
+        b_mid = 0.5 * self.max_B
+        b_half = max(0.5 * self.max_B, 1e-6)
 
-        # layer ordering: station -> view -> layer-within-view
-        for z_station in self.station_z:
-            for v in range(self.n_views_per_station):
-                view_base_z = z_station + v * self.view_z_gap
-                ang = self.view_angles[v] if v < len(self.view_angles) else self.view_angles[-1]
-                for l in range(self.n_layers_per_view):
-                    positions.append(view_base_z + l * self.layer_z_gap)
-                    angles.append(ang)
+        norm_z = (z_hit - z_mid) / z_half
+        norm_y = straw_y / self.layer_height
+        norm_angle = (angle_hit - a_mid) / a_half
+        norm_B = jnp.broadcast_to(((B_field - b_mid) / b_half)[:, None], (B, M))
 
-        if len(positions) != self.n_layers:
-            raise RuntimeError(f"current_design_dict produced {len(positions)} layers, expected {self.n_layers}")
+        return jnp.stack([time, norm_z, norm_y, norm_angle, norm_B], axis=-1)
 
-        return {
-            "positions": positions,
-            "angles": angles,
-            "magnetic_strength": float(self.max_B),
-        }
-
-    def get_current_design_array(self):
-        return self.layer_design_to_array(self.get_current_design())
-
-    def get_encoded_current_design(self):
-        return np.asarray(self.encode_design(self.get_current_design_array()), dtype=np.float32)
-
-    # ------------------------------------------------------------------ #
-    # YAML (high-level) design space -- used by the BO outer loop
-    # ------------------------------------------------------------------ #
-    def encode_yaml_design(self, yaml_params):
-        """Encode YAML parameters into the normalized BO search space."""
-        params = []
-
-        station_z = np.array(yaml_params.get("station_z", self.station_z), dtype=np.float32)
-
-        if self.constrain_stereo_angles:
-            if "stereo_angle" in yaml_params:
-                stereo_angle = np.float32(yaml_params["stereo_angle"])
-            elif "view_angles" in yaml_params:
-                angles = yaml_params["view_angles"]
-                stereo_angle = np.float32(angles[1]) if len(angles) > 1 else 0.0
-            else:
-                stereo_angle = np.float32(self.view_angles[1])
-        else:
-            view_angles = np.array(yaml_params.get("view_angles", self.view_angles), dtype=np.float32)
-        layer_z_gap = np.float32(yaml_params.get("layer_z_gap", self.layer_z_gap))
-        view_z_gap = np.float32(yaml_params.get("view_z_gap", self.view_z_gap))
-        max_B = np.float32(yaml_params.get("max_B", self.max_B))
-        B_sigma = np.float32(yaml_params.get("B_sigma", self.B_sigma))
-        z0 = np.float32(yaml_params.get("z0", self.z0))
-
-        if self.optimize_stations:
-            station_z_norm = uniform_to_normal(station_z, *self.layer_bounds)
-            params.append(station_z_norm)
-
-        if self.constrain_stereo_angles:
-            stereo_angle_norm = uniform_to_normal(stereo_angle, 0.0, 0.2)
-            params.append([stereo_angle_norm])
-        else:
-            view_angles_norm = uniform_to_normal(view_angles, -0.2, 0.2)
-            params.append(view_angles_norm)
-
-        if self.optimize_gaps:
-            layer_z_gap_norm = uniform_to_normal(layer_z_gap, 0.5, 10.0)
-            view_z_gap_norm = uniform_to_normal(view_z_gap, 1.0, 20.0)
-            params.append([layer_z_gap_norm])
-            params.append([view_z_gap_norm])
-
-        if self.optimize_bfield:
-            max_B_norm = uniform_to_normal(max_B, 0.0, 1.0)
-            B_sigma_norm = uniform_to_normal(B_sigma, 50.0, 1000.0)
-            z0_norm = uniform_to_normal(z0, *self.layer_bounds)
-            params.append([max_B_norm])
-            params.append([B_sigma_norm])
-            params.append([z0_norm])
-
-        return np.concatenate(params, axis=0)
-
-    def decode_yaml_design(self, encoded):
-        """Decode normalized BO parameters back to YAML physical parameters."""
-        idx = 0
-
-        if self.optimize_stations:
-            n_stations = len(self.station_z)
-            station_z = normal_to_uniform(encoded[idx : idx + n_stations], *self.layer_bounds)
-            idx += n_stations
-        else:
-            station_z = np.array(self.station_z, dtype=np.float32)
-
-        if self.constrain_stereo_angles:
-            stereo_angle = normal_to_uniform(encoded[idx], 0.0, 0.2)
-            idx += 1
-            view_angles = np.array([0.0, stereo_angle, -stereo_angle, 0.0], dtype=np.float32)
-        else:
-            n_angles = len(self.view_angles)
-            view_angles = normal_to_uniform(encoded[idx : idx + n_angles], -0.2, 0.2)
-            idx += n_angles
-
-        if self.optimize_gaps:
-            layer_z_gap = normal_to_uniform(encoded[idx], 0.5, 10.0)
-            idx += 1
-            view_z_gap = normal_to_uniform(encoded[idx], 1.0, 20.0)
-            idx += 1
-        else:
-            layer_z_gap = np.float32(self.layer_z_gap)
-            view_z_gap = np.float32(self.view_z_gap)
-
-        if self.optimize_bfield:
-            max_B = normal_to_uniform(encoded[idx], 0.0, 1.0)
-            idx += 1
-            B_sigma = normal_to_uniform(encoded[idx], 50.0, 1000.0)
-            idx += 1
-            z0 = normal_to_uniform(encoded[idx], *self.layer_bounds)
-        else:
-            max_B = np.float32(self.max_B)
-            B_sigma = np.float32(self.B_sigma)
-            z0 = np.float32(self.z0)
-
-        result = {
-            "station_z": [float(z) for z in station_z],
-            "view_angles": [float(a) for a in view_angles],
-            "layer_z_gap": float(layer_z_gap),
-            "view_z_gap": float(view_z_gap),
-            "max_B": float(max_B),
-            "B_sigma": float(B_sigma),
-            "z0": float(z0),
-        }
-        if self.constrain_stereo_angles:
-            result["stereo_angle"] = float(view_angles[1])
-        return result
-
-    def yaml_to_layer_design(self, yaml_params):
-        """Expand YAML parameters into a per-layer ``{positions, angles, B}`` dict."""
-        positions = []
-        angles = []
-
-        station_z = yaml_params["station_z"]
-        view_angles = yaml_params["view_angles"]
-        layer_z_gap = yaml_params["layer_z_gap"]
-        view_z_gap = yaml_params["view_z_gap"]
-
-        for z_station in station_z:
-            for v in range(self.n_views_per_station):
-                view_base_z = z_station + v * view_z_gap
-                ang = view_angles[v] if v < len(view_angles) else view_angles[-1]
-                for l in range(self.n_layers_per_view):
-                    positions.append(view_base_z + l * layer_z_gap)
-                    angles.append(ang)
-
-        if len(positions) != self.n_layers:
-            raise RuntimeError(f"yaml_to_layer_design produced {len(positions)} layers, " f"expected {self.n_layers}")
-
-        return {
-            "positions": positions,
-            "angles": angles,
-            "magnetic_strength": yaml_params["max_B"],
-        }
-
-    def yaml_to_design_array(self, yaml_params):
-        """YAML parameters -> physical design array ``[positions(n), angles(n), B]``."""
-        return self.layer_design_to_array(self.yaml_to_layer_design(yaml_params))
-
-    def get_current_yaml_design(self):
-        return {
-            "station_z": list(self.station_z),
-            "view_angles": list(self.view_angles),
-            "layer_z_gap": float(self.layer_z_gap),
-            "view_z_gap": float(self.view_z_gap),
-            "max_B": float(self.max_B),
-            "B_sigma": float(self.B_sigma),
-            "z0": float(self.z0),
-        }
-
-    def get_encoded_current_yaml_design(self):
-        yaml_params = self.get_current_yaml_design()
-        enc = self.encode_yaml_design(yaml_params)
-        return np.asarray(enc, dtype=np.float32)
-
-    def yaml_design_shape(self):
-        """Shape of the YAML (BO) design parameter vector."""
-        n_params = 0
-        if self.optimize_stations:
-            n_params += len(self.station_z)
-        if self.constrain_stereo_angles:
-            n_params += 1
-        else:
-            n_params += len(self.view_angles)
-        if self.optimize_gaps:
-            n_params += 2
-        if self.optimize_bfield:
-            n_params += 3
-        return (n_params,)
+    def _decode_to_layer_geometry(self, d_enc):
+        """Encoded design ``(B, design_dim)`` -> per-layer ``(positions(B,n),
+        angles(B,n), B_field(B))``, used by :meth:`combine`. Defined by the
+        design subclass (it owns how the design expands into per-layer geometry)."""
+        raise NotImplementedError("_decode_to_layer_geometry is defined by the design subclass")

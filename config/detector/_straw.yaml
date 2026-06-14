@@ -1,6 +1,6 @@
 straw:
-  # Station z-positions (cm)
-  station_z: [8407.0, 8607.0, 9307.0, 9507.0]
+  # Structural counts (NO nominal design; the design is supplied per-call)
+  n_stations: 4
   n_views_per_station: 4
   n_layers_per_view: 2
   n_straws_per_layer: 200
@@ -8,32 +8,17 @@ straw:
   # Straw geometry
   straw_length: 400.0 # cm
   straw_pitch: 2.0 # cm (centre-to-centre in a layer)
-  layer_x_offset: 1.0 # cm (Layer-2 vs Layer-1 x-offset)
-
-  # View geometry
-  view_angles: [0.0, 0.0798, -0.0798, 0.0] # X, U, X', V (radians, stereo angle = 4.57°)
-  layer_z_gap: 1.732 # cm (between layers in a view)
-  view_z_gap: 5.0 # cm (between consecutive views)
-
-  constrain_stereo_angles: true
-  optimize_stations: false # Freeze station positions
-  optimize_gaps: false # Freeze layer_z_gap and view_z_gap
-  optimize_bfield: false # Freeze max_B, B_sigma, z0
+  layer_y_offset: 1.0 # cm (half-pitch y-stagger between the two layers in a view)
 
   # Physics parameters
   dt: 0.1 #ns
-  max_B: 0.15 # Tesla (maximum magnetic field strength for optimization)
-  z0: 8957.0 # Center of magnetic field (cm)
-  B_sigma: 300.0 # Sigma (width) of magnetic field (cm)
+  max_B: 0.20 # Tesla; peak |Bx| of the FairShip V13_3500 spectrometer field map (on-axis)
+  z0: 8957.0 # Center of magnetic field (cm) = FairShip magnet centre (geometry_config c.z = 89.57 m, map z_local=0)
+  B_sigma: 286.0 # cm; our-form width fit to V13_3500 Bx(z) on-axis (int Bx dz ~ 1.05 T.m)
   layer_bounds: [8200., 9750.] # Valid range for layer z-positions (mm), should encompass all stations
   max_particles: 2 # Accommodate all daughter particles from HNL decay
-  p_spawn_single: 0.0
-  p_spawn_pair: 0.0
-  E_sec_MeV: 0.01
   # Data loading
   data_dir: "selected_data" # "combined_tof"
 
-
-  # Loss function parameters for HNL reconstruction
-  # NOTE: Normalization now uses target_mean and target_std computed from data
-  # The scales below are kept for backward compatibility but not used in loss
+  # Target normalization (decay_mean/decay_sigma, momentum_mean/momentum_sigma)
+  # defaults to data-derived values; omit to use the StrawDetector defaults / data.

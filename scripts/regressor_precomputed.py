@@ -55,9 +55,7 @@ def save_deepset_input_label_hists(measurements_list, targets_list, design, mode
     y = np.concatenate(y_list, axis=0)  # (n_batches*batch, ...) targets
 
     # Normalize targets for visualization
-    target_mean = np.asarray(detector.target_mean)
-    target_std = np.asarray(detector.target_std)
-    y = (y - target_mean) / target_std
+    y = np.asarray(detector.normalize_target(y))
 
     hits_per_event = np.concatenate(hits_per_event_list)  # (n_batches*batch,)
 
@@ -175,16 +173,12 @@ def regress(
 
     design = np.tile(enc, (batch, 1))
 
-    # Extract detector constants to avoid closure capture causing recompilation
-    target_mean = detector.target_mean
-    target_std = detector.target_std
-
     def loss_f(x, c, t, r_params, r_state):
         regressor = nnx.merge(regressor_def, r_params, r_state)
         p = regressor(x, c, deterministic=True)
 
         # DCA
-        p_denorm = p * target_std + target_mean
+        p_denorm = detector.denormalize_predictions(p)
         t_denorm = t
 
         # Extract position and momentum: [x, y, z, px, py, pz]
@@ -206,7 +200,7 @@ def regress(
         # end DCA
 
         # Standard MSE loss on normalized values
-        target_norm = (t - target_mean) / target_std
+        target_norm = detector.normalize_target(t)
         diff = target_norm - p
         mse = jnp.mean(jnp.square(diff), axis=-1)
         mse_loss = jnp.mean(mse)
@@ -221,7 +215,7 @@ def regress(
     def metric_f(x, c, t, r_params, r_state):
         regressor = nnx.merge(regressor_def, r_params, r_state)
         p = regressor(x, c, deterministic=True)
-        target_norm = (t - target_mean) / target_std
+        target_norm = detector.normalize_target(t)
         rmse = jnp.sqrt(jnp.mean(jnp.square(target_norm - p), axis=-1))
         metric = jnp.mean(rmse)
         return metric
@@ -297,7 +291,7 @@ def regress(
             predictions_norm = regressor_merged(measurements, jnp.array(design))
 
             # Denormalize predictions to raw units for visualization
-            predictions = predictions_norm * detector.target_std + detector.target_mean
+            predictions = detector.denormalize_predictions(predictions_norm)
 
             val_loss = metric_f(measurements, design, target, r_params, r_state)
             val_loss_sum += val_loss

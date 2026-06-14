@@ -118,8 +118,8 @@ class FullBudgetTrainer(Trainer):
         # Populate EVERYTHING up front: the whole budget under this single design.
         tp, vp = self.train_pool, self.val_pool
         train_seq, val_seq = data_seq.spawn(2)
-        self._fill_pool(design_phys, design_enc, tp, "train", tp.n_max, train_seq)
-        self._fill_pool(design_phys, design_enc, vp, "val", vp.n_max, val_seq)
+        self._fill_pool(design_phys, design_enc, tp, tp.n_max, train_seq)
+        self._fill_pool(design_phys, design_enc, vp, vp.n_max, val_seq)
         start = jnp.int32(0)
         train_count, val_count = int(tp.n_current), int(vp.n_current)
 

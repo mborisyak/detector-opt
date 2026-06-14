@@ -335,7 +335,6 @@ def train_and_evaluate(
     device = _resolve_device(config.get("device"))
     design_array = np.tile(design.reshape(1, -1), (batch, 1))
     design_array_j = jax.device_put(jnp.asarray(design_array), device=device)
-    target_mean, target_std = detector.target_mean, detector.target_std
 
     # Co-locate model params/state and optimizer state with the kernels.
     r_params = jax.device_put(r_params, device=device)
@@ -351,7 +350,7 @@ def train_and_evaluate(
     def loss_fn(x, c, t, params, state):
         reg = nnx.merge(regressor_def, params, state)
         pred = reg(x, c, deterministic=True)
-        target_norm = (t - target_mean) / target_std
+        target_norm = detector.normalize_target(t)
         mse = jnp.mean(jnp.square(target_norm - pred))
         _, _, state = nnx.split(reg, nnx.Param, nnx.Variable)
         return mse, state
@@ -388,7 +387,7 @@ def train_and_evaluate(
             info, tgt = inputs
             reg = nnx.merge(regressor_def, params, state)
             pred = reg(info, design_array_j, deterministic=True)
-            target_norm = (tgt - target_mean) / target_std
+            target_norm = detector.normalize_target(tgt)
             mse = jnp.mean(jnp.square(target_norm - pred))
             return None, mse
 
@@ -645,7 +644,7 @@ def train_and_evaluate(
             configurations=c,
         )
         pred = reg(measurements, jnp.array(c), deterministic=True)
-        target_norm = (target - target_mean) / target_std
+        target_norm = detector.normalize_target(target)
         mse_per_event = jnp.mean(jnp.square(target_norm - pred), axis=-1)
         val_per_sample.extend(np.asarray(mse_per_event).tolist())
     val_loss = float(np.mean(val_per_sample))

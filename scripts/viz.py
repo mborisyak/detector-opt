@@ -1,373 +1,143 @@
-import os
+"""Fire the straw detector and save a few visualisations.
 
-import jax
-import jax.numpy as jnp
+New Detector contract (detector-spec.md): events come from
+``detector.sample_events(seed, design)`` ->
+``{ground_truth, X, mask, targets, trajectories}`` where ``X`` is the dense
+padded ``(B, M, 5)`` hit array ``[station, view, layer_in_view, straw, time]``
+and ``mask`` marks the real hits. No sparse containers, no splits, no state.
+
+Run headless:  ``python scripts/viz.py [ship2numpy.npz] [out_dir]``
+"""
+
+import os
+import sys
+import time
+
+import matplotlib
+
+matplotlib.use("Agg")  # headless: save figures, never block
 import matplotlib.pyplot as plt
 import numpy as np
 
 import detopt
 
-# NOTE: partially ported to the new Detector contract (detector-spec.md).
-# Event generation now goes through detector.sample_events(seed, design) ->
-# {ground_truth, X, mask, targets, trajectories, sparse_hits}. Visualisation that
-# assumed the old ragged per-hit layout may still need adjustment.
 
-
-def viz(seed=123, design="data/design/default.json", use_root_particles=False, **config):
-    batch = 2
-    detector = detopt.detector.from_config(config["detector"])
-    enc = detector.get_encoded_current_design()
-    enc = enc.reshape(1, -1)
-    enc = np.tile(enc, (batch, 1))
-    print(enc.shape)
-    input("wait enc")
-
-    if True:
-        _ev = detector.sample_events((seed, 1, 1, 0), enc)
-        initial = _ev["ground_truth"]
-        measurements = _ev["X"]
-        target = _ev["targets"]
-        trajectories = _ev["trajectories"]
-        hits = _ev["sparse_hits"]
-        print(initial.shape)
-        input("wait init")
-        print(detector.decode_ground_truth(initial))
-        masses, charges, initial_positions, initial_momentum = detector.decode_ground_truth(initial)
-        print(masses, masses.shape)
-        input("wait masses")
-
-        for ev_idx in range(masses.shape[0]):  # Show first 3 events
-            n_particles = np.sum(masses[ev_idx] > 0)
-            print(f"Number of particles: {n_particles}")
-
-            if n_particles > 0:
-                print(
-                    f"\n{'Idx':<4} {'Mass (MeV)':<12} {'Charge':<8} {'Position (x,y,z) [cm]':<35} {'Momentum (px,py,pz) [GeV/c]'}"
-                )
-                print("-" * 110)
-                for i in range(min(n_particles, 10)):  # Show first 10 particles
-                    mass = masses[ev_idx][i]
-                    charge = charges[ev_idx][i]
-                    print(initial_positions.shape)
-                    # input("wait pos")
-                    pos = initial_positions[ev_idx][i]
-                    mom = initial_momentum[ev_idx][i]
-                    print(pos)
-                    print(
-                        f"{i:<4} {mass:<12.2f} {charge:+.1f}     ({pos[0] / 10:8.2f},{pos[1] / 10:8.2f},{pos[2] / 10:8.2f})  ({mom[0]:7.4f},{mom[1]:7.4f},{mom[2]:7.4f})"
-                    )
-
-                if n_particles > 10:
-                    print(f"... and {n_particles - 10} more particles")
-
-        print(f"\n{'=' * 80}\n")
-
-        layers, angles, widths, heights, Bs = detector.get_design(enc)
-
-        # Debug: check sparse_hits type
-        # print(f"DEBUG: sparse_hits type = {type(sparse_hits)}")
-        # print(f"DEBUG: sparse_hits = {sparse_hits}")
-        # from detopt.detector.straw import SparseHits
-
-        # print(f"DEBUG: isinstance check = {isinstance(sparse_hits, SparseHits)}")
-
-        # Visualize all events overlaid together
-        # print(f"\n{'=' * 80}")
-        # print(f"Visualizing ALL {masses.shape[0]} Events Overlaid")
-        # print(f"{'=' * 80}")
-
-        print(layers, trajectories.shape, masses.shape)
-        input("wait lay")
-        mask = [[]]
-        detopt.utils.viz.straw.show(
-            layers[0],
-            angles[0],
-            widths[0],
-            heights[0],
-            hits,
-            masses,
-            trajectories,  # Show first event's trajectories (or could show all)
-            mask=mask[0],
-            n_particles=detector.max_particles,
-            n_straws=detector.n_straws,
-        )
-
-        # --- Plot all waveforms on the same canvas without normalization ---
-        import matplotlib.cm as cm
-
-        # Draw a separate canvas for each station, visualizing only the layers belonging to that station
-        n_stations = detector.n_stations
-        n_views_per_station = detector.n_views_per_station
-        n_layers_per_view = detector.n_layers_per_view
-        layers_per_station = n_views_per_station * n_layers_per_view
-
-        # for station in range(n_stations):
-        #     plt.figure()
-        #     for key, (t, s) in waveforms.items():
-        #         layer = key[2]
-        #         this_station = layer // layers_per_station
-        #         if this_station == station:
-        #             plt.plot(t, s, label=f"event={key[0]}, particle={key[1]}, layer={layer}, straw={key[3]}")
-        #     plt.xlabel("Time [ns]")
-        #     plt.ylabel("Signal [Coulombs]")
-        #     plt.title(f"Straw hit waveforms for Station {station+1} (not normalized)")
-        #     # plt.legend(fontsize='x-small', ncol=2)
-        #     plt.show()
-
-        # --- Plot histogram of FairShip-style fdigi_times per station (stacked) ---
-        _, layers, straws, fdigi_times = measurements
-
-        plt.figure()
-        plt.hist(np.asarray(fdigi_times, dtype=float), bins=50, alpha=0.7)
-        plt.xlabel("TDC time [ns]")
-        plt.ylabel("Counts")
-        plt.title("Histogram of FairShip-style TDC times")
-        plt.show()
-
-        print(fdigi_times.shape)
-        input("f")
-        tdc_by_station = [[] for _ in range(n_stations)]
-        for i in range(len(fdigi_times)):
-            layer = layers[i]
-            station = layer // layers_per_station
-            tdc_by_station[station].append(fdigi_times[i])
-        plt.figure()
-        # Only include stations with hits
-        tdc_data = [tdc_by_station[station] for station in range(n_stations) if tdc_by_station[station]]
-        labels = [f"Station {station + 1}" for station in range(n_stations) if tdc_by_station[station]]
-        plt.hist(tdc_data, bins=50, stacked=True, label=labels, alpha=0.7)  #
-        plt.xlabel("TDC time [ns]")
-        plt.ylabel("Counts")
-        plt.title("Stacked histogram of FairShip-style TDC times per station")
-        plt.legend()
-        plt.show()
-
-        # # --- Compute and plot histogram of TDC times per station ---
-        # from detopt.detector.straw_signal import compute_tdc_times
-        # tdc_times = compute_tdc_times(
-        #     waveforms, t0_arr, r_mm,
-        #     straw_length=detector.straw_length,
-        #     v_wire=0.2,  # mm/ns, adjust as needed
-        #     t0_event=0.0
-        # )
-        # tdc_by_station = [[] for _ in range(n_stations)]
-        # for key, fdigi in tdc_times.items():
-        #     layer = key[2]
-        #     station = layer // layers_per_station
-        #     tdc_by_station[station].append(fdigi)
-        # plt.figure()
-        # # Only include stations with hits
-        # tdc_data = [tdc_by_station[station] for station in range(n_stations) if tdc_by_station[station]]
-        # labels = [f"Station {station+1}" for station in range(n_stations) if tdc_by_station[station]]
-        # plt.hist(tdc_data, bins=50, stacked=True, label=labels, alpha=0.7)
-        # plt.xlabel("TDC time [ns]")
-        # plt.ylabel("Counts")
-        # plt.title("Stacked histogram of TDC times per station")
-        # plt.legend()
-        # plt.show()
-
-    # configs already defined above for visualization
-    import time
-
-    n_trials = 1
-    start_time = time.perf_counter()
-    for i in range(n_trials):
-        _ = detector(1, configs)
-    runtime = time.perf_counter() - start_time
-    events_per_second_single_core = n_trials * n_batch / runtime
-    print(f"events per second: {events_per_second_single_core}")
-
-    from concurrent.futures import ThreadPoolExecutor
-
-    n_cores = 1  # os.cpu_count()
-    start_time = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=n_cores) as executor:
-        futures = [executor.submit(detector, 1, configs) for _ in range(n_trials)]
-
-        for future in futures:
-            _ = future.result()
-
-    runtime = time.perf_counter() - start_time
-    events_per_second_multi_core = n_trials * n_batch / runtime
-    print(
-        f"events per second: {events_per_second_multi_core} "
-        f"(eff. {events_per_second_multi_core / events_per_second_single_core / n_cores})"
-    )
-
-    v0s = list()
-    ys = list()
-    for i in range(1):
-        _, _, _, v0, trajectories, response, signal = detector.sample(seed=i, design=configs)
-        v0s.append(v0)
-        ys.append(signal)
-        # print(i, end='\n')
-        # print( *response, *signal, sep='\n', end='\n\n')
-
-    v0s = np.concatenate(v0s, axis=0)
-    ys = np.concatenate(ys, axis=0)
-
-    ns = np.sum(np.sum(np.square(v0s), axis=-1) > 1.0e-3, axis=-1)
-
-    plt.hist([ns[ys > 0.5], ns[ys < 0.5]], bins=7, label=["signal", "noise"], histtype="step")
-    plt.title("Number of trajectories per event")
-    plt.legend()
-    plt.savefig("straw-events.png")
-    plt.close()
-
-    _, _, _, _, trajectories, response, signal = detector.sample(seed=seed, design=configs)
-    layers, angles, widths, heights, Bs, Ls = detector.get_design(design=configs)
-
-    # print(layers, angles, widths, heights, Bs, Ls, sep='  \n\n')
-    # Bs, Ls - easy
-    # angles - easy
-    #
-
-    print(response.shape)
-    plt.matshow(response[0].T)
-    plt.colorbar()
-    plt.show()
-    plt.close()
-
-    detopt.utils.viz.straw.show(
-        layers[0],
-        angles[0],
-        widths[0],
-        heights[0],
-        response[0],
-        trajectories[0],
-        signal[0],
-        threshold=0.3,
+def _build_detector(data_path):
+    return detopt.detector.FreeStrawDetector(
+        n_stations=4,
+        n_views_per_station=4,
+        n_layers_per_view=2,
+        n_straws_per_layer=200,
+        straw_pitch=2.0,
+        straw_length=400.0,
+        max_B=0.15,
+        B_sigma=300.0,
+        z0=8957.0,
+        layer_bounds=(8200.0, 9750.0),
+        max_particles=64,
+        data_dir=data_path,
+        # the three "easy" physics processes, on so the plots show their effect
+        lambda_conv_cm=50.0,
+        enable_decay=True,
+        noise_rate=3.0,
     )
 
 
-def compare(
-    design,
-    reference="data/design/default.json",
-    report="designs.png",
-    aux=None,
-    seed=123456789,
-    **config,
-):
-    import json
+def _hit_world(detector, X, mask, design):
+    """Map dense hits to world coords for the event display.
 
-    import matplotlib.pyplot as plt
+    Returns ``(z, y, station)`` arrays for the masked hits of one event:
+    the hit's layer z (from the design) and its straw transverse position.
+    """
+    m = mask.astype(bool)
+    station = X[m, 0].astype(int)
+    view = X[m, 1].astype(int)
+    layer_in_view = X[m, 2].astype(int)
+    straw = X[m, 3]
+    per_station = detector.n_views_per_station * detector.n_layers_per_view
+    layer = station * per_station + view * detector.n_layers_per_view + layer_in_view
+    positions = np.asarray(design[: detector.n_layers], dtype=np.float32)
+    z = positions[np.clip(layer, 0, detector.n_layers - 1)]
+    y_stagger = np.where(layer_in_view & 1, 0.5 * detector.layer_y_offset, -0.5 * detector.layer_y_offset)
+    y = (straw + 0.5) * detector.straw_pitch - detector.layer_height + y_stagger
+    return z, y, station
 
-    detector: detopt.detector.StrawDetector = detopt.detector.from_config(config["detector"])
-    L = detector.L
-    W = detector.layer_width
-    H = detector.layer_height
 
-    with open(design, "r") as f:
-        design = json.load(f)
+def _event_display(detector, out, X, mask, trajectories, design, n_events=3):
+    positions = np.asarray(design[: detector.n_layers], dtype=np.float32)
+    for ev in range(min(n_events, X.shape[0])):
+        if mask[ev].sum() == 0:
+            continue
+        fig, ax = plt.subplots(figsize=(9, 5))
+        # layer planes
+        for zc in positions:
+            ax.axvline(zc, color="0.85", lw=0.6, zorder=0)
+        # hits, coloured by station
+        z, y, station = _hit_world(detector, X[ev], mask[ev], design)
+        sc = ax.scatter(z, y, c=station, cmap="tab10", vmin=0, vmax=9, s=10, zorder=3)
+        # daughter trajectories (z vs y), drop padded (all-zero) steps
+        traj = trajectories[ev]  # (max_particles, n_t, 3)
+        for p in range(traj.shape[0]):
+            pts = traj[p]
+            live = np.abs(pts).sum(axis=1) > 0
+            if live.sum() > 1:
+                ax.plot(pts[live, 2], pts[live, 1], lw=0.7, alpha=0.6, zorder=2)
+        ax.set_xlabel("z [cm]")
+        ax.set_ylabel("transverse y [cm]")
+        ax.set_title(f"Event {ev}: {int(mask[ev].sum())} hits")
+        fig.colorbar(sc, ax=ax, label="station")
+        fig.tight_layout()
+        path = os.path.join(out, f"viz_event_{ev}.png")
+        fig.savefig(path, dpi=130)
+        plt.close(fig)
+        print(f"  wrote {path}")
 
-    rng = np.random.default_rng(seed)
 
-    with open(reference, "r") as f:
-        reference = json.load(f)
-
-    pos = np.array(design["positions"])
-    pos_ref = np.array(reference["positions"])
-
-    angles = np.array(design["angles"])
-    angles_ref = np.array(reference["angles"])
-
-    B = design["magnetic_strength"]
-    B_ref = reference["magnetic_strength"]
-
-    ys = np.array([-H, H])[:, None] + 0 * pos[None, :]
-    xs = np.array([-W, W])[:, None] + 0 * pos[None, :]
-
-    zs = np.linspace(-5, 5, num=128)
-    Bs_ref = B_ref * np.exp(-np.square(zs / L))
-    Bs = B * np.exp(-np.square(zs / L))
-    max_B = max(np.max(Bs_ref), np.max(Bs))
-
-    def sample(d, n):
-        encoded = detector.encode_design(d)
-        configs = np.broadcast_to(encoded[None], shape=(n, *encoded.shape))
-        _, _, _, _, trajectories, response, signal = detector.sample(seed=seed, design=configs)
-        return trajectories
-
-    fig = plt.figure(figsize=(12, 6))
-    axes = fig.subplots(2, 2)
-
-    traj = sample(reference, 32)
-
-    ax = axes[0, 0]
-    ax.set_title("default design (side view)")
-    ax.plot(np.stack([pos_ref, pos_ref]), ys, color=plt.cm.tab10(0))
-    twin = ax.twinx()
-    twin.plot(zs, Bs_ref, color="black")
-    twin.set_ylim([-0.05, 1.05 * max_B])
-    twin.set_ylabel("magnetic field, $B_x$")
-
-    for i in range(traj.shape[0]):
-        ax.plot(traj[i, 0, :, 2], traj[i, 0, :, 1], color=plt.cm.tab10(0), alpha=0.15)
-        ax.plot(traj[i, 1, :, 2], traj[i, 1, :, 1], color=plt.cm.tab10(0), alpha=0.15)
-
-    ax.set_ylim([-1.25 * H, 1.25 * H])
-    ax.set_xlim([-6.0, 6.0])
-    ax.set_ylabel("y-axis")
-    ax.set_xlabel("z-axis")
-
-    ax = axes[0, 1]
-    ax.bar(
-        pos_ref,
-        angles_ref + np.pi / 3,
-        width=0.05,
-        color=plt.cm.tab10(0),
-        bottom=-np.pi / 3,
-    )
-    ax.plot([-6.0, 6.0], [0.0, 0.0], color="black", linestyle="--")
-    ax.set_ylim([-np.pi / 3, np.pi / 3])
-    ax.set_xlim([-6.0, 6.0])
-
-    ax.set_ylabel("layer's angle")
-    ax.set_xlabel("z-axis")
-
-    ax = axes[1, 0]
-    ax.set_title("optimized design (side view)")
-    ax.plot(np.stack([pos, pos]), ys, color=plt.cm.tab10(1))
-    twin = ax.twinx()
-    twin.plot(zs, Bs, color="black")
-    twin.set_ylim([-0.05, 1.05 * max_B])
-    twin.set_ylabel("magnetic field, $B_x$")
-
-    traj = sample(design, 32)
-    for i in range(traj.shape[0]):
-        ax.plot(traj[i, 0, :, 2], traj[i, 0, :, 1], color=plt.cm.tab10(1), alpha=0.15)
-        ax.plot(traj[i, 1, :, 2], traj[i, 1, :, 1], color=plt.cm.tab10(1), alpha=0.15)
-
-    ax.set_ylim([-1.25 * H, 1.25 * H])
-    ax.set_xlim([-6.0, 6.0])
-    ax.set_ylabel("y-axis")
-    ax.set_xlabel("z-axis")
-
-    ax = axes[1, 1]
-    ax.bar(pos, angles + np.pi / 3, width=0.05, color=plt.cm.tab10(1), bottom=-np.pi / 3)
-    ax.plot([-6.0, 6.0], [0.0, 0.0], color="black", linestyle="--")
-    ax.set_ylim([-np.pi / 3, np.pi / 3])
-    ax.set_xlim([-6.0, 6.0])
-
-    ax.set_ylabel("layer's angle")
-    ax.set_xlabel("z-axis")
-
+def _tdc_histogram(out, X, mask):
+    times = X[..., 4][mask.astype(bool)]
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.hist(np.asarray(times, dtype=float), bins=60, alpha=0.8)
+    ax.set_xlabel("TDC time [ns]")
+    ax.set_ylabel("counts")
+    ax.set_title(f"FairShip-style TDC times ({times.size} hits)")
     fig.tight_layout()
-    fig.savefig(report)
+    path = os.path.join(out, "viz_tdc.png")
+    fig.savefig(path, dpi=130)
     plt.close(fig)
+    print(f"  wrote {path}")
 
-    if aux is not None:
-        checkpointer = detopt.utils.io.get_checkpointer(aux)
-        aux = detopt.utils.io.restore_aux(checkpointer)
 
-    losses = aux["regressor"]["validation"]
-    mean = np.mean(losses[-1])
-    std = np.std(losses[-1])
-    error = std / np.sqrt(1 + np.prod(losses.shape[1:]))
-    print(f"{mean:.3f} +- {error:.3f}")
+def main(data_path="ship2numpy.npz", out="output/viz", seed=123, batch=256):
+    os.makedirs(out, exist_ok=True)
+    detector = _build_detector(data_path)
+    print(f"detector: {detector.n_events} source events, boundary_z={detector.boundary_z} cm")
+
+    import yaml
+
+    nd = yaml.safe_load(open("config/detector/straw.yaml"))["nominal_design"]
+    design = detopt.detector.free_design_array(
+        nd["station_z"], n_layers_per_view=detector.n_layers_per_view,
+        view_angles=nd["view_angles"], view_z_gap=nd["view_z_gap"],
+        layer_z_gap=nd["layer_z_gap"], B=nd["B"],
+    )
+    designs = np.tile(design[None, :], (batch, 1)).astype(np.float32)
+
+    out_dict = detector.sample_events(seed, designs)
+    X, mask = np.asarray(out_dict["X"]), np.asarray(out_dict["mask"])
+    trajectories = np.asarray(out_dict["trajectories"])
+    print(f"generated {batch} events, mean {mask.sum(1).mean():.1f} hits/event, " f"{int((mask.sum(1) > 0).sum())} with hits")
+
+    _event_display(detector, out, X, mask, trajectories, design)
+    _tdc_histogram(out, X, mask)
+
+    # quick throughput number
+    t0 = time.perf_counter()
+    detector(seed + 1, designs)
+    dt = time.perf_counter() - t0
+    print(f"throughput: {batch / dt:.0f} events/s ({dt * 1e3:.0f} ms for {batch} events)")
 
 
 if __name__ == "__main__":
-    import gearup
-
-    gearup.gearup(viz=viz, compare=compare).with_config("config/config.yaml")()
+    data = sys.argv[1] if len(sys.argv) > 1 else "ship2numpy.npz"
+    out_dir = sys.argv[2] if len(sys.argv) > 2 else "output/viz"
+    main(data, out_dir)

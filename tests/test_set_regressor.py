@@ -54,8 +54,8 @@ def test_set_regressor_is_detector_agnostic(seed):
 
 def test_set_regressor_factory_from_detector(seed):
     """``detopt.nn.from_config`` builds a SetRegressor from the detector."""
-    detector = detopt.detector.StrawDetector(
-        station_z=[8407.0, 8607.0, 9307.0, 9507.0],
+    detector = detopt.detector.FreeStrawDetector(
+        n_stations=4,
         n_views_per_station=4,
         n_layers_per_view=2,
         n_straws_per_layer=200,
@@ -64,10 +64,6 @@ def test_set_regressor_factory_from_detector(seed):
         B_sigma=300.0,
         z0=8957.0,
         layer_bounds=(8200.0, 9750.0),
-        constrain_stereo_angles=True,
-        optimize_stations=True,
-        optimize_gaps=True,
-        optimize_bfield=True,
     )
     rngs = nnx.Rngs(seed)
     reg = detopt.nn.from_config(

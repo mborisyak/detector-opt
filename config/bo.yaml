@@ -1,7 +1,32 @@
-# Extended-budget BO run on the self-generating debug detector, warm-starting
-# each design's network from the nearest previously trained design.
+# Extended-budget BO run on the stereo straw detector over the FairShip ship2numpy
+# events, warm-starting each design's network from the nearest previously trained one.
 detector:
-  debug: {}
+  stereo_straw:
+    n_stations_upstream: 2    # stations upstream of the magnet (z < z0)
+    n_stations_downstream: 2  # stations downstream of the magnet (z > z0)
+    n_layers_per_view: 2
+    n_straws_per_layer: 200
+    straw_length: 400.0
+    straw_pitch: 2.0
+    layer_z_gap: 1.732
+    view_z_gap: 5.0
+    magnet_half_cm: 140.0  # exclude the spectrometer magnet (FairShip YokeDepth 1.4 m) from station bounds
+    max_B: 0.20            # T; peak |Bx| of FairShip V13_3500 spectrometer field map (on-axis)
+    z0: 8957.0             # magnet centre (FairShip c.z = 89.57 m, map z_local=0)
+    B_sigma: 286.0         # cm; our-form width fit to the V13_3500 Bx(z) on-axis profile (int Bx dz ~ 1.05 T.m)
+    layer_bounds: [8200.0, 9750.0]
+    max_particles: 2
+    max_dt: 1.0
+    max_time: 300.0
+    material: kapton
+    data_dir: "data/mc"  # 36k events across the 50 files; boundary crossings are upstream of the magnet (magnet-independent)
+
+# Nominal (initial/baseline) design -- NOT detector state. Read by scripts to build a
+# concrete design via detopt.detector.stereo_design_array (BO itself seeds from random proposals).
+nominal_design:
+  station_z: [8407.0, 8607.0, 9307.0, 9507.0]
+  stereo_angle: 0.0798
+  B: 0.20
 
 regressor:
   set-ensemble-regressor:
@@ -28,7 +53,7 @@ training:
   val_fraction: 0.25
   # Convergence: per-epoch-slope flatness tol, target loss precision, plateau window.
   flatness_tol: 1.0
-  loss_precision: 2.0e-2
+  loss_precision: 2.5e-2
   patience: 32
   optimizer:
     adamw:

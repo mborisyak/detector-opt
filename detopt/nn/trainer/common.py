@@ -271,7 +271,7 @@ class Trainer:
     # ------------------------------------------------------------------ #
     # Event sampling -- the only place the detector is called.
     # ------------------------------------------------------------------ #
-    def _fill_pool(self, design_phys, design_enc, pool, split, n_to_add, seed_seq):
+    def _fill_pool(self, design_phys, design_enc, pool, n_to_add, seed_seq):
         """Generate ``n_to_add`` events at ``design_phys`` and append them.
 
         The detector is called with the *physical* design; the stored per-event
@@ -285,7 +285,7 @@ class Trainer:
             k = min(chunk, n_to_add - added)
             phys_b = np.broadcast_to(design_phys[None, :], (k, design_phys.shape[0]))
             enc_b = np.broadcast_to(design_enc[None, :], (k, design_enc.shape[0]))
-            _gt, X, mask, targets = self.detector(seed_seq.spawn(1)[0], phys_b, split=split)
+            _gt, X, mask, targets = self.detector(seed_seq.spawn(1)[0], phys_b)
             pool.append(X, mask, targets, enc_b)
             added += k
 
@@ -307,9 +307,9 @@ class Trainer:
         if n_train > tp.n_max - tp.n_current or n_val > vp.n_max - vp.n_current:
             return None
         train_seq, val_seq = seed_seq.spawn(2)
-        self._fill_pool(design_phys, design_enc, tp, "train", n_train, train_seq)
+        self._fill_pool(design_phys, design_enc, tp, n_train, train_seq)
         if n_val > 0:
-            self._fill_pool(design_phys, design_enc, vp, "val", n_val, val_seq)
+            self._fill_pool(design_phys, design_enc, vp, n_val, val_seq)
         return n_train
 
     # ------------------------------------------------------------------ #

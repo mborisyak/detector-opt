@@ -2,6 +2,7 @@
 #include <Python.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <stdio.h>
 
 #define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
@@ -46,6 +47,196 @@ static inline uint32_t xorshift32_next(uint32_t *state) {
 static inline float rand01(uint32_t *state) {
   uint32_t r = xorshift32_next(state);
   return (float)(r >> 8) * (1.0f / 16777216.0f);
+}
+
+/* Per-solve() configuration + mutable dense output, threaded by pointer rather
+ * than via file-scope statics: solve() runs under Py_BEGIN_ALLOW_THREADS, so
+ * globals would be non-reentrant. Built once in solve(); passed (const) to
+ * track_particle / dense_record, which only mutate the buffers it points at. */
+/* Immutable simulation settings, constant for the whole solve() call. Per-step
+ * dt is 0.9x the sagitta-bounded ceiling (chord-vs-arc error < straw resolution),
+ * clamped to max_dt; a fixed `dt` (>0) overrides it. max_time caps total flight
+ * time so trapped/curling tracks terminate. The trajectory buffer is sampled
+ * evenly in time at step_t = max_time / n_traj (decoupled from the physics step). */
+typedef struct {
+  float max_dt, max_time, step_t;
+  int n_traj;
+  // Extra physics processes (all default off; baseline behaviour unchanged).
+  float lambda_conv_cm;  // photon conversion length (cm); <=0 disables gamma->e+e-
+  int enable_decay;      // charged pi/K decay-in-flight on/off
+  float noise_rate;      // mean uncorrelated noise hits per event; <=0 disables
+  // Secondary production in the thin straw wall, computed per hit from these
+  // energy-INDEPENDENT material constants x the track's (z, beta, gamma):
+  //   delta-ray rate ~ delta_const*(z^2/beta^2)*(1/Tcut - 1/Tmax)
+  //   pair/brems     ~ 1 / lambda_conv_cm   (asymptotic, energy-independent)
+  // delta_const = (K/2)(Z/A)rho [MeV/cm]; t_wall = straw wall thickness (cm, the
+  // track crosses 2 per hit); delta_Tcut = delta-ray tracking threshold (MeV).
+  float delta_const, t_wall, delta_Tcut;
+  // Multiple-scattering material budget per layer crossing (x/X0, dimensionless);
+  // <=0 disables the Highland kick (baseline clean tracks).
+  float scatter_xX0;
+  // Per-layer y-stagger (cm): straw centres in layer-in-view i are shifted by
+  // -layer_y_offset/2 (i even) or +layer_y_offset/2 (i odd) -- the half-pitch
+  // brick-laying that covers tube cusps and breaks left/right drift ambiguity.
+  float layer_y_offset;
+  // Integration caps / recursion / hit-buffer layout.
+  npy_float dt_fixed;    // fixed-step override (>0); 0 -> adaptive per-step dt
+  int n_steps;           // physics-loop safety cap (the loop is time-bounded)
+  int max_depth, max_particles;
+  int n_views, n_lpv, M; // decompose the global layer index + per-event hit cap
+} SimConfig;
+
+/* Per-event detector geometry (immutable during tracking). The layer arrays are
+ * batch-wide and indexed by event via their strides; z0_field/B_sigma/B are this
+ * event's field (peak z, Gaussian width, strength). */
+typedef struct {
+  const npy_float *layers, *heights, *widths, *angles;
+  npy_intp ls0, ls1, hs0, hs1, ws0, ws1, as0, as1;
+  int n_layers, n_straws;
+  npy_float z0_field, B_sigma, B;
+} Geometry;
+
+/* Mutable dense output, written in place: padded (n, M, 5) hits + (n, M) mask
+ * (counts[event] is the per-event write cursor) and the (n, max_particles,
+ * n_traj, 3) trajectory viz buffer (NULL to skip). */
+typedef struct {
+  npy_float *X;
+  int *mask;
+  int *counts;
+  npy_float *trajectories;
+  npy_intp trs0, trs1, trs2, trs3;
+  // Per-event O(1) dedup indicator: fired[global_layer*fired_stride + straw] != 0
+  // iff that straw already recorded a hit this event. Scratch; sparse-cleared
+  // after each event by walking its hits (no per-event memset).
+  uint8_t *fired;
+  int fired_stride;  // = n_straws
+} HitBuffers;
+
+/* Append one dense hit for an event (with per-(event,straw) dedup); returns 1 if
+ * written/already-present (i.e. a real hit exists), 0 only if the buffer is full. */
+static inline int dense_record(const SimConfig *cfg, HitBuffers *out, int event_idx, int k, int straw_i, float fdigi) {
+  const int per_station = cfg->n_views * cfg->n_lpv;
+  const int station = (per_station > 0) ? k / per_station : 0;
+  const int rem = (per_station > 0) ? k % per_station : 0;
+  const int view = (cfg->n_lpv > 0) ? rem / cfg->n_lpv : 0;
+  const int lpv = (cfg->n_lpv > 0) ? rem % cfg->n_lpv : 0;
+  // O(1) dedup: has this (global layer, straw) already fired in this event?
+  const npy_intp fi = (npy_intp)k * out->fired_stride + straw_i;
+  if (out->fired[fi]) return 0;  // already present -> not a new hit (skip re-record / re-spawn)
+
+  const int count = out->counts[event_idx];
+  if (count >= cfg->M) return 0;  // event buffer full
+  out->fired[fi] = 1;  // set only on an actual record, so the clear can walk the hit list
+  const npy_intp base = (npy_intp)event_idx * cfg->M * 5 + (npy_intp)count * 5;
+  out->X[base + 0] = (npy_float)station;
+  out->X[base + 1] = (npy_float)view;
+  out->X[base + 2] = (npy_float)lpv;
+  out->X[base + 3] = (npy_float)straw_i;
+  out->X[base + 4] = fdigi;
+  out->mask[(npy_intp)event_idx * cfg->M + count] = 1;
+  out->counts[event_idx] = count + 1;
+  return 1;
+}
+
+/* Proper decay length c*tau (cm) for the chargeable, in-flight-decaying
+ * species, keyed by mass (MeV). Returns 0 for stable / neutral / unknown
+ * particles (no decay-in-flight applied). */
+static inline float ctau_cm_for_mass(npy_float mass_mev) {
+  if (f32_abs(mass_mev - 139.57f) < 1.0f) return 780.4f; /* pi+- */
+  if (f32_abs(mass_mev - 493.68f) < 2.0f) return 371.2f; /* K+-  */
+  return 0.0f;
+}
+
+/* FairShip-matched constants (see ../FairShip): speed of light and straw
+ * digitisation. v_drift = 1/(30 ns/mm) and sigma_spatial come straight from
+ * geometry_config.py; the TDC formula matches strawtubesHit.cxx. */
+#define C_CM_PER_NS 29.9792458f
+#define STRAW_VDRIFT 0.0033333333f   /* cm/ns */
+#define STRAW_SIGMA_SPATIAL 0.012f   /* cm    */
+#define MASS_E 0.511f                /* electron mass (MeV/c^2) */
+#define MASS_MU 105.66f              /* muon mass (MeV/c^2) */
+#define K_BORIS 44.937759f           /* 0.5e-9 * e[C] / (MeV/c^2 in kg); see track_particle */
+
+/* Standard normal via Box-Muller (one of the pair). */
+static inline float rand_normal(uint32_t *state, float mean, float sigma) {
+  float u1 = rand01(state);
+  float u2 = rand01(state);
+  if (u1 < 1e-12f) u1 = 1e-12f;
+  const float z = sqrtf(-2.0f * logf(u1)) * cosf(2.0f * (float)M_PI * u2);
+  return mean + sigma * z;
+}
+
+/* Highland multiple-scattering kick applied once per layer crossing. The track's
+ * velocity direction is deflected by two independent Gaussian angular kicks (the
+ * two transverse axes), each with RMS
+ *   theta0 = (13.6 MeV / (beta * p)) * |q| * sqrt(x/X0) * [1 + 0.038 ln(x/X0)]
+ * (PDG), with p the momentum magnitude (MeV/c) and x/X0 the layer material
+ * budget. Speed |v| (= beta) is conserved -- scattering rotates the direction,
+ * not its magnitude. Off when scatter_xX0 <= 0 (baseline behaviour unchanged). */
+static inline void apply_scatter(uint32_t *state, npy_float xX0, npy_float charge,
+                                 npy_float p_mag, npy_float beta,
+                                 npy_float *vx, npy_float *vy, npy_float *vz) {
+  if (xX0 <= 0.0f || beta <= SLOW || p_mag <= SLOW || f32_abs(charge) < SLOW) return;
+  const float theta0 = (13.6f / (beta * p_mag)) * f32_abs(charge) *
+                       sqrtf(xX0) * (1.0f + 0.038f * logf(xX0));
+  if (!(theta0 > 0.0f)) return;
+  const npy_float vmag = sqrtf((*vx) * (*vx) + (*vy) * (*vy) + (*vz) * (*vz));
+  if (vmag <= SLOW) return;
+  const npy_float ux = *vx / vmag, uy = *vy / vmag, uz = *vz / vmag;
+  // Perpendicular basis: cross u with the axis it is least aligned with.
+  npy_float ax = 0.0f, ay = 0.0f, az = 0.0f;
+  if (f32_abs(ux) <= f32_abs(uy) && f32_abs(ux) <= f32_abs(uz)) ax = 1.0f;
+  else if (f32_abs(uy) <= f32_abs(uz)) ay = 1.0f;
+  else az = 1.0f;
+  npy_float e1x = uy * az - uz * ay, e1y = uz * ax - ux * az, e1z = ux * ay - uy * ax;
+  const npy_float e1n = sqrtf(e1x * e1x + e1y * e1y + e1z * e1z);
+  if (e1n <= SLOW) return;
+  e1x /= e1n; e1y /= e1n; e1z /= e1n;
+  const npy_float e2x = uy * e1z - uz * e1y;  // u x e1 (already unit)
+  const npy_float e2y = uz * e1x - ux * e1z;
+  const npy_float e2z = ux * e1y - uy * e1x;
+  const float t1 = rand_normal(state, 0.0f, theta0);
+  const float t2 = rand_normal(state, 0.0f, theta0);
+  npy_float nx = ux + t1 * e1x + t2 * e2x;
+  npy_float ny = uy + t1 * e1y + t2 * e2y;
+  npy_float nz = uz + t1 * e1z + t2 * e2z;
+  const npy_float nn = sqrtf(nx * nx + ny * ny + nz * nz);
+  if (nn <= SLOW) return;
+  *vx = vmag * nx / nn;
+  *vy = vmag * ny / nn;
+  *vz = vmag * nz / nn;
+}
+
+/* Poisson sample (Knuth) -- fine for the small means used for noise. */
+static inline int rand_poisson(uint32_t *state, float lam) {
+  if (lam <= 0.0f) return 0;
+  const float L = expf(-lam);
+  float p = 1.0f;
+  int k = 0;
+  do {
+    k++;
+    p *= rand01(state);
+  } while (p > L);
+  return k - 1;
+}
+
+// Flat (T, SPACE_DIM) float32 vector pool for the sparse particle inputs.
+const PyArrayObject *check_flat_vector(const PyObject *object, npy_intp total) {
+  if (!PyArray_Check(object)) return NULL;
+  const PyArrayObject *a = (const PyArrayObject *)object;
+  if (PyArray_TYPE(a) == NPY_FLOAT32 && PyArray_NDIM(a) == 2 &&
+      PyArray_DIM(a, 0) == total && PyArray_DIM(a, 1) == SPACE_DIM)
+    return a;
+  return NULL;
+}
+
+// Flat (T,) float32 scalar pool for the sparse particle inputs.
+const PyArrayObject *check_flat_scalar(const PyObject *object, npy_intp total) {
+  if (!PyArray_Check(object)) return NULL;
+  const PyArrayObject *a = (const PyArrayObject *)object;
+  if (PyArray_TYPE(a) == NPY_FLOAT32 && PyArray_NDIM(a) == 1 && PyArray_DIM(a, 0) == total)
+    return a;
+  return NULL;
 }
 
 const PyArrayObject *check_vector_array(const PyObject *object, int batch,
@@ -124,64 +315,51 @@ int point_in_parallelogram(npy_float x, npy_float y,
 
 // Track a single particle through the detector + recursive secondary tracking
 static void track_particle(
-    int event_idx,           // Event index
-    int particle_idx,        // Particle index (for output identification)
-    npy_float x0, npy_float y0, npy_float z0,           // Initial position (cm)
-    npy_float px0, npy_float py0, npy_float pz0,        // Initial momentum (MeV/c)
-    npy_float mass, npy_float charge,                    // Mass (MeV/c^2), charge (e)
-    npy_float t_initial,     // Initial time of particle (ns)
-    int start_step,          // Time step to start from
-    int depth,               // Recursion depth (0 for primary)
-    int max_depth,           // Max recursion depth
-    // Detector geometry
-    const npy_float *layers, const npy_float *heights,
-    const npy_float *widths, const npy_float *angles,
-    npy_float z0_field, npy_float B_sigma,
-    int n_layers, int n_straws,
-    npy_intp ls0, npy_intp ls1,
-    npy_intp hs0, npy_intp hs1,
-    npy_intp ws0, npy_intp ws1,
-    npy_intp as0, npy_intp as1,
-    // Simulation parameters
-    npy_float dt, npy_float B, int n_steps,
-    // Sparse output arrays
-    int *sparse_events, int *sparse_particles, int *sparse_layers, int *sparse_straws,
-    npy_float *sparse_values, npy_float *sparse_r_mm, npy_float *sparse_t0,
-    npy_float *sparse_hit_pos, int *sparse_count,
-    // Trajectories
-    npy_float *trajectories,
-    npy_intp trs0, npy_intp trs1, npy_intp trs2, npy_intp trs3,
-    // Secondary production parameters
-    float p_spawn_single, float p_spawn_pair, float E_sec_MeV,
-    int *next_secondary_idx,  // Pointer to next available secondary index
-    int max_particles
+    const SimConfig *cfg,    // immutable simulation settings
+    const Geometry *geom,    // this event's detector geometry
+    HitBuffers *out,         // dense hit + trajectory output (mutated in place)
+    int event_idx, int particle_idx,
+    npy_float x0, npy_float y0, npy_float z0,     // initial position (cm)
+    npy_float px0, npy_float py0, npy_float pz0,  // initial momentum (MeV/c)
+    npy_float mass, npy_float charge,             // mass (MeV/c^2), charge (e)
+    npy_float t_initial,                          // particle start time (ns)
+    int start_step, int depth,                    // loop start index, recursion depth
+    int *next_secondary_idx,                      // next free secondary slot (shared)
+    uint32_t *rng_seed                            // advancing RNG seed stream (owned by solve)
 );
 
 // Forward declaration for recursion
 static void track_particle(
+    const SimConfig *cfg, const Geometry *geom, HitBuffers *out,
     int event_idx, int particle_idx,
     npy_float x0, npy_float y0, npy_float z0,
     npy_float px0, npy_float py0, npy_float pz0,
     npy_float mass, npy_float charge,
     npy_float t_initial,
-    int start_step, int depth, int max_depth,
-    const npy_float *layers, const npy_float *heights,
-    const npy_float *widths, const npy_float *angles,
-    npy_float z0_field, npy_float B_sigma,
-    int n_layers, int n_straws,
-    npy_intp ls0, npy_intp ls1, npy_intp hs0, npy_intp hs1,
-    npy_intp ws0, npy_intp ws1, npy_intp as0, npy_intp as1,
-    npy_float dt, npy_float B, int n_steps,
-    int *sparse_events, int *sparse_particles, int *sparse_layers, int *sparse_straws,
-    npy_float *sparse_values, npy_float *sparse_r_mm, npy_float *sparse_t0,
-    npy_float *sparse_hit_pos, int *sparse_count,
-    npy_float *trajectories,
-    npy_intp trs0, npy_intp trs1, npy_intp trs2, npy_intp trs3,
-    float p_spawn_single, float p_spawn_pair, float E_sec_MeV,
-    int *next_secondary_idx, int max_particles
+    int start_step, int depth,
+    int *next_secondary_idx,
+    uint32_t *rng_seed
 ) {
-  // Initialize RNG state per particle
-  uint32_t rng_state = RNG_SEED_BASE + (uint32_t)(event_idx * 10000 + particle_idx + depth * 1000);
+  // Unpack the structs into the locals the physics body uses by bare name.
+  const npy_float *layers = geom->layers, *heights = geom->heights;
+  const npy_float *widths = geom->widths, *angles = geom->angles;
+  const npy_intp ls0 = geom->ls0, ls1 = geom->ls1, hs0 = geom->hs0, hs1 = geom->hs1;
+  const npy_intp ws0 = geom->ws0, ws1 = geom->ws1, as0 = geom->as0, as1 = geom->as1;
+  const int n_layers = geom->n_layers, n_straws = geom->n_straws;
+  const npy_float z0_field = geom->z0_field, B_sigma = geom->B_sigma, B = geom->B;
+  const npy_float dt_fixed = cfg->dt_fixed;  // fixed-step override (>0); 0 -> adaptive
+  const int n_steps = cfg->n_steps, max_depth = cfg->max_depth, max_particles = cfg->max_particles;
+  const float delta_const = cfg->delta_const, t_wall = cfg->t_wall, delta_Tcut = cfg->delta_Tcut;
+  const float scatter_xX0 = cfg->scatter_xX0;
+  const float max_dt = cfg->max_dt, max_time = cfg->max_time, step_t = cfg->step_t, lambda_conv_cm = cfg->lambda_conv_cm;
+  const int n_traj = cfg->n_traj, enable_decay = cfg->enable_decay;
+  npy_float *trajectories = out->trajectories;
+  const npy_intp trs0 = out->trs0, trs1 = out->trs1, trs2 = out->trs2, trs3 = out->trs3;
+
+  // Per-particle RNG seed: consume one from the advancing stream owned by solve()
+  // and advance it by the golden-ratio odd stride so adjacent draws decorrelate.
+  uint32_t rng_state = *rng_seed;
+  *rng_seed += 0x9E3779B9u;
 
   npy_float x = x0;
   npy_float y = y0;
@@ -194,16 +372,54 @@ static void track_particle(
   // printf("track_particle: event=%d, particle=%d, depth=%d, pos=(%.2f,%.2f,%.2f), p=(%.2f,%.2f,%.2f), mass=%.2f, charge=%.2f\n",
   //        event_idx, particle_idx, depth, x, y, z, px, py, pz, mass, charge);
 
-  // Check for ghost particles
-  if (mass < SLOW || (f32_abs(px) < SLOW && f32_abs(py) < SLOW && f32_abs(pz) < SLOW)) {
-    // printf("  -> GHOST PARTICLE, skipping\n");
+  // Empty slot / zero-momentum ghost: nothing to track.
+  if (f32_abs(px) < SLOW && f32_abs(py) < SLOW && f32_abs(pz) < SLOW) {
     return;
+  }
+
+  // Photon (massless): no ionisation, so it is invisible to the straws unless
+  // it converts to an e+e- pair (gamma -> e+ e-). It records no hits itself;
+  // the conversion point is sampled exponentially along its straight path and
+  // the pair (opposite charges, half the energy each) is tracked from there.
+  if (mass < SLOW) {
+    if (lambda_conv_cm > 0.0f && depth < max_depth) {
+      const npy_float p_mag = sqrtf(px * px + py * py + pz * pz);
+      const npy_float ux = px / p_mag, uy = py / p_mag, uz = pz / p_mag;
+      const npy_float dl = max_dt * C_CM_PER_NS; /* straight photon step (cm), speed c */
+      const float pconv = 1.0f - expf(-dl / lambda_conv_cm);
+      npy_float t_ph = t_initial;
+      for (int j = start_step; j < n_steps && (t_ph - t_initial) < max_time; ++j) {
+        if (rand01(&rng_state) < pconv) {
+          if (*next_secondary_idx + 1 < max_particles) {
+            const int e_minus = (*next_secondary_idx)++;
+            const int e_plus = (*next_secondary_idx)++;
+            const npy_float pe = 0.5f * p_mag; /* split photon energy */
+            const npy_float charges_pair[2] = {-1.0f, +1.0f};
+            const int idx_pair[2] = {e_minus, e_plus};
+            for (int s = 0; s < 2; ++s) {
+              track_particle(
+                  cfg, geom, out,
+                  event_idx, idx_pair[s], x, y, z, ux * pe, uy * pe, uz * pe,
+                  MASS_E, charges_pair[s], t_ph, 0, depth + 1,
+                  next_secondary_idx, rng_seed);
+            }
+          }
+          return; /* photon consumed at conversion */
+        }
+        x += ux * dl; /* propagate straight to the next step */
+        y += uy * dl;
+        z += uz * dl;
+        t_ph += max_dt;
+      }
+    }
+    return; /* no conversion (or disabled): photon leaves no hits */
   }
 
   // printf("  -> Valid particle, tracking through %d steps, start_step=%d, n_steps=%d\n", n_steps - start_step, start_step, n_steps);
   // printf("  -> z0_field=%.2f, B_sigma=%.2f, n_layers=%d, n_straws=%d\n", z0_field, B_sigma, n_layers, n_straws);
 
   npy_float p2 = px * px + py * py + pz * pz;
+  const npy_float p_mag = sqrtf(p2);  // |p| (MeV/c), conserved under static B
   const npy_float gamma = sqrtf(1.0f + p2 / (mass * mass));
   // printf("  -> gamma=%.5f\n", gamma);
   npy_float vx = px / (gamma * mass); // v's are dimensionless, in units of c
@@ -211,13 +427,79 @@ static void track_particle(
   npy_float vz = pz / (gamma * mass);
   //printf("  -> v=%.5f\n", sqrtf(vx * vx + vy * vy + vz * vz));
 
-  const npy_float mass_MeV_kg = 1.78266192e-30f;
-  const npy_float charge_e_C = 1.602176634e-19f;
-  const npy_float c = 0.5 * (dt / 1e9) * (charge * charge_e_C) /
-                      (mass * mass_MeV_kg) / gamma;
+  // The per-step dt is chosen adaptively in the loop (sagitta-bounded). The
+  // Bx-independent part of that bound is constant along the path -- |p|, gamma,
+  // beta are conserved in a static B field -- so precompute it once:
+  //   dt_sag = 0.9 * sqrt(sag_num / Bx),  sag_num = 4*sigma*m*gamma/(beta*c*K*|q|)
+  // Derivation: the Boris push rotates v by theta with tan(theta/2) =
+  // K_BORIS*dt*q*Bx/(m*gamma) (line below); the chord is L = beta*C_CM*dt; the
+  // chord-vs-arc sagitta s = L*tan(theta/4)/2 ~ L*theta/8. Imposing s <= sigma
+  // (STRAW_SIGMA_SPATIAL) and solving for dt gives the bound above.
+  const npy_float beta = sqrtf(vx * vx + vy * vy + vz * vz);
+  const npy_float qabs = f32_abs(charge);
+  const npy_float sag_num =
+      (qabs > SLOW && beta > SLOW)
+          ? 4.0f * STRAW_SIGMA_SPATIAL * mass * gamma / (beta * C_CM_PER_NS * K_BORIS * qabs)
+          : 1e30f;  // straight / neutral track -> field imposes no ceiling
 
+  // Per-layer geometry is invariant across steps -> precompute once. -O3 can't
+  // hoist it from the step loop because the layer arrays may alias the dense
+  // output buffers written each step; doing it by hand removes the redundancy
+  // (was the dominant cost in the callgrind profile).
+  npy_float pl_z[n_layers], pl_height[n_layers], pl_width[n_layers];
+  npy_float pl_r[n_layers], pl_left[n_layers], pl_right[n_layers], pl_yoff[n_layers];
+  int order[n_layers];
+  npy_float max_right = -1e30f;
+  // Half-pitch stagger: even layer-in-view -> -h, odd -> +h. per_station decomposes
+  // the global layer index k into (station, view, layer-in-view) like dense_record.
+  const npy_float yoff_half = 0.5f * cfg->layer_y_offset;
+  const int per_station = cfg->n_views * cfg->n_lpv;
+  for (int k = 0; k < n_layers; ++k) {
+    const npy_float lz = layers[event_idx * ls0 + k * ls1];
+    const npy_float lh = heights[event_idx * hs0 + k * hs1];
+    const npy_float lr = lh / n_straws;  // straw radius (height is half-height)
+    const int lpv = (cfg->n_lpv > 0) ? (k % per_station) % cfg->n_lpv : 0;
+    pl_z[k] = lz;
+    pl_height[k] = lh;
+    pl_width[k] = widths[event_idx * ws0 + k * ws1];
+    pl_r[k] = lr;
+    pl_left[k] = lz - lr;  // layer_half_thickness = r
+    pl_right[k] = lz + lr;
+    pl_yoff[k] = (lpv & 1) ? yoff_half : -yoff_half;  // even i -> -h, odd i -> +h
+    if (pl_right[k] > max_right) max_right = pl_right[k];
+    order[k] = k;
+  }
+  // Sort layer indices by z (insertion sort; n_layers is small). The optimiser
+  // may place stations out of z-order, so don't assume the input is sorted.
+  for (int a = 1; a < n_layers; ++a) {
+    const int key = order[a];
+    const npy_float kz = pl_z[key];
+    int b = a - 1;
+    while (b >= 0 && pl_z[order[b]] > kz) {
+      order[b + 1] = order[b];
+      b--;
+    }
+    order[b + 1] = key;
+  }
+
+  npy_float t_now = t_initial;
+  int last_traj = 0;
   for (int j = start_step; j < n_steps; ++j) {
+    if (t_now - t_initial >= max_time) break;  // trapped/curling -> give up
+
     const npy_float Bx = B * exp(-square((z - z0_field) / B_sigma));
+
+    // Adaptive step: 0.9x the sagitta ceiling, clamped to max_dt. A fixed dt
+    // (dt_fixed > 0) overrides the adaptive choice.
+    npy_float dt_step = max_dt;
+    if (dt_fixed > 0.0f) {
+      dt_step = dt_fixed;
+    } else if (Bx > SLOW) {
+      const npy_float dt_sag = 0.9f * sqrtf(sag_num / Bx);
+      if (dt_sag < dt_step) dt_step = dt_sag;
+    }
+
+    const npy_float c = K_BORIS * dt_step * charge / (mass * gamma);
     const npy_float tx = c * Bx;
     const npy_float t_norm_sqr = tx * tx;
 
@@ -230,9 +512,9 @@ static void track_particle(
     vy = vy_m + vz_m * sx;
     vz = vz_m - vy_m * sx;
 
-    const npy_float dx = dt * vx * 29.9792f;
-    const npy_float dy = dt * vy * 29.9792f;
-    const npy_float dz = dt * vz * 29.9792f;
+    const npy_float dx = dt_step * vx * C_CM_PER_NS;
+    const npy_float dy = dt_step * vy * C_CM_PER_NS;
+    const npy_float dz = dt_step * vz * C_CM_PER_NS;
 
     const npy_float x_ = x + dx;
     const npy_float y_ = y + dy;
@@ -241,30 +523,29 @@ static void track_particle(
     //if (j % 50 == 0) printf("  Step %d: pos=(%.2f,%.2f,%.2f) -> (%.2f,%.2f,%.2f), time %f\n", j, x, y, z, x_, y_, z_, j * dt);
 
 
-    for (int k = 0; k < n_layers; ++k) {
-      const npy_float layer = layers[event_idx * ls0 + k * ls1];
-      const npy_float height = heights[event_idx * hs0 + k * hs1];
-      const npy_float width = widths[event_idx * ws0 + k * ws1];
-      const npy_float r = height / n_straws;  // Straw radius (height is half-height)
-      // Use larger acceptance window to prevent particles from stepping over layers
-      // Particles moving at ~c with dt=0.1ns move ~3cm per step, so need margin > straw diameter
-      const npy_float layer_half_thickness = 1.0f * r;  // 3x radius for safe margin
-      const npy_float left = layer - layer_half_thickness;
-      const npy_float right = layer + layer_half_thickness;
-
-      // Debug output (disabled by default)
-      // if (event_idx == 0  && k == 8) {
-      //   printf("E%d P%d L%d Step%d: layer_z=%.2f, r=%.2f, bounds=[%.2f,%.2f], z=%.2f->%.2f\n",
-      //          event_idx, particle_idx, k, j, layer, r, left, right, z, z_);
-      // }
-
-      // check for potential hit
-      if ((z < left && z_ < left) || (z > right && z_ > right)) {
-        // if (event_idx == 0 && particle_idx < 2 && k < 5 && j < 10) {
-        //   printf("  -> SKIP: both before or both after layer\n");
-        // }
-        continue;
-      }
+    // Scan only the layers the step [zmin, zmax] can reach, in z-order. Binary
+    // search the first layer whose right edge reaches zmin, then scan until a
+    // left edge passes zmax. No persistent cursor -> correct in either direction
+    // (handles curling tracks). Assumes a uniform straw radius (true for the SST)
+    // so pl_right is sorted in `order`.
+    const npy_float zmin = (z < z_) ? z : z_;
+    const npy_float zmax = (z > z_) ? z : z_;
+    int klo = 0, khi = n_layers;
+    while (klo < khi) {
+      const int mid = (klo + khi) >> 1;
+      if (pl_right[order[mid]] < zmin)
+        klo = mid + 1;
+      else
+        khi = mid;
+    }
+    for (int ki = klo; ki < n_layers; ++ki) {
+      const int k = order[ki];
+      if (pl_left[k] > zmax) break;  // ahead -> all later (sorted) layers too
+      const npy_float layer = pl_z[k];
+      const npy_float height = pl_height[k];
+      const npy_float width = pl_width[k];
+      const npy_float r = pl_r[k];
+      const npy_float yoff = pl_yoff[k];  // half-pitch stagger of this layer's straw centres
       // if (event_idx == 0 && particle_idx < 2 && k == 8) {
       //   printf("  -> CROSSING layer %d at step %d!\n", k, j);
       // }
@@ -289,223 +570,126 @@ static void track_particle(
       // if (event_idx == 0 && particle_idx < 2 && k == 8) {
       //     printf("  -> PASSED POINTS\n");
       // }
-      const npy_int straw_i_center = (npy_int)floor(0.5 * (ry + height) / r);
-
       // Particle segment: from (x,y,z) to (x_,y_,z_)
-      const npy_float rx_ = nx * x_ + ny * y_;
       const npy_float ry_ = -ny * x_ + nx * y_;
 
       // Particle direction vector AB
-      const npy_float drx = rx_ - rx;
       const npy_float dry = ry_ - ry;
       const npy_float dz = z_ - z;
 
-      npy_int best_straw_i = -1;
-      npy_float best_dist_sq = r * r + 1.0f;
+      // The segment crosses the plane spanning transverse [ry, ry_]. Convert that
+      // span to a straw index RANGE (a track crossing at an angle passes through
+      // several adjacent tubes); the +/-1 pad covers the straw-radius overlap at
+      // the ends. EVERY tube the segment actually enters (dist < r) fires -- not
+      // just the single closest -- each with its own drift distance / TDC time.
+      const npy_float ry_min = (ry < ry_) ? ry : ry_;
+      const npy_float ry_max = (ry > ry_) ? ry : ry_;
+      // Invert straw_y = (2i+1)*r - height + yoff -> i = floor((y + height - yoff)/(2r)).
+      npy_int i_lo = (npy_int)floor(0.5 * (ry_min + height - yoff) / r) - 1;
+      npy_int i_hi = (npy_int)floor(0.5 * (ry_max + height - yoff) / r) + 1;
+      if (i_lo < 0) i_lo = 0;
+      if (i_hi >= n_straws) i_hi = n_straws - 1;
 
-      for (int straw_offset = -2; straw_offset <= 2; straw_offset++) {
-        const npy_int straw_i = straw_i_center + straw_offset;
-        if (!(straw_i >= 0 && straw_i < n_straws)) {
-          continue;
-        }
+      // Wire direction is along x (CD = (1,0,0)); AB x CD is invariant across the
+      // straws in this layer, so hoist it out of the index loop.
+      const npy_float cross_y = dz;
+      const npy_float cross_z = -dry;
+      const npy_float cross_norm = sqrtf(cross_y * cross_y + cross_z * cross_z);
 
-        const npy_float straw_y = (2 * straw_i + 1) * r - height;
+      int fired_any = 0;
+      for (npy_int straw_i = i_lo; straw_i <= i_hi; ++straw_i) {
+        const npy_float straw_y = (2 * straw_i + 1) * r - height + yoff;
 
-        // Wire direction: along x-axis, CD = (1, 0, 0)
-        // Vector from particle start to wire point: AC = (0, straw_y, layer) - (rx, ry, z)
-        const npy_float acx = -rx;
+        // Vector from particle start to wire point: AC = (0, straw_y, layer) - (rx, ry, z).
+        // The rx (=acx) component drops out below since CD = (1,0,0) -> cross_x = 0.
         const npy_float acy = straw_y - ry;
         const npy_float acz = layer - z;
-
-        // Cross product AB x CD where CD = (1, 0, 0)
-        const npy_float cross_x = 0.0f;
-        const npy_float cross_y = dz;
-        const npy_float cross_z = -dry;
-        const npy_float cross_norm = sqrtf(cross_y * cross_y + cross_z * cross_z);
 
         npy_float sqr_distance_to_wire;
         if (cross_norm < 1e-6f) {
           // Lines are parallel, use perpendicular distance
           sqr_distance_to_wire = acy * acy + acz * acz;
         } else {
-          // Distance = |AC · (AB x CD)| / |AB x CD|
-          const npy_float dot = acx * cross_x + acy * cross_y + acz * cross_z;
+          // Distance = |AC . (AB x CD)| / |AB x CD| (CD = (1,0,0) -> cross_x = 0)
+          const npy_float dot = acy * cross_y + acz * cross_z;
           const npy_float dist = fabsf(dot) / cross_norm;
           sqr_distance_to_wire = dist * dist;
         }
 
-        // if (event_idx == 0 && particle_idx < 2 && k == 8) {
-        //     printf(" DIST %f   r = %f straw=%d %f\n", sqr_distance_to_wire, r, straw_i, sqrtf(sqr_distance_to_wire));
-        // }
+        if (sqr_distance_to_wire >= r * r) continue;  // tube not entered -> no hit
 
-        if (sqr_distance_to_wire < r * r && sqr_distance_to_wire < best_dist_sq) {
-          best_straw_i = straw_i;
-          best_dist_sq = sqr_distance_to_wire;
+        // Record the hit straight into the dense buffer (per-(event,straw) dedup).
+        // FairShip TDC: t_MC + |Gaus(dist,sigma)|/v_drift + (wire_end - x)/c.
+        const float dist_cm = sqrtf(sqr_distance_to_wire);
+        const float t_drift = fabsf(rand_normal(&rng_state, dist_cm, STRAW_SIGMA_SPATIAL)) / STRAW_VDRIFT;
+        const float t_prop = (width - x) / C_CM_PER_NS; /* width = widths[event,k] = +x readout end */
+        const float fdigi = t_now + t_drift + t_prop;
+        if (dense_record(cfg, out, event_idx, k, straw_i, fdigi)) fired_any = 1;
+      }
+
+      // Highland multiple scattering: one kick per layer crossing the track passes
+      // through (it is inside the frame here). Deflects v for the onward steps;
+      // off when scatter_xX0 <= 0.
+      apply_scatter(&rng_state, scatter_xX0, charge, p_mag, beta, &vx, &vy, &vz);
+
+      if (!fired_any) {
+        continue;  // no tube entered (or all already fired / buffer full) -> no secondaries
+      }
+
+      // Per-layer secondary production in the thin straw wall (track crosses 2
+      // walls per hit). Probabilities are built here from energy-independent
+      // material constants x the track kinematics:
+      //   delta-ray:  p = delta_const * L * (z^2/beta^2) * (1/Tcut - 1/Tmax)
+      //   pair/brems: p = L / lambda_conv_cm        (asymptotic, energy-indep.)
+      if (depth < max_depth) {
+        const float L_wall = 2.0f * t_wall;
+        const float me_over_M = MASS_E / mass;
+        const float Tmax = 2.0f * MASS_E * beta * beta * gamma * gamma /
+                           (1.0f + 2.0f * gamma * me_over_M + me_over_M * me_over_M);
+        float p_single = 0.0f;
+        if (beta > SLOW && delta_Tcut > 0.0f && Tmax > delta_Tcut) {
+          p_single = delta_const * L_wall * (charge * charge) / (beta * beta) *
+                     (1.0f / delta_Tcut - 1.0f / Tmax);
         }
-      }
+        const float p_pair = (lambda_conv_cm > 0.0f) ? L_wall / lambda_conv_cm : 0.0f;
 
-      if (best_straw_i < 0) {
-        continue;
-      }
-
-      // if (event_idx == 0 && particle_idx < 2 && k == 8) {
-      //     printf("  -> PASSED DIST %f\n", best_dist_sq);
-      // }
-
-      // Check if this straw was already hit by this particle
-      int is_first_hit_in_straw = 1;
-      for (int h = 0; h < sparse_count[0]; h++) {
-        if (sparse_events[h] == event_idx && sparse_particles[h] == particle_idx &&
-            sparse_layers[h] == k && sparse_straws[h] == best_straw_i) {
-          is_first_hit_in_straw = 0;
-          break;
-        }
-      }
-      if (!is_first_hit_in_straw) {
-        continue;
-      }
-
-      // if (event_idx == 0 && particle_idx < 2 && k == 8) {
-      //     printf("  -> STORED\n");
-      // }
-
-      // Record hit to sparse arrays
-      int sparse_idx = sparse_count[0];
-      sparse_events[sparse_idx] = event_idx;
-      sparse_particles[sparse_idx] = particle_idx;
-      sparse_layers[sparse_idx] = k;
-      sparse_straws[sparse_idx] = best_straw_i;
-      sparse_values[sparse_idx] = dt;
-      sparse_r_mm[sparse_idx] = sqrtf(best_dist_sq) * 10.0f;
-      sparse_t0[sparse_idx] = t_initial + j * dt;
-
-      sparse_hit_pos[sparse_idx * 3 + 0] = x;
-      sparse_hit_pos[sparse_idx * 3 + 1] = y;
-      sparse_hit_pos[sparse_idx * 3 + 2] = z;
-
-      sparse_count[0]++;
-
-      // if (particle_idx < 10) {
-      //   printf("  HIT recorded: particle=%d, layer=%d, straw=%d, t0=%.2f ns, sparse_count=%d\n",
-      //          particle_idx, k, straw_i, j * dt, sparse_count[0]);
-      // }
-
-      // Spawn secondaries on first hit in this straw (if not at max depth)
-      if (is_first_hit_in_straw && depth < max_depth &&
-          (p_spawn_single > 0.0f || p_spawn_pair > 0.0f)) {
-        float r_spawn = rand01(&rng_state);
-
-        // single electron first
-        if (r_spawn < p_spawn_single) {
-          // Get next secondary index - check bounds
-          if (*next_secondary_idx >= max_particles) {
-            // No more slots available for secondaries
-            continue;
+        if (p_single > 0.0f || p_pair > 0.0f) {
+          const float r_spawn = rand01(&rng_state);
+          if (r_spawn < p_single && *next_secondary_idx < max_particles) {
+            // delta-ray: energy ~ 1/T^2 on [Tcut, Tmax] (inverse-CDF), isotropic.
+            const int e_idx = (*next_secondary_idx)++;
+            const float uu = rand01(&rng_state);
+            const float T = 1.0f / (1.0f / delta_Tcut - uu * (1.0f / delta_Tcut - 1.0f / Tmax));
+            const float u = rand01(&rng_state), v = rand01(&rng_state);
+            const float cos_theta = 2.0f * u - 1.0f;
+            const float sin_theta = sqrtf(fmaxf(0.0f, 1.0f - cos_theta * cos_theta));
+            const float phi = 2.0f * (float)M_PI * v;
+            const npy_float p_sec = sqrtf(T * T + 2.0f * T * MASS_E);
+            track_particle(cfg, geom, out, event_idx, e_idx, x_, y_, z_,
+                           p_sec * sin_theta * cosf(phi), p_sec * sin_theta * sinf(phi),
+                           p_sec * cos_theta, MASS_E, -1.0f, t_initial, 0, depth + 1,
+                           next_secondary_idx, rng_seed);
+          } else if (r_spawn < p_single + p_pair && *next_secondary_idx + 1 < max_particles) {
+            // e+e- pair from a hard radiated photon: 1/k brems spectrum (log-uniform
+            // on [Tcut, KE]), each lepton gets half, emitted back-to-back.
+            const int e_minus_idx = (*next_secondary_idx)++;
+            const int e_plus_idx = (*next_secondary_idx)++;
+            const float KE = fmaxf((gamma - 1.0f) * mass, delta_Tcut * 1.001f);
+            const float kgamma = delta_Tcut * expf(rand01(&rng_state) * logf(KE / delta_Tcut));
+            const float T_half = 0.5f * kgamma;
+            const float u = rand01(&rng_state), v = rand01(&rng_state);
+            const float cos_theta = 2.0f * u - 1.0f;
+            const float sin_theta = sqrtf(fmaxf(0.0f, 1.0f - cos_theta * cos_theta));
+            const float phi = 2.0f * (float)M_PI * v;
+            const npy_float p_sec = sqrtf(T_half * T_half + 2.0f * T_half * MASS_E);
+            const npy_float pxm = p_sec * sin_theta * cosf(phi);
+            const npy_float pym = p_sec * sin_theta * sinf(phi);
+            const npy_float pzm = p_sec * cos_theta;
+            track_particle(cfg, geom, out, event_idx, e_minus_idx, x, y, z,
+                           pxm, pym, pzm, MASS_E, -1.0f, t_initial, 0, depth + 1, next_secondary_idx, rng_seed);
+            track_particle(cfg, geom, out, event_idx, e_plus_idx, x, y, z,
+                           -pxm, -pym, -pzm, MASS_E, +1.0f, t_initial, 0, depth + 1, next_secondary_idx, rng_seed);
           }
-          int e_idx = (*next_secondary_idx)++;
-
-          // Random isotropic direction
-          float u = rand01(&rng_state);
-          float v = rand01(&rng_state);
-          float cos_theta = 2.0f * u - 1.0f;
-          float sin_theta = sqrtf(fmaxf(0.0f, 1.0f - cos_theta * cos_theta));
-          float phi = 2.0f * (float)M_PI * v;
-
-          const npy_float mass_e = 0.511f;
-          const npy_float charge_e = -1.0f;
-          npy_float p_sec = sqrtf(E_sec_MeV * E_sec_MeV + 2.0f * E_sec_MeV * mass_e);
-
-          npy_float px_e = p_sec * sin_theta * cosf(phi);
-          npy_float py_e = p_sec * sin_theta * sinf(phi);
-          npy_float pz_e = p_sec * cos_theta;
-
-          // Recursively track secondary from this position
-          track_particle(
-              event_idx, e_idx,
-              x_, y_, z_,
-              px_e, py_e, pz_e,
-              mass_e, -1.0f,
-              t_initial,
-              j + 1, depth + 1, max_depth,
-              layers, heights, widths, angles, z0_field, B_sigma,
-              n_layers, n_straws,
-              ls0, ls1, hs0, hs1, ws0, ws1, as0, as1,
-              dt, B, n_steps,
-              sparse_events, sparse_particles, sparse_layers, sparse_straws,
-              sparse_values, sparse_r_mm, sparse_t0, sparse_hit_pos, sparse_count,
-              trajectories, trs0, trs1, trs2, trs3,
-              p_spawn_single, p_spawn_pair, E_sec_MeV,
-              next_secondary_idx, max_particles
-          );
-        }
-        // e+e- pair production
-        else if (r_spawn < (p_spawn_single + p_spawn_pair)) {
-          // Get indices for e- and e+ - check bounds
-          if (*next_secondary_idx + 1 >= max_particles) {
-            // Need 2 slots for pair, not enough available
-            continue;
-          }
-          int e_minus_idx = (*next_secondary_idx)++;
-          int e_plus_idx = (*next_secondary_idx)++;
-
-          // Random direction for pair axis
-          float u = rand01(&rng_state);
-          float v = rand01(&rng_state);
-          float cos_theta = 2.0f * u - 1.0f;
-          float sin_theta = sqrtf(fmaxf(0.0f, 1.0f - cos_theta * cos_theta));
-          float phi = 2.0f * (float)M_PI * v;
-
-          const npy_float mass_e = 0.511f;
-          const npy_float T_half = E_sec_MeV * 0.5f;
-          npy_float p_sec = sqrtf(T_half * T_half + 2.0f * T_half * mass_e);
-
-          // e- momentum
-          npy_float px_em = p_sec * sin_theta * cosf(phi);
-          npy_float py_em = p_sec * sin_theta * sinf(phi);
-          npy_float pz_em = p_sec * cos_theta;
-
-          // e+ momentum (opposite, back-to-back)
-          npy_float px_ep = -px_em;
-          npy_float py_ep = -py_em;
-          npy_float pz_ep = -pz_em;
-
-          // Recursively track e-
-          track_particle(
-            event_idx, e_minus_idx,
-            x, y, z,
-            px_em, py_em, pz_em,
-            mass_e, -1.0f,
-            t_initial,  // Inherit mother's initial time
-            j, depth + 1, max_depth,
-            layers, heights, widths, angles, z0_field, B_sigma,
-            n_layers, n_straws,
-            ls0, ls1, hs0, hs1, ws0, ws1, as0, as1,
-            dt, B, n_steps,
-            sparse_events, sparse_particles, sparse_layers, sparse_straws,
-            sparse_values, sparse_r_mm, sparse_t0, sparse_hit_pos, sparse_count,
-            trajectories, trs0, trs1, trs2, trs3,
-            p_spawn_single, p_spawn_pair, E_sec_MeV,
-            next_secondary_idx, max_particles
-          );
-
-          // Recursively track e+
-          track_particle(
-            event_idx, e_plus_idx,
-            x, y, z,
-            px_ep, py_ep, pz_ep,
-            mass_e, +1.0f,
-            t_initial,  // Inherit mother's initial time
-            j, depth + 1, max_depth,
-            layers, heights, widths, angles, z0_field, B_sigma,
-            n_layers, n_straws,
-            ls0, ls1, hs0, hs1, ws0, ws1, as0, as1,
-            dt, B, n_steps,
-            sparse_events, sparse_particles, sparse_layers, sparse_straws,
-            sparse_values, sparse_r_mm, sparse_t0, sparse_hit_pos, sparse_count,
-            trajectories, trs0, trs1, trs2, trs3,
-            p_spawn_single, p_spawn_pair, E_sec_MeV,
-            next_secondary_idx, max_particles
-          );
         }
       }
     }
@@ -513,11 +697,48 @@ static void track_particle(
     x = x_;
     y = y_;
     z = z_;
+    t_now += dt_step;
 
-    if (trajectories != NULL && particle_idx < max_particles) {  // Limit trajectory storage
-      trajectories[event_idx * trs0 + particle_idx * trs1 + j * trs2] = x;
-      trajectories[event_idx * trs0 + particle_idx * trs1 + j * trs2 + trs3] = y;
-      trajectories[event_idx * trs0 + particle_idx * trs1 + j * trs2 + 2 * trs3] = z;
+    // Trajectory: sampled evenly in elapsed time (viz only). One physics step may
+    // span many sample slots (super-sample) or none (sub-sample); fill every slot
+    // whose timestamp i*step_t the accumulated time has now passed.
+    if (trajectories != NULL && particle_idx < max_particles && step_t > 0.0f) {
+      int upto = (int)((t_now - t_initial) / step_t);
+      if (upto > n_traj) upto = n_traj;
+      const npy_intp tbase = event_idx * trs0 + particle_idx * trs1;
+      for (int i = last_traj; i < upto; ++i) {
+        trajectories[tbase + i * trs2] = x;
+        trajectories[tbase + i * trs2 + trs3] = y;
+        trajectories[tbase + i * trs2 + 2 * trs3] = z;
+      }
+      last_traj = upto;
+    }
+
+    // Past the last layer and still moving forward -> no more hits possible.
+    if (vz > 0.0f && z > max_right) break;
+
+    // Decay-in-flight: pi+- / K+- -> mu + nu. The muon carries the bulk of the
+    // momentum and continues nearly collinearly (a small kink); the parent
+    // stops here. Decay probability over this step uses the lab decay length
+    // L = beta*gamma*c*tau, so dl/L = c*dt / (gamma*c*tau).
+    if (enable_decay && depth < max_depth) {
+      const float ctau = ctau_cm_for_mass(mass);
+      if (ctau > 0.0f) {
+        const float pdecay = 1.0f - expf(-dt_step * C_CM_PER_NS / (gamma * ctau));
+        if (rand01(&rng_state) < pdecay && *next_secondary_idx < max_particles) {
+          const int mu_idx = (*next_secondary_idx)++;
+          // Muon direction = current velocity direction; |p| conserved by B.
+          const npy_float pmag = sqrtf(px * px + py * py + pz * pz);
+          const npy_float vmag = sqrtf(vx * vx + vy * vy + vz * vz);
+          const npy_float scale = (vmag > SLOW) ? pmag / vmag : 0.0f;
+          track_particle(
+              cfg, geom, out,
+              event_idx, mu_idx, x, y, z, vx * scale, vy * scale, vz * scale,
+              MASS_MU, charge, t_now, 0, depth + 1,
+              next_secondary_idx, rng_seed);  // t_now = decay time; muon starts fresh
+          return; /* parent stops at the decay point */
+        }
+      }
     }
   }
 }
@@ -545,41 +766,67 @@ static PyObject *solve(PyObject *self, PyObject *args) {
 
   PyObject *py_steps = NULL;
   PyObject *py_n_batch = NULL;
-  PyObject *py_n_particles = NULL;
+  PyObject *py_offsets = NULL;  // (n_batch+1,) int32 CSR offsets into the flat particle pool
   PyObject *py_max_particles = NULL;
   PyObject *py_n_layers = NULL;
   PyObject *py_n_straws = NULL;
 
   PyObject *py_trajectories = NULL;
 
-  // Sparse output arrays (pre-allocated from Python)
-  PyObject *py_sparse_events = NULL;
-  PyObject *py_sparse_particles = NULL;
-  PyObject *py_sparse_layers = NULL;
-  PyObject *py_sparse_straws = NULL;
-  PyObject *py_sparse_values = NULL;
-  PyObject *py_sparse_r_mm = NULL;
-  PyObject *py_sparse_t0 = NULL;
-  PyObject *py_sparse_hit_pos = NULL;
-  PyObject *py_sparse_count = NULL;
-
   // Secondary particle parameters
-  PyObject *py_p_spawn_single = NULL;
-  PyObject *py_p_spawn_pair = NULL;
-  PyObject *py_E_sec = NULL;
+  PyObject *py_delta_const = NULL;
+  PyObject *py_t_wall = NULL;
+  PyObject *py_delta_Tcut = NULL;
+
+  // Extra physics-process parameters (gamma conversion / decay / noise).
+  PyObject *py_lambda_conv = NULL;
+  PyObject *py_enable_decay = NULL;
+  PyObject *py_noise_rate = NULL;
+
+  // Dense output: the C code writes the padded (n_batch, M, 5) hit array + the
+  // (n_batch, M) mask directly, using `counts` as the per-event write cursor.
+  PyObject *py_X = NULL;
+  PyObject *py_mask = NULL;
+  PyObject *py_counts = NULL;
+  PyObject *py_n_views = NULL;
+  PyObject *py_n_lpv = NULL;
+  PyObject *py_seed = NULL;  // caller-supplied RNG seed (propagated to all C randomness)
+  PyObject *py_max_dt = NULL;   // upper clamp on the adaptive step (ns)
+  PyObject *py_max_time = NULL;  // per-particle integration-time cap (ns)
+  PyObject *py_scatter_xX0 = NULL;  // Highland material budget x/X0 per layer (<=0 off)
+  PyObject *py_layer_y_offset = NULL;  // half-pitch stagger between layers (cm)
 
   if (!PyArg_UnpackTuple(
-          args, "straw_solve", 32, 32, &py_initial_positions,
+          args, "straw_solve", 36, 36, &py_initial_positions,
           &py_initial_momenta, &py_masses, &py_charges, &py_initial_times,
           &py_B, &py_z0,
-          &py_B_sigma, &py_steps, &py_dt, &py_n_batch, &py_n_particles,
+          &py_B_sigma, &py_steps, &py_dt, &py_n_batch, &py_offsets,
           &py_n_layers, &py_n_straws, &py_layers, &py_width, &py_heights,
-          &py_angles, &py_trajectories, &py_sparse_events, &py_sparse_particles,
-          &py_sparse_layers, &py_sparse_straws, &py_sparse_values,
-          &py_sparse_r_mm, &py_sparse_t0, &py_sparse_hit_pos, &py_sparse_count,
-          &py_p_spawn_single, &py_p_spawn_pair, &py_E_sec, &py_max_particles)) {
+          &py_angles, &py_trajectories,
+          &py_delta_const, &py_t_wall, &py_delta_Tcut, &py_max_particles,
+          &py_lambda_conv, &py_enable_decay, &py_noise_rate,
+          &py_X, &py_mask, &py_counts, &py_n_views, &py_n_lpv, &py_seed,
+          &py_max_dt, &py_max_time, &py_scatter_xX0, &py_layer_y_offset)) {
     return NULL;
   }
+  if (!PyFloat_Check(py_max_dt) || !PyFloat_Check(py_max_time) ||
+      !PyFloat_Check(py_scatter_xX0) || !PyFloat_Check(py_layer_y_offset)) {
+    PyErr_SetString(PyExc_TypeError, "max_dt, max_time, scatter_xX0 and layer_y_offset must be floats");
+    return NULL;
+  }
+  SimConfig cfg = {0};   // immutable simulation settings, filled below
+  HitBuffers out = {0};  // mutable dense + trajectory output
+  cfg.max_dt = (float)PyFloat_AsDouble(py_max_dt);
+  cfg.max_time = (float)PyFloat_AsDouble(py_max_time);
+  cfg.scatter_xX0 = (float)PyFloat_AsDouble(py_scatter_xX0);
+  cfg.layer_y_offset = (float)PyFloat_AsDouble(py_layer_y_offset);
+  if (!PyLong_Check(py_seed)) {
+    PyErr_SetString(PyExc_TypeError, "seed must be an int");
+    return NULL;
+  }
+  // Running RNG seed stream, owned by solve() and advanced by every track_particle
+  // entry + noise draw (passed by pointer, like next_secondary_idx).
+  uint32_t rng_seed = (uint32_t)PyLong_AsUnsignedLongMask(py_seed);
 
   // Get dimensions directly from parameters
   if (!PyLong_Check(py_steps)) {
@@ -588,44 +835,63 @@ static PyObject *solve(PyObject *self, PyObject *args) {
   }
   const long n_steps = PyLong_AsLong(py_steps);
 
-  if (!PyLong_Check(py_n_batch) || !PyLong_Check(py_n_particles) ||
+  if (!PyLong_Check(py_n_batch) ||
       !PyLong_Check(py_n_layers) || !PyLong_Check(py_n_straws)) {
-    PyErr_SetString(PyExc_TypeError, "n_batch, n_particles, n_layers, and n_straws must be ints");
+    PyErr_SetString(PyExc_TypeError, "n_batch, n_layers, and n_straws must be ints");
     return NULL;
   }
   const npy_intp n_batch = PyLong_AsLong(py_n_batch);
-  const npy_intp n_particles = PyLong_AsLong(py_n_particles);
   const npy_intp n_layers = PyLong_AsLong(py_n_layers);
   const npy_intp n_straws = PyLong_AsLong(py_n_straws);
   const npy_intp max_particles = PyLong_AsLong(py_max_particles);
 
-  // Get sparse array pointers
-  int *sparse_events = (int *)PyArray_DATA((PyArrayObject *)py_sparse_events);
-  int *sparse_particles =
-      (int *)PyArray_DATA((PyArrayObject *)py_sparse_particles);
-  int *sparse_layers = (int *)PyArray_DATA((PyArrayObject *)py_sparse_layers);
-  int *sparse_straws = (int *)PyArray_DATA((PyArrayObject *)py_sparse_straws);
-  npy_float *sparse_values =
-      (npy_float *)PyArray_DATA((PyArrayObject *)py_sparse_values);
-  npy_float *sparse_r_mm =
-      (npy_float *)PyArray_DATA((PyArrayObject *)py_sparse_r_mm);
-  npy_float *sparse_t0 =
-      (npy_float *)PyArray_DATA((PyArrayObject *)py_sparse_t0);
-  npy_float *sparse_hit_pos =
-      (npy_float *)PyArray_DATA((PyArrayObject *)py_sparse_hit_pos);
-  int *sparse_count = (int *)PyArray_DATA((PyArrayObject *)py_sparse_count);
-
-  /* Initialize sparse counter to 0 */
-  sparse_count[0] = 0;
-
-  // Get secondary parameters
-  if (!PyFloat_Check(py_p_spawn_single) || !PyFloat_Check(py_p_spawn_pair) || !PyFloat_Check(py_E_sec)) {
-    PyErr_SetString(PyExc_TypeError, "p_spawn_single, p_spawn_pair and E_sec must be floats");
+  // Sparse particle inputs: a flat pool indexed by event via CSR offsets.
+  // offsets is (n_batch+1,) int32; offsets[n_batch] = total particle count T.
+  if (!PyArray_Check(py_offsets) || PyArray_TYPE((PyArrayObject *)py_offsets) != NPY_INT32 ||
+      PyArray_NDIM((PyArrayObject *)py_offsets) != 1 ||
+      PyArray_DIM((PyArrayObject *)py_offsets, 0) != n_batch + 1) {
+    PyErr_SetString(PyExc_TypeError, "offsets must be a (n_batch+1,) int32 array");
     return NULL;
   }
-  const float p_spawn_single = (float)PyFloat_AsDouble(py_p_spawn_single);
-  const float p_spawn_pair = (float)PyFloat_AsDouble(py_p_spawn_pair);
-  const float E_sec_MeV = (float)PyFloat_AsDouble(py_E_sec);
+  const npy_int32 *offsets = (const npy_int32 *)PyArray_DATA((PyArrayObject *)py_offsets);
+  const npy_intp n_total = (npy_intp)offsets[n_batch];
+
+  // Secondary-production material constants (delta-ray rate prefactor, straw wall
+  // thickness, delta-ray tracking cut).
+  if (!PyFloat_Check(py_delta_const) || !PyFloat_Check(py_t_wall) || !PyFloat_Check(py_delta_Tcut)) {
+    PyErr_SetString(PyExc_TypeError, "delta_const, t_wall and delta_Tcut must be floats");
+    return NULL;
+  }
+  cfg.delta_const = (float)PyFloat_AsDouble(py_delta_const);
+  cfg.t_wall = (float)PyFloat_AsDouble(py_t_wall);
+  cfg.delta_Tcut = (float)PyFloat_AsDouble(py_delta_Tcut);
+
+  // Extra physics-process config (set the per-call file-scope knobs).
+  if (!PyFloat_Check(py_lambda_conv) || !PyFloat_Check(py_noise_rate)) {
+    PyErr_SetString(PyExc_TypeError, "lambda_conv and noise_rate must be floats");
+    return NULL;
+  }
+  if (!PyLong_Check(py_enable_decay)) {
+    PyErr_SetString(PyExc_TypeError, "enable_decay must be an int");
+    return NULL;
+  }
+  cfg.lambda_conv_cm = (float)PyFloat_AsDouble(py_lambda_conv);
+  cfg.enable_decay = (int)PyLong_AsLong(py_enable_decay);
+  cfg.noise_rate = (float)PyFloat_AsDouble(py_noise_rate);
+
+  // Integration caps into the config.
+  cfg.n_steps = (int)n_steps;
+  cfg.max_particles = (int)max_particles;
+  cfg.max_depth = 2;  // primary -> secondary -> tertiary
+
+  // Dense output buffers + layer-index decomposition. The caller preallocates X
+  // (zeroed), mask (zeroed) and counts (zeroed, the per-event write cursor).
+  out.X = (npy_float *)PyArray_DATA((PyArrayObject *)py_X);
+  out.mask = (int *)PyArray_DATA((PyArrayObject *)py_mask);
+  out.counts = (int *)PyArray_DATA((PyArrayObject *)py_counts);
+  cfg.M = (int)PyArray_DIM((PyArrayObject *)py_X, 1);
+  cfg.n_views = (int)PyLong_AsLong(py_n_views);
+  cfg.n_lpv = (int)PyLong_AsLong(py_n_lpv);
 
   PyArrayObject *trajectories_array;
 
@@ -642,55 +908,51 @@ static PyObject *solve(PyObject *self, PyObject *args) {
             PyArray_TYPE(trajectories_array) == NPY_FLOAT32 &&
             PyArray_NDIM(trajectories_array) == 4 &&
             PyArray_DIM(trajectories_array, 0) == n_batch &&
-            PyArray_DIM(trajectories_array, 1) == n_particles &&
-            PyArray_DIM(trajectories_array, 2) == n_steps &&
+            PyArray_DIM(trajectories_array, 1) == max_particles &&
+            PyArray_DIM(trajectories_array, 2) >= 1 &&
             PyArray_DIM(trajectories_array, 3) == SPACE_DIM)) {
-      PyErr_SetString(PyExc_TypeError, "The trajectories buffer must be a (n, n_particles, n_t, 3) float64 array.");
+      PyErr_SetString(PyExc_TypeError, "The trajectories buffer must be a (n, max_particles, n_t, 3) float32 array.");
       return NULL;
     }
   } else {
     trajectories_array = NULL;
   }
 
+  // Trajectory is sampled evenly in time, decoupled from the physics step count
+  // (n_steps is just the loop's safety cap). step_t = max_time / n_traj.
+  cfg.n_traj = (trajectories_array != NULL) ? (int)PyArray_DIM(trajectories_array, 2) : 0;
+  cfg.step_t = (cfg.n_traj > 0) ? cfg.max_time / (float)cfg.n_traj : 0.0f;
+
+  // Sparse particle inputs: flat (T, ...) pools indexed by event via `offsets`.
   const PyArrayObject *initial_positions_array =
-      check_vector_array(py_initial_positions, n_batch, n_particles);
+      check_flat_vector(py_initial_positions, n_total);
   if (initial_positions_array == NULL) {
-    PyErr_SetString(
-        PyExc_TypeError,
-        "initial_positions must be a (n, n_particles, 3) float64 array.");
+    PyErr_SetString(PyExc_TypeError, "initial_positions must be a (T, 3) float32 array.");
     return NULL;
   }
 
   const PyArrayObject *initial_momenta_array =
-      check_vector_array(py_initial_momenta, n_batch, n_particles);
+      check_flat_vector(py_initial_momenta, n_total);
   if (initial_momenta_array == NULL) {
-    PyErr_SetString(PyExc_TypeError,
-                    "Invalid value for initial momenta provided. Must be a (n, "
-                    "n_particles, 3) float64 array.");
+    PyErr_SetString(PyExc_TypeError, "initial_momenta must be a (T, 3) float32 array.");
     return NULL;
   }
 
-  const PyArrayObject *masses_array =
-      check_scalar_array(py_masses, n_batch, n_particles);
+  const PyArrayObject *masses_array = check_flat_scalar(py_masses, n_total);
   if (masses_array == NULL) {
-    PyErr_SetString(PyExc_TypeError, "Invalid value for masses provided. Must "
-                                     "be a (n, n_particles) float64 array.");
+    PyErr_SetString(PyExc_TypeError, "masses must be a (T,) float32 array.");
     return NULL;
   }
 
-  const PyArrayObject *charges_array =
-      check_scalar_array(py_charges, n_batch, n_particles);
+  const PyArrayObject *charges_array = check_flat_scalar(py_charges, n_total);
   if (charges_array == NULL) {
-    PyErr_SetString(PyExc_TypeError, "Invalid value for charges provided. Must "
-                                     "be a (n, n_particles) float64 array.");
+    PyErr_SetString(PyExc_TypeError, "charges must be a (T,) float32 array.");
     return NULL;
   }
 
-  const PyArrayObject *initial_times_array =
-      check_scalar_array(py_initial_times, n_batch, n_particles);
+  const PyArrayObject *initial_times_array = check_flat_scalar(py_initial_times, n_total);
   if (initial_times_array == NULL) {
-    PyErr_SetString(PyExc_TypeError, "Invalid value for initial_times provided. Must "
-                                     "be a (n, n_particles) float64 array.");
+    PyErr_SetString(PyExc_TypeError, "initial_times must be a (T,) float32 array.");
     return NULL;
   }
 
@@ -753,7 +1015,7 @@ static PyObject *solve(PyObject *self, PyObject *args) {
     PyErr_SetString(PyExc_TypeError, "dt must be a double");
     return NULL;
   }
-  const npy_float dt = PyFloat_AsDouble(py_dt);
+  cfg.dt_fixed = (npy_float)PyFloat_AsDouble(py_dt);  // 0 -> adaptive per-step dt
 
   const npy_float *initial_positions = PyArray_DATA(initial_positions_array);
   const npy_float *initial_momenta = PyArray_DATA(initial_momenta_array);
@@ -775,25 +1037,16 @@ static PyObject *solve(PyObject *self, PyObject *args) {
 
   npy_intp Bs0 = PyArray_STRIDE(B_array, 0) / sizeof(npy_float);
 
-  npy_intp ips0 =
-      PyArray_STRIDE(initial_positions_array, 0) / sizeof(npy_float);
-  npy_intp ips1 =
-      PyArray_STRIDE(initial_positions_array, 1) / sizeof(npy_float);
-  npy_intp ips2 =
-      PyArray_STRIDE(initial_positions_array, 2) / sizeof(npy_float);
+  // Flat pools: row stride (per particle) + element stride (per xyz component).
+  npy_intp ips0 = PyArray_STRIDE(initial_positions_array, 0) / sizeof(npy_float);
+  npy_intp ips1 = PyArray_STRIDE(initial_positions_array, 1) / sizeof(npy_float);
 
   npy_intp ivs0 = PyArray_STRIDE(initial_momenta_array, 0) / sizeof(npy_float);
   npy_intp ivs1 = PyArray_STRIDE(initial_momenta_array, 1) / sizeof(npy_float);
-  npy_intp ivs2 = PyArray_STRIDE(initial_momenta_array, 2) / sizeof(npy_float);
 
   npy_intp chs0 = PyArray_STRIDE(charges_array, 0) / sizeof(npy_float);
-  npy_intp chs1 = PyArray_STRIDE(charges_array, 1) / sizeof(npy_float);
-
   npy_intp ms0 = PyArray_STRIDE(masses_array, 0) / sizeof(npy_float);
-  npy_intp ms1 = PyArray_STRIDE(masses_array, 1) / sizeof(npy_float);
-
   npy_intp its0 = PyArray_STRIDE(initial_times_array, 0) / sizeof(npy_float);
-  npy_intp its1 = PyArray_STRIDE(initial_times_array, 1) / sizeof(npy_float);
 
   npy_intp ls0 = PyArray_STRIDE(layers_array, 0) / sizeof(npy_float);
   npy_intp ls1 = PyArray_STRIDE(layers_array, 1) / sizeof(npy_float);
@@ -819,6 +1072,22 @@ static PyObject *solve(PyObject *self, PyObject *args) {
     trs3 = PyArray_STRIDE(trajectories_array, 3) / sizeof(npy_float);
   }
 
+  out.trajectories = trajectories;
+  out.trs0 = trs0;
+  out.trs1 = trs1;
+  out.trs2 = trs2;
+  out.trs3 = trs3;
+
+  // Per-event dedup indicator (global layer, straw). One constant per-call alloc;
+  // calloc gives the initial all-zero state, then each event sparse-clears only the
+  // bits it set, so it stays zero between events. Freed after the threaded region.
+  out.fired_stride = (int)n_straws;
+  out.fired = (uint8_t *)calloc((size_t)n_layers * (size_t)n_straws, sizeof(uint8_t));
+  if (out.fired == NULL) {
+    PyErr_NoMemory();
+    return NULL;
+  }
+
   Py_BEGIN_ALLOW_THREADS
 
   // printf("\n=== Starting solve: n_batch=%ld, n_particles=%ld, n_layers=%ld, n_straws=%ld ===\n",
@@ -827,63 +1096,90 @@ static PyObject *solve(PyObject *self, PyObject *args) {
   for (int l = 0; l < n_batch; ++l) {
     const npy_float B = Bs[l * Bs0];
 
+    // This event's geometry + field, shared by all its particles.
+    const Geometry geom = {
+        .layers = layers, .heights = heights, .widths = widths, .angles = angles,
+        .ls0 = ls0, .ls1 = ls1, .hs0 = hs0, .hs1 = hs1,
+        .ws0 = ws0, .ws1 = ws1, .as0 = as0, .as1 = as1,
+        .n_layers = (int)n_layers, .n_straws = (int)n_straws,
+        .z0_field = z0s[l], .B_sigma = B_sigmas[l], .B = B,
+    };
+
     // printf("\nEvent %d: B=%.4f T\n", l, B);
 
-    // Count actual primary particles in this event (non-zero mass)
-    int n_primaries = 0;
-    for (int i = 0; i < n_particles; ++i) {
-      npy_float mass = masses[l * ms0 + i * ms1];
-      if (mass > SLOW) {
-        n_primaries = i + 1;  // Track highest valid particle index + 1
-      }
-    }
+    // This event's primaries are the flat rows [offsets[l], offsets[l+1]). The
+    // loader caps each event at max_particles, so the local index i (used as the
+    // trajectory slot) stays < max_particles; secondaries take slots [n_prim, ...).
+    const npy_intp p_start = offsets[l];
+    const npy_intp p_end = offsets[l + 1];
+    const int n_primaries = (int)(p_end - p_start);
 
-    // Track to keep secondary particle indices
     int next_secondary_idx = n_primaries;  // Secondaries start after primaries
 
-    for (int i = 0; i < n_particles; ++i) {
-      // Extract scalar initial conditions for this particle
-      npy_float x0 = initial_positions[l * ips0 + i * ips1];
-      npy_float y0 = initial_positions[l * ips0 + i * ips1 + ips2];
-      npy_float z0 = initial_positions[l * ips0 + i * ips1 + 2 * ips2];
+    for (int i = 0; i < n_primaries; ++i) {
+      const npy_intp r = p_start + i;  // flat row for this primary
 
-      npy_float px0 = initial_momenta[l * ivs0 + i * ivs1];
-      npy_float py0 = initial_momenta[l * ivs0 + i * ivs1 + ivs2];
-      npy_float pz0 = initial_momenta[l * ivs0 + i * ivs1 + 2 * ivs2];
+      npy_float x0 = initial_positions[r * ips0];
+      npy_float y0 = initial_positions[r * ips0 + ips1];
+      npy_float z0 = initial_positions[r * ips0 + 2 * ips1];
 
-      npy_float charge = charges[l * chs0 + i * chs1];
-      npy_float mass = masses[l * ms0 + i * ms1];
-      npy_float t_initial = initial_times[l * its0 + i * its1];
+      npy_float px0 = initial_momenta[r * ivs0];
+      npy_float py0 = initial_momenta[r * ivs0 + ivs1];
+      npy_float pz0 = initial_momenta[r * ivs0 + 2 * ivs1];
 
-      npy_float z0_field = z0s[l];
-      npy_float B_sigma = B_sigmas[l];
+      npy_float charge = charges[r * chs0];
+      npy_float mass = masses[r * ms0];
+      npy_float t_initial = initial_times[r * its0];
 
       // Track this primary particle (depth=0)
       track_particle(
-          l, i,  // event_idx, particle_idx
+          &cfg, &geom, &out,
+          l, i,
           x0, y0, z0,
           px0, py0, pz0,
           mass, charge,
-          t_initial,  // Initial time from data
-          0, 0, 2,  // start_step=0, depth=0, max_depth=2
-          layers, heights, widths, angles, z0_field, B_sigma,
-          n_layers, n_straws,
-          ls0, ls1, hs0, hs1, ws0, ws1, as0, as1,
-          dt, B, n_steps,
-          sparse_events, sparse_particles, sparse_layers, sparse_straws,
-          sparse_values, sparse_r_mm, sparse_t0, sparse_hit_pos, sparse_count,
-          trajectories, trs0, trs1, trs2, trs3,
-          p_spawn_single, p_spawn_pair, E_sec_MeV,
-          &next_secondary_idx, max_particles
+          t_initial,
+          0, 0,  // start_step=0, depth=0
+          &next_secondary_idx, &rng_seed
       );
+    }
+
+    // Uncorrelated detector noise: a few random straw hits per event, written
+    // straight into the dense buffer. Generic electronic noise -- NOT a model of
+    // the full-sim hit_track==-2 hits (those are real untracked shower secondaries).
+    if (cfg.noise_rate > 0.0f) {
+      uint32_t noise_rng = rng_seed;
+      rng_seed += 0x9E3779B9u;
+      const int n_noise = rand_poisson(&noise_rng, cfg.noise_rate);
+      for (int q = 0; q < n_noise; ++q) {
+        int k = (int)(rand01(&noise_rng) * n_layers);
+        if (k >= n_layers) k = n_layers - 1;
+        int straw_i = (int)(rand01(&noise_rng) * n_straws);
+        if (straw_i >= n_straws) straw_i = n_straws - 1;
+        const float t_noise = 278.0f + rand01(&noise_rng) * 160.0f; /* plausible TDC window (ns) */
+        dense_record(&cfg, &out, l, k, straw_i, t_noise);
+      }
+    }
+
+    // Restore the dedup indicator to all-zero by clearing only the bits this event
+    // set (one per recorded hit) -- cheaper than a full memset per event.
+    {
+      const int cnt = out.counts[l];
+      const npy_intp eb = (npy_intp)l * cfg.M * 5;
+      const int per_station = cfg.n_views * cfg.n_lpv;
+      for (int q = 0; q < cnt; ++q) {
+        const npy_intp b = eb + (npy_intp)q * 5;
+        const int kk = (int)out.X[b + 0] * per_station + (int)out.X[b + 1] * cfg.n_lpv + (int)out.X[b + 2];
+        out.fired[(npy_intp)kk * out.fired_stride + (int)out.X[b + 3]] = 0;
+      }
     }
   }
 
   Py_END_ALLOW_THREADS
 
-  // printf("\n=== solve complete: total hits recorded = %d ===\n\n", sparse_count[0]);
+  free(out.fired);
 
-  /* Return 0 - sparse arrays were filled in-place */
+  /* Return 0 - dense X / mask were filled in-place */
   return PyLong_FromLong(0);
 }
 

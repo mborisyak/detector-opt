@@ -365,11 +365,11 @@ class DebugDetector(Detector):
     # ------------------------------------------------------------------ #
     # Detector contract
     # ------------------------------------------------------------------ #
-    def __call__(self, seed, design, split=None):
+    def __call__(self, seed, design):
         """Generate one event per design row; returns ``(gt, X, mask, target)``.
 
-        ``split`` is accepted for API compatibility and ignored (events are
-        generated on demand, so train/val draw independent streams via ``seed``).
+        Events are generated on demand from ``seed``; train/val draw independent
+        streams via different seeds (the detector owns no split).
         """
         rng = np.random.default_rng(seed)
         station_z, tilt, B = self._split_design(design)
@@ -377,7 +377,7 @@ class DebugDetector(Detector):
         X, mask, *_ = self._measure(rng, ev, station_z, tilt, B)
         return ev["ground_truth"], X, mask, ev["target"]
 
-    def sample_events(self, seed, design, split=None, n_traj_steps=4):
+    def sample_events(self, seed, design, n_traj_steps=4):
         """Generate events and return a rich dict for visualisation / inspection.
 
         ``design`` is the *physical* (un-encoded) design ``(B, design_dim)`` (or a

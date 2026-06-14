@@ -20,8 +20,8 @@ matplotlib.use("AGG")
 MAX_INT = 9223372036854775807
 
 # Enable JAX compilation logging to detect recompilations
-jax.config.update("jax_log_compiles", True)
-jax.config.update("jax_explain_cache_misses", True)
+# jax.config.update("jax_log_compiles", True)
+# jax.config.update("jax_explain_cache_misses", True)
 
 
 def optimize(seed, output, progress=True, restore=True, trace=None, report=None, **config):
@@ -83,17 +83,13 @@ def optimize(seed, output, progress=True, restore=True, trace=None, report=None,
 
     reg_coef = config.get("regularization", 1.0e-4)
 
-    # Extract detector constants to avoid closure capture causing recompilation
-    target_mean = detector.target_mean
-    target_std = detector.target_std
-
     @jax.jit
     def loss_f(x, c, t, r_params, r_state):
         regressor = nnx.merge(regressor_def, r_params, r_state)
         p = regressor(x, c, deterministic=False)
 
         # Standard MSE loss on normalized values
-        target_norm = (t - target_mean) / target_std
+        target_norm = detector.normalize_target(t)
         diff = target_norm - p
         mse = jnp.mean(jnp.square(diff), axis=-1)
         mse_loss = jnp.mean(mse)
@@ -112,7 +108,7 @@ def optimize(seed, output, progress=True, restore=True, trace=None, report=None,
         p = regressor(x, c, deterministic=True)
 
         # RMSE on normalized values
-        target_norm = (t - target_mean) / target_std
+        target_norm = detector.normalize_target(t)
         rmse = jnp.sqrt(jnp.mean(jnp.square(target_norm - p), axis=-1))
         metric = jnp.mean(rmse)
 
@@ -125,7 +121,7 @@ def optimize(seed, output, progress=True, restore=True, trace=None, report=None,
         p = regressor(x, c, deterministic=True)
 
         # Unnormalize predictions and targets to physical units
-        p_unnorm = p * target_std + target_mean
+        p_unnorm = detector.denormalize_predictions(p)
 
         # Per-component RMSE in physical units
         per_component_rmse = jnp.sqrt(jnp.mean(jnp.square(t - p_unnorm), axis=0))
