@@ -51,7 +51,7 @@ def test_encode_decode_roundtrip_and_jittable():
     d = _make()
     phys = d.get_current_design_array()
     enc = jax.jit(d.encode_design)(jnp.asarray(phys))
-    back = np.asarray(d.decode_design(enc))
+    back = np.asarray(d.flatten_design(d.decode_design(enc)))  # decode -> dict -> flat
     np.testing.assert_allclose(back, phys, rtol=1e-3, atol=1e-2)
     assert enc.shape == (d.design_dim(),)
 

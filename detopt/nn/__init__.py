@@ -7,7 +7,7 @@ from .. import utils
 from .regressor import *
 from .generator import *
 from .discriminator import *
-from .set_regressor import SetRegressor, SetEnsembleRegressor
+from .set_regressor import SetRegressor
 
 __models__: dict[str, type[Regressor]] = {
     "mlp": MLP,
@@ -15,12 +15,11 @@ __models__: dict[str, type[Regressor]] = {
     "hyper-resnet": HyperResNet,
     "deep-set": DeepSet,
     "bayes-deep-set": BayesDeepSet,
-    "set-regressor": SetRegressor,
-    "set-ensemble-regressor": SetEnsembleRegressor,
+    "set-regressor": SetRegressor,  # ensemble via n_models (None = single net)
     "deep-set-vae": DeepSetVAE,
     "cvae": CVAE,
     "mlp-vae": MLPVAE,
-    "deep-set-lfi": DeepSetLFI,
+    "set-discriminator": SetDiscriminator,
 }
 
 

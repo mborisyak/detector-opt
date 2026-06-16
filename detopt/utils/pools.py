@@ -17,8 +17,9 @@ detector calls are visible there) and append them here.
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
-__all__ = ["Pool"]
+__all__ = ["Pool", "RingBuffer"]
 
 
 class Pool:
@@ -65,3 +66,68 @@ class Pool:
         per event), so ``combine`` can be design-conditioned.
         """
         return self.X, self.mask, self.targets, self.designs
+
+
+class RingBuffer:
+    """Fixed-capacity FIFO ring of recent training examples on a JAX device.
+
+    Unlike :class:`Pool` (append-only, sized to the whole budget), the ring keeps only
+    the most recent ``capacity`` examples: ``push`` overwrites the oldest once full via a
+    modular cursor. It stores **network-ready** ``features`` (already design-``combine``d),
+    the per-event ``mask``, and the normalised ``targets`` -- exactly what a scan-folded
+    train step samples minibatches from. ``state``/``load_state`` round-trip the arrays +
+    cursor so the ring survives a checkpoint/restore.
+    """
+
+    def __init__(self, capacity, feature_shape, mask_shape, target_shape, device=None):
+        self.capacity = int(capacity)
+        self.device = device
+
+        def alloc(per_event_shape, dtype):
+            zeros = jnp.zeros((self.capacity, *tuple(per_event_shape)), dtype=dtype)
+            return jax.device_put(zeros, device=device)
+
+        self.features = alloc(feature_shape, jnp.float32)
+        self.mask = alloc(mask_shape, jnp.int32)
+        self.targets = alloc(target_shape, jnp.float32)
+        self.cursor = 0  # next write position (mod capacity)
+        self.n_filled = 0  # number of valid rows so far (<= capacity)
+
+    def push(self, features, mask, targets):
+        """Write a chunk of ``n`` examples, overwriting the oldest once the ring is full."""
+        features, mask, targets = (jnp.asarray(features), jnp.asarray(mask), jnp.asarray(targets))
+        n = features.shape[0]
+        if n > self.capacity:  # an oversized chunk: keep only its last `capacity` rows
+            features, mask, targets = features[-self.capacity :], mask[-self.capacity :], targets[-self.capacity :]
+            n = self.capacity
+        idx = (self.cursor + jnp.arange(n)) % self.capacity
+        self.features = self.features.at[idx].set(features)
+        self.mask = self.mask.at[idx].set(mask)
+        self.targets = self.targets.at[idx].set(targets)
+        self.cursor = int((self.cursor + n) % self.capacity)
+        self.n_filled = int(min(self.n_filled + n, self.capacity))
+
+    def buffers(self):
+        """The three per-example buffers ``(features, mask, targets)`` (full capacity)."""
+        return self.features, self.mask, self.targets
+
+    def __len__(self):
+        return self.n_filled
+
+    def state(self):
+        """Serialisable snapshot (arrays + cursor) for checkpointing."""
+        return {
+            "features": self.features,
+            "mask": self.mask,
+            "targets": self.targets,
+            "cursor": np.int32(self.cursor),
+            "n_filled": np.int32(self.n_filled),
+        }
+
+    def load_state(self, state):
+        """Restore from a :meth:`state` snapshot."""
+        self.features = jax.device_put(jnp.asarray(state["features"]), self.device)
+        self.mask = jax.device_put(jnp.asarray(state["mask"]), self.device)
+        self.targets = jax.device_put(jnp.asarray(state["targets"]), self.device)
+        self.cursor = int(state["cursor"])
+        self.n_filled = int(state["n_filled"])

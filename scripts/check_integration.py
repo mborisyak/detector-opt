@@ -18,13 +18,17 @@ import yaml
 from detopt.detector.free_straw import FreeStrawDetector, free_design_array
 
 
-def _nominal_design(det, cfg_path="config/detector/straw.yaml"):
+def _nominal_design(det, cfg_path="config/detector/nominal_design.yaml"):
     nd = yaml.safe_load(open(cfg_path))["nominal_design"]
     return free_design_array(
-        nd["station_z"], n_layers_per_view=det.n_layers_per_view,
-        view_angles=nd["view_angles"], view_z_gap=nd["view_z_gap"],
-        layer_z_gap=nd["layer_z_gap"], B=nd["B"],
+        nd["station_z"],
+        n_layers_per_view=det.n_layers_per_view,
+        view_angles=nd["view_angles"],
+        view_z_gap=nd["view_z_gap"],
+        layer_z_gap=nd["layer_z_gap"],
+        B=nd["B"],
     )
+
 
 NPZ = sys.argv[1] if len(sys.argv) > 1 else "ship2numpy.npz"
 N_EVENTS = int(sys.argv[2]) if len(sys.argv) > 2 else 150
@@ -60,7 +64,9 @@ def hitset_and_times(det, events, idx, seed):
     out = {}
     for e in idx:
         dd = _event_dd(events, e)
-        X, mask, _ = det._run_solver(dd, design, np.random.default_rng(seed))
+        ie = det._make_input_events(dd)
+        n = len(dd["masses"])
+        X, mask, _ = det._run_solver(np.array([[0, n]], np.int32), design, np.random.default_rng(seed), input_events=ie)
         h = X[0, mask[0].astype(bool)]
         for row in h:
             out[(e, int(row[0]), int(row[1]), int(row[2]), int(row[3]))] = float(row[4])

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Does dropout help convergence (data-to-precision) for the ENSEMBLE regressor?
 
-Repeats the dropout convergence experiment, but with
-:class:`detopt.nn.SetEnsembleRegressor` (``n_models`` independently-trained
+Repeats the dropout convergence experiment, but with an ensemble
+:class:`detopt.nn.SetRegressor` (``n_models`` independently-trained
 members) in place of the single set regressor. One design is trained with the
 real :class:`detopt.nn.trainer.DesignTrainer` + the actual stopping criterion,
 varying only the dropout rate, and we report how much data / how many epochs each
@@ -35,7 +35,7 @@ def run(seed=0, n_models=4, budget=400_000, iteration_limit=16384, loss_precisio
         trainer = DesignTrainer(
             det,
             regressor_config={
-                "set-ensemble-regressor": {
+                "set-regressor": {
                     "features": [[64, 64], [64, 32]],
                     "n_models": n_models,
                     "p_dropout": p,

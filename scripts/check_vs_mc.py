@@ -24,14 +24,18 @@ import yaml  # noqa: E402
 from detopt.detector.free_straw import FreeStrawDetector, free_design_array  # noqa: E402
 
 
-def _nominal_design(det, cfg_path="config/detector/straw.yaml"):
+def _nominal_design(det, cfg_path="config/detector/nominal_design.yaml"):
     """Read the nominal design from config (not detector state) and build the array."""
     nd = yaml.safe_load(open(cfg_path))["nominal_design"]
     return free_design_array(
-        nd["station_z"], n_layers_per_view=det.n_layers_per_view,
-        view_angles=nd["view_angles"], view_z_gap=nd["view_z_gap"],
-        layer_z_gap=nd["layer_z_gap"], B=nd["B"],
+        nd["station_z"],
+        n_layers_per_view=det.n_layers_per_view,
+        view_angles=nd["view_angles"],
+        view_z_gap=nd["view_z_gap"],
+        layer_z_gap=nd["layer_z_gap"],
+        B=nd["B"],
     )
+
 
 NPZ = sys.argv[1] if len(sys.argv) > 1 else "ship2numpy.npz"
 N_SHOW = int(sys.argv[2]) if len(sys.argv) > 2 else 6
@@ -48,13 +52,42 @@ def event_daughters(events, e):
         "positions": events["positions"][s],
         "momenta": events["momenta"][s],
         "times": events["times"][s],
-        "offsets": np.array([0, n], dtype=np.int32),
     }
+
+
+def run_one(det, dd, design, rng):
+    """Solve a single hand-built event dict and return (X, mask, trajectories)."""
+    ie = det._make_input_events(dd)
+    n = len(dd["masses"])
+    traj = np.zeros((1, det.max_particles, det.n_t, 3), dtype=np.float32)
+    X, mask, _ = det._run_solver(np.array([[0, n]], np.int32), design, rng, input_events=ie, trajectories=traj)
+    return X, mask, traj
 
 
 def event_nparticles(events, e):
     o = events["offsets"]
     return int(o[e + 1]) - int(o[e])
+
+
+def _frame_corners(det, z, angle):
+    """Lab-frame corners of a layer's parallelogram (matches viz/straw._frame_corners):
+    vertical sides at x = +/-width; top/bottom edges sheared by the stereo tilt."""
+    w, h = det.layer_width, det.layer_height
+    s = w * np.tan(angle)
+    x = np.array([-w, -w, w, w], dtype=np.float32)
+    y = np.array([-h - s, h - s, h + s, -h + s], dtype=np.float32)
+    return x, y, float(z)
+
+
+def draw_stations(ax, det, design):
+    """Overlay the detector's station/layer planes: one wireframe parallelogram per
+    layer, drawn in the plot's (z, x, y) axis order so tracks/hits sit in context."""
+    positions, angles = det._design_to_geometry(design)[:2]
+    positions, angles = positions[0], angles[0]
+    for k in range(det.n_layers):
+        x, y, z = _frame_corners(det, float(positions[k]), float(angles[k]))
+        xl, yl = np.append(x, x[0]), np.append(y, y[0])  # close the loop
+        ax.plot(np.full_like(xl, z), xl, yl, color="0.6", lw=0.5, alpha=0.4)
 
 
 def main():
@@ -80,7 +113,7 @@ def main():
     # ---- per-event residual + multiplicity over a larger sample -----------------
     sim_mult, mc_mult, residuals = [], [], []
     for e in cand[:200]:
-        _, mask, traj = det._run_solver(event_daughters(events, e), design, rng)
+        _, mask, traj = run_one(det, event_daughters(events, e), design, rng)
         sim_mult.append(int(mask.sum()))
         mc = hits_xyz[(hit_ev == e) & real]  # real tracks only
         mc_mult.append(len(mc))
@@ -94,16 +127,24 @@ def main():
     sim_mult, mc_mult, residuals = map(np.asarray, (sim_mult, mc_mult, residuals))
     print(f"events checked: {len(sim_mult)}")
     print(f"hits/event  sim: mean {sim_mult.mean():.1f}  MC: mean {mc_mult.mean():.1f}")
-    print(f"MC-hit -> nearest-trajectory residual (cm): "
-          f"median {np.median(residuals):.2f}  p90 {np.percentile(residuals, 90):.2f}  mean {residuals.mean():.2f}")
+    print(
+        f"MC-hit -> nearest-trajectory residual (cm): "
+        f"median {np.median(residuals):.2f}  p90 {np.percentile(residuals, 90):.2f}  mean {residuals.mean():.2f}"
+    )
 
     # ---- 3D overlays ------------------------------------------------------------
+    # Axis limits = the detector volume: z over the layer span, x over the straw
+    # half-length, y over the straw half-height (so strays don't blow out the view).
+    zl = det._design_to_geometry(design)[0][0]
+    zlo, zhi = float(zl.min()), float(zl.max())
+    zmar = 0.05 * (zhi - zlo)
     ncol = 3
     nrow = int(np.ceil(len(show) / ncol))
     fig = plt.figure(figsize=(6 * ncol, 5 * nrow))
     for i, e in enumerate(show):
-        _, mask, traj = det._run_solver(event_daughters(events, e), design, rng)
+        _, mask, traj = run_one(det, event_daughters(events, e), design, rng)
         ax = fig.add_subplot(nrow, ncol, i + 1, projection="3d")
+        draw_stations(ax, det, design)  # detector station/layer frames for context
         npart = event_nparticles(events, e)
         for p in range(min(npart, traj.shape[1])):
             t = traj[0, p]
@@ -117,6 +158,9 @@ def main():
         ax.set_xlabel("z (cm)")
         ax.set_ylabel("x (cm)")
         ax.set_zlabel("y (cm)")
+        ax.set_xlim(zlo - zmar, zhi + zmar)
+        ax.set_ylim(-det.layer_width, det.layer_width)
+        ax.set_zlim(-det.layer_height, det.layer_height)
     fig.tight_layout()
     out = Path("output/check_vs_mc.png")
     out.parent.mkdir(exist_ok=True)

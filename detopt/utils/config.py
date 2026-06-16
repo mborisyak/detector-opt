@@ -37,10 +37,14 @@ def extract(config: dict[str, dict[str, Any]], library: dict[str, T]) -> tuple[T
     return library[name], arguments
 
 
-def optimizer(config: dict[str, Any]):
+def optimizer(config: dict[str, Any], n_total_steps: int | None=None):
     import optax
 
     name, arguments = split(config)
+    if 'learning_rate' in arguments:
+        if isinstance(arguments['learning_rate'], dict):
+            lr_name, lr_arguments = split(arguments['learning_rate'])
+            arguments['learning_rate'] = getattr(optax, lr_name)(**lr_arguments, decay_steps=n_total_steps)
 
     return getattr(optax, name)(**arguments)
 

@@ -26,13 +26,17 @@ import yaml  # noqa: E402
 from detopt.detector.free_straw import FreeStrawDetector, free_design_array  # noqa: E402
 
 
-def _nominal_design(det, cfg_path="config/detector/straw.yaml"):
+def _nominal_design(det, cfg_path="config/detector/nominal_design.yaml"):
     nd = yaml.safe_load(open(cfg_path))["nominal_design"]
     return free_design_array(
-        nd["station_z"], n_layers_per_view=det.n_layers_per_view,
-        view_angles=nd["view_angles"], view_z_gap=nd["view_z_gap"],
-        layer_z_gap=nd["layer_z_gap"], B=nd["B"],
+        nd["station_z"],
+        n_layers_per_view=det.n_layers_per_view,
+        view_angles=nd["view_angles"],
+        view_z_gap=nd["view_z_gap"],
+        layer_z_gap=nd["layer_z_gap"],
+        B=nd["B"],
     )
+
 
 NPZ = sys.argv[1] if len(sys.argv) > 1 else "ship2numpy.npz"
 N = int(sys.argv[2]) if len(sys.argv) > 2 else 400
@@ -49,8 +53,16 @@ def event_dd(ev, e):
         "positions": ev["positions"][s],
         "momenta": ev["momenta"][s],
         "times": ev["times"][s],
-        "offsets": np.array([0, n], dtype=np.int32),
     }
+
+
+def run_one(det, dd, design, rng):
+    """Solve a single hand-built event dict -> (X, mask, trajectories)."""
+    ie = det._make_input_events(dd)
+    n = len(dd["masses"])
+    traj = np.zeros((1, det.max_particles, det.n_t, 3), dtype=np.float32)
+    X, mask, _ = det._run_solver(np.array([[0, n]], np.int32), design, rng, input_events=ie, trajectories=traj)
+    return X, mask, traj
 
 
 def event_npart(ev, e):
@@ -85,7 +97,7 @@ def main():
     cand = [e for e in range(det.n_events) if event_npart(ev, e) > 0 and np.any((he == e) & real)][:N]
     for e in cand:
         dd = event_dd(ev, e)
-        X, mask, traj = det._run_solver(dd, design, rng)
+        X, mask, traj = run_one(det, dd, design, rng)
         h = X[0, mask[0].astype(bool)]
         sim_mult.append(len(h))
         for row in h:
@@ -93,34 +105,55 @@ def main():
             sim_z.append(float(layers_z[k]))
             yoff = (0.5 if int(row[2]) & 1 else -0.5) * det.layer_y_offset
             sim_y.append((row[3] + 0.5) * det.straw_pitch - det.layer_height + yoff)
+        # Occupancy/multiplicity compare against ALL MC hits: the sim emits its tracked
+        # secondaries (delta-rays / pairs / decay mu), so the like-for-like MC set must
+        # include the untracked shower secondaries (hit_track==-2), not just real tracks.
+        # The trajectory miss below still uses real tracks (it needs the daughter match).
         mc = hits[(he == e) & real]
-        mc_mult.append(len(mc))
-        mc_z.extend(mc[:, 2].tolist())
-        mc_y.extend(mc[:, 1].tolist())
+        mc_all = hits[he == e]
+        mc_mult.append(len(mc_all))
+        mc_z.extend(mc_all[:, 2].tolist())
+        mc_y.extend(mc_all[:, 1].tolist())
         npp = event_npart(ev, e)
         for hh in mc:
-            d = [np.hypot(*(at_z(traj[0, p], hh[2]) - hh[:2])) for p in range(min(npp, traj.shape[1])) if at_z(traj[0, p], hh[2]) is not None]
+            d = [
+                np.hypot(*(at_z(traj[0, p], hh[2]) - hh[:2]))
+                for p in range(min(npp, traj.shape[1]))
+                if at_z(traj[0, p], hh[2]) is not None
+            ]
             if d:
                 miss.append(min(d))
 
     sim_mult, mc_mult, miss = map(np.asarray, (sim_mult, mc_mult, miss))
     print(f"events: {len(cand)}")
-    print(f"hits/event   sim mean {sim_mult.mean():.1f} median {np.median(sim_mult):.0f} | MC mean {np.mean(mc_mult):.1f} median {np.median(mc_mult):.0f}")
+    print(
+        f"hits/event   sim mean {sim_mult.mean():.1f} median {np.median(sim_mult):.0f} | MC mean {np.mean(mc_mult):.1f} median {np.median(mc_mult):.0f}"
+    )
     print(f"transverse miss (cm): median {np.median(miss):.2f}  p90 {np.percentile(miss,90):.2f}")
     print(f"hit z (cm):  sim [{min(sim_z):.0f},{max(sim_z):.0f}] | MC [{min(mc_z):.0f},{max(mc_z):.0f}]")
 
     fig, ax = plt.subplots(2, 2, figsize=(13, 9))
-    ax[0, 0].hist(mc_mult, bins=30, alpha=0.5, label="MC", color="k")
-    ax[0, 0].hist(sim_mult, bins=30, alpha=0.5, label="sim", color="C0")
-    ax[0, 0].set(title="hits / event", xlabel="n hits"); ax[0, 0].legend()
-    ax[0, 1].hist(mc_z, bins=80, alpha=0.5, label="MC", color="k", density=True)
-    ax[0, 1].hist(sim_z, bins=80, alpha=0.5, label="sim", color="C0", density=True)
-    ax[0, 1].set(title="hit z occupancy", xlabel="z (cm)"); ax[0, 1].legend()
+    ax[0, 0].hist(mc_mult, bins=30, alpha=0.5, label="MC (all hits)", color="k", density=True)
+    ax[0, 0].hist(sim_mult, bins=30, alpha=0.5, label="sim", color="C0", density=True)
+    ax[0, 0].set(title="hits / event", xlabel="n hits", ylabel="density")
+    ax[0, 0].legend()
+    # Per-layer occupancy: sim hits sit at discrete layer z, so even z-bins catch uneven
+    # numbers of layers (false spikes). Snap both sim and MC to the nearest layer and
+    # count per layer -- a fair, discreteness-free occupancy comparison.
+    zl = np.asarray(layers_z)
+    sim_layer = np.argmin(np.abs(np.asarray(sim_z)[:, None] - zl[None, :]), axis=1)
+    mc_layer = np.argmin(np.abs(np.asarray(mc_z)[:, None] - zl[None, :]), axis=1)
+    xl = np.arange(len(zl))
+    ax[0, 1].step(xl, np.bincount(mc_layer, minlength=len(zl)), where="mid", color="k", label="MC (all hits)")
+    ax[0, 1].step(xl, np.bincount(sim_layer, minlength=len(zl)), where="mid", color="C0", label="sim")
+    ax[0, 1].set(title="hit occupancy per layer", xlabel="layer index (z-ordered)", ylabel="hits", ylim=(0, None))
+    ax[0, 1].legend()
     ax[1, 0].hist(miss, bins=np.linspace(0, 30, 60), color="C2")
-    ax[1, 0].set(title="per-z transverse miss (sim track -> MC hit)", xlabel="cm", yscale="log")
-    ax[1, 1].hist(mc_y, bins=80, alpha=0.5, label="MC", color="k", density=True)
+    ax[1, 0].set(title="transverse miss", xlabel="cm", yscale="log")
+    ax[1, 1].hist(mc_y, bins=80, alpha=0.5, label="MC (all hits)", color="k", density=True)
     ax[1, 1].hist(sim_y, bins=80, alpha=0.5, label="sim", color="C0", density=True)
-    ax[1, 1].set(title="hit transverse y", xlabel="y (cm)"); ax[1, 1].legend()
+    ax[1, 1].set(title="hit transverse y", xlabel="y (cm)")
+    ax[1, 1].legend()
     fig.tight_layout()
     out = Path("output/check_distributions.png")
     out.parent.mkdir(exist_ok=True)

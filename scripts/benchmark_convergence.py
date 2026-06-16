@@ -50,7 +50,7 @@ def _train_curve(seed, n0, max_epochs):
         seed=seed,
     )
     design_enc = np.zeros(det.design_dim(), dtype=np.float32)
-    design_phys = np.asarray(det.decode_design(design_enc), dtype=np.float32)
+    design_phys = np.asarray(det.flatten_design(det.decode_design(design_enc)), dtype=np.float32)
 
     init_seq, train_seq, val_seq, run_seq = np.random.SeedSequence(seed).spawn(4)
     tp, vp = trainer.train_pool, trainer.val_pool

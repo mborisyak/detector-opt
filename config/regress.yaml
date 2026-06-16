@@ -1,20 +1,28 @@
-detector: straw
+detector: stereo
+design: initial_stereo
 
 regressor:
-  deep-set:
-    features: [[64, 128], [128, 96]]
-    p_dropout: 0.1
+  set-regressor:
+    features: [ [ 64, 32 ], [ 64, 32 ], [ 64, 32 ] ]
 
 optimizer:
-  adabelief:
-    learning_rate: 1e-4
+  adamw:
+    learning_rate:
+      cosine_decay_schedule:
+        init_value: 1.0e-3
 
-initial_design: data/design/default.json
+    weight_decay: 1.0e-3
 
-batch: 32
-epochs: 32
-steps: 6000
+sampling:
+  batch: 1024
 
-validation_batches: 32
+training:
+  batch: 32
+  epochs: 32
+  samples: 32768
+
+validation:
+  batch: 128
+  samples: 16384
 
 report: output/losses.png

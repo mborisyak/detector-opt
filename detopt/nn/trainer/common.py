@@ -181,7 +181,7 @@ class Trainer:
                 mask_e = mask_b.reshape((members, batch) + mask_b.shape[1:])
                 pred = reg(feats_e, mask_e, deterministic=False, rngs=nnx.Rngs(drop_key))  # (N, batch, T)
                 pred = pred.reshape((members * batch,) + pred.shape[2:])
-            loss = jnp.mean(detector.loss(pred, targets_b))
+            loss = jnp.mean(detector.loss(pred, detector.normalize_target(targets_b)))
             _, _, new_state = nnx.split(reg, nnx.Param, nnx.Variable)
             return loss, new_state
 
@@ -261,7 +261,7 @@ class Trainer:
                     feats_e = jnp.broadcast_to(features, (members,) + features.shape)
                     mask_e = jnp.broadcast_to(mask_b, (members,) + mask_b.shape)
                     pred = reg(feats_e, mask_e, deterministic=True).mean(axis=0)  # (E, T)
-                return None, detector.loss(pred, targets_buf[safe])
+                return None, detector.loss(pred, detector.normalize_target(targets_buf[safe]))
 
             _, losses = jax.lax.scan(body, None, jnp.arange(n_chunks))
             return losses.reshape(-1)[:window]  # per-event losses over the window

@@ -93,7 +93,7 @@ def test_set_ensemble_regressor_shape_and_members(seed):
     ensemble axis (members are initialised and trained independently).
     """
     N, B, M, F, T = 4, 3, 16, 8, 6
-    reg = detopt.nn.SetEnsembleRegressor(
+    reg = detopt.nn.SetRegressor(
         n_features_in=F, target_dim=T, features=[[16, 16], [16, 8]], n_models=N, rngs=nnx.Rngs(seed)
     )
     assert reg.ensemble() == N
@@ -110,7 +110,7 @@ def test_set_ensemble_regressor_shape_and_members(seed):
 def test_set_ensemble_regressor_mask_independence(seed):
     """Padded slots must not influence any member's prediction."""
     N, B, M, F, T = 3, 2, 32, 5, 4
-    reg = detopt.nn.SetEnsembleRegressor(n_features_in=F, target_dim=T, features=[[12, 12]], n_models=N, rngs=nnx.Rngs(seed))
+    reg = detopt.nn.SetRegressor(n_features_in=F, target_dim=T, features=[[12, 12]], n_models=N, rngs=nnx.Rngs(seed))
     rng = np.random.default_rng(seed)
     feats = jnp.asarray(rng.standard_normal((N, B, M, F)).astype("float32"))
     mask = jnp.asarray(np.concatenate([np.ones((N, B, M // 2)), np.zeros((N, B, M // 2))], axis=2).astype("int32"))
@@ -126,8 +126,8 @@ def test_set_ensemble_regressor_factory_and_ensemble_query(seed):
     detector = detopt.detector.DebugDetector()
     reg = detopt.nn.from_config(
         detector,
-        config={"set-ensemble-regressor": {"features": [[8, 8]], "n_models": 5}},
+        config={"set-regressor": {"features": [[8, 8]], "n_models": 5}},
         rngs=nnx.Rngs(seed),
     )
-    assert isinstance(reg, detopt.nn.SetEnsembleRegressor)
+    assert isinstance(reg, detopt.nn.SetRegressor)
     assert reg.ensemble() == 5

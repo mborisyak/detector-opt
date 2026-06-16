@@ -46,7 +46,7 @@ def confirm(results, max_epochs: int = 100, seed: int = 0, **config):
     print(f"Best design: iteration {best['iteration']} of {len(rs)} " f"| BO loss = {bo_loss:.4f} ± {bo_std:.4f}")
 
     detector = detopt.detector.from_config(config["detector"])
-    phys = np.asarray(detector.decode_design(design_enc), dtype=np.float32)
+    phys = np.asarray(detector.flatten_design(detector.decode_design(design_enc)), dtype=np.float32)
     print(f"  encoded  = {design_enc.tolist()}")
     print(f"  physical = {phys.tolist()}")
 
@@ -137,7 +137,7 @@ def evaluate(checkpoint, seed: int = 0, step=None, **config):
     params_pure, state_pure, design, aux = io.restore_training_checkpoint(manager, step)
 
     design_enc = np.asarray(design["encoded"], dtype=np.float32)
-    phys = np.asarray(detector.decode_design(design_enc), dtype=np.float32)
+    phys = np.asarray(detector.flatten_design(detector.decode_design(design_enc)), dtype=np.float32)
     print(f"Loaded checkpoint {checkpoint} (step {used_step})")
     print(f"  design encoded  = {design_enc.tolist()}")
     if aux:
@@ -159,7 +159,7 @@ def evaluate(checkpoint, seed: int = 0, step=None, **config):
         # The design's true ENCODED design (1-D -> combine broadcasts per event).
         feats = detector.combine(X_norm, design_enc)
         pred = net(feats, mask, deterministic=True)  # dropout off
-        return detector.loss(pred, targets)  # per-event (B,)
+        return detector.loss(pred, detector.normalize_target(targets))  # per-event (B,)
 
     budget = int(config["training"]["budget"])
     chunk = int(config["training"].get("eval_batch", 2048))

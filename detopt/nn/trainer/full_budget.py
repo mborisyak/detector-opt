@@ -109,7 +109,7 @@ class FullBudgetTrainer(Trainer):
         """
         detector = self.detector
         design_enc = np.asarray(design_enc, dtype=np.float32)
-        design_phys = np.asarray(detector.decode_design(design_enc), dtype=np.float32)
+        design_phys = np.asarray(detector.flatten_design(detector.decode_design(design_enc)), dtype=np.float32)
         init_seq, training_seq, data_seq = seed_seq.spawn(3)
 
         # Fresh, randomly initialised regressor + optimiser (cosine-scheduled LR).

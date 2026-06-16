@@ -64,7 +64,7 @@ def save_design(detector, design_path, design):
 
     os.makedirs(os.path.dirname(design_path), exist_ok=True)
 
-    decoded = np.asarray(detector.decode_design(design), dtype=np.float32)
+    decoded = np.asarray(detector.flatten_design(detector.decode_design(design)), dtype=np.float32)
     with open(design_path, "w") as f:
         json.dump(decoded.tolist(), f, indent=2)
 

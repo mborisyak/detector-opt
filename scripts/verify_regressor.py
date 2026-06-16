@@ -1,31 +1,17 @@
-"""Fixed-design regressor training + validation, for ONE design.
+"""Fixed-design regressor verification.
 
-Train a single regressor on a large pool of (precomputed-MC-backed) events simulated under one fixed
-design, then report held-out validation metrics. No discriminator, no design gradient -- just "how
-well can the regressor reconstruct the target at THIS design?". Train and validation events come from
-disjoint detector pools.
+A sanity check decoupled from design optimization: take ONE design, sample a large training buffer
+under it, train ONLY the regressor on that buffer, and report held-out validation metrics. No
+discriminator, no design gradient -- just "how well can the regressor reconstruct the target at this
+design?". Train and validation events come from disjoint detector pools.
 
-The design is either the config ``design`` (the shared initial physical-design dict, e.g.
-``initial_stereo``) when no ``checkpoint`` is given, or the encoded ``theta`` restored from a
-design-optimization checkpoint (e.g. ``data/lfi``) when ``checkpoint=<dir>`` is passed.
+Config: ``config/subgradient.yaml`` (detector + regressor + training.optimizer + nominal_design +
+pool_split). The design defaults to ``nominal_design``; override with a ``design:`` config key (a
+named physical-design dict). The ``verify:`` block sets the buffer sizes / training budget.
 
-To COMPARE two designs, launch the script twice (same ``seed``, so both regressors share their init
-and event RNG stream and the only difference is the design):
-
-    python scripts/regression.py seed=0 report=output/nominal.png
-    python scripts/regression.py seed=0 report=output/lfi.png checkpoint=data/lfi
-
-Each run writes the report PNG (training-loss + validation curves) and, alongside it, a
-``<report>.metrics.json`` (final per-component validation MSE + the decoded physical design) so the
-two runs can be diffed directly.
-
-Config: ``config/regress.yaml`` -- ``detector``/``design`` are shared references (``detector: stereo``
--> ``config/detector/stereo.yaml``; ``design: initial_stereo`` -> ``config/design/initial_stereo.yaml``)
-so they never drift; ``regressor``, ``optimizer`` and the ``training:``/``validation:`` blocks
-(``batch``/``epochs``/``samples``) are this process's own knobs.
+    python scripts/verify_regressor.py seed=0 verify.train_samples=65536 verify.steps=8000
 """
 
-import json
 import os
 
 import matplotlib
@@ -39,15 +25,13 @@ import numpy as np
 import optax
 from flax import nnx
 
-import orbax.checkpoint as ocp
-
 import detopt
 from detopt.utils.config import optimizer as make_optimizer, resolve_device
 from detopt.utils.pools import RingBuffer
 
 
 # --------------------------------------------------------------------------- #
-# Ensemble-aware forward (mirrors scripts/verify_regressor.py / lfi.py).
+# Ensemble-aware forward (mirrors scripts/subgradient.py).
 # --------------------------------------------------------------------------- #
 def _forward(reg, feats, mask, members, batch, *, deterministic, rngs=None):
     """TRAIN path: a ``(members*batch, ...)`` minibatch -> ``(members*batch, T)`` (each member its slice)."""
@@ -77,37 +61,21 @@ def _key(seq):
     return jax.random.PRNGKey(int(seq.spawn(1)[0].generate_state(1)[0]))
 
 
-def _resolve_design(detector, config, checkpoint):
-    """The FIXED encoded design (``theta``) for this run, plus a human-readable source label.
-
-    With ``checkpoint=<dir>`` -> the latest ``theta`` saved by a design-optimization run (lfi.py /
-    subgradient.py store ``design = {"theta", "optimizer_state"}``). Otherwise -> ``encode_design`` of
-    the ``design`` config block (the shared initial physical-design dict, e.g. ``initial_stereo``)."""
-    if checkpoint:
-        manager = detopt.utils.io.get_checkpointer(checkpoint)
-        step = manager.latest_step()
-        if step is None:
-            raise FileNotFoundError(f"no checkpoint steps found under {checkpoint!r}")
-        data = manager.restore(step, args=ocp.args.Composite(design=ocp.args.PyTreeRestore()))
-        manager.close()
-        return jnp.asarray(data["design"]["theta"], jnp.float32), f"checkpoint {checkpoint} (step {step})"
-    return jnp.asarray(detector.encode_design(config["design"]), jnp.float32), "initial design (config)"
-
-
-def regress(seed, report=None, checkpoint=None, progress=True, **config):
-    report = report or config.get("report")
+def verify(seed, output=None, progress=True, **config):
     device = resolve_device(config.get("device"))
-    train_samples = config["training"]["samples"]
-    batch = config["training"]["batch"]
-    epochs = config["training"]["epochs"]
-    val_samples = config["validation"]["samples"]
-    eval_batch = config["validation"]["batch"]
-    sampling_batch = config["sampling"]["batch"]
-    steps_per_epoch = max(1, train_samples // batch)
+    v = config.get("verify", {})
+    train_samples = int(v.get("train_samples", 32768))  # events in the fixed training buffer
+    val_samples = int(v.get("val_samples", 8192))  # events in the held-out validation buffer
+    steps = int(v.get("steps", 4000))  # total SGD steps over the training buffer
+    batch = int(v.get("batch", 256))  # minibatch size (per member)
+    sample_chunk = int(v.get("sample_chunk", 1024))  # events simulated per detector call while filling buffers
+    eval_batch = int(v.get("eval_batch", 512))  # validation buffer is scanned in chunks of this size
+    val_every = int(v.get("val_every", max(1, steps // 20)))  # validate (+ log) every this many SGD steps
 
     detector = detopt.detector.from_config(config["detector"])
-    theta, design_source = _resolve_design(detector, config, checkpoint)
-    design_dim = detector.design_dim()
+    design = config.get("design") or config["nominal_design"]
+    theta = jnp.asarray(detector.encode_design(design), jnp.float32)  # the FIXED design (encoded), shared by every event
+    design_dim = int(detector.design_dim())
     labels = tuple(detector.metric_labels())
 
     # Disjoint pools: train the regressor on 'train', validate on a held-out pool (the last key,
@@ -124,11 +92,11 @@ def regress(seed, report=None, checkpoint=None, progress=True, **config):
     model = detopt.nn.from_config(detector, config=config["regressor"], rngs=rngs)
     reg_def, params, state = nnx.split(model, nnx.Param, nnx.Variable)
     members = model.ensemble() if hasattr(model, "ensemble") else None
-    opt = make_optimizer(config["optimizer"], n_total_steps=steps_per_epoch * epochs)
+    opt = make_optimizer(config["training"]["optimizer"])
     opt_state = opt.init(params)
 
     M, F = detector.combined_event_shape()
-    target_dim = detector.target_shape()[0]
+    target_dim = int(detector.target_shape()[0])
 
     @jax.jit
     def prepare(X, targets):
@@ -143,7 +111,7 @@ def regress(seed, report=None, checkpoint=None, progress=True, **config):
         filled = 0
         bar = tqdm(total=n, desc=f"sample[{pool}]", disable=not progress)
         while filled < n:
-            chunk = min(sampling_batch, n - filled)
+            chunk = min(sample_chunk, n - filled)
             phys = detector.decode_design(jnp.broadcast_to(theta[None, :], (chunk, design_dim)))
             ev = detector.sample_events(seq.spawn(1)[0], phys, pool=pool)
             feats, tnorm = prepare(ev["X"], ev["targets"])
@@ -156,15 +124,15 @@ def regress(seed, report=None, checkpoint=None, progress=True, **config):
     def _net_loss(params, state, drop_key, feats, mask, targets_norm, count):
         reg = nnx.merge(reg_def, params, state)
         pred = _forward(reg, feats, mask, members, count, deterministic=False, rngs=nnx.Rngs(drop_key))
-        loss = jnp.mean(detector.loss(pred, targets_norm))
+        loss = jnp.mean(detector.loss(pred, targets_norm))  # buffer targets are already normalized
         _, _, new_state = nnx.split(reg, nnx.Param, nnx.Variable)
         return loss, new_state
 
     draw = (members or 1) * batch
 
     @jax.jit
-    def train_epoch(params, state, opt_state, key, feats_buf, mask_buf, tgt_buf, n):
-        """One epoch = ``steps_per_epoch`` scan-folded AdamW gradient steps over the fixed training buffer."""
+    def train_chunk(params, state, opt_state, key, feats_buf, mask_buf, tgt_buf, n):
+        """``val_every`` scan-folded SGD steps over the fixed training buffer."""
 
         def step(carry, k):
             params, state, opt_state = carry
@@ -177,8 +145,7 @@ def regress(seed, report=None, checkpoint=None, progress=True, **config):
             params = optax.apply_updates(params, updates)
             return (params, state, opt_state), loss
 
-        keys = jax.random.split(key, steps_per_epoch)
-        (params, state, opt_state), losses = jax.lax.scan(step, (params, state, opt_state), keys)
+        (params, state, opt_state), losses = jax.lax.scan(step, (params, state, opt_state), jax.random.split(key, val_every))
         return params, state, opt_state, losses
 
     @jax.jit
@@ -205,62 +172,39 @@ def regress(seed, report=None, checkpoint=None, progress=True, **config):
     val_buf = fill(val_samples, val_pool, sample_seq)
     n_train = jnp.int32(len(train_buf))
 
-    physical = detector.flatten_design(detector.decode_design(theta))
-    print(f"design source: {design_source}")
-    print(f"design (decoded->physical): {detector.decode_design(theta)}")
-    print(
-        f"train={train_samples} val={val_samples}  epochs={epochs} batch={batch} "
-        f"steps/epoch={steps_per_epoch}  members={members or 1}"
-    )
+    print(f"design (encoded->physical): {detector.decode_design(theta)}")
+    print(f"train={train_samples} val={val_samples}  steps={steps} batch={batch}  members={members or 1}")
 
     history = []
-    for epoch in range(1, epochs + 1):
-        params, state, opt_state, losses = train_epoch(params, state, opt_state, _key(train_seq), *train_buf.buffers(), n_train)
+    done = 0
+    while done < steps:
+        params, state, opt_state, losses = train_chunk(params, state, opt_state, _key(train_seq), *train_buf.buffers(), n_train)
+        done += val_every
         train_loss = float(jnp.mean(losses))
         val = validate(params, state, *val_buf.buffers())
-        history.append((epoch, train_loss, {k: float(val[k]) for k in labels}))
+        history.append((done, train_loss, {k: float(val[k]) for k in labels}))
         if progress:
             vstr = " ".join(f"{k}={float(val[k]):.3f}" for k in labels)
-            print(f"epoch {epoch}/{epochs}  train={train_loss:.4f}  val[{vstr}]")
+            print(f"step {done}/{steps}  train={train_loss:.4f}  val[{vstr}]")
 
-    final = {k: float(val[k]) for k in labels}
-    print("\nfinal validation MSE (normalized):")
-    for k in labels:
-        print(f"  {k:>10s} = {final[k]:.5f}")
-
-    if report:
-        os.makedirs(os.path.dirname(report) or ".", exist_ok=True)
-        metrics_path = os.path.splitext(report)[0] + ".metrics.json"
-        with open(metrics_path, "w") as f:
-            json.dump(
-                {
-                    "seed": int(seed),
-                    "design_source": design_source,
-                    "design_physical": np.asarray(physical).tolist(),
-                    "design_encoded": np.asarray(theta).tolist(),
-                    "labels": list(labels),
-                    "final_validation": final,
-                    "history": [{"epoch": e, "train": tr, "val": vv} for e, tr, vv in history],
-                },
-                f,
-                indent=2,
-            )
-        _plot(history, labels, report)
+    if output:
+        os.makedirs(output, exist_ok=True)
+        _plot(history, labels, os.path.join(output, "verify.png"))
     return history
 
 
 def _plot(history, labels, path):
     from matplotlib.figure import Figure
 
-    epochs = [h[0] for h in history]
+    steps = [h[0] for h in history]
     train = [h[1] for h in history]
     fig = Figure(figsize=(11, 5))
     ax_train, ax_val = fig.subplots(1, 2)
-    ax_train.plot(epochs, train, ".-")
-    ax_train.set(title="regressor training loss", xlabel="epoch", ylabel="MSE", yscale="log")
+    ax_train.plot(steps, train, ".-")
+    ax_train.set(title="regressor training loss", xlabel="step", ylabel="MSE", yscale="log")
     for name in labels:
-        ax_val.plot(epochs, [h[2][name] for h in history], ".-", label=name)
-    ax_val.set(title="validation MSE (normalized)", xlabel="epoch", yscale="log")
+        ax_val.plot(steps, [h[2][name] for h in history], ".-", label=name)
+    ax_val.set(title="validation MSE (normalized)", xlabel="step", yscale="log")
     ax_val.legend(fontsize=8, ncol=2)
     fig.tight_layout()
     fig.savefig(path)
@@ -269,4 +213,4 @@ def _plot(history, labels, path):
 if __name__ == "__main__":
     import gearup
 
-    gearup.gearup(regress).with_config("config/regress.yaml")()
+    gearup.gearup(verify).with_config("config/subgradient.yaml")()

@@ -1,143 +1,135 @@
-"""Fire the straw detector and save a few visualisations.
+"""Overlay our simulated trajectories on the FairShip MC truth hits.
 
-New Detector contract (detector-spec.md): events come from
-``detector.sample_events(seed, design)`` ->
-``{ground_truth, X, mask, targets, trajectories}`` where ``X`` is the dense
-padded ``(B, M, 5)`` hit array ``[station, view, layer_in_view, straw, time]``
-and ``mask`` marks the real hits. No sparse containers, no splits, no state.
+Builds the straw detector straight from ``config/detector/straw.yaml`` (whose
+geometry/field are taken from FairShip -- SST strawtubes_config.yaml +
+MainSpectrometerField.root), runs our solver on each MC event's boundary-crossing
+daughters, and draws our trajectories (lines) over the MC-truth ``hits`` (points)
+for a few events. If the geometry/field model is faithful the tracks thread the
+MC hits.
 
-Run headless:  ``python scripts/viz.py [ship2numpy.npz] [out_dir]``
+Run headless:  ``python scripts/viz.py [data/mc/sim_1000-0-V2023.npz] [out_dir]``
 """
 
 import os
 import sys
-import time
 
 import matplotlib
 
 matplotlib.use("Agg")  # headless: save figures, never block
 import matplotlib.pyplot as plt
 import numpy as np
+import yaml
 
 import detopt
 
+CFG = "config/detector/straw.yaml"
 
-def _build_detector(data_path):
-    return detopt.detector.FreeStrawDetector(
-        n_stations=4,
-        n_views_per_station=4,
-        n_layers_per_view=2,
-        n_straws_per_layer=200,
-        straw_pitch=2.0,
-        straw_length=400.0,
-        max_B=0.15,
-        B_sigma=300.0,
-        z0=8957.0,
-        layer_bounds=(8200.0, 9750.0),
-        max_particles=64,
-        data_dir=data_path,
-        # the three "easy" physics processes, on so the plots show their effect
-        lambda_conv_cm=50.0,
-        enable_decay=True,
-        noise_rate=3.0,
+
+def build_detector(data_path):
+    """FreeStrawDetector from the (FairShip-derived) config + the nominal design array."""
+    cfg = yaml.safe_load(open(CFG))
+    det = detopt.detector.FreeStrawDetector(**cfg["straw"], data_dir=data_path)
+    nd = yaml.safe_load(open("config/detector/nominal_design.yaml"))["nominal_design"]
+    design = detopt.detector.free_design_array(
+        nd["station_z"],
+        n_layers_per_view=det.n_layers_per_view,
+        view_angles=nd["view_angles"],
+        view_z_gap=nd["view_z_gap"],
+        layer_z_gap=nd["layer_z_gap"],
+        B=nd["B"],
     )
+    return det, design
 
 
-def _hit_world(detector, X, mask, design):
-    """Map dense hits to world coords for the event display.
-
-    Returns ``(z, y, station)`` arrays for the masked hits of one event:
-    the hit's layer z (from the design) and its straw transverse position.
-    """
-    m = mask.astype(bool)
-    station = X[m, 0].astype(int)
-    view = X[m, 1].astype(int)
-    layer_in_view = X[m, 2].astype(int)
-    straw = X[m, 3]
-    per_station = detector.n_views_per_station * detector.n_layers_per_view
-    layer = station * per_station + view * detector.n_layers_per_view + layer_in_view
-    positions = np.asarray(design[: detector.n_layers], dtype=np.float32)
-    z = positions[np.clip(layer, 0, detector.n_layers - 1)]
-    y_stagger = np.where(layer_in_view & 1, 0.5 * detector.layer_y_offset, -0.5 * detector.layer_y_offset)
-    y = (straw + 0.5) * detector.straw_pitch - detector.layer_height + y_stagger
-    return z, y, station
+def event_daughters(events, e):
+    """Single-event daughter_data dict (flat slice + offsets) for ``_run_solver``."""
+    o = events["offsets"]
+    s = slice(int(o[e]), int(o[e + 1]))
+    n = int(o[e + 1]) - int(o[e])
+    return {
+        "masses": events["masses"][s],
+        "charges": events["charges"][s],
+        "positions": events["positions"][s],
+        "momenta": events["momenta"][s],
+        "times": events["times"][s],
+        "offsets": np.array([0, n], dtype=np.int32),
+    }, n
 
 
-def _event_display(detector, out, X, mask, trajectories, design, n_events=3):
-    positions = np.asarray(design[: detector.n_layers], dtype=np.float32)
-    for ev in range(min(n_events, X.shape[0])):
-        if mask[ev].sum() == 0:
-            continue
-        fig, ax = plt.subplots(figsize=(9, 5))
-        # layer planes
-        for zc in positions:
-            ax.axvline(zc, color="0.85", lw=0.6, zorder=0)
-        # hits, coloured by station
-        z, y, station = _hit_world(detector, X[ev], mask[ev], design)
-        sc = ax.scatter(z, y, c=station, cmap="tab10", vmin=0, vmax=9, s=10, zorder=3)
-        # daughter trajectories (z vs y), drop padded (all-zero) steps
-        traj = trajectories[ev]  # (max_particles, n_t, 3)
-        for p in range(traj.shape[0]):
-            pts = traj[p]
-            live = np.abs(pts).sum(axis=1) > 0
-            if live.sum() > 1:
-                ax.plot(pts[live, 2], pts[live, 1], lw=0.7, alpha=0.6, zorder=2)
-        ax.set_xlabel("z [cm]")
-        ax.set_ylabel("transverse y [cm]")
-        ax.set_title(f"Event {ev}: {int(mask[ev].sum())} hits")
-        fig.colorbar(sc, ax=ax, label="station")
+def _overlay(ax, traj, mc, n_part, proj):
+    """Draw our trajectory polylines + MC hit points in projection ``proj``
+    ('zy' = bending plane, 'zx' = non-bending). ``traj`` is (max_particles,n_t,3)."""
+    a, b = (2, 1) if proj == "zy" else (2, 0)  # (z, y) or (z, x)
+    for p in range(min(n_part, traj.shape[0])):
+        t = traj[p]
+        t = t[np.abs(t).sum(1) > 0]  # drop padded steps
+        if len(t) > 1:
+            ax.plot(t[:, a], t[:, b], lw=1.0, alpha=0.8, zorder=2)
+    if len(mc):
+        ax.scatter(mc[:, a], mc[:, b], s=6, c="k", alpha=0.45, zorder=3, label="MC hits")
+    ax.set_xlabel("z [cm]")
+    ax.set_ylabel(("y" if proj == "zy" else "x") + " [cm]")
+
+
+def main(data_path="data/mc/sim_1000-0-V2023.npz", out="output/viz", n_show=6):
+    os.makedirs(out, exist_ok=True)
+    det, design = build_detector(data_path)
+    events = det._events
+    design_b = design[None, :]
+    rng = np.random.default_rng(0)
+    # z-axis (the x of these 2D plots) limited to the detector span, with a small margin.
+    z_layers = np.asarray(design[: det.n_layers], dtype=np.float32)
+    z_margin = 0.05 * (z_layers.max() - z_layers.min())
+    zlim = (z_layers.min() - z_margin, z_layers.max() + z_margin)
+
+    raw = np.load(data_path, allow_pickle=True)
+    hits = np.asarray(raw["hits"], np.float32)
+    he = np.asarray(raw["hit_event_index"], np.int64)
+    real = np.asarray(raw["hit_track"], np.int64) >= 0  # exclude untracked shower secondaries
+    have_hits = set(np.unique(he[real]).tolist())
+
+    # events that have both daughters and MC hits
+    cand = [
+        e for e in range(det.n_events) if e in have_hits and (int(events["offsets"][e + 1]) - int(events["offsets"][e])) > 0
+    ]
+    show = cand[:n_show]
+    print(
+        f"detector: {det.n_events} events, boundary_z={det.boundary_z} cm, n_straws={det.n_straws}, "
+        f"B_peak={design[-1]:.3f} T, B_sigma={det.B_sigma} cm"
+    )
+    print(f"overlaying {len(show)} events (our trajectories + MC hits)")
+
+    ncol = 2
+    nrow = int(np.ceil(len(show) / ncol))
+    for proj, tag in [("zy", "bending plane z-y"), ("zx", "non-bending z-x")]:
+        fig, axes = plt.subplots(nrow, ncol, figsize=(7 * ncol, 4 * nrow), squeeze=False)
+        for i, e in enumerate(show):
+            dd, n = event_daughters(events, e)
+            ie = det._make_input_events(dd)  # this event's particles as a 1-event pool
+            bnd = np.array([[0, n]], dtype=np.int32)
+            traj = np.zeros((1, det.max_particles, det.n_t, 3), dtype=np.float32)
+            _, mask, _ = det._run_solver(bnd, design_b, rng, input_events=ie, trajectories=traj)
+            mc = hits[(he == e) & real]
+            ax = axes[i // ncol][i % ncol]
+            _overlay(ax, traj[0], mc, n, proj)
+            ax.set_xlim(*zlim)  # restrict z-axis to the detector span (ignore stray MC hits)
+            # vertical axis spans the full detector extent (height for z-y, width for z-x)
+            half = det.layer_height if proj == "zy" else det.layer_width
+            ax.set_ylim(-half, half)
+            ax.set_title(f"event {e}: {n} daughters, {len(mc)} MC hits, {int(mask[0].sum())} sim hits")
+            if i == 0:
+                ax.legend(loc="best", fontsize=8)
+        for j in range(len(show), nrow * ncol):
+            axes[j // ncol][j % ncol].axis("off")
+        fig.suptitle(f"Our trajectories vs FairShip MC hits ({tag})")
         fig.tight_layout()
-        path = os.path.join(out, f"viz_event_{ev}.png")
-        fig.savefig(path, dpi=130)
+        path = os.path.join(out, f"viz_overlay_{proj}.png")
+        fig.savefig(path, dpi=120)
         plt.close(fig)
         print(f"  wrote {path}")
 
 
-def _tdc_histogram(out, X, mask):
-    times = X[..., 4][mask.astype(bool)]
-    fig, ax = plt.subplots(figsize=(7, 4))
-    ax.hist(np.asarray(times, dtype=float), bins=60, alpha=0.8)
-    ax.set_xlabel("TDC time [ns]")
-    ax.set_ylabel("counts")
-    ax.set_title(f"FairShip-style TDC times ({times.size} hits)")
-    fig.tight_layout()
-    path = os.path.join(out, "viz_tdc.png")
-    fig.savefig(path, dpi=130)
-    plt.close(fig)
-    print(f"  wrote {path}")
-
-
-def main(data_path="ship2numpy.npz", out="output/viz", seed=123, batch=256):
-    os.makedirs(out, exist_ok=True)
-    detector = _build_detector(data_path)
-    print(f"detector: {detector.n_events} source events, boundary_z={detector.boundary_z} cm")
-
-    import yaml
-
-    nd = yaml.safe_load(open("config/detector/straw.yaml"))["nominal_design"]
-    design = detopt.detector.free_design_array(
-        nd["station_z"], n_layers_per_view=detector.n_layers_per_view,
-        view_angles=nd["view_angles"], view_z_gap=nd["view_z_gap"],
-        layer_z_gap=nd["layer_z_gap"], B=nd["B"],
-    )
-    designs = np.tile(design[None, :], (batch, 1)).astype(np.float32)
-
-    out_dict = detector.sample_events(seed, designs)
-    X, mask = np.asarray(out_dict["X"]), np.asarray(out_dict["mask"])
-    trajectories = np.asarray(out_dict["trajectories"])
-    print(f"generated {batch} events, mean {mask.sum(1).mean():.1f} hits/event, " f"{int((mask.sum(1) > 0).sum())} with hits")
-
-    _event_display(detector, out, X, mask, trajectories, design)
-    _tdc_histogram(out, X, mask)
-
-    # quick throughput number
-    t0 = time.perf_counter()
-    detector(seed + 1, designs)
-    dt = time.perf_counter() - t0
-    print(f"throughput: {batch / dt:.0f} events/s ({dt * 1e3:.0f} ms for {batch} events)")
-
-
 if __name__ == "__main__":
-    data = sys.argv[1] if len(sys.argv) > 1 else "ship2numpy.npz"
+    data = sys.argv[1] if len(sys.argv) > 1 else "data/mc/sim_1000-0-V2023.npz"
     out_dir = sys.argv[2] if len(sys.argv) > 2 else "output/viz"
     main(data, out_dir)

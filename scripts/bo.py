@@ -97,7 +97,7 @@ def bo(output, seed: int, **config):
                 f"log_amp={info['log_amplitude']:.3f}"
             )
 
-        design_phys = np.asarray(detector.decode_design(x_prop), dtype=np.float32).tolist()
+        design_phys = np.asarray(detector.flatten_design(detector.decode_design(x_prop)), dtype=np.float32).tolist()
 
         def _on_epoch(snapshot, _i=i, _d=design_phys):
             vlp = snapshot["val_loss_per_epoch"]

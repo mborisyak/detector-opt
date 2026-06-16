@@ -6,11 +6,12 @@ Each station carries a fixed [0, +a, -a, 0] view layout (horizontal, +stereo,
     [ station_z (n_stations) , stereo_angle a ]
 
 so dimension ``n_stations + 1`` instead of the base ``2*n_layers + 1``. The
-magnetic field and the intra-station gaps are fixed. Station z-bounds exclude
-the spectrometer magnet (centred at ``z0``, half-length ``magnet_half_cm``, from
-the FairShip geometry), so the optimiser never drops a station inside the magnet:
-upstream stations stay below ``z0 - magnet_half`` and downstream ones above
-``z0 + magnet_half``.
+magnetic field and the intra-station gaps are fixed. The station-z encoding is
+**coupled and ordered**: each station has a z width (``station_width``) and the
+decode is sequential, so decoded stations are always ordered, never overlap each
+other, and never intrude into the spectrometer magnet (centred at ``z0``,
+half-width ``magnet_half_cm``). Upstream stations sit below ``z0 - magnet_half``,
+downstream ones above ``z0 + magnet_half`` (see ``_station_lo_hi``).
 """
 
 import numpy as np
@@ -18,13 +19,7 @@ import numpy as np
 from .straw import StrawDetector
 from ..utils.encoding import normal_to_uniform_jax, uniform_to_normal_jax
 
-__all__ = ["StereoStrawDetector", "stereo_design_array"]
-
-
-def stereo_design_array(station_z, stereo_angle=0.0798, B=0.20):
-    """Build a compact stereo design ``[station_z(n), stereo_angle, B]`` from a
-    nominal layout. Lives OUTSIDE the detector (caller-owned initial design)."""
-    return np.concatenate([np.asarray(station_z, np.float32), [float(stereo_angle), float(B)]]).astype(np.float32)
+__all__ = ["StereoStrawDetector"]
 
 
 class StereoStrawDetector(StrawDetector):
@@ -35,15 +30,16 @@ class StereoStrawDetector(StrawDetector):
         n_stations_upstream: int = 2,
         n_stations_downstream: int = 2,
         n_layers_per_view: int = 2,
-        n_straws_per_layer: int = 200,
-        straw_pitch: float = 2.0,
-        straw_length: float = 400.0,
-        layer_y_offset: float = 1.0,
+        n_straws_per_layer: int = 316,  # FairShip SST V2023 straws per layer (digi_straw index 1..316); 2 cm pitch -> |y| <= 316 cm
+        straw_pitch: float = 2.0,  # cm; = outer straw diameter (tightly packed) -> straw radius 1 cm
+        straw_length: float = 400.0,  # cm; FairShip SST aperture width 200 cm (half)
         # Stereo design scheme: intra-station view/layer z spacing + optimizable angle bound.
         layer_z_gap: float = 1.732,
         view_z_gap: float = 5.0,
         stereo_bound: tuple = (0.0, 0.2),
-        magnet_half_cm: float = 140.0,
+        magnet_half_cm: float = 140.0,  # magnet z half-width (FairShip YokeDepth)
+        station_width: float = 100.0,  # station z full-width (= 2 x FairShip strawtubes station_length 50)
+        station_clearance: float = 0.0,  # minimum z gap between adjacent station footprints (0 = may touch)
         # Physics / field
         max_B: float = 0.20,
         z0: float = 8957.0,
@@ -53,19 +49,22 @@ class StereoStrawDetector(StrawDetector):
         max_dt: float = 1.0,
         max_time: float = 200.0,
         max_particles: int = 5,
+        max_hits_per_event: int = 384,
         material: str = "kapton",
         wall_thickness: float = 0.0036,
-        delta_Tcut: float = 0.5,
-        lambda_conv_cm=None,
-        enable_decay: bool = False,
+        # Physics-process defaults below match the base StrawDetector: tuned so the
+        # per-hit process composition approximately matches the FairShip MC truth.
+        delta_Tcut: float = 0.28,
+        lambda_conv_cm=95.0,
+        enable_decay: bool = True,
         noise_rate: float = 0.0,
-        scatter_xX0: float = 0.0,
-        decay_mean=None,
-        decay_sigma=None,
-        momentum_mean=None,
-        momentum_sigma=None,
+        scatter_xX0: float = 2.5e-4,
+        # Target/conditioning normalization is FIXED in the base StrawDetector (see its
+        # decay_mean/.../mass_* defaults) so a data swap can't re-scale the loss; not
+        # overridden here. To recompute from data, edit the base defaults to None.
         data_dir=None,
         boundary_z=None,
+        pool_split=None,
     ):
         super().__init__(
             n_stations=int(n_stations_upstream) + int(n_stations_downstream),
@@ -74,7 +73,6 @@ class StereoStrawDetector(StrawDetector):
             n_straws_per_layer=n_straws_per_layer,
             straw_pitch=straw_pitch,
             straw_length=straw_length,
-            layer_y_offset=layer_y_offset,
             max_B=max_B,
             z0=z0,
             B_sigma=B_sigma,
@@ -85,6 +83,7 @@ class StereoStrawDetector(StrawDetector):
             max_dt=max_dt,
             max_time=max_time,
             max_particles=max_particles,
+            max_hits_per_event=max_hits_per_event,
             material=material,
             wall_thickness=wall_thickness,
             delta_Tcut=delta_Tcut,
@@ -92,54 +91,98 @@ class StereoStrawDetector(StrawDetector):
             enable_decay=enable_decay,
             noise_rate=noise_rate,
             scatter_xX0=scatter_xX0,
-            decay_mean=decay_mean,
-            decay_sigma=decay_sigma,
-            momentum_mean=momentum_mean,
-            momentum_sigma=momentum_sigma,
             data_dir=data_dir,
             boundary_z=boundary_z,
+            pool_split=pool_split,
         )
         self.n_stations_upstream = int(n_stations_upstream)
         self.stereo_bound = (float(stereo_bound[0]), float(stereo_bound[1]))
         self.magnet_half_cm = float(magnet_half_cm)
+        self.station_width = float(station_width)
+        self.station_clearance = float(station_clearance)
         self.layer_z_gap = float(layer_z_gap)
         self.view_z_gap = float(view_z_gap)
 
         # Fixed per-layer maps (global layer -> station, z-offset within station,
         # stereo-angle sign): ordering is station -> view -> layer-in-view.
+        # station_z is the CENTRE of each station: offset the per-layer z by -span/2 so
+        # the views/layers are laid out symmetrically about the station-centre design dof.
+        span = (4 - 1) * self.view_z_gap + (self.n_layers_per_view - 1) * self.layer_z_gap
+        half_span = 0.5 * span
         pattern = np.array([0.0, 1.0, -1.0, 0.0], dtype=np.float32)  # [0,+a,-a,0]
         st, zoff, sign = [], [], []
         for s in range(self.n_stations):
             for v in range(4):
                 for l in range(self.n_layers_per_view):
                     st.append(s)
-                    zoff.append(v * self.view_z_gap + l * self.layer_z_gap)
+                    zoff.append(v * self.view_z_gap + l * self.layer_z_gap - half_span)
                     sign.append(pattern[v])
         self._layer_station = np.array(st, dtype=np.int64)
         self._layer_zoff = np.array(zoff, dtype=np.float32)
         self._layer_anglesign = np.array(sign, dtype=np.float32)
 
-        # Magnet-aware per-station z bounds on the station base position (the span
-        # of its views/layers is reserved so the whole station stays out of the magnet).
-        # The first n_stations_upstream stations are upstream of the magnet; rest downstream.
-        span = (4 - 1) * self.view_z_gap + (self.n_layers_per_view - 1) * self.layer_z_gap
-        lo, hi = [], []
-        for s in range(self.n_stations):
-            if s < self.n_stations_upstream:  # upstream of the magnet
-                lo.append(self.layer_bounds[0])
-                hi.append(self.z0 - self.magnet_half_cm - span)
-            else:  # downstream
-                lo.append(self.z0 + self.magnet_half_cm)
-                hi.append(self.layer_bounds[1] - span)
-        self._station_lo = np.array(lo, dtype=np.float32)
-        self._station_hi = np.array(hi, dtype=np.float32)
+    def _station_lo_hi(self, k, prev_z):
+        """Coupled ``(lo, hi)`` bound on the station-CENTRE z at global index ``k``.
+
+        Stations have a z width (``station_width``) and cannot overlap each other or
+        the magnet (``z0 +/- magnet_half_cm``). The bound is sequential: it depends on
+        the previous station's z (``prev_z``; ``None`` for the first station of a side).
+        Upstream stations live below the magnet, downstream ones above; each reserves
+        room for the stations still to come between it and the magnet edge / detector
+        edge. ``prev_z`` may be a (batched) array -> the returned bound is too.
+        """
+        w = self.station_width
+        h = 0.5 * w  # station half-width: keep this clear of the magnet face / detector edge
+        p = w + self.station_clearance  # min center-to-center pitch (footprints + clearance)
+        n_up = self.n_stations_upstream
+        n_dn = self.n_stations - n_up
+        min_z, max_z = self.layer_bounds
+        if k < n_up:  # upstream of the magnet (most-upstream first)
+            i = k
+            lo = (min_z + h) if prev_z is None else prev_z + p
+            hi = (self.z0 - self.magnet_half_cm - h) - (n_up - 1 - i) * p
+        else:  # downstream of the magnet (nearest-magnet first)
+            j = k - n_up
+            lo = (self.z0 + self.magnet_half_cm + h) if prev_z is None else prev_z + p
+            hi = (max_z - h) - (n_dn - 1 - j) * p
+        return lo, hi
 
     # ------------------------------------------------------------------ #
     # Compact design space: [station_z(n_stations), stereo_angle]
     # ------------------------------------------------------------------ #
     def design_shape(self):
-        # [station_z(n_stations), stereo_angle, B]
-        return (self.n_stations + 2,)
+        # [station_z(n_stations), stereo_angle];  peak field is FIXED at max_B (not a dof)
+        return (self.n_stations + 1,)
+
+    def design_spec(self):
+        return {"stations": (self.n_stations,), "angle": (1,)}
+
+    def flatten_design(self, design):
+        """Design dict ``{stations (...,n), angle (...,1)}`` -> flat ``(..., n+1)`` (a non-dict
+        passes through unchanged)."""
+        import jax.numpy as jnp
+
+        if not isinstance(design, dict):
+            return jnp.asarray(design, jnp.float32)
+        stations = jnp.asarray(design["stations"], jnp.float32)
+        angle = jnp.asarray(design["angle"], jnp.float32).reshape(stations.shape[:-1] + (1,))
+        return jnp.concatenate([stations, angle], axis=-1)
+
+    def unflatten_design(self, flat):
+        """Flat ``(..., n+1)`` -> design dict ``{stations (...,n), angle (...,1)}``."""
+        import jax.numpy as jnp
+
+        flat = jnp.asarray(flat, jnp.float32)
+        n = self.n_stations
+        return {"stations": flat[..., :n], "angle": flat[..., n : n + 1]}
+
+    def design_bounds(self):
+        # station-CENTRE range (footprint must fit inside layer_bounds) + the stereo angle range
+        lo, hi = self.layer_bounds
+        return {
+            "stations": (lo + 0.5 * self.station_width, hi - 0.5 * self.station_width),
+            "angle": (self.stereo_bound[0], self.stereo_bound[1]),
+        }
 
     def _expand(self, design, xp):
         """Compact ``[station_z(n_stations), a]`` -> per-layer ``(positions, angles)``.
@@ -163,39 +206,57 @@ class StereoStrawDetector(StrawDetector):
         design = np.asarray(design, np.float32)
         d2 = design[None, :] if design.ndim == 1 else design
         positions, angles = self._expand(d2, np)
-        n_batch, m = positions.shape
-        widths = np.full((n_batch, m), self.layer_width, dtype=np.float32)
-        heights = np.full((n_batch, m), self.layer_height, dtype=np.float32)
-        Bs = d2[:, self.n_stations + 1].astype(np.float32)  # peak field is the last design dof
-        return positions.astype(np.float32), angles.astype(np.float32), widths, heights, Bs
+        # Field is fixed at max_B (not a design dof).
+        Bs = np.full(d2.shape[0], self.max_B, dtype=np.float32)
+        return positions.astype(np.float32), angles.astype(np.float32), Bs
 
     # ------------------------------------------------------------------ #
     # Encode/decode: compact physical <-> N(0,1)  (B fixed, not a design dof)
     # ------------------------------------------------------------------ #
-    def encode_design(self, design):
+    def _encode_flat(self, design):
         import jax.numpy as jnp
 
         d = jnp.asarray(design, jnp.float32)
         ns = self.n_stations
-        z_e = uniform_to_normal_jax(d[..., :ns], jnp.asarray(self._station_lo), jnp.asarray(self._station_hi))
+        # Station z's: invert the sequential coupled bounds. We have the physical z's,
+        # so each station's (lo, hi) follows from the previous station's z directly.
+        es, prev = [], None
+        for k in range(ns):
+            if k == self.n_stations_upstream:
+                prev = None  # new side downstream of the magnet
+            z_k = d[..., k]
+            lo, hi = self._station_lo_hi(k, prev)
+            hi = lo + jnp.maximum(hi - lo, 1e-3)  # guard a collapsed interval (max-packed extreme) from a /0 in the inverse
+            es.append(uniform_to_normal_jax(z_k, lo, hi))
+            prev = z_k
+        z_e = jnp.stack(es, axis=-1)
         a_e = uniform_to_normal_jax(d[..., ns : ns + 1], self.stereo_bound[0], self.stereo_bound[1])
-        b_e = uniform_to_normal_jax(d[..., ns + 1 : ns + 2], 0.0, self.max_B)
-        return jnp.concatenate([z_e, a_e, b_e], axis=-1)
+        return jnp.concatenate([z_e, a_e], axis=-1)
 
-    def decode_design(self, encoded_design):
+    def _decode_flat(self, encoded_design):
         import jax.numpy as jnp
 
         e = jnp.asarray(encoded_design, jnp.float32)
         ns = self.n_stations
-        z_d = normal_to_uniform_jax(e[..., :ns], jnp.asarray(self._station_lo), jnp.asarray(self._station_hi))
+        # Station z's: decode sequentially so the bound for each station depends on the
+        # previous decoded z -> ordered, non-overlapping, magnet-excluding by construction.
+        zs, prev = [], None
+        for k in range(ns):
+            if k == self.n_stations_upstream:
+                prev = None  # new side downstream of the magnet
+            lo, hi = self._station_lo_hi(k, prev)
+            z_k = normal_to_uniform_jax(e[..., k], lo, hi)
+            zs.append(z_k)
+            prev = z_k
+        z_d = jnp.stack(zs, axis=-1)
         a_d = normal_to_uniform_jax(e[..., ns : ns + 1], self.stereo_bound[0], self.stereo_bound[1])
-        b_d = normal_to_uniform_jax(e[..., ns + 1 : ns + 2], 0.0, self.max_B)
-        return jnp.concatenate([z_d, a_d, b_d], axis=-1)
+        return jnp.concatenate([z_d, a_d], axis=-1)
 
     def _decode_to_layer_geometry(self, d_enc):
         import jax.numpy as jnp
 
-        phys = self.decode_design(d_enc)  # (B, ns+2) compact
+        phys = self._decode_flat(d_enc)  # (B, ns+1) flat physical
         positions, angles = self._expand(phys, jnp)  # (B, n_layers) each
-        B_field = phys[:, self.n_stations + 1]  # peak field per design
+        # Field is fixed at max_B (not a design dof).
+        B_field = jnp.full((phys.shape[0],), self.max_B, dtype=jnp.float32)
         return positions, angles, B_field

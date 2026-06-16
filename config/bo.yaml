@@ -5,33 +5,34 @@ detector:
     n_stations_upstream: 2    # stations upstream of the magnet (z < z0)
     n_stations_downstream: 2  # stations downstream of the magnet (z > z0)
     n_layers_per_view: 2
-    n_straws_per_layer: 200
+    n_straws_per_layer: 316  # FairShip SST V2023 straws per layer (digi_straw index 1..316); 2 cm pitch -> |y| <= 316 cm
     straw_length: 400.0
     straw_pitch: 2.0
     layer_z_gap: 1.732
     view_z_gap: 5.0
     magnet_half_cm: 140.0  # exclude the spectrometer magnet (FairShip YokeDepth 1.4 m) from station bounds
-    max_B: 0.20            # T; peak |Bx| of FairShip V13_3500 spectrometer field map (on-axis)
+    max_B: -0.151          # T; on-axis peak Bx of FairShip MainSpectrometerField.root (negative polarity; bends in -y)
     z0: 8957.0             # magnet centre (FairShip c.z = 89.57 m, map z_local=0)
-    B_sigma: 286.0         # cm; our-form width fit to the V13_3500 Bx(z) on-axis profile (int Bx dz ~ 1.05 T.m)
+    B_sigma: 283.0         # cm; proper-Gaussian std-dev matched to MainSpectrometerField on-axis Bx(z) (int Bx dz ~ -1.07 T.m)
     layer_bounds: [8200.0, 9750.0]
-    max_particles: 2
+    max_particles: 1024    # DEBUG-only now (trajectory/tree slots); does not gate hits or input
+    max_hits_per_event: 384  # NN-facing per-event hit cap (solver emits the M earliest-TDC straws)
     max_dt: 1.0
     max_time: 300.0
     material: kapton
     data_dir: "data/mc"  # 36k events across the 50 files; boundary crossings are upstream of the magnet (magnet-independent)
+    pool_split: {train: 0.9, val: 0.1}   # disjoint event pools (train / held-out val)
 
-# Nominal (initial/baseline) design -- NOT detector state. Read by scripts to build a
-# concrete design via detopt.detector.stereo_design_array (BO itself seeds from random proposals).
+# Nominal (initial/baseline) design -- NOT detector state. A named physical-design dict the
+# detector encodes via encode_design (BO itself seeds from random proposals).
 nominal_design:
-  station_z: [8407.0, 8607.0, 9307.0, 9507.0]
-  stereo_angle: 0.0798
-  B: 0.20
+  stations: [8407.0, 8607.0, 9307.0, 9507.0]
+  angle: 0.0798
 
 regressor:
-  set-ensemble-regressor:
+  set-regressor:
     features: [[24, 32], [32, 24]]
-    n_models: 8
+    n_models: 8   # ensemble of 8 (omit n_models for a single net)
     p_dropout: 0.1
 
 device: cuda

@@ -63,6 +63,7 @@ class DebugDetector(Detector):
         # Small Gaussian angular kicks accumulate down the track (random walk).
         scatter_sigma: float = 1e-3,
         loss=None,
+        pool_split=None,  # Sequence|Mapping of fractions -> disjoint event STREAMS (keys define pools)
     ):
         self.n_stations = int(n_stations)
         self.n_views_per_station = int(n_views_per_station)
@@ -89,6 +90,11 @@ class DebugDetector(Detector):
 
         # straw pitch in the (sheared) straw coordinate c = y - (tilt/half_width)*x
         self.straw_pitch = 2.0 * self.view_half_height / self.n_straws
+
+        # Disjoint event pools: DebugDetector synthesizes events, so a pool is an independent
+        # RNG STREAM keyed by the pool key (fractions are informational only here).
+        self.pool_split = self.resolve_pool_split(pool_split)
+        self._default_pool = next(iter(self.pool_split))
 
         # Station-position bounds: stations before the magnet live in
         # [decay_end, magnet_start], those after in [magnet_end, z_max].
@@ -147,11 +153,53 @@ class DebugDetector(Detector):
         return (self.max_hits_per_event, 4)
 
     def combined_event_shape(self):
-        # combine() -> [energy, norm_station_z, norm_station_y, norm_tilt, norm_B]
+        # combine() -> [energy, norm_station_z, wire_y_left, wire_y_right, field_strength]
         return (self.max_hits_per_event, 5)
 
     def target_shape(self):
         return (6,)
+
+    # Conditioning for the LFI discriminator: reuse the full target as the "ground truth"
+    # (the stereo detector conditions on HNL [mass, p(3)]; here the 6-vec target stands in).
+    def conditioning_shape(self):
+        return self.target_shape()
+
+    def conditioning_dim(self):
+        return int(self.target_dim())
+
+    def normalize_conditioning(self, conditioning):
+        return self.normalize_target(conditioning)
+
+    def metric_labels(self):
+        """Keys of the metric() dict, in display order."""
+        return ("loss", "vertex_x", "vertex_y", "vertex_z", "p_x", "p_y", "p_z")
+
+    def loss(self, predicted, target):
+        """Per-sample ``(...,)`` MSE between predictions and the ALREADY-NORMALIZED 6-vec target
+        ``[vertex(3), momentum(3)]`` (caller standardises via :meth:`normalize_target`)."""
+        import jax.numpy as jnp
+
+        predicted = jnp.asarray(predicted, jnp.float32)
+        target = jnp.asarray(target, jnp.float32)
+        return jnp.mean(jnp.square(predicted - target), axis=-1)
+
+    def metric(self, predicted, target):
+        """Per-sample diagnostics dict on the normalized target: overall ``loss`` plus per-component
+        squared error -- ``vertex_{x,y,z}`` and the momentum ``p_{x,y,z}``."""
+        import jax.numpy as jnp
+
+        predicted = jnp.asarray(predicted, jnp.float32)
+        target = jnp.asarray(target, jnp.float32)
+        se = jnp.square(predicted - target)
+        return {
+            "loss": self.loss(predicted, target),
+            "vertex_x": se[..., 0],
+            "vertex_y": se[..., 1],
+            "vertex_z": se[..., 2],
+            "p_x": se[..., 3],
+            "p_y": se[..., 4],
+            "p_z": se[..., 5],
+        }
 
     def ground_truth_shape(self):
         # [charge_mu, charge_pi, mu_p (3), pi_p (3)]
@@ -161,7 +209,9 @@ class DebugDetector(Detector):
     # Design slicing
     # ------------------------------------------------------------------ #
     def _split_design(self, design):
-        """``(B, 9)`` physical design -> (station_z (B,S), tilt (B,V), B (B,))."""
+        """``(B, 9)`` physical design (dict or flat array) -> (station_z (B,S), tilt (B,V), B (B,))."""
+        if isinstance(design, dict):
+            design = self.flatten_design(design)
         design = np.asarray(design, dtype=np.float32)
         if design.ndim == 1:
             design = design[None, :]
@@ -172,8 +222,21 @@ class DebugDetector(Detector):
     # ------------------------------------------------------------------ #
     # Event generation (numpy)
     # ------------------------------------------------------------------ #
-    def generate_events(self, rng, n):
-        """Sample ``n`` HNL -> muon + pion events. Returns a dict of numpy arrays."""
+    @staticmethod
+    def _pool_int(pool):
+        """Stable (run-independent) int from a pool key (int or str) for seed-folding."""
+        import zlib
+
+        return pool if isinstance(pool, int) else int(zlib.crc32(str(pool).encode())) & 0x7FFFFFFF
+
+    def generate_events(self, rng, n, pool=None):
+        """Sample ``n`` HNL -> muon + pion events. Returns a dict of numpy arrays.
+
+        ``pool`` (int|str) selects a disjoint event stream: the kinematics rng is folded
+        with the pool key, so different pools yield independent (non-overlapping) events.
+        """
+        if pool is not None and pool != self._default_pool:
+            rng = np.random.default_rng([int(rng.integers(0, 2**31)), self._pool_int(pool)])
         dvz0, dvz1 = self.decay_volume_z
         z0 = rng.uniform(dvz0, dvz1, size=n)
         x0 = rng.normal(0.0, self.vertex_sigma_xy, size=n)
@@ -365,19 +428,19 @@ class DebugDetector(Detector):
     # ------------------------------------------------------------------ #
     # Detector contract
     # ------------------------------------------------------------------ #
-    def __call__(self, seed, design):
+    def __call__(self, seed, design, pool=None):
         """Generate one event per design row; returns ``(gt, X, mask, target)``.
 
-        Events are generated on demand from ``seed``; train/val draw independent
-        streams via different seeds (the detector owns no split).
+        Events are generated on demand from ``seed``; ``pool`` (int|str) selects a disjoint
+        event stream (folded into the kinematics rng), so train/val pools never overlap.
         """
         rng = np.random.default_rng(seed)
         station_z, tilt, B = self._split_design(design)
-        ev = self.generate_events(rng, station_z.shape[0])
+        ev = self.generate_events(rng, station_z.shape[0], pool=pool)
         X, mask, *_ = self._measure(rng, ev, station_z, tilt, B)
         return ev["ground_truth"], X, mask, ev["target"]
 
-    def sample_events(self, seed, design, n_traj_steps=4):
+    def sample_events(self, seed, design, n_traj_steps=4, pool=None):
         """Generate events and return a rich dict for visualisation / inspection.
 
         ``design`` is the *physical* (un-encoded) design ``(B, design_dim)`` (or a
@@ -389,7 +452,7 @@ class DebugDetector(Detector):
         """
         rng = np.random.default_rng(seed)
         station_z, tilt, B = self._split_design(design)
-        ev = self.generate_events(rng, station_z.shape[0])
+        ev = self.generate_events(rng, station_z.shape[0], pool=pool)
         X, mask, sidx, vidx, straw, valid = self._measure(rng, ev, station_z, tilt, B)
         trajectories = self._trajectory(ev["vertex"], ev["momenta"], ev["charges"], B)
         return {
@@ -397,6 +460,8 @@ class DebugDetector(Detector):
             "momenta": ev["momenta"],
             "charges": ev["charges"],
             "target": ev["target"],
+            "targets": ev["target"],  # StrawDetector-contract alias used by training scripts
+            "conditioning": ev["target"],  # LFI ground-truth conditioning (full target stands in)
             "ground_truth": ev["ground_truth"],
             "X": X,
             "mask": mask,
@@ -459,13 +524,39 @@ class DebugDetector(Detector):
     # ------------------------------------------------------------------ #
     # Design encode / decode (JAX, differentiable) + current design
     # ------------------------------------------------------------------ #
-    def encode_design(self, design):
+    def design_spec(self):
+        return {"stations": (self.n_stations,), "tilts": (self.n_views_per_station,), "field_strength": (1,)}
+
+    def flatten_design(self, design):
+        """Design dict ``{stations (...,S), tilts (...,V), field_strength (...,1)}`` -> flat
+        ``(..., S+V+1)`` (a non-dict passes through unchanged)."""
+        if not isinstance(design, dict):
+            return jnp.asarray(design, jnp.float32)
+        stations = jnp.asarray(design["stations"], jnp.float32)
+        tilts = jnp.asarray(design["tilts"], jnp.float32)
+        field = jnp.asarray(design["field_strength"], jnp.float32).reshape(stations.shape[:-1] + (1,))
+        return jnp.concatenate([stations, tilts, field], axis=-1)
+
+    def unflatten_design(self, flat):
+        """Flat ``(..., S+V+1)`` -> design dict ``{stations (...,S), tilts (...,V), field_strength (...,1)}``."""
+        flat = jnp.asarray(flat, jnp.float32)
+        s, v = self.n_stations, self.n_views_per_station
+        return {"stations": flat[..., :s], "tilts": flat[..., s : s + v], "field_strength": flat[..., s + v : s + v + 1]}
+
+    def design_bounds(self):
+        return {
+            "stations": (self.decay_volume_z[1], 400.0),
+            "tilts": (-self.tilt_bound, self.tilt_bound),
+            "field_strength": (self.B_bounds[0], self.B_bounds[1]),
+        }
+
+    def _encode_flat(self, design):
         d = jnp.asarray(design, dtype=jnp.float32)
         low = jnp.asarray(self._design_low)
         high = jnp.asarray(self._design_high)
         return uniform_to_normal_jax(d, low, high)
 
-    def decode_design(self, encoded_design):
+    def _decode_flat(self, encoded_design):
         e = jnp.asarray(encoded_design, dtype=jnp.float32)
         low = jnp.asarray(self._design_low)
         high = jnp.asarray(self._design_high)
@@ -497,14 +588,29 @@ class DebugDetector(Detector):
         edep = X_norm[..., 3] * max(self.edep_sigma, 1e-3) + self.edep_mean
         return jnp.stack([X_norm[..., 0], X_norm[..., 1], X_norm[..., 2], edep], axis=-1)
 
+    def normalize_target(self, target):
+        """Physical 6-vec target ``[vertex(3), momentum(3)]`` -> standardised by ``target_mean``/``target_std``."""
+        import jax.numpy as jnp
+
+        target = jnp.asarray(target, jnp.float32)
+        return (target - jnp.asarray(self.target_mean)) / jnp.asarray(self.target_std)
+
+    def denormalize_predictions(self, normalised):
+        """Inverse of :meth:`normalize_target`: back to physical units."""
+        import jax.numpy as jnp
+
+        normalised = jnp.asarray(normalised, jnp.float32)
+        return normalised * jnp.asarray(self.target_std) + jnp.asarray(self.target_mean)
+
     def combine(self, X_norm, encoded_design):
         """Per-hit design-informed features (all *normalised*, not encoded):
 
-            [energy, norm(station z), norm(station y), norm(view tilt), norm(B)]
+            [energy, norm(station z), wire_y_left, wire_y_right, field_strength]
 
-        Each hit's station z and view tilt are gathered from the **decoded**
-        design; station y is the hit straw's transverse position. Differentiable
-        w.r.t. the encoded design through the decode + gather.
+        Mirrors :meth:`StrawDetector.combine`: the sheared sense wire is encoded by its two
+        y-endpoints at the fixed x-ends (``x = +/- view_half_width``), where the shear slope
+        is ``tilt / view_half_width`` so ``y(+/-width) = straw_y +/- tilt``. station z and
+        tilt are gathered from the decoded design; differentiable through decode + gather.
         """
         import jax.numpy as jnp
 
@@ -519,23 +625,26 @@ class DebugDetector(Detector):
         d_enc = jnp.asarray(encoded_design, dtype=jnp.float32)
         if d_enc.ndim == 1:
             d_enc = jnp.broadcast_to(d_enc[None, :], (B, d_enc.shape[0]))
-        phys = self.decode_design(d_enc)  # (B, design_dim)
+        phys = self._decode_flat(d_enc)  # (B, design_dim) flat physical
         station_z = phys[:, : self.n_stations]  # (B, S)
         tilts = phys[:, self.n_stations : self.n_stations + self.n_views_per_station]
         B_field = phys[:, -1]  # (B,)
 
         z_hit = jnp.take_along_axis(station_z, station_idx, axis=1)  # (B, M)
-        tilt_hit = jnp.take_along_axis(tilts, view_idx, axis=1)  # (B, M)
-        straw_y = (straw_idx + 0.5) * self.straw_pitch - self.view_half_height
+        tilt_hit = jnp.take_along_axis(tilts, view_idx, axis=1)  # (B, M) y-offset at x=+width (cm)
+        straw_y = (straw_idx + 0.5) * self.straw_pitch - self.view_half_height  # wire centre y (at x=0)
 
         norm_z = (z_hit - self._Z_MEAN) / self._Z_STD
-        norm_y = straw_y / self.view_half_height
-        norm_tilt = tilt_hit / self.tilt_bound
-        b_mid = 0.5 * (self.B_bounds[0] + self.B_bounds[1])
-        b_half = max(0.5 * (self.B_bounds[1] - self.B_bounds[0]), 1e-6)
-        norm_B = jnp.broadcast_to(((B_field - b_mid) / b_half)[:, None], (B, M))
+        # Wire y at the fixed x-ends (+/- view_half_width); y-scale bounds |y| over all straws
+        # and the steepest tilt so the features stay ~[-1, 1].
+        y_scale = max(self.view_half_height + self.tilt_bound, 1e-6)
+        wire_y_left = (straw_y - tilt_hit) / y_scale
+        wire_y_right = (straw_y + tilt_hit) / y_scale
+        # field_strength = fraction of the field range, mapped to ~[-1, 1].
+        b_lo, b_hi = self.B_bounds
+        field_strength = jnp.broadcast_to((2.0 * (B_field - b_lo) / max(b_hi - b_lo, 1e-6) - 1.0)[:, None], (B, M))
 
-        return jnp.stack([energy, norm_z, norm_y, norm_tilt, norm_B], axis=-1)
+        return jnp.stack([energy, norm_z, wire_y_left, wire_y_right, field_strength], axis=-1)
 
 
 def _boost(p_rest, E_rest, P_hnl, E_hnl, M):

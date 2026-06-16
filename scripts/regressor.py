@@ -120,7 +120,7 @@ def regress(seed, output, progress=False, restore=True, trace=None, report=None,
     @nnx.jit
     def metric_f(model, x, c, t):
         p = model(x, c)
-        return jnp.mean(detector.metric(p, t))
+        return jnp.mean(detector.metric(p, t)["loss"])
 
     @nnx.jit
     def step(model, optimizer, x, c, t):

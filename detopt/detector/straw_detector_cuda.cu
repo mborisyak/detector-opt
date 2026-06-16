@@ -213,8 +213,8 @@ __global__ void track_kernel(
       const float vy_m = vy + vz * tx;
       const float vz_m = vz - vy * tx;
       const float sx   = 2.0f * tx / (1.0f + t2);
-      vy = vy_m + vz_m * sx;
-      vz = vz_m - vy_m * sx;
+      vy = vy + vz_m * sx;  /* v+ adds onto original v- (conserves |v|), not v' */
+      vz = vz - vy_m * sx;
 
       const float x_ = x + dt * vx * 29.9792f;
       const float y_ = y + dt * vy * 29.9792f;

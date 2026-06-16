@@ -1,128 +1,40 @@
-# NOTE: ragged-layout model (own combine + segment_sum over event_indices).
-# NOT YET PORTED to the new Detector padded (B, M, F) contract; superseded
-# by detopt/nn/set_regressor.py for the supervised path.
-import inspect
-from typing import Sequence
+"""Detector-agnostic LFI discriminator (ground-truth conditioned).
 
-import math
+A :class:`~detopt.nn.set_regressor.SetRegressor` with a fixed single-unit output, squeezed
+to a scalar logit per event. It consumes ``(features, mask, conditioning)`` where the
+conditioning is the (normalized) HNL ground truth ``[mass, p(3)]``; the conditioning is
+broadcast onto every hit and concatenated to the design-``combine``d per-hit features.
 
-import jax
+Used by ``scripts/lfi.py`` to separate the joint ``(X, theta) | gt`` from the product
+``(X, theta_shuffled) | gt`` (the ground-truth conditioning stays matched to ``X`` in both;
+only ``theta`` is shuffled). At the optimum its logit is
+``log p(X | theta, gt) - log p(X | gt)``, so its theta-gradient estimates the conditional
+score ``grad_theta log p(X | theta, gt)``. Conditioning on the HNL kinematics removes that
+nuisance variation so the theta-signal is learnable.
+"""
+
 import jax.numpy as jnp
-import jax.nn as jnn
-
 from flax import nnx
 
-from ..detector import Detector
-from .common import Model, Block, SiLU, LeakyTanh, bayes_aggregate
+from .set_regressor import SetRegressor
 
-__all__ = ["Discriminator", "DeepSetLFI"]
-
-
-class Discriminator(Model):
-    def __call__(
-        self,
-        X: jax.Array,
-        design: jax.Array,
-        ground_truth: jax.Array,
-        *,
-        deterministic: bool = True,
-    ):
-        raise NotImplementedError()
+__all__ = ["SetDiscriminator"]
 
 
-class DeepSetLFI(Discriminator):
-    def __init__(
-        self,
-        detector: Detector,
-        features: Sequence[Sequence[int]],
-        p_dropout: float | None = None,
-        *,
-        rngs: nnx.Rngs,
-    ):
-        super().__init__(detector, rngs=rngs)
-        target_dim = 1
-        ground_truth_dim = math.prod(self.ground_truth_shape)
+class SetDiscriminator(SetRegressor):
+    """SetRegressor with a single logit output, conditioned on the HNL ground truth.
 
-        ### position + angle + B
-        n_design = 3 + ground_truth_dim
+    ``__call__(features, mask, conditioning)`` broadcasts ``conditioning`` ``(..., C)`` onto
+    the ``M`` hits, concatenates it to ``features`` ``(..., M, F)``, and returns the
+    SetRegressor output with the length-1 target axis dropped: ``(..., )``.
+    """
 
-        n_layers, n_straws = self.input_shape
+    @classmethod
+    def from_config(cls, detector, config, *, rngs: nnx.Rngs):
+        n_in = int(detector.combined_feature_dim) + int(detector.conditioning_dim())
+        return cls(n_features_in=n_in, target_dim=1, rngs=rngs, **config)
 
-        dropout = lambda: (() if p_dropout is None else (nnx.Dropout(rate=p_dropout, rngs=rngs),))
-
-        self.blocks: list[Block] = []
-
-        n_features = n_design + n_straws
-        for block_def in features:
-            units = (n_features, *block_def)
-            self.blocks.append(
-                Block(
-                    *(
-                        Block(
-                            *dropout(),
-                            nnx.Linear(n_in, n_out, rngs=rngs),
-                            LeakyTanh(
-                                n_out,
-                            ),
-                        )
-                        for n_in, n_out in zip(units[:-2], units[1:-1])
-                    ),
-                    [
-                        Block(*dropout(), nnx.Linear(units[-2], units[-1], rngs=rngs)),
-                        Block(*dropout(), nnx.Linear(units[-2], units[-1], rngs=rngs)),
-                    ],
-                )
-            )
-            n_features = 3 * units[-1]
-
-        *_, last = features
-        *_, n_latent = last
-
-        self.output = nnx.Linear(2 * n_latent, target_dim, rngs=rngs)
-
-    def combine(self, X, design, ground_truth):
-        n_b, n_l, n_s = X.shape
-        _, n_d = design.shape
-        n_gt = math.prod(ground_truth.shape[1:])
-
-        X = jnp.reshape(X, shape=(n_b, n_l, n_s))
-        ground_truth = jnp.reshape(ground_truth, shape=(n_b, n_gt))
-        ground_truth = jnp.broadcast_to(ground_truth[:, None, :], shape=(n_b, n_l, n_gt))
-
-        positions, angles, magnetic_strength = (
-            design[:, :n_l],
-            design[:, n_l : 2 * n_l],
-            design[:, -1],
-        )
-        positions = jnp.broadcast_to(positions[:, :, None], shape=(n_b, n_l, 1))
-        angles = jnp.broadcast_to(angles[:, :, None], shape=(n_b, n_l, 1))
-        magnetic_strength = jnp.broadcast_to(magnetic_strength[:, None, None], shape=(n_b, n_l, 1))
-
-        return jnp.concatenate([X, positions, angles, magnetic_strength, ground_truth], axis=-1)
-
-    def __call__(
-        self,
-        X: jax.Array,
-        design: jax.Array,
-        ground_truth: jax.Array,
-        *,
-        deterministic: bool = True,
-    ):
-        result = self.combine(X, design, ground_truth)
-
-        *rest, last = self.blocks
-
-        for block in rest:
-            mus, sigmas = block(result)
-            mu, sigma = bayes_aggregate(mus, sigmas, keepdims=True, axis=(1,))
-            mu = jnp.broadcast_to(mu, shape=mus.shape)
-            sigma = jnp.broadcast_to(sigma, shape=sigmas.shape)
-            result = jnp.concatenate([mus, mu, sigma], axis=-1)
-
-        mus, sigmas = last(result)
-        mu, sigma = bayes_aggregate(mus, sigmas, keepdims=False, axis=(1,))
-        result = jnp.concatenate([mu, sigma], axis=-1)
-
-        result = self.output(result)
-
-        return jnp.reshape(result, shape=(result.shape[0],))
+    def __call__(self, features, mask, conditioning, *, deterministic: bool = True, rngs=None):
+        cond = jnp.broadcast_to(conditioning[..., None, :], features.shape[:-1] + (conditioning.shape[-1],))
+        feats = jnp.concatenate([features, cond], axis=-1)
+        return super().__call__(feats, mask, deterministic=deterministic, rngs=rngs)[..., 0]

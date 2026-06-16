@@ -1,21 +1,77 @@
-detector: straw
+# Subgradient design optimization (scripts/subgradient.py). Mirrors config/bo.yaml
+# minus the `bo:` block; adds a `subgradient:` block. The design lives in encoded
+# space and is descended by an analytic gradient through combine() over a RingBuffer.
+detector:
+  stereo_straw:
+    n_stations_upstream: 2
+    n_stations_downstream: 2
+    n_layers_per_view: 2
+    n_straws_per_layer: 316
+    straw_length: 400.0
+    straw_pitch: 2.0
+    layer_z_gap: 1.732
+    view_z_gap: 5.0
+    magnet_half_cm: 140.0   # magnet z half-width (FairShip YokeDepth)
+    station_width: 100.0    # station z full-width (2 x FairShip station_length); coupled non-overlap encoding
+    station_clearance: 50.0 # minimum z gap between adjacent station footprints (0 = may touch)
+    max_B: -0.151
+    z0: 8957.0
+    B_sigma: 283.0
+    layer_bounds: [8200.0, 9750.0]
+    max_particles: 1024
+    max_hits_per_event: 384
+    max_dt: 1.0
+    max_time: 300.0
+    material: kapton
+    data_dir: "data/mc"
+    pool_split: {train: 0.45, design: 0.45, val: 0.1}   # disjoint pools: net / design gradient / held-out validation
 
-regressor: deep-set-128
+# Initial (nominal) design -> the starting encoded theta. Field is FIXED at max_B (not a
+# design dof: it collapsed to ~0 / was a near-flat objective in the HNL runs).
+nominal_design:
+  stations: [8407.0, 8607.0, 9307.0, 9507.0]
+  angle: 0.0798
 
-initial_design: data/design/default.json
-trace: data/design/subgradient/10/
-report: data/design/subgradient/10/
+regressor:
+  set-regressor:
+    features: [[64, 32], [64, 32]]
+    n_models: 8   # ensemble of 8 (omit n_models for a single net)
 
-# Physical parameter optimization (13 params: station positions, angles, spacings, B-field)
-design_eps: 1.0e-1
-optimizer:
-  adam:
-    learning_rate: 1.0e-4
-    b1: 0.99
-    b2: 0.998
+device: cuda
 
-batch: 10
-epochs: 100
-steps: 1000
-substeps: 10
-validation_batches: 20
+# Network (regressor) optimizer.
+training:
+  optimizer:
+    adamw:
+      learning_rate: 2.0e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-4
+
+  design_optimizer:
+    adamaxw:
+      learning_rate: 2.0e-3
+      b1: 0.0
+      b2: 0.9
+      weight_decay: 1.0e-3
+
+subgradient:
+  epochs: 1024
+  steps: 32
+  samples: 256
+
+  substeps: 32
+  batch: 32
+  ring_capacity: 4096
+
+  warmup:
+    samples: 32768
+    steps: 128
+    design_eps: 0.25
+
+  design_batch: 128
+  design_eps: 0.1
+
+  validation_batches: 128
+  validation_batch: 256
