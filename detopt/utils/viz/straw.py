@@ -27,7 +27,35 @@ try:
 except Exception:  # pragma: no cover - pyvista is an optional viz dep
     pv = None
 
-__all__ = ["show_event"]
+__all__ = ["show_event", "daughter_polylines"]
+
+
+def daughter_polylines(detector, dd, design, rng, *, z_grid=None, m=None):
+    """Per-daughter ``[x, y, z]`` polylines from the C solver's crossing-track buffer.
+
+    Solves the single hand-built event ``dd`` once at ``design`` and samples each of the first
+    ``m`` primaries' (the HNL daughters') in-aperture ``(x, y)`` crossings at the reference planes
+    ``z_grid`` (default: a fine grid over ``detector.layer_bounds``). Returns ``(X, mask, lines)``
+    with ``lines[p]`` a ``(k, 3)`` ``[x, y, z]`` array (z increasing) of the planes daughter ``p``
+    actually crossed -- the drop-in replacement for the old per-particle trajectory slice (secondary
+    paths are no longer recorded; only the first ``m`` primaries). ``m`` defaults to the event's
+    particle count."""
+    if z_grid is None:
+        lo, hi = detector.layer_bounds
+        z_grid = np.linspace(float(lo), float(hi), 400)
+    ie = detector._make_input_events(dd)
+    n = len(np.asarray(dd["masses"]))
+    m = n if m is None else int(m)
+    zp = np.ascontiguousarray(z_grid, dtype=np.float32)
+    traj = np.zeros((1, m, zp.shape[0], 3), dtype=np.float32)
+    n_cross = np.zeros((1, m), dtype=np.int32)
+    part_idx = np.full((1, m), -1, dtype=np.int32)
+    X, mask, _ = detector._run_solver(
+        np.array([[0, n]], np.int32), design, rng, input_events=ie, z_planes=zp,
+        traj=traj, n_cross=n_cross, part_idx=part_idx, primaries=True,
+    )
+    lines = [traj[0, s, : int(n_cross[0, s])] for s in range(m)]  # each (n_cross, 3) ordered (x, y, z) polyline
+    return X, mask, lines
 
 
 def _require_pyvista():
@@ -85,12 +113,11 @@ def show_event(
         design: the physical design array ``[layer_z(n), layer_angle(n), B]``.
         X: one event's dense hits ``(M, 5)`` = ``[station, view, layer_in_view, straw, time]``.
         mask: ``(M,)`` 1 for a real hit. Only fired straws are drawn.
-        trajectories: optional ``(max_particles, n_t, 3)`` per-particle paths. Slots
-            ``0..n_daughters-1`` are the HNL daughters (primaries); the rest are the
-            tracked secondaries (delta-rays, conversion pairs, decay muons).
-        n_daughters: number of primaries (the HNL daughters) to highlight; the
-            remaining live trajectories are drawn as muted thin secondaries. ``None``
-            -> treat every particle as a daughter.
+        trajectories: optional sequence of per-daughter ``(k, 3)`` ``[x, y, z]`` polylines
+            (from :func:`daughter_polylines`) -- one per HNL daughter. (A single
+            ``(n_particles, n_t, 3)`` array still works: it is iterated per particle.)
+        n_daughters: number of primaries (the HNL daughters) to highlight; any extra
+            polylines are drawn as muted thin secondaries. ``None`` -> all daughters.
         off_screen: render without a window (headless); pair with ``screenshot``.
         screenshot: path to save a PNG (None -> show interactively if not off_screen).
     """
@@ -130,11 +157,10 @@ def show_event(
     # thick, opaque, vivid. Secondaries (delta-rays / conversion pairs / decay muons)
     # are drawn muted and thin so the daughters stand out.
     if trajectories is not None:
-        trajectories = np.asarray(trajectories)
-        n_d = trajectories.shape[0] if n_daughters is None else int(n_daughters)
+        n_d = len(trajectories) if n_daughters is None else int(n_daughters)
         daughter_palette = ["royalblue", "limegreen", "magenta", "cyan", "darkorange", "purple"]
-        for p in range(trajectories.shape[0]):
-            pts = trajectories[p]
+        for p, pts in enumerate(trajectories):
+            pts = np.asarray(pts)
             pts = pts[np.abs(pts).sum(axis=1) > 0]
             # Cut the portion that leaves the detector volume (clip to the frame box).
             inside = (

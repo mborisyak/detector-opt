@@ -1,8 +1,8 @@
 """Tests for the Detector contract from detector-spec.md.
 
 Event generation (``__call__``) needs a data source and is not exercised here;
-these cover the differentiable / network-facing surface: shapes, design
-encode/decode, event normalize, combine, and the loss/metric dicts.
+these cover the differentiable / network-facing surface: record specs, design
+encode/decode, combine/combine_encoded, and the loss/metric dicts.
 """
 
 import inspect
@@ -13,6 +13,7 @@ import jax.numpy as jnp
 import pytest
 
 import detopt
+from detopt.detector.straw import StrawEvent, StrawGroundTruth
 
 
 def _make_detector():
@@ -34,6 +35,19 @@ def _nominal_design(d):
     return detopt.detector.free_design_array([8407.0, 8607.0, 9307.0, 9507.0], n_layers_per_view=d.n_layers_per_view, B=d.max_B)
 
 
+def _fab_event(d, B, rng):
+    """A fabricated batched ``StrawEvent`` (random valid hit address + TDC) for combine tests."""
+    M = d.max_hits_per_event
+    ri = lambda hi: rng.integers(0, hi, (B, M)).astype(np.int32)
+    return StrawEvent(
+        station=ri(d.n_stations),
+        view=ri(d.n_views_per_station),
+        layer=ri(d.n_layers_per_view),
+        straw=ri(d.n_straws),
+        tdc=(440.0 + 30.0 * rng.standard_normal((B, M))).astype(np.float32),
+    )
+
+
 def test_contract_surface():
     d = _make_detector()
     # No mutable "current design".
@@ -42,24 +56,34 @@ def test_contract_surface():
         "__call__",
         "encode_design",
         "decode_design",
-        "normalize",
-        "denormalize",
         "combine",
+        "combine_encoded",
+        "event_spec",
+        "target_spec",
+        "ground_truth_spec",
         "loss",
         "metric",
         "normalize_target",
         "denormalize_predictions",
+        "normalize_ground_truth",
     ):
         assert hasattr(d, name), f"missing {name!r}"
+    # Event normalization is folded into combine_encoded -- no standalone event normalize/denormalize.
+    assert not hasattr(d, "normalize")
+    assert not hasattr(d, "denormalize")
 
 
 def test_shape_invariants():
     d = _make_detector()
-    # max_hits_per_event is now a decoupled constructor param (default 384), not 2*max_particles*n_layers.
+    # max_hits_per_event is a decoupled constructor param (default 384).
     assert d.max_hits_per_event == 384
-    assert d.event_shape() == (d.max_hits_per_event, 5)
-    assert d.raw_feature_dim == 5
-    assert d.target_shape() == (6,)
+    # event_spec is a StrawEvent of ShapeDtypeStruct with honest dtypes (int address + float TDC).
+    es = d.event_spec()
+    assert isinstance(es, StrawEvent)
+    assert es.station.shape == (d.max_hits_per_event,) and es.station.dtype == np.int32
+    assert es.tdc.dtype == np.float32
+    assert d.target_dim() == 6  # HNL [vertex(3), momentum(3)]
+    assert d.ground_truth_dim() == 7  # [mass(1), p(3), vertex(3)]
     # design = positions(n_layers) + angles(n_layers) + B(1)
     assert d.design_dim() == 2 * d.n_layers + 1
     # combine() gathers per-hit design context into a compact fixed width
@@ -72,22 +96,22 @@ def test_encode_decode_roundtrip():
     d = _make_detector()
     phys = _nominal_design(d)
     enc = d.encode_design(phys)
-    # decode_design returns a named dict now; flatten it back to compare with the flat physical.
+    # decode_design returns a Design namedtuple now; flatten it back to compare with the flat physical.
     back = np.asarray(d.flatten_design(d.decode_design(enc)))
     np.testing.assert_allclose(back, phys, rtol=1e-3, atol=1e-2)
 
 
-def test_design_dict_contract():
+def test_design_record_contract():
     d = _make_detector()
-    spec = d.design_spec()  # Mapping[str, Shape]
-    assert sum(int(np.prod(shape)) for shape in spec.values()) == d.design_dim()
-    assert set(spec) == set(d.design_bounds())
-    # flatten/unflatten round-trip on the flat physical vector
+    spec = d.design_spec()  # Design namedtuple of jax.ShapeDtypeStruct
+    assert sum(int(np.prod(leaf.shape)) for leaf in spec) == d.design_dim()
+    assert set(spec._fields) == set(d.design_bounds())  # bounds keyed by the Design field names
+    # flatten/unflatten round-trip on the flat physical vector (via the tensor codec)
     a = np.arange(d.design_dim(), dtype=np.float32)
     np.testing.assert_allclose(np.asarray(d.flatten_design(d.unflatten_design(a))), a)
-    # decode -> dict keyed by the spec names
+    # decode -> Design namedtuple whose fields are the spec fields
     enc = jnp.asarray(np.random.default_rng(0).standard_normal(d.design_dim()).astype("float32"))
-    assert set(d.decode_design(enc)) == set(spec)
+    assert d.decode_design(enc)._fields == spec._fields
 
 
 def test_encode_decode_jittable():
@@ -98,38 +122,69 @@ def test_encode_decode_jittable():
     assert bool(jnp.all(jnp.isfinite(enc)))
 
 
-def test_normalize_denormalize_roundtrip():
+def test_combine_encoded_shape_and_broadcast():
     d = _make_detector()
-    rng = np.random.default_rng(0)
-    X = jnp.asarray(rng.standard_normal((4, d.max_hits_per_event, 5)).astype("float32"))
-    back = d.denormalize(d.normalize(X))
-    assert float(jnp.max(jnp.abs(X - back))) < 1e-3
-
-
-def test_combine_shape_and_broadcast():
-    d = _make_detector()
-    B, M = 3, d.max_hits_per_event
+    B = 3
     rng = np.random.default_rng(1)
-    X_norm = jnp.asarray(rng.standard_normal((B, M, 5)).astype("float32"))
+    event = _fab_event(d, B, rng)
     d_enc = jnp.asarray(rng.standard_normal(d.design_dim()).astype("float32"))
 
-    feats_1d = d.combine(X_norm, d_enc)
-    feats_2d = d.combine(X_norm, jnp.broadcast_to(d_enc[None, :], (B, d.design_dim())))
-    assert feats_1d.shape == (B, M, d.combined_feature_dim)  # compact fixed width
+    feats_1d = d.combine_encoded(event, d_enc)
+    feats_2d = d.combine_encoded(event, jnp.broadcast_to(d_enc[None, :], (B, d.design_dim())))
+    assert feats_1d.shape == (B, d.max_hits_per_event, d.combined_feature_dim)  # compact fixed width
     # A 1-D design broadcasts to the per-row design.
     np.testing.assert_allclose(np.asarray(feats_1d), np.asarray(feats_2d), rtol=1e-5)
 
 
+def test_combine_matches_combine_encoded():
+    """``combine(event, design)`` defaults to ``combine_encoded(event, encode_design(design))``."""
+    d = _make_detector()
+    rng = np.random.default_rng(5)
+    event = _fab_event(d, 3, rng)
+    enc = d.encode_design(jnp.asarray(_nominal_design(d)))
+    a = d.combine(event, d.decode_design(enc))  # physical Design -> encode -> combine_encoded
+    b = d.combine_encoded(event, enc)
+    np.testing.assert_allclose(np.asarray(a), np.asarray(b), rtol=1e-4, atol=1e-4)
+
+
 def test_combine_differentiable_wrt_design():
     d = _make_detector()
-    B, M = 2, d.max_hits_per_event
     rng = np.random.default_rng(2)
-    X_norm = jnp.asarray(rng.standard_normal((B, M, 5)).astype("float32"))
+    event = _fab_event(d, 2, rng)
     d_enc = jnp.asarray(rng.standard_normal(d.design_dim()).astype("float32"))
 
-    grad = jax.grad(lambda e: jnp.sum(d.combine(X_norm, e)))(d_enc)
+    grad = jax.grad(lambda e: jnp.sum(d.combine_encoded(event, e)))(d_enc)
     assert bool(jnp.all(jnp.isfinite(grad)))
     assert float(jnp.sum(jnp.abs(grad))) > 0.0
+
+
+def test_target_roundtrip_and_record_type():
+    """normalize_target(Target) -> flat array; denormalize_predictions(array) -> Target."""
+    d = _make_detector()
+    from detopt.detector.straw import HNLTarget
+
+    rng = np.random.default_rng(7)
+    t = HNLTarget(
+        vertex=rng.standard_normal((5, 3)).astype(np.float32), momentum=rng.standard_normal((5, 3)).astype(np.float32)
+    )
+    tn = d.normalize_target(t)
+    assert tn.shape == (5, d.target_dim())
+    back = d.denormalize_predictions(tn)
+    assert isinstance(back, HNLTarget)
+    np.testing.assert_allclose(np.asarray(back.vertex), np.asarray(t.vertex), rtol=1e-3, atol=1e-3)
+    np.testing.assert_allclose(np.asarray(back.momentum), np.asarray(t.momentum), rtol=1e-3, atol=1e-3)
+
+
+def test_normalize_ground_truth():
+    d = _make_detector()
+    rng = np.random.default_rng(6)
+    gt = StrawGroundTruth(
+        mass=rng.standard_normal((4, 1)).astype(np.float32),
+        momentum=rng.standard_normal((4, 3)).astype(np.float32),
+        vertex=rng.standard_normal((4, 3)).astype(np.float32),
+    )
+    out = d.normalize_ground_truth(gt)
+    assert out.shape == (4, d.ground_truth_dim())  # [mass, p(3), vertex(3)] = 7
 
 
 def test_loss_is_array_and_matches_mse():
@@ -187,6 +242,8 @@ def test_simulate_debug_outputs():
 
     Secondary channels are off here for a clean, deterministic 2-primary event (the
     physics rates are matched/validated elsewhere); this just checks the API surface.
+    ``simulate_debug`` / ``_run_solver`` return the RAW ``(n, M, 5)`` float buffer (the
+    typed ``Event`` packing happens only in ``sample_events`` / ``__call__``).
     """
     d = detopt.detector.FreeStrawDetector(
         n_stations=4,
@@ -226,8 +283,6 @@ def test_simulate_debug_outputs():
     assert np.all(out["process_id"] == 0)
     assert np.all(out["parent_id"] == -1)
 
-    # every emitted hit carries a valid process code; with min-TDC dedup the emitted
-    # count is <= the particles' total tube entries (shared straws collapse to one).
     assert set(np.unique(out["process_ids"][mask]).tolist()) <= {0}
     assert int(mask.sum()) <= int(out["n_hits"].sum())
 
@@ -255,9 +310,10 @@ def test_debug_detector_pools_disjoint():
     d = detopt.detector.DebugDetector(pool_split={"train": 0.8, "val": 0.2})
     assert list(d.pool_split) == ["train", "val"]
     design = np.zeros((64, d.design_dim()), np.float32)
+    flat = lambda t: np.concatenate([np.asarray(x) for x in t], axis=-1)  # Target record -> flat array
     _, _, _, t_train = d(0, design, pool="train")
     _, _, _, t_val = d(0, design, pool="val")
-    assert not np.allclose(np.asarray(t_train), np.asarray(t_val))
+    assert not np.allclose(flat(t_train), flat(t_val))
     # the default pool (no arg) matches the first key
     _, _, _, t_default = d(0, design)
-    assert np.allclose(np.asarray(t_default), np.asarray(t_train))
+    assert np.allclose(flat(t_default), flat(t_train))

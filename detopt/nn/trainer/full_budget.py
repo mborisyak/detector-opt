@@ -109,7 +109,7 @@ class FullBudgetTrainer(Trainer):
         """
         detector = self.detector
         design_enc = np.asarray(design_enc, dtype=np.float32)
-        design_phys = np.asarray(detector.flatten_design(detector.decode_design(design_enc)), dtype=np.float32)
+        design = detector.decode_design(design_enc)  # physical Design namedtuple (what the pools store)
         init_seq, training_seq, data_seq = seed_seq.spawn(3)
 
         # Fresh, randomly initialised regressor + optimiser (cosine-scheduled LR).
@@ -118,8 +118,8 @@ class FullBudgetTrainer(Trainer):
         # Populate EVERYTHING up front: the whole budget under this single design.
         tp, vp = self.train_pool, self.val_pool
         train_seq, val_seq = data_seq.spawn(2)
-        self._fill_pool(design_phys, design_enc, tp, tp.n_max, train_seq)
-        self._fill_pool(design_phys, design_enc, vp, vp.n_max, val_seq)
+        self._fill_pool(design, tp, tp.n_max, train_seq)
+        self._fill_pool(design, vp, vp.n_max, val_seq)
         start = jnp.int32(0)
         train_count, val_count = int(tp.n_current), int(vp.n_current)
 

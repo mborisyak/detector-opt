@@ -1,3 +1,6 @@
+# DEPRECATED: not maintained against the typed-records detector API (Event/Target/Design
+# namedtuples, combine/combine_encoded, raw buffers). Left untouched on purpose -- do not use
+# or refactor.
 import os
 
 import numpy as np

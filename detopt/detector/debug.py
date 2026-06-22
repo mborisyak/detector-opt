@@ -17,19 +17,46 @@ Per-hit raw features (``raw_feature_dim = 4``): ``[station, view, straw, edep]``
 Target (``target_dim = 6``): ``[vtx_x, vtx_y, vtx_z, HNL_px, HNL_py, HNL_pz]``.
 """
 
+from typing import NamedTuple
+
 import numpy as np
 
 import jax
 import jax.numpy as jnp
 
 from ..utils.encoding import uniform_to_normal_jax, normal_to_uniform_jax
+from ..utils import tensor
 from .common import Detector
 
-__all__ = ["DebugDetector"]
+__all__ = ["DebugDetector", "DebugEvent", "DebugTarget", "DebugDesign"]
 
 _MUON_MASS = 0.105658  # GeV
 _PION_MASS = 0.139570  # GeV
 _C_CM_PER_NS = 29.9792
+
+
+class DebugEvent(NamedTuple):
+    """Raw per-hit debug event: int (station, view, straw) address + float energy deposit."""
+
+    station: jax.Array  # int32
+    view: jax.Array  # int32
+    straw: jax.Array  # int32
+    energy: jax.Array  # float32 (edep)
+
+
+class DebugTarget(NamedTuple):
+    """Debug target == discriminator conditioning: HNL decay vertex (cm) + HNL momentum (GeV)."""
+
+    vertex: jax.Array  # (..., 3)
+    momentum: jax.Array  # (..., 3)
+
+
+class DebugDesign(NamedTuple):
+    """Debug design: per-station z, per-view tilt (shared across stations), field strength."""
+
+    stations: jax.Array  # (..., n_stations)
+    tilts: jax.Array  # (..., n_views_per_station)
+    field_strength: jax.Array  # (..., 1)
 
 
 class DebugDetector(Detector):
@@ -148,27 +175,24 @@ class DebugDetector(Detector):
         # station_z (n_stations) + view_tilt (n_views, shared) + B (1)
         return (self.n_stations + self.n_views_per_station + 1,)
 
-    def event_shape(self):
-        # per-hit raw features: [station, view, straw, edep]
-        return (self.max_hits_per_event, 4)
+    def event_spec(self):
+        # Raw per-hit features: int32 [station, view, straw] + float32 energy deposit.
+        M = self.max_hits_per_event
+        i = jax.ShapeDtypeStruct((M,), np.int32)
+        return DebugEvent(station=i, view=i, straw=i, energy=jax.ShapeDtypeStruct((M,), np.float32))
 
     def combined_event_shape(self):
         # combine() -> [energy, norm_station_z, wire_y_left, wire_y_right, field_strength]
         return (self.max_hits_per_event, 5)
 
-    def target_shape(self):
-        return (6,)
+    def target_spec(self):
+        f = lambda n: jax.ShapeDtypeStruct((n,), np.float32)
+        return DebugTarget(vertex=f(3), momentum=f(3))
 
-    # Conditioning for the LFI discriminator: reuse the full target as the "ground truth"
-    # (the stereo detector conditions on HNL [mass, p(3)]; here the 6-vec target stands in).
-    def conditioning_shape(self):
-        return self.target_shape()
-
-    def conditioning_dim(self):
-        return int(self.target_dim())
-
-    def normalize_conditioning(self, conditioning):
-        return self.normalize_target(conditioning)
+    def ground_truth_spec(self):
+        # Ground truth == conditioning: the full 6-vec target stands in (stereo uses [mass, p, vtx]).
+        f = lambda n: jax.ShapeDtypeStruct((n,), np.float32)
+        return DebugTarget(vertex=f(3), momentum=f(3))
 
     def metric_labels(self):
         """Keys of the metric() dict, in display order."""
@@ -201,18 +225,13 @@ class DebugDetector(Detector):
             "p_z": se[..., 5],
         }
 
-    def ground_truth_shape(self):
-        # [charge_mu, charge_pi, mu_p (3), pi_p (3)]
-        return (8,)
-
     # ------------------------------------------------------------------ #
     # Design slicing
     # ------------------------------------------------------------------ #
     def _split_design(self, design):
-        """``(B, 9)`` physical design (dict or flat array) -> (station_z (B,S), tilt (B,V), B (B,))."""
-        if isinstance(design, dict):
-            design = self.flatten_design(design)
-        design = np.asarray(design, dtype=np.float32)
+        """``(B, 9)`` physical design (``DebugDesign`` / Mapping / flat array) -> (station_z (B,S),
+        tilt (B,V), B (B,))."""
+        design = np.asarray(self.flatten_design(design), dtype=np.float32)
         if design.ndim == 1:
             design = design[None, :]
         s = self.n_stations
@@ -438,7 +457,18 @@ class DebugDetector(Detector):
         station_z, tilt, B = self._split_design(design)
         ev = self.generate_events(rng, station_z.shape[0], pool=pool)
         X, mask, *_ = self._measure(rng, ev, station_z, tilt, B)
-        return ev["ground_truth"], X, mask, ev["target"]
+        return self._pack_target(ev["target"]), self._pack_event(X), mask, self._pack_target(ev["target"])
+
+    def _pack_event(self, X):
+        """Pack the ``(n, M, 4)`` float buffer [station, view, straw, edep] into a ``DebugEvent``."""
+        X = np.asarray(X)
+        idx = lambda c: np.rint(X[..., c]).astype(np.int32)
+        return DebugEvent(station=idx(0), view=idx(1), straw=idx(2), energy=X[..., 3].astype(np.float32))
+
+    def _pack_target(self, target):
+        """Pack the ``(n, 6)`` target [vertex, momentum] into a ``DebugTarget`` (== conditioning)."""
+        t = np.asarray(target)
+        return DebugTarget(vertex=t[..., :3], momentum=t[..., 3:6])
 
     def sample_events(self, seed, design, n_traj_steps=4, pool=None):
         """Generate events and return a rich dict for visualisation / inspection.
@@ -459,11 +489,9 @@ class DebugDetector(Detector):
             "vertex": ev["vertex"],
             "momenta": ev["momenta"],
             "charges": ev["charges"],
-            "target": ev["target"],
-            "targets": ev["target"],  # StrawDetector-contract alias used by training scripts
-            "conditioning": ev["target"],  # LFI ground-truth conditioning (full target stands in)
-            "ground_truth": ev["ground_truth"],
-            "X": X,
+            "target": self._pack_target(ev["target"]),  # DebugTarget
+            "ground_truth": self._pack_target(ev["target"]),  # == conditioning (full target stands in)
+            "X": self._pack_event(X),  # DebugEvent
             "mask": mask,
             "station_idx": sidx,
             "view_idx": vidx,
@@ -525,23 +553,9 @@ class DebugDetector(Detector):
     # Design encode / decode (JAX, differentiable) + current design
     # ------------------------------------------------------------------ #
     def design_spec(self):
-        return {"stations": (self.n_stations,), "tilts": (self.n_views_per_station,), "field_strength": (1,)}
-
-    def flatten_design(self, design):
-        """Design dict ``{stations (...,S), tilts (...,V), field_strength (...,1)}`` -> flat
-        ``(..., S+V+1)`` (a non-dict passes through unchanged)."""
-        if not isinstance(design, dict):
-            return jnp.asarray(design, jnp.float32)
-        stations = jnp.asarray(design["stations"], jnp.float32)
-        tilts = jnp.asarray(design["tilts"], jnp.float32)
-        field = jnp.asarray(design["field_strength"], jnp.float32).reshape(stations.shape[:-1] + (1,))
-        return jnp.concatenate([stations, tilts, field], axis=-1)
-
-    def unflatten_design(self, flat):
-        """Flat ``(..., S+V+1)`` -> design dict ``{stations (...,S), tilts (...,V), field_strength (...,1)}``."""
-        flat = jnp.asarray(flat, jnp.float32)
-        s, v = self.n_stations, self.n_views_per_station
-        return {"stations": flat[..., :s], "tilts": flat[..., s : s + v], "field_strength": flat[..., s + v : s + v + 1]}
+        # DebugDesign filled with ShapeDtypeStruct; flatten/unflatten are generic (base, via tensor).
+        f = lambda n: jax.ShapeDtypeStruct((n,), np.float32)
+        return DebugDesign(stations=f(self.n_stations), tilts=f(self.n_views_per_station), field_strength=f(1))
 
     def design_bounds(self):
         return {
@@ -566,61 +580,49 @@ class DebugDetector(Detector):
         return np.concatenate([self.station_z, self.view_tilt, np.array([self.B], np.float32)]).astype(np.float32)
 
     # ------------------------------------------------------------------ #
-    # Event normalisation + combine
+    # Target / ground-truth normalisation + combine
+    # combine_encoded owns event normalisation (the per-hit energy standardisation).
     # ------------------------------------------------------------------ #
     # Station-z normalisation constants (physical cm -> ~[-1, 1]).
     _Z_MEAN = 300.0
     _Z_STD = 75.0
 
-    def normalize(self, X):
-        """Standardise the per-hit energy; keep the (station, view, straw)
-        indices intact for the per-hit lookups in :meth:`combine`."""
-        import jax.numpy as jnp
-
-        X = jnp.asarray(X, dtype=jnp.float32)
-        energy = (X[..., 3] - self.edep_mean) / max(self.edep_sigma, 1e-3)
-        return jnp.stack([X[..., 0], X[..., 1], X[..., 2], energy], axis=-1)
-
-    def denormalize(self, X_norm):
-        import jax.numpy as jnp
-
-        X_norm = jnp.asarray(X_norm, dtype=jnp.float32)
-        edep = X_norm[..., 3] * max(self.edep_sigma, 1e-3) + self.edep_mean
-        return jnp.stack([X_norm[..., 0], X_norm[..., 1], X_norm[..., 2], edep], axis=-1)
-
     def normalize_target(self, target):
-        """Physical 6-vec target ``[vertex(3), momentum(3)]`` -> standardised by ``target_mean``/``target_std``."""
+        """Physical ``DebugTarget`` ``[vertex(3), momentum(3)]`` -> standardised by ``target_mean``/``target_std``."""
         import jax.numpy as jnp
 
-        target = jnp.asarray(target, jnp.float32)
-        return (target - jnp.asarray(self.target_mean)) / jnp.asarray(self.target_std)
+        flat, _ = tensor.flatten(target)  # DebugTarget record (or flat (B, 6) array) -> (B, 6)
+        return (flat - jnp.asarray(self.target_mean)) / jnp.asarray(self.target_std)
 
     def denormalize_predictions(self, normalised):
-        """Inverse of :meth:`normalize_target`: back to physical units."""
+        """Inverse of :meth:`normalize_target`: flat normalised array -> ``DebugTarget``."""
         import jax.numpy as jnp
 
-        normalised = jnp.asarray(normalised, jnp.float32)
-        return normalised * jnp.asarray(self.target_std) + jnp.asarray(self.target_mean)
+        phys = jnp.asarray(normalised, jnp.float32) * jnp.asarray(self.target_std) + jnp.asarray(self.target_mean)
+        return tensor.unflatten(tensor.structure(self.target_spec()), phys)
 
-    def combine(self, X_norm, encoded_design):
-        """Per-hit design-informed features (all *normalised*, not encoded):
+    def normalize_ground_truth(self, ground_truth):
+        """Debug ground truth == conditioning == the 6-vec target; standardised by ``target_mean``/``target_std``."""
+        return self.normalize_target(ground_truth)
+
+    def combine_encoded(self, event, encoded_design):
+        """Raw ``DebugEvent`` + ENCODED design -> per-hit features (all *normalised*):
 
             [energy, norm(station z), wire_y_left, wire_y_right, field_strength]
 
-        Mirrors :meth:`StrawDetector.combine`: the sheared sense wire is encoded by its two
-        y-endpoints at the fixed x-ends (``x = +/- view_half_width``), where the shear slope
-        is ``tilt / view_half_width`` so ``y(+/-width) = straw_y +/- tilt``. station z and
-        tilt are gathered from the decoded design; differentiable through decode + gather.
+        The energy is standardised here (this method owns event normalisation). Mirrors
+        :meth:`StrawDetector.combine_encoded`: the sheared sense wire is encoded by its two
+        y-endpoints at the fixed x-ends (``x = +/- view_half_width``), where the shear slope is
+        ``tilt / view_half_width`` so ``y(+/-width) = straw_y +/- tilt``. station z and tilt are
+        gathered from the decoded design; differentiable through decode + gather.
         """
         import jax.numpy as jnp
 
-        X_norm = jnp.asarray(X_norm, dtype=jnp.float32)
-        B, M, _ = X_norm.shape
-
-        station_idx = jnp.clip(jnp.round(X_norm[..., 0]).astype(jnp.int32), 0, self.n_stations - 1)
-        view_idx = jnp.clip(jnp.round(X_norm[..., 1]).astype(jnp.int32), 0, self.n_views_per_station - 1)
-        straw_idx = X_norm[..., 2]
-        energy = X_norm[..., 3]
+        station_idx = jnp.asarray(event.station, jnp.int32)
+        view_idx = jnp.asarray(event.view, jnp.int32)
+        straw_idx = jnp.asarray(event.straw, jnp.float32)  # float: indexes the continuous wire-centre y
+        energy = (jnp.asarray(event.energy, jnp.float32) - self.edep_mean) / max(self.edep_sigma, 1e-3)
+        B, M = station_idx.shape
 
         d_enc = jnp.asarray(encoded_design, dtype=jnp.float32)
         if d_enc.ndim == 1:

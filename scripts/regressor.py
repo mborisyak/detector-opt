@@ -279,4 +279,4 @@ def regress(seed, output, progress=False, restore=True, trace=None, report=None,
 if __name__ == "__main__":
     import gearup
 
-    gearup.gearup(regress=regress).with_config("config/regress.yaml")()
+    gearup.gearup(regress=regress).with_config("config/regression.yaml")()

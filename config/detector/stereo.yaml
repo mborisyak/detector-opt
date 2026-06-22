@@ -10,12 +10,12 @@ stereo_tracking:
   magnet_half_cm: 140.0   # magnet z half-width (FairShip YokeDepth)
   station_width: 100.0    # station z full-width (2 x FairShip station_length); coupled non-overlap encoding
   station_clearance: 50.0 # minimum z gap between adjacent station footprints (0 = may touch)
-  max_B: -0.151
+  max_B: -0.205    # FairShip V2023 polarity; int Bx dz = -1.07 T.m with B_sigma=208
   z0: 8957.0
-  B_sigma: 283.0
+  B_sigma: 208.0
   layer_bounds: [ 8200.0, 9750.0 ]
   max_particles: 1024
-  max_hits_per_event: 384
+  max_hits_per_event: 128
   max_dt: 1.0
   max_time: 300.0
   material: kapton

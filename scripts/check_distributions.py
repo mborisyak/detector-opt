@@ -24,6 +24,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 import yaml  # noqa: E402
 
 from detopt.detector.free_straw import FreeStrawDetector, free_design_array  # noqa: E402
+from detopt.utils.viz.straw import daughter_polylines  # noqa: E402
 
 
 def _nominal_design(det, cfg_path="config/detector/nominal_design.yaml"):
@@ -57,12 +58,8 @@ def event_dd(ev, e):
 
 
 def run_one(det, dd, design, rng):
-    """Solve a single hand-built event dict -> (X, mask, trajectories)."""
-    ie = det._make_input_events(dd)
-    n = len(dd["masses"])
-    traj = np.zeros((1, det.max_particles, det.n_t, 3), dtype=np.float32)
-    X, mask, _ = det._run_solver(np.array([[0, n]], np.int32), design, rng, input_events=ie, trajectories=traj)
-    return X, mask, traj
+    """Solve a single hand-built event dict -> (X, mask, daughter [x,y,z] polylines)."""
+    return daughter_polylines(det, dd, design, rng)
 
 
 def event_npart(ev, e):
@@ -97,7 +94,7 @@ def main():
     cand = [e for e in range(det.n_events) if event_npart(ev, e) > 0 and np.any((he == e) & real)][:N]
     for e in cand:
         dd = event_dd(ev, e)
-        X, mask, traj = run_one(det, dd, design, rng)
+        X, mask, lines = run_one(det, dd, design, rng)
         h = X[0, mask[0].astype(bool)]
         sim_mult.append(len(h))
         for row in h:
@@ -116,11 +113,7 @@ def main():
         mc_y.extend(mc_all[:, 1].tolist())
         npp = event_npart(ev, e)
         for hh in mc:
-            d = [
-                np.hypot(*(at_z(traj[0, p], hh[2]) - hh[:2]))
-                for p in range(min(npp, traj.shape[1]))
-                if at_z(traj[0, p], hh[2]) is not None
-            ]
+            d = [np.hypot(*(at_z(ln, hh[2]) - hh[:2])) for ln in lines if at_z(ln, hh[2]) is not None]
             if d:
                 miss.append(min(d))
 

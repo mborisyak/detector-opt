@@ -1,7 +1,9 @@
 import math
 import os
 import subprocess
+from typing import NamedTuple
 
+import jax
 import numpy as np
 
 # For reading ROOT files
@@ -14,11 +16,47 @@ from ..utils.encoding import (
     normal_to_uniform_jax,
     uniform_to_normal_jax,
 )
+from ..utils import tensor
 from ..data import load_ship2numpy_events
 from . import straw_detector
 from .common import Detector
 
-__all__ = ["StrawDetector", "MATERIALS", "material_constants"]
+__all__ = ["StrawDetector", "StrawEvent", "HNLTarget", "StrawGroundTruth", "MATERIALS", "material_constants"]
+
+
+class StrawEvent(NamedTuple):
+    """Raw per-hit straw event (leaves carry a leading batch axis ``(B, M)`` once sampled).
+
+    The hit address is honest integers; only the TDC is a continuous measurement -- so no
+    rounding is needed to recover indices (unlike the old all-float ``(M, 5)`` tensor)."""
+
+    station: jax.Array  # int32
+    view: jax.Array  # int32 (view-within-station)
+    layer: jax.Array  # int32 (layer-within-view)
+    straw: jax.Array  # int32
+    tdc: jax.Array  # float32 (drift/propagation TDC, ns)
+    # Optional per-hit truth measurements for the tracking fits, produced only under the
+    # __call__ flags (None otherwise): x, y = the exact (x, y) crossing of the layer plane
+    # (hits_xy); drift_r = perpendicular crossing->wire distance, re-derived host-side from
+    # (x, y) (drift_r). All float32, parallel to the address leaves.
+    x: jax.Array | None = None
+    y: jax.Array | None = None
+    drift_r: jax.Array | None = None
+
+
+class HNLTarget(NamedTuple):
+    """HNL regression target: decay vertex (cm) + HNL momentum (GeV)."""
+
+    vertex: jax.Array  # (..., 3)
+    momentum: jax.Array  # (..., 3)
+
+
+class StrawGroundTruth(NamedTuple):
+    """Generator ground truth == discriminator conditioning: HNL mass, momentum, decay vertex."""
+
+    mass: jax.Array  # (..., 1) GeV
+    momentum: jax.Array  # (..., 3) GeV
+    vertex: jax.Array  # (..., 3) cm
 
 
 # Energy-independent material constants for secondary production (PDG values).
@@ -330,22 +368,26 @@ class StrawDetector(Detector):
         # The base carries no design scheme -- subclasses define the design space.
         raise NotImplementedError("design_shape is defined by the design subclass")
 
-    def target_shape(self):
-        # Network regression target, selected by `_targets_field`: the HNL 6-vec
-        # [vertex, momentum] or the daughter 9-vec [vertex, p1, p2].
-        return (9,) if getattr(self, "_targets_field", "targets") == "daughter_targets" else (6,)
+    def event_spec(self):
+        # Raw per-hit features: int32 address [station, view, layer-in-view, straw] + float32 TDC.
+        M = self.max_hits_per_event
+        i = jax.ShapeDtypeStruct((M,), np.int32)
+        return StrawEvent(station=i, view=i, layer=i, straw=i, tdc=jax.ShapeDtypeStruct((M,), np.float32))
 
-    def event_shape(self):
-        # per-hit raw features: [station, view, layer_in_view, straw, time]
-        return (self.max_hits_per_event, 5)
+    def target_spec(self):
+        # HNL regression target: decay vertex (cm) + HNL momentum (GeV). StereoTracking overrides.
+        f = lambda n: jax.ShapeDtypeStruct((n,), np.float32)
+        return HNLTarget(vertex=f(3), momentum=f(3))
 
     def combined_event_shape(self):
         # combine() -> [TDC, norm_layer_z, wire_y_left, wire_y_right]  (field fixed -> not a feature)
         return (self.max_hits_per_event, 4)
 
-    def ground_truth_shape(self):
-        # charges + positions + momenta (flattened)
-        return (2 * self.max_particles + 3 * self.max_particles + 3 * self.max_particles,)
+    def ground_truth_spec(self):
+        # Ground truth == conditioning: HNL mass + momentum + decay vertex (retires the old
+        # generator charges/positions/momenta truth, which was never implemented for the sparse pool).
+        f = lambda n: jax.ShapeDtypeStruct((n,), np.float32)
+        return StrawGroundTruth(mass=f(1), momentum=f(3), vertex=f(3))
 
     # ------------------------------------------------------------------ #
     # Ground-truth encoding (daughter particles) -- unimplemented for the sparse
@@ -436,44 +478,59 @@ class StrawDetector(Detector):
         return mean, std
 
     def normalize_target(self, target):
-        """Physical 6-vec target -> standardised; vertex by decay_*, momentum by momentum_*."""
-        import jax.numpy as jnp
-
+        """Physical ``Target`` -> standardised flat array; vertex by decay_*, momentum by momentum_*
+        (daughter target: both momenta by daughter_momentum_*). Accepts a flat array too."""
         mean, std = self._target_norm_arrays()
-        return (jnp.asarray(target, dtype=jnp.float32) - mean) / std
+        flat, _ = tensor.flatten(target)  # Target record (or flat (B, T) array) -> (B, T)
+        return (flat - mean) / std
 
     def denormalize_predictions(self, normalised):
-        """Inverse of :meth:`normalize_target`: back to physical units (cm, GeV)."""
+        """Inverse of :meth:`normalize_target`: flat normalised array -> physical ``Target`` namedtuple."""
         import jax.numpy as jnp
 
         mean, std = self._target_norm_arrays()
-        return jnp.asarray(normalised, dtype=jnp.float32) * std + mean
+        phys = jnp.asarray(normalised, dtype=jnp.float32) * std + mean
+        return tensor.unflatten(tensor.structure(self.target_spec()), phys)
+
+    def prediction_errors(self, predicted_norm, target_norm):
+        """Signed real-unit residuals ``predicted - true`` per quantity, for error histograms.
+        Both inputs are NORMALIZED ``(N, 6)`` arrays; returns an ordered ``{label: (errors(N,),
+        unit)}`` -- vertex in cm, HNL momentum in GeV."""
+        import numpy as np
+
+        pred = self.denormalize_predictions(predicted_norm)  # HNLTarget
+        true = self.denormalize_predictions(target_norm)
+        v = np.asarray(pred.vertex) - np.asarray(true.vertex)
+        p = np.asarray(pred.momentum) - np.asarray(true.momentum)
+        return {
+            "vertex_x": (v[:, 0], "cm"),
+            "vertex_y": (v[:, 1], "cm"),
+            "vertex_z": (v[:, 2], "cm"),
+            "p_x": (p[:, 0], "GeV"),
+            "p_y": (p[:, 1], "GeV"),
+            "p_z": (p[:, 2], "GeV"),
+        }
 
     # ------------------------------------------------------------------ #
-    # HNL conditioning [mass, p(3)] (for the LFI discriminator, etc.)
+    # Ground truth == conditioning [HNL mass, p(3), decay vertex(3)] (for the LFI discriminator).
     # ------------------------------------------------------------------ #
-    def conditioning_shape(self):
-        return (4,)  # [HNL mass, px, py, pz]
-
-    def conditioning_dim(self):
-        return 4
-
-    def _conditioning_norm_arrays(self):
+    def normalize_ground_truth(self, ground_truth):
+        """Physical ``StrawGroundTruth`` (mass, momentum, decay vertex) -> standardised flat
+        ``(..., 7)``: mass by ``mass_*``, momentum by ``momentum_*``, vertex by ``decay_*``.
+        Field order is [mass, momentum, vertex] (matches ``StrawGroundTruth``). Accepts a flat array too."""
         import jax.numpy as jnp
 
-        mean = jnp.concatenate([jnp.asarray(self.mass_mean)[None], jnp.asarray(self.momentum_mean)])
-        std = jnp.concatenate([jnp.asarray(self.mass_sigma)[None], jnp.asarray(self.momentum_sigma)])
-        return mean, std
-
-    def normalize_conditioning(self, conditioning):
-        """Physical HNL ``[mass, p(3)]`` -> standardised (mass by mass_*, p by momentum_*)."""
-        import jax.numpy as jnp
-
-        mean, std = self._conditioning_norm_arrays()
-        return (jnp.asarray(conditioning, dtype=jnp.float32) - mean) / std
+        mean = jnp.concatenate(
+            [jnp.asarray(self.mass_mean)[None], jnp.asarray(self.momentum_mean), jnp.asarray(self.decay_mean)]
+        )
+        std = jnp.concatenate(
+            [jnp.asarray(self.mass_sigma)[None], jnp.asarray(self.momentum_sigma), jnp.asarray(self.decay_sigma)]
+        )
+        flat, _ = tensor.flatten(ground_truth)  # StrawGroundTruth record (or flat (B, 7) array) -> (B, 7)
+        return (flat - mean) / std
 
     def loss_label(self):
-        return f"MSE (normalized {self.target_shape()[0]}-vec target)"
+        return f"MSE (normalized {self.target_dim()}-vec target)"
 
     def metric_labels(self):
         """Keys of the metric() dict, in display order."""
@@ -545,24 +602,39 @@ class StrawDetector(Detector):
         idx = pool_idx[rng.integers(0, len(pool_idx), size=int(n))]  # with replacement, within the pool
         boundaries = np.stack([offsets[idx], offsets[idx + 1]], axis=1).astype(np.int32)
         conditioning = (
-            ev["conditioning"][idx] if "conditioning" in ev else np.zeros((len(idx), self.conditioning_dim()), dtype=np.float32)
-        )
+            ev["conditioning"][idx] if "conditioning" in ev else np.zeros((len(idx), 4), dtype=np.float32)
+        )  # raw HNL [mass, p(3)] from the data file; the decay vertex (from `targets`) completes the GroundTruth
         # `_targets_field` lets a subclass pick a different regression target (e.g. the
         # tracking detector uses "daughter_targets"); defaults to the HNL 6-vec "targets".
         targets = ev[getattr(self, "_targets_field", "targets")][idx]
         return boundaries, targets, conditioning
 
-    def _run_solver(self, boundaries, design, rng, input_events=None, trajectories=None, process_ids=None, tree=None):
+    def _run_solver(
+        self,
+        boundaries,
+        design,
+        rng,
+        input_events=None,
+        z_planes=None,
+        traj=None,
+        n_cross=None,
+        part_idx=None,
+        primaries=True,
+        process_ids=None,
+        tree=None,
+    ):
         """Run the C straw solver for ``design`` over the events selected by
         ``boundaries`` ((n, 2) ``[start, end)`` spans) into the shared particle pool
         ``input_events`` (the cached ``self._input_events`` if None). The solver writes
-        the dense ``X (n, M, 5)`` + ``mask (n, M)`` directly. Returns ``(X, mask,
-        trajectories)``.
+        the dense ``X (n, M, 5)`` + ``mask (n, M)`` directly. Returns ``(X, mask, traj)``.
 
-        The optional debug buffers (``trajectories (n, mp, n_t, 3)``, ``process_ids
-        (n, M)``, ``tree`` dict) are caller-allocated numpy arrays, filled in place via
-        a ``DebugBuffers`` object; pass ``None`` (default) to skip -- they do not affect
-        ``X``/``mask``.
+        Per-track trajectory (all caller-allocated, filled in place; pass ``None`` to skip):
+        with ``z_planes (m,)`` reference z's, ``traj (n, n_tracks, m, 3)`` gets each slot's
+        ordered ``(x, y, z)`` in-aperture plane crossings, ``n_cross (n, n_tracks)`` the count
+        per slot, and ``part_idx (n, n_tracks)`` the input-particle index per slot (-1 if a
+        secondary). ``primaries`` True -> only primaries' trajectories (slot = input index);
+        False -> all particles. The debug buffers (``process_ids (n, M)``, ``tree`` dict) are
+        separate; all of these are optional and never affect ``X``/``mask``.
         """
         ie = input_events if input_events is not None else self._input_events
         if ie is None:
@@ -580,9 +652,8 @@ class StrawDetector(Detector):
         mask = np.zeros((n_events, M), dtype=np.int32)
 
         debug = None
-        if trajectories is not None or process_ids is not None or tree is not None:
+        if process_ids is not None or tree is not None:
             debug = straw_detector.DebugBuffers(
-                trajectories,
                 process_ids,
                 None if tree is None else tree["int"],
                 None if tree is None else tree["float"],
@@ -602,23 +673,27 @@ class StrawDetector(Detector):
             Bs_arr,
             X,
             mask,
+            z_planes,
+            traj,
+            n_cross,
+            part_idx,
+            int(bool(primaries)),
             debug,
         )
-        return X, mask, trajectories
+        return X, mask, traj
 
     def simulate_debug(self, daughter_data, design, rng):
         """Run the solver with all debug outputs on (for sim-vs-MC matching).
 
-        On top of the production ``X / mask / trajectories`` this also returns the
-        per-hit ``process_ids`` (the TMCProcess code of the particle that caused
-        each hit, parallel to ``mask``) and a flat/sparse MC-particle ``tree`` --
-        one row per tracked particle (primaries + secondaries) across the whole
-        batch, located by ``event_index`` (CSR-style). Mirrors the FairShip
-        ``mc_info`` / ``mc_particles`` layout so the two are directly comparable.
+        On top of the production ``X / mask`` this also returns the per-hit ``process_ids``
+        (the TMCProcess code of the particle that caused each hit, parallel to ``mask``) and
+        a flat/sparse MC-particle ``tree`` -- one row per tracked particle (primaries +
+        secondaries) across the whole batch, located by ``event_index`` (CSR-style). Mirrors
+        the FairShip ``mc_info`` / ``mc_particles`` layout so the two are directly comparable.
 
-        Returns a dict with: ``X, mask, trajectories, process_ids`` and the tree
-        arrays ``pdg, process_id, parent_id, n_hits`` (int) + ``momentum (P, 3),
-        position (P, 3), t0 (P,)`` (float) + ``event_index (P,)``.
+        Returns a dict with: ``X, mask, process_ids`` and the tree arrays ``pdg, process_id,
+        parent_id, n_hits`` (int) + ``momentum (P, 3), position (P, 3), t0 (P,)`` (float) +
+        ``event_index (P,)``.
         """
         design = np.asarray(design, dtype=np.float32)
         design = design[None, :] if design.ndim == 1 else design
@@ -632,7 +707,6 @@ class StrawDetector(Detector):
             n_part = len(np.asarray(daughter_data["masses"]))
             boundaries = np.tile(np.array([[0, n_part]], dtype=np.int32), (n_events, 1))
 
-        trajectories = np.zeros((n_events, self.max_particles, self.n_t, 3), dtype=np.float32)
         process_ids = np.zeros((n_events, self.max_hits_per_event), dtype=np.int32)
         # Debug MC tree, flat across the batch; cap = n_events * max_particles (max_particles
         # is the DEBUG slot count -- make it large enough for the faithful cascade; the C
@@ -644,12 +718,11 @@ class StrawDetector(Detector):
             "event": np.zeros((cap,), dtype=np.int32),
             "count": np.zeros((1,), dtype=np.int32),  # shared write cursor / final count
         }
-        X, mask, trajectories = self._run_solver(
+        X, mask, _ = self._run_solver(
             boundaries,
             design,
             rng,
             input_events=ie,
-            trajectories=trajectories,
             process_ids=process_ids,
             tree=tree,
         )
@@ -659,7 +732,6 @@ class StrawDetector(Detector):
         return {
             "X": X,
             "mask": mask,
-            "trajectories": trajectories,
             "process_ids": process_ids,
             "pdg": ti[:, 0],
             "process_id": ti[:, 1],
@@ -671,118 +743,196 @@ class StrawDetector(Detector):
             "event_index": tree["event"][:p],
         }
 
-    def sample_events(self, seed, design, pool=None):
+    def sample_events(self, seed, design, pool=None, z_planes=None, n_tracks=2, primaries=True):
         """Generate events and return a rich dict.
 
         ``design`` is the *physical* (un-encoded) design ``(B, design_dim)`` (or
         ``(design_dim,)`` for a single event). Batch size ``B`` is inferred. ``pool``
         (int|str) selects the disjoint event pool to sample from (default = first key).
-        Used by visualisation / likelihood-free / generative scripts that need
-        the daughter ground truth or trajectories.
+
+        If ``z_planes`` (a ``(m,)`` array of reference z's, cm) is given, the dict also
+        carries the per-track trajectory ``traj (B, n_tracks, m, 3)`` -- each slot's ordered
+        ``(x, y, z)`` in-aperture plane crossings -- with ``n_cross (B, n_tracks)`` (crossings
+        per slot) and ``part_idx (B, n_tracks)`` (input-particle index per slot, -1 if a
+        secondary). ``primaries`` True records only primaries (slot = input index, e.g. the
+        two HNL daughters); False records all particles incl. secondaries.
         """
-        if isinstance(design, dict):
-            design = self.flatten_design(design)  # named physical design -> flat array
-        design = np.asarray(design, dtype=np.float32)
+        design = np.asarray(self.flatten_design(design), dtype=np.float32)  # Design/Mapping/array -> flat physical
         if design.ndim == 1:
             design = design[None, :]
         n_events = design.shape[0]
 
         rng = np.random.default_rng(seed)
         boundaries, targets, conditioning = self.generate_events(rng, n_events, pool=pool)
-        X, mask, _ = self._run_solver(boundaries, design, rng)  # operational: no debug buffers
 
-        # ground_truth (daughter conditioning for generators/LFI) is unimplemented
-        # for the sparse pool -- to be reworked. The regression/BO path uses only
-        # X, mask, targets, so it is unaffected. trajectories are a debug-only output
-        # (use simulate_debug / pass a trajectory buffer to _run_solver) -> None here.
+        traj = n_cross = part_idx = zp = None
+        if z_planes is not None:
+            zp = np.ascontiguousarray(z_planes, dtype=np.float32)
+            m = zp.shape[0]
+            traj = np.zeros((n_events, int(n_tracks), m, 3), dtype=np.float32)
+            n_cross = np.zeros((n_events, int(n_tracks)), dtype=np.int32)
+            part_idx = np.full((n_events, int(n_tracks)), -1, dtype=np.int32)
+        X, mask, _ = self._run_solver(
+            boundaries, design, rng, z_planes=zp, traj=traj, n_cross=n_cross, part_idx=part_idx, primaries=primaries
+        )
+
         return {
-            "X": X,
+            "X": self._pack_event(X),  # StrawEvent (raw int address + float TDC)
             "mask": mask,
-            "targets": targets,
-            "conditioning": conditioning,  # (B, 4) HNL [mass, p(3)]
-            "ground_truth": None,
-            "trajectories": None,
+            "target": self._pack_target(targets),  # HNLTarget / DaughterTarget
+            "ground_truth": self._pack_ground_truth(targets, conditioning),  # StrawGroundTruth (== conditioning)
+            "traj": traj,  # (B, n_tracks, m, 3) or None
+            "n_cross": n_cross,  # (B, n_tracks) or None
+            "part_idx": part_idx,  # (B, n_tracks) or None
         }
 
-    def __call__(self, seed, design, pool=None):
+    def _pack_event(self, X):
+        """Pack the solver's ``(n, M, 5)`` float buffer [station, view, layer, straw, tdc] into a
+        ``StrawEvent`` -- the index columns become int32, the TDC stays float32 (host-side numpy)."""
+        X = np.asarray(X)
+        idx = lambda c: np.rint(X[..., c]).astype(np.int32)
+        return StrawEvent(station=idx(0), view=idx(1), layer=idx(2), straw=idx(3), tdc=X[..., 4].astype(np.float32))
+
+    def _pack_target(self, targets):
+        """Pack the HNL target array ``(n, 6)`` [vertex, momentum] into an ``HNLTarget``."""
+        t = np.asarray(targets)
+        return HNLTarget(vertex=t[..., :3], momentum=t[..., 3:6])
+
+    def _pack_ground_truth(self, targets, conditioning):
+        """``StrawGroundTruth`` (== conditioning): HNL mass + momentum (from the data conditioning
+        ``[mass, p(3)]``) and the decay vertex (the target's first 3 components)."""
+        c, t = np.asarray(conditioning), np.asarray(targets)
+        return StrawGroundTruth(mass=c[..., 0:1], momentum=c[..., 1:4], vertex=t[..., :3])
+
+    def _trajectory_to_event(self, traj, n_cross, design, hits_xy=False, drift_r=False, tdc=False,
+                             digi=None, digi_mask=None, smear_seed=0):
+        """Build a tracking ``StrawEvent`` from the solver's per-track trajectory
+        (``traj (B, n_tracks, m, 3)``, ``n_cross (B, n_tracks)``). Each recorded crossing becomes one
+        hit: its ``(station, view, layer-in-view)`` address + nearest ``straw`` are quantised from the
+        ``(x, y, z)`` crossing (same geometry as :meth:`combine_encoded`), and -- under the flags --
+        ``x, y`` (the exact crossing, ``hits_xy``); ``drift_r`` (perpendicular crossing->wire distance,
+        re-derived host-side from ``(x, y)`` then SMEARED by ``N(0, sigma_spatial)`` to be FairShip-
+        realistic, ``drift_r``); and ``tdc`` (the real digitised TDC, looked up from the ``digi`` packed
+        StrawEvent by straw address -- ``NaN`` where the crossing has no matching fired straw). Returns
+        ``(StrawEvent, mask)`` with leaves ``(B, M)``, ``M = n_tracks * m``. Uniform design across batch."""
+        traj = np.asarray(traj, np.float32)
+        n_cross = np.asarray(n_cross)
+        B, T, m, _ = traj.shape
+        flat_design = np.asarray(self.flatten_design(design), np.float32)
+        flat_design = flat_design[None] if flat_design.ndim == 1 else flat_design
+        positions, angles, _ = self._design_to_geometry(flat_design)
+        lz, ang0 = np.asarray(positions[0], np.float32), np.asarray(angles[0], np.float32)  # uniform design
+        n_layers = lz.shape[0]
+        order = np.argsort(lz)
+        # crossing z -> global layer index k (z == lz[k] exactly, copied from z_planes by the solver)
+        rank = np.clip(np.searchsorted(lz[order], traj[..., 2]), 0, n_layers - 1)
+        k = order[rank]  # (B, T, m) global layer index
+        per_station = self.n_views_per_station * self.n_layers_per_view
+        station, within = k // per_station, k % per_station
+        view, lpv = within // self.n_layers_per_view, within % self.n_layers_per_view
+        tan = np.tan(ang0[k])
+        cos = 1.0 / np.sqrt(1.0 + tan * tan)
+        xx, yy = traj[..., 0], traj[..., 1]
+        c = yy - xx * tan  # sheared (wire-frame) coordinate, constant along a wire
+        y_stagger = np.where((lpv & 1) == 1, 0.5 * self.layer_y_offset, -0.5 * self.layer_y_offset)
+        pitch, height, ns = self.straw_pitch, self.layer_height, self.n_straws
+        straw = np.clip(np.round((c + height - y_stagger) / pitch - 0.5), 0, ns - 1)
+        wire = (straw + 0.5) * pitch - height + y_stagger  # nearest wire-centre sheared y
+        dr = np.abs(c - wire) * cos  # drift radius (perpendicular crossing->wire), re-derived from (x, y)
+        if drift_r:  # FairShip-realistic measurement: smear by the single-hit spatial resolution
+            rng = np.random.default_rng(smear_seed)
+            dr = np.abs(dr + rng.normal(0.0, 0.012, dr.shape))  # 0.012 cm = straw_detector.c STRAW_SIGMA_SPATIAL
+        flat = lambda a: a.reshape(B, T * m)
+        event = StrawEvent(
+            station=flat(station.astype(np.int32)),
+            view=flat(view.astype(np.int32)),
+            layer=flat(lpv.astype(np.int32)),
+            straw=flat(straw.astype(np.int32)),
+            tdc=flat(self._match_tdc(k, straw, n_cross, digi, digi_mask)) if tdc
+            else flat(np.zeros((B, T, m), np.float32)),  # real TDC by address (V2) else unused
+            x=flat(xx) if hits_xy else None,
+            y=flat(yy) if hits_xy else None,
+            drift_r=flat(dr.astype(np.float32)) if drift_r else None,
+        )
+        mask = flat((np.arange(m)[None, None, :] < n_cross[:, :, None]).astype(np.int32))
+        return event, mask
+
+    def _match_tdc(self, k, straw, n_cross, digi, digi_mask):
+        """Real digitised TDC for each trajectory crossing, looked up from the digitised ``digi`` packed
+        StrawEvent by global straw key (event, global-layer, straw). ``NaN`` where a crossing has no fired
+        straw (capped out / shared). ``k``, ``straw`` are ``(B, T, m)``; returns ``(B, T, m)`` float32."""
+        B, T, m = k.shape
+        per_station, nlpv, ns = self.n_views_per_station * self.n_layers_per_view, self.n_layers_per_view, self.n_straws
+        kpl = self.n_layers * ns  # key span per event
+        ck = (np.arange(B)[:, None, None] * kpl + k * ns + straw.astype(np.int64)).reshape(-1)  # crossing keys
+        dk_layer = np.asarray(digi.station) * per_station + np.asarray(digi.view) * nlpv + np.asarray(digi.layer)
+        dk = (np.arange(B)[:, None] * kpl + dk_layer * ns + np.asarray(digi.straw)).astype(np.int64)  # (B, Md)
+        keep = np.asarray(digi_mask) > 0
+        dk_f, dt_f = dk[keep], np.asarray(digi.tdc, np.float32)[keep]  # fired digitised straws
+        o = np.argsort(dk_f, kind="stable")
+        dk_s, dt_s = dk_f[o], dt_f[o]
+        pos = np.clip(np.searchsorted(dk_s, ck), 0, max(dk_s.shape[0] - 1, 0))
+        hit = (dk_s.shape[0] > 0) & (dk_s[pos] == ck)
+        return np.where(hit, dt_s[pos], np.nan).reshape(B, T, m).astype(np.float32)
+
+    def __call__(self, seed, design, pool=None, hits_xy=False, drift_r=False, tdc=False, n_tracks=2, primaries=True):
         """Generate events for an un-encoded ``design`` ``(B, design_dim)``.
 
-        Returns ``(ground_truth (B, G), measurements (B, M, 5), mask (B, M),
-        target (B, 6))``. ``pool`` selects the disjoint event pool (default = first key).
-        """
-        out = self.sample_events(seed, design, pool=pool)
-        return out["ground_truth"], out["X"], out["mask"], out["targets"]
+        Returns ``(ground_truth, event, mask, target)`` namedtuple records (leaves carry the
+        leading batch axis). ``pool`` selects the disjoint event pool (default = first key).
+
+        Default: ``event`` is the realistic fired-straw ``StrawEvent`` (address + TDC). With
+        ``hits_xy``, ``drift_r`` and/or ``tdc`` set, instead returns a TRACKING event built from the
+        per-track trajectory crossings (``n_tracks`` slots, ``primaries`` -> daughters only), carrying the
+        exact ``(x, y)`` crossing (``hits_xy``), the smeared ``drift_r`` (``drift_r``), and the real
+        digitised ``tdc`` matched to each crossing's fired straw (``tdc``)."""
+        if not (hits_xy or drift_r or tdc):
+            out = self.sample_events(seed, design, pool=pool)
+            return out["ground_truth"], out["X"], out["mask"], out["target"]
+        flat_design = np.asarray(self.flatten_design(design), np.float32)
+        fd = flat_design[None] if flat_design.ndim == 1 else flat_design
+        layer_z = np.asarray(self._design_to_geometry(fd)[0][0], np.float32)  # uniform-design layer z's
+        out = self.sample_events(seed, design, pool=pool, z_planes=layer_z, n_tracks=n_tracks, primaries=primaries)
+        event, mask = self._trajectory_to_event(out["traj"], out["n_cross"], design, hits_xy=hits_xy,
+                                                 drift_r=drift_r, tdc=tdc, digi=out["X"], digi_mask=out["mask"])
+        return out["ground_truth"], event, mask, out["target"]
 
     # Design encoding: the base Detector wraps the subclass `_encode_flat`/`_decode_flat`
     # (flat physical <-> encoded) with the dict<->flat conversion; the design subclass owns
     # the bounds, `design_spec`, `design_bounds`, and the flat encode/decode to N(0,1).
 
     # ------------------------------------------------------------------ #
-    # Event normalisation
+    # Combine: raw StrawEvent + ENCODED design -> per-hit network features.
+    # combine_encoded owns event normalisation (the TDC standardisation constants live here);
+    # the base Detector.combine wraps it as combine_encoded(event, encode_design(design)).
     # ------------------------------------------------------------------ #
-    # Continuous-feature standardisation constants.
     _TDC_MEAN = 440.0
     _TDC_STD = 80.0
 
-    def _feature_scales(self):
-        """Per-column ``(mean, std)`` for the 5 raw event features."""
-        means = np.array([0.0, 0.0, 0.0, 0.0, self._TDC_MEAN], dtype=np.float32)
-        stds = np.array(
-            [
-                max(self.n_stations - 1, 1),
-                max(self.n_views_per_station - 1, 1),
-                max(self.n_layers_per_view - 1, 1),
-                max(self.n_straws - 1, 1),
-                self._TDC_STD,
-            ],
-            dtype=np.float32,
-        )
-        return means, stds
-
-    def normalize(self, X):
-        """``(B, M, 5)`` raw event features -> standardised ~[-1, 1]."""
-        import jax.numpy as jnp
-
-        means, stds = self._feature_scales()
-        return (jnp.asarray(X, dtype=jnp.float32) - means) / stds
-
-    def denormalize(self, X_norm):
-        import jax.numpy as jnp
-
-        means, stds = self._feature_scales()
-        return jnp.asarray(X_norm, dtype=jnp.float32) * stds + means
-
-    # ------------------------------------------------------------------ #
-    # Combine
-    # ------------------------------------------------------------------ #
-    def combine(self, X_norm, encoded_design):
-        """Per-hit design-informed features (all *normalised*, not encoded):
+    def combine_encoded(self, event, encoded_design):
+        """Raw ``StrawEvent`` + ENCODED design -> per-hit features (all *normalised*):
 
             [TDC, norm(layer z), wire_y_left, wire_y_right]
 
-        Each hit's layer z and stereo angle are gathered from the **decoded** design at the
-        hit's own (station, view, layer-in-view) -> global layer index. Rather than handing
-        the network ``(straw_y, angle)`` separately, we encode the (tilted) sense wire as its
-        two y-endpoints at the FIXED x-ends of the parallelogram (``x = +/- layer_width``;
-        sheared geometry ``Y = y - x*tan(angle)`` is constant along the wire). These two y's
-        give the network the wire as a 3D line segment -- the natural input for stereo
-        triangulation -> track fit -> curvature -> momentum -- and are differentiable w.r.t.
-        the design through the decode+gather. The hit ``mask`` is threaded separately.
+        The TDC is standardised here (this method owns event normalisation). Each hit's
+        ``(station, view, layer-in-view)`` integers index the **decoded** design at the hit's own
+        global layer to gather that layer's z and stereo angle. Rather than handing the network
+        ``(straw_y, angle)`` separately, we encode the (tilted) sense wire as its two y-endpoints at
+        the FIXED x-ends of the parallelogram (``x = +/- layer_width``; sheared geometry
+        ``Y = y - x*tan(angle)`` is constant along the wire) -- the natural input for stereo
+        triangulation -> track fit -> curvature -> momentum -- differentiable w.r.t. the design
+        through the decode+gather. The hit ``mask`` is threaded separately by the caller.
         """
         import jax.numpy as jnp
 
-        X_norm = jnp.asarray(X_norm, dtype=jnp.float32)
-        B, M, _ = X_norm.shape
+        station = jnp.asarray(event.station, jnp.int32)
+        view = jnp.asarray(event.view, jnp.int32)
+        layer_in_view = jnp.asarray(event.layer, jnp.int32)
+        straw = jnp.asarray(event.straw, jnp.float32)  # float: indexes the continuous wire-centre y
+        tdc = (jnp.asarray(event.tdc, jnp.float32) - self._TDC_MEAN) / self._TDC_STD
 
-        # Recover the raw integer indices that normalize() standardised.
-        means, stds = self._feature_scales()
-        raw = X_norm * jnp.asarray(stds) + jnp.asarray(means)  # [station, view, layer_in_view, straw, time]
+        B, M = station.shape
         per_station = self.n_views_per_station * self.n_layers_per_view
-        station = jnp.clip(jnp.round(raw[..., 0]).astype(jnp.int32), 0, self.n_stations - 1)
-        view = jnp.clip(jnp.round(raw[..., 1]).astype(jnp.int32), 0, self.n_views_per_station - 1)
-        layer_in_view = jnp.clip(jnp.round(raw[..., 2]).astype(jnp.int32), 0, self.n_layers_per_view - 1)
-        straw = raw[..., 3]
-        tdc = X_norm[..., 4]  # the (already standardised) drift/propagation TDC measurement
         layer = station * per_station + view * self.n_layers_per_view + layer_in_view  # (B, M) global layer idx
 
         # Decode design and gather each hit's own layer geometry.

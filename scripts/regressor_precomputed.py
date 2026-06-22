@@ -1,3 +1,6 @@
+# DEPRECATED: not maintained against the typed-records detector API (Event/Target/Design
+# namedtuples, combine/combine_encoded, raw buffers). Left untouched on purpose -- do not use
+# or refactor; see scripts/regression.py for the current regressor-training entry point.
 import math
 import os
 import time

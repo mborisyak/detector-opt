@@ -22,6 +22,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 import yaml  # noqa: E402
 
 from detopt.detector.free_straw import FreeStrawDetector, free_design_array  # noqa: E402
+from detopt.utils.viz.straw import daughter_polylines  # noqa: E402
 
 
 def _nominal_design(det, cfg_path="config/detector/nominal_design.yaml"):
@@ -56,12 +57,8 @@ def event_daughters(events, e):
 
 
 def run_one(det, dd, design, rng):
-    """Solve a single hand-built event dict and return (X, mask, trajectories)."""
-    ie = det._make_input_events(dd)
-    n = len(dd["masses"])
-    traj = np.zeros((1, det.max_particles, det.n_t, 3), dtype=np.float32)
-    X, mask, _ = det._run_solver(np.array([[0, n]], np.int32), design, rng, input_events=ie, trajectories=traj)
-    return X, mask, traj
+    """Solve a single hand-built event dict; return (X, mask, daughter [x,y,z] polylines)."""
+    return daughter_polylines(det, dd, design, rng)
 
 
 def event_nparticles(events, e):
@@ -113,12 +110,11 @@ def main():
     # ---- per-event residual + multiplicity over a larger sample -----------------
     sim_mult, mc_mult, residuals = [], [], []
     for e in cand[:200]:
-        _, mask, traj = run_one(det, event_daughters(events, e), design, rng)
+        _, mask, lines = run_one(det, event_daughters(events, e), design, rng)
         sim_mult.append(int(mask.sum()))
         mc = hits_xyz[(hit_ev == e) & real]  # real tracks only
         mc_mult.append(len(mc))
-        pts = traj.reshape(-1, 3)
-        pts = pts[np.abs(pts).sum(1) > 0]  # filled trajectory samples
+        pts = np.concatenate(lines) if any(len(t) for t in lines) else np.zeros((0, 3), np.float32)
         if len(pts) and len(mc):
             # nearest trajectory point to each MC hit (cm)
             for h in mc[:: max(1, len(mc) // 50)]:
@@ -142,14 +138,12 @@ def main():
     nrow = int(np.ceil(len(show) / ncol))
     fig = plt.figure(figsize=(6 * ncol, 5 * nrow))
     for i, e in enumerate(show):
-        _, mask, traj = run_one(det, event_daughters(events, e), design, rng)
+        _, mask, lines = run_one(det, event_daughters(events, e), design, rng)
         ax = fig.add_subplot(nrow, ncol, i + 1, projection="3d")
         draw_stations(ax, det, design)  # detector station/layer frames for context
         npart = event_nparticles(events, e)
-        for p in range(min(npart, traj.shape[1])):
-            t = traj[0, p]
-            t = t[np.abs(t).sum(1) > 0]
-            if len(t):
+        for t in lines:
+            if len(t) > 1:
                 ax.plot(t[:, 2], t[:, 0], t[:, 1], lw=1.0, alpha=0.8)
         mc = hits_xyz[(hit_ev == e) & real]
         if len(mc):

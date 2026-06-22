@@ -66,11 +66,9 @@ static inline float rand01(uint64_t *state) {
 /* Immutable simulation settings, constant for the whole solve() call. Per-step
  * dt is 0.9x the sagitta-bounded ceiling (chord-vs-arc error < straw resolution),
  * clamped to max_dt; a fixed `dt` (>0) overrides it. max_time caps total flight
- * time so trapped/curling tracks terminate. The trajectory buffer is sampled
- * evenly in time at step_t = max_time / n_traj (decoupled from the physics step). */
+ * time so trapped/curling tracks terminate. */
 typedef struct {
-  float max_dt, max_time, step_t;
-  int n_traj;
+  float max_dt, max_time;
   // Extra physics processes (all default off; baseline behaviour unchanged).
   float lambda_conv_cm;  // photon conversion length (cm); <=0 disables gamma->e+e-
   int enable_decay;      // charged pi/K decay-in-flight on/off
@@ -101,8 +99,14 @@ typedef struct {
   // Integration caps / recursion / hit-buffer layout.
   npy_float dt_fixed;    // fixed-step override (>0); 0 -> adaptive per-step dt
   int n_steps;           // physics-loop safety cap (the loop is time-bounded)
-  int max_depth, max_particles;
+  int max_depth;
   int n_views, n_lpv, M; // decompose the global layer index + per-event hit cap
+  // Per-track trajectory recording: up to `n_tracks` track slots, each storing its first
+  // `n_planes` (= len(z_planes) = `m`) ordered z-plane crossings. `primaries`: 1 -> record
+  // only primary particles (the input-event rows -- HNL daughters; slot = input index),
+  // 0 -> record ALL particles incl. secondaries (slots allocated in first-crossing order).
+  // 0 n_planes -> disabled.
+  int n_planes, n_tracks, primaries;
 } SimConfig;
 
 /* Per-event detector geometry (immutable during tracking). The layer arrays are
@@ -118,7 +122,7 @@ typedef struct {
 
 /* Mutable dense output, written in place: padded (n, M, 5) hits + (n, M) mask
  * (mask[e,i]=1 for a real hit, 0 for padding -- the per-event count is just
- * mask[e].sum()) and the (n, max_particles, n_traj, 3) trajectory viz buffer. */
+ * mask[e].sum()) and the (n, n_tracks, m, 3) per-track trajectory crossings. */
 typedef struct {
   npy_float *X;
   int *mask;
@@ -126,8 +130,19 @@ typedef struct {
   // to mask ((n, M) int32); NULL to skip. The first particle to fire a straw owns
   // the hit (later crossings of the same straw are deduped, so do not overwrite it).
   int *process_ids;
-  npy_float *trajectories;
+  // Per-track trajectory output at the reference z-planes (z_planes (m,) shared across
+  // events): traj (n, n_tracks, m, 3) = ordered (x, y, z) of each slot's first m in-aperture
+  // crossings; n_cross (n, n_tracks) i32 = number of crossings recorded per slot; part_idx
+  // (n, n_tracks) i32 = input-event particle index per slot (-1 if a secondary). traj NULL ->
+  // recording disabled. traj_count (n,) i32 = per-event next-free-slot cursor (primaries=0).
+  const npy_float *z_planes;
+  npy_float *traj;
   npy_intp trs0, trs1, trs2, trs3;
+  int *n_cross;
+  npy_intp ncs0, ncs1;
+  int *part_idx;
+  npy_intp pis0, pis1;
+  int *traj_count;
   // Per-event per-straw scratch (FairShip-style dedup): tdc[k*n_straws + straw] is
   // the EARLIEST (min) TDC seen in that straw this event; an unfired straw holds the
   // STRAW_TDC_EMPTY sentinel (so a plain min() records). proc is the matching
@@ -386,7 +401,7 @@ const PyArrayObject *check_design_array(const PyObject *object, int batch) {
 static void track_particle(
     const SimConfig *cfg,    // immutable simulation settings
     const Geometry *geom,    // this event's detector geometry
-    HitBuffers *out,         // dense hit + trajectory output (mutated in place)
+    HitBuffers *out,         // dense hit + crossing-track output (mutated in place)
     int event_idx, int particle_idx,
     int parent_idx, int process_id,               // tree parent (-1 if primary) + TMCProcess code
     npy_float x0, npy_float y0, npy_float z0,     // initial position (cm)
@@ -418,16 +433,14 @@ static void track_particle(
   const int n_layers = geom->n_layers, n_straws = geom->n_straws;
   const npy_float z0_field = geom->z0_field, B_sigma = geom->B_sigma, B = geom->B;
   const npy_float dt_fixed = cfg->dt_fixed;  // fixed-step override (>0); 0 -> adaptive
-  const int n_steps = cfg->n_steps, max_depth = cfg->max_depth, max_particles = cfg->max_particles;
+  const int n_steps = cfg->n_steps, max_depth = cfg->max_depth;
   const float delta_const = cfg->delta_const, t_wall = cfg->t_wall, delta_Tcut = cfg->delta_Tcut;
   const float scatter_xX0 = cfg->scatter_xX0;
   const int enable_eloss = cfg->enable_eloss;
   const float eloss_wall_coef = cfg->eloss_wall_coef, eloss_gas_const = cfg->eloss_gas_const;
   const float eloss_I = cfg->eloss_I, eloss_min_ke = cfg->eloss_min_ke;
-  const float max_dt = cfg->max_dt, max_time = cfg->max_time, step_t = cfg->step_t, lambda_conv_cm = cfg->lambda_conv_cm;
-  const int n_traj = cfg->n_traj, enable_decay = cfg->enable_decay;
-  npy_float *trajectories = out->trajectories;
-  const npy_intp trs0 = out->trs0, trs1 = out->trs1, trs2 = out->trs2, trs3 = out->trs3;
+  const float max_dt = cfg->max_dt, max_time = cfg->max_time, lambda_conv_cm = cfg->lambda_conv_cm;
+  const int enable_decay = cfg->enable_decay;
 
   // This particle's RNG stream is seeded from its own key (JAX-style); draws advance
   // rng_state, and each spawned secondary gets an independent stream via split_key().
@@ -453,6 +466,9 @@ static void track_particle(
   // each exit via TREE_NHITS(). tree_slot < 0 means tree disabled or capacity hit.
   int tree_slot = -1;
   int n_hits_local = 0;
+  // Trajectory slot for this particle (resolved lazily on its first recorded crossing):
+  // -2 = unresolved, -1 = not recorded (not a primary under primaries=1, or slots full).
+  int my_slot = -2;
   if (out->tree_int != NULL) {
     const int slot = (*out->tree_count)++;
     if (slot >= out->tree_cap) {
@@ -583,7 +599,6 @@ static void track_particle(
   }
 
   npy_float t_now = t_initial;
-  int last_traj = 0;
   for (int j = start_step; j < n_steps; ++j) {
     if (t_now - t_initial >= max_time) break;  // trapped/curling -> give up
 
@@ -819,25 +834,47 @@ static void track_particle(
       }
     }
 
+    // Per-track trajectory: append every reference-z-plane crossing of this step [z, z_], in
+    // (x, y, z), if the crossing lies inside the detector aperture, into this particle's slot.
+    // primaries=1 records only primaries (slot = input index); primaries=0 records all particles
+    // (slot allocated in first-crossing order). Planes are visited in z_planes order (= crossing
+    // order for a forward track through ascending planes -- the tracking case).
+    if (out->traj != NULL) {
+      const npy_float dz_step = z_ - z;
+      if (f32_abs(dz_step) > SLOW) {
+        for (int p = 0; p < cfg->n_planes; ++p) {
+          const npy_float f = (out->z_planes[p] - z) / dz_step;
+          if (f < 0.0f || f > 1.0f) continue;  // plane not spanned by this step
+          const npy_float xc = x + f * (x_ - x);
+          const npy_float yc = y + f * (y_ - y);
+          if (f32_abs(xc) > layer_width || f32_abs(yc) > layer_height) continue;  // outside aperture
+          if (my_slot == -2) {  // resolve this particle's slot on its first recorded crossing
+            if (cfg->primaries)
+              my_slot = (parent_idx == -1 && particle_idx < cfg->n_tracks) ? particle_idx : -1;
+            else
+              my_slot = (*out->traj_count < cfg->n_tracks) ? (*out->traj_count)++ : -1;
+            if (my_slot >= 0)
+              out->part_idx[(npy_intp)event_idx * out->pis0 + (npy_intp)my_slot * out->pis1] =
+                  (parent_idx == -1) ? particle_idx : -1;
+          }
+          if (my_slot < 0) break;  // not recorded (non-primary under primaries=1, or slots full)
+          const npy_intp ncidx = (npy_intp)event_idx * out->ncs0 + (npy_intp)my_slot * out->ncs1;
+          const int nc = out->n_cross[ncidx];
+          if (nc >= cfg->n_planes) break;  // slot full (m crossings)
+          const npy_intp tb =
+              (npy_intp)event_idx * out->trs0 + (npy_intp)my_slot * out->trs1 + (npy_intp)nc * out->trs2;
+          out->traj[tb] = xc;
+          out->traj[tb + out->trs3] = yc;
+          out->traj[tb + 2 * out->trs3] = out->z_planes[p];
+          out->n_cross[ncidx] = nc + 1;
+        }
+      }
+    }
+
     x = x_;
     y = y_;
     z = z_;
     t_now += dt_step;
-
-    // Trajectory: sampled evenly in elapsed time (viz only). One physics step may
-    // span many sample slots (super-sample) or none (sub-sample); fill every slot
-    // whose timestamp i*step_t the accumulated time has now passed.
-    if (trajectories != NULL && particle_idx < max_particles && step_t > 0.0f) {
-      int upto = (int)((t_now - t_initial) / step_t);
-      if (upto > n_traj) upto = n_traj;
-      const npy_intp tbase = event_idx * trs0 + particle_idx * trs1;
-      for (int i = last_traj; i < upto; ++i) {
-        trajectories[tbase + i * trs2] = x;
-        trajectories[tbase + i * trs2 + trs3] = y;
-        trajectories[tbase + i * trs2 + 2 * trs3] = z;
-      }
-      last_traj = upto;
-    }
 
     // Past the last layer and still moving forward -> no more hits possible.
     if (vz > 0.0f && z > max_right) break;
@@ -877,7 +914,7 @@ static void track_particle(
  *   SimParams    - physics + solver constants
  *   Layout       - fixed structural counts
  *   InputEvents  - the validated particle pool (holds refs to its numpy arrays)
- *   DebugBuffers - optional debug outputs (trajectories / process_ids / MC tree)
+ *   DebugBuffers - optional debug outputs (process_ids / MC tree)
  * solve() reads these plus the per-call explicit arrays (seeds, boundaries, design,
  * scratch, X/mask/counts). Any type that stores a numpy data pointer Py_INCREFs the
  * backing array in tp_init and Py_XDECREFs it in tp_dealloc. */
@@ -885,8 +922,8 @@ static void track_particle(
 /* ---- SimParams: physics + solver constants ---- */
 // Embeds the SimConfig the tracker consumes directly: init fills the physics +
 // solver fields once. solve() copies the struct and overlays the fields that come
-// from elsewhere -- Layout (n_views/n_lpv/M/layer_y_offset) and the per-call debug
-// buffers (max_particles/n_traj/step_t) -- so there is no field-by-field repackaging.
+// from elsewhere -- Layout (n_views/n_lpv/M/layer_y_offset) and the per-call track
+// outputs (n_planes/n_tracks/primaries) -- so there is no field-by-field repackaging.
 typedef struct {
   PyObject_HEAD
   SimConfig cfg;
@@ -1050,32 +1087,15 @@ static PyTypeObject InputEventsType = {
 /* ---- DebugBuffers: optional batched debug outputs (any field None to skip) ---- */
 typedef struct {
   PyObject_HEAD
-  PyObject *o_traj, *o_proc, *o_ti, *o_tf, *o_te, *o_tc;  // INCREF'd
-  npy_float *traj; npy_intp trs0, trs1, trs2, trs3; int n_traj, max_particles;
+  PyObject *o_proc, *o_ti, *o_tf, *o_te, *o_tc;  // INCREF'd
   int *proc_ids;
   int *tree_int; npy_float *tree_float; int *tree_event; int *tree_count; int tree_cap;
 } DebugBuffersObject;
 
 static int DebugBuffers_init(DebugBuffersObject *s, PyObject *args, PyObject *kwds) {
   (void)kwds;
-  PyObject *tj, *pi, *ti, *tf, *te, *tc;
-  if (!PyArg_ParseTuple(args, "OOOOOO", &tj, &pi, &ti, &tf, &te, &tc)) return -1;
-  if (!Py_IsNone(tj)) {
-    PyArrayObject *a = (PyArrayObject *)tj;
-    if (!PyArray_Check(tj) || PyArray_TYPE(a) != NPY_FLOAT32 || PyArray_NDIM(a) != 4 ||
-        PyArray_DIM(a, 3) != SPACE_DIM) {
-      PyErr_SetString(PyExc_TypeError, "trajectories must be (n, max_particles, n_traj, 3) float32");
-      return -1;
-    }
-    s->traj = (npy_float *)PyArray_DATA(a);
-    s->trs0 = PyArray_STRIDE(a, 0) / sizeof(npy_float);
-    s->trs1 = PyArray_STRIDE(a, 1) / sizeof(npy_float);
-    s->trs2 = PyArray_STRIDE(a, 2) / sizeof(npy_float);
-    s->trs3 = PyArray_STRIDE(a, 3) / sizeof(npy_float);
-    s->max_particles = (int)PyArray_DIM(a, 1);
-    s->n_traj = (int)PyArray_DIM(a, 2);
-    Py_INCREF(tj); s->o_traj = tj;
-  }
+  PyObject *pi, *ti, *tf, *te, *tc;
+  if (!PyArg_ParseTuple(args, "OOOOO", &pi, &ti, &tf, &te, &tc)) return -1;
   if (!Py_IsNone(pi)) {
     PyArrayObject *a = (PyArrayObject *)pi;
     if (!PyArray_Check(pi) || PyArray_TYPE(a) != NPY_INT32 || PyArray_NDIM(a) != 2) {
@@ -1110,7 +1130,7 @@ static int DebugBuffers_init(DebugBuffersObject *s, PyObject *args, PyObject *kw
   return 0;
 }
 static void DebugBuffers_dealloc(DebugBuffersObject *s) {
-  Py_XDECREF(s->o_traj); Py_XDECREF(s->o_proc);
+  Py_XDECREF(s->o_proc);
   Py_XDECREF(s->o_ti); Py_XDECREF(s->o_tf); Py_XDECREF(s->o_te); Py_XDECREF(s->o_tc);
   Py_TYPE(s)->tp_free((PyObject *)s);
 }
@@ -1128,13 +1148,16 @@ static PyObject *solve(PyObject *self, PyObject *args) {
   // Init-once objects: SimParams/Layout/InputEvents/Scratch + optional DebugBuffers.
   PyObject *py_sim_params = NULL, *py_layout = NULL, *py_input_events = NULL, *py_scratch = NULL, *py_debug = NULL;
   // Explicit per-call arrays: seeds, (n,2) boundaries, the per-layer design (z + angle
-  // + peak B), and the non-debug outputs X/mask.
+  // + peak B), the non-debug outputs X/mask, the per-track trajectory outputs
+  // z_planes/traj/n_cross/part_idx (z_planes+traj None to skip) and the `primaries` flag.
   PyObject *py_seeds = NULL, *py_boundaries = NULL, *py_layers = NULL, *py_angles = NULL, *py_B = NULL;
   PyObject *py_X = NULL, *py_mask = NULL;
+  PyObject *py_z_planes = NULL, *py_traj = NULL, *py_n_cross = NULL, *py_part_idx = NULL, *py_primaries = NULL;
 
   if (!PyArg_UnpackTuple(
-          args, "straw_solve", 12, 12, &py_sim_params, &py_layout, &py_input_events, &py_scratch,
-          &py_seeds, &py_boundaries, &py_layers, &py_angles, &py_B, &py_X, &py_mask, &py_debug)) {
+          args, "straw_solve", 17, 17, &py_sim_params, &py_layout, &py_input_events, &py_scratch,
+          &py_seeds, &py_boundaries, &py_layers, &py_angles, &py_B, &py_X, &py_mask,
+          &py_z_planes, &py_traj, &py_n_cross, &py_part_idx, &py_primaries, &py_debug)) {
     return NULL;
   }
   if (!PyObject_TypeCheck(py_sim_params, &SimParamsType) || !PyObject_TypeCheck(py_layout, &LayoutType) ||
@@ -1185,16 +1208,61 @@ static PyObject *solve(PyObject *self, PyObject *args) {
   out.mask = (int *)PyArray_DATA((PyArrayObject *)py_mask);
   cfg.M = (int)PyArray_DIM((PyArrayObject *)py_X, 1);
 
+  // Per-track trajectory (z_planes + traj None to skip): z_planes (m,) f32, traj
+  // (n, n_tracks, m, 3) f32, n_cross (n, n_tracks) i32, part_idx (n, n_tracks) i32.
+  // m = z_planes len = max crossings per slot; n_tracks = traj.shape[1]. `primaries`
+  // selects primary-only (1) vs all-particle (0) recording.
+  cfg.n_planes = 0;
+  cfg.n_tracks = 0;
+  cfg.primaries = PyObject_IsTrue(py_primaries);
+  if (!Py_IsNone(py_traj)) {
+    if (Py_IsNone(py_z_planes) || Py_IsNone(py_n_cross) || Py_IsNone(py_part_idx)) {
+      PyErr_SetString(PyExc_TypeError, "traj needs z_planes, n_cross and part_idx (pass all or none)");
+      return NULL;
+    }
+    if (!PyArray_Check(py_z_planes) || PyArray_TYPE((PyArrayObject *)py_z_planes) != NPY_FLOAT32 ||
+        PyArray_NDIM((PyArrayObject *)py_z_planes) != 1) {
+      PyErr_SetString(PyExc_TypeError, "z_planes must be a (m,) float32 array");
+      return NULL;
+    }
+    const npy_intp m = PyArray_DIM((PyArrayObject *)py_z_planes, 0);
+    PyArrayObject *tj = (PyArrayObject *)py_traj, *nc = (PyArrayObject *)py_n_cross, *pid = (PyArrayObject *)py_part_idx;
+    if (PyArray_TYPE(tj) != NPY_FLOAT32 || PyArray_NDIM(tj) != 4 || PyArray_DIM(tj, 0) != n_batch ||
+        PyArray_DIM(tj, 2) != m || PyArray_DIM(tj, 3) != 3) {
+      PyErr_SetString(PyExc_TypeError, "traj must be a (n, n_tracks, m, 3) float32 array");
+      return NULL;
+    }
+    const npy_intp n_tracks = PyArray_DIM(tj, 1);
+    if (PyArray_TYPE(nc) != NPY_INT32 || PyArray_NDIM(nc) != 2 || PyArray_DIM(nc, 0) != n_batch ||
+        PyArray_DIM(nc, 1) != n_tracks) {
+      PyErr_SetString(PyExc_TypeError, "n_cross must be a (n, n_tracks) int32 array");
+      return NULL;
+    }
+    if (PyArray_TYPE(pid) != NPY_INT32 || PyArray_NDIM(pid) != 2 || PyArray_DIM(pid, 0) != n_batch ||
+        PyArray_DIM(pid, 1) != n_tracks) {
+      PyErr_SetString(PyExc_TypeError, "part_idx must be a (n, n_tracks) int32 array");
+      return NULL;
+    }
+    cfg.n_planes = (int)m;
+    cfg.n_tracks = (int)n_tracks;
+    out.z_planes = (const npy_float *)PyArray_DATA((PyArrayObject *)py_z_planes);
+    out.traj = (npy_float *)PyArray_DATA(tj);
+    out.trs0 = PyArray_STRIDE(tj, 0) / sizeof(npy_float);
+    out.trs1 = PyArray_STRIDE(tj, 1) / sizeof(npy_float);
+    out.trs2 = PyArray_STRIDE(tj, 2) / sizeof(npy_float);
+    out.trs3 = PyArray_STRIDE(tj, 3) / sizeof(npy_float);
+    out.n_cross = (int *)PyArray_DATA(nc);
+    out.ncs0 = PyArray_STRIDE(nc, 0) / sizeof(int);
+    out.ncs1 = PyArray_STRIDE(nc, 1) / sizeof(int);
+    out.part_idx = (int *)PyArray_DATA(pid);
+    out.pis0 = PyArray_STRIDE(pid, 0) / sizeof(int);
+    out.pis1 = PyArray_STRIDE(pid, 1) / sizeof(int);
+  }
+
   // Optional debug outputs from the DebugBuffers object (dbg == NULL -> none). The
   // buffers were validated in DebugBuffers.__init__; here we just cross-check n/M and
-  // wire them in. max_particles only gates the (debug) trajectory write -- it is large
-  // when no trajectory buffer is present, so it never affects X/mask.
+  // wire them in.
   int tree_overflow = 0;
-  npy_float *trajectories = NULL;
-  npy_intp trs0 = 0, trs1 = 0, trs2 = 0, trs3 = 0;
-  cfg.max_particles = 1 << 30;
-  cfg.n_traj = 0;
-  cfg.step_t = 0.0f;
   if (dbg != NULL) {
     if (dbg->o_proc != NULL) {
       if (PyArray_DIM((PyArrayObject *)dbg->o_proc, 0) != n_batch ||
@@ -1208,17 +1276,6 @@ static PyObject *solve(PyObject *self, PyObject *args) {
       out.tree_int = dbg->tree_int; out.tree_float = dbg->tree_float;
       out.tree_event = dbg->tree_event; out.tree_count = dbg->tree_count;
       out.tree_cap = dbg->tree_cap; out.tree_overflow = &tree_overflow;
-    }
-    if (dbg->o_traj != NULL) {
-      if (PyArray_DIM((PyArrayObject *)dbg->o_traj, 0) != n_batch) {
-        PyErr_SetString(PyExc_TypeError, "DebugBuffers.trajectories must have a leading dim of n");
-        return NULL;
-      }
-      trajectories = dbg->traj;
-      trs0 = dbg->trs0; trs1 = dbg->trs1; trs2 = dbg->trs2; trs3 = dbg->trs3;
-      cfg.max_particles = dbg->max_particles;
-      cfg.n_traj = dbg->n_traj;
-      cfg.step_t = (cfg.n_traj > 0) ? cfg.max_time / (float)cfg.n_traj : 0.0f;
     }
   }
 
@@ -1248,13 +1305,6 @@ static PyObject *solve(PyObject *self, PyObject *args) {
   npy_intp ls1 = PyArray_STRIDE(layers_array, 1) / sizeof(npy_float);
   npy_intp as0 = PyArray_STRIDE(angles_array, 0) / sizeof(npy_float);
   npy_intp as1 = PyArray_STRIDE(angles_array, 1) / sizeof(npy_float);
-
-  // trajectories + its strides (trs*) were set from the DebugBuffers object above.
-  out.trajectories = trajectories;
-  out.trs0 = trs0;
-  out.trs1 = trs1;
-  out.trs2 = trs2;
-  out.trs3 = trs3;
 
   // Per-straw min-TDC scratch from the Scratch object (allocated once in Python, reused;
   // tdc pre-filled with the empty sentinel and kept clean by emit_event's sparse-clear).
@@ -1310,6 +1360,8 @@ static PyObject *solve(PyObject *self, PyObject *args) {
     const int n_primaries = (int)(p_end - p_start);
 
     int next_secondary_idx = n_primaries;  // Secondaries start after primaries
+    int traj_slot_counter = 0;  // per-event next-free trajectory slot (primaries=0 lazy alloc)
+    out.traj_count = &traj_slot_counter;
 
     for (int i = 0; i < n_primaries; ++i) {
       const npy_intp r = p_start + i;  // flat row for this primary

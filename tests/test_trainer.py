@@ -166,9 +166,9 @@ def test_continual_replay_sampling():
 
 
 def test_trainers_are_design_conditioned():
-    """No design scramble: the design fed to ``combine`` reaches the network, so the
-    shared loss kernel (used by every trainer) gives a different loss for the real
-    encoded design than for a zeroed one."""
+    """No design scramble: the per-event PHYSICAL design fed to ``combine`` reaches the network, so
+    the shared loss kernel (used by every trainer) gives a different loss for the real design than
+    for a shifted one. The pool now stores raw events + raw physical design; ``combine`` encodes it."""
     det = DebugDetector()
     _, trainer = _small_trainer(0.5, n0=256, n_increment=128, iteration_limit=512, budget=20_000, seed=0)
     reg_def, params, state = trainer._build_regressor(0)
@@ -176,13 +176,12 @@ def test_trainers_are_design_conditioned():
 
     B = 16
     design = det.get_current_design_array()
-    phys = np.broadcast_to(design[None, :], (B, det.design_dim()))
-    _gt, X, mask, targets = det(np.random.SeedSequence(0), phys)
-    enc = np.asarray(det.encode_design(design), np.float32)
-    enc_b = np.broadcast_to(enc[None, :], (B, det.design_dim())).astype(np.float32)
+    phys = np.broadcast_to(design[None, :], (B, det.design_dim())).astype(np.float32)
+    _gt, event, mask, target = det(np.random.SeedSequence(0), phys)
 
     key = jax.random.PRNGKey(0)
-    X, mask, targets = jnp.asarray(X), jnp.asarray(mask), jnp.asarray(targets)
-    loss_real, _ = loss_fn(params, state, key, X, mask, jnp.asarray(enc_b), targets)
-    loss_zero, _ = loss_fn(params, state, key, X, mask, jnp.zeros_like(jnp.asarray(enc_b)), targets)
-    assert abs(float(loss_real) - float(loss_zero)) > 1e-4  # the design actually feeds combine
+    design_real = jnp.asarray(phys)  # per-event PHYSICAL design (combine encodes it)
+    design_alt = design_real.at[:, : det.n_stations].add(40.0)  # shift station z -> different geometry
+    loss_real, _ = loss_fn(params, state, key, event, mask, design_real, target)
+    loss_alt, _ = loss_fn(params, state, key, event, mask, design_alt, target)
+    assert abs(float(loss_real) - float(loss_alt)) > 1e-4  # the design actually feeds combine

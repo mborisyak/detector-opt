@@ -14,12 +14,22 @@ half-width ``magnet_half_cm``). Upstream stations sit below ``z0 - magnet_half``
 downstream ones above ``z0 + magnet_half`` (see ``_station_lo_hi``).
 """
 
+from typing import NamedTuple
+
+import jax
 import numpy as np
 
 from .straw import StrawDetector
 from ..utils.encoding import normal_to_uniform_jax, uniform_to_normal_jax
 
-__all__ = ["StereoStrawDetector"]
+__all__ = ["StereoStrawDetector", "StereoDesign"]
+
+
+class StereoDesign(NamedTuple):
+    """Compact stereo design: per-station z centres + one shared stereo angle (field fixed)."""
+
+    stations: jax.Array  # (..., n_stations)
+    angle: jax.Array  # (..., 1)
 
 
 class StereoStrawDetector(StrawDetector):
@@ -40,10 +50,14 @@ class StereoStrawDetector(StrawDetector):
         magnet_half_cm: float = 140.0,  # magnet z half-width (FairShip YokeDepth)
         station_width: float = 100.0,  # station z full-width (= 2 x FairShip strawtubes station_length 50)
         station_clearance: float = 0.0,  # minimum z gap between adjacent station footprints (0 = may touch)
-        # Physics / field
-        max_B: float = 0.20,
+        # Physics / field -- FairShip V2023 MainSpectrometerField (NEGATIVE polarity, int Bx dz = -1.07
+        # T.m over the 208 cm width). The old +0.20 default had the wrong sign (tracks bent the opposite
+        # way -> 12-18 cm divergence from FairShip downstream of the magnet); with these our crossings
+        # match FairShip's MC hits to sub-3 mm at all 4 stations. Faithfulness tracks int Bx dz + sign,
+        # not the width (283/-0.151 and 208/-0.205 are equally faithful; both give int Bx dz = -1.07).
+        max_B: float = -0.205,
         z0: float = 8957.0,
-        B_sigma: float = 286.0,
+        B_sigma: float = 208.0,
         layer_bounds: tuple = (8000.0, 10000.0),
         dt=None,
         max_dt: float = 1.0,
@@ -155,26 +169,9 @@ class StereoStrawDetector(StrawDetector):
         return (self.n_stations + 1,)
 
     def design_spec(self):
-        return {"stations": (self.n_stations,), "angle": (1,)}
-
-    def flatten_design(self, design):
-        """Design dict ``{stations (...,n), angle (...,1)}`` -> flat ``(..., n+1)`` (a non-dict
-        passes through unchanged)."""
-        import jax.numpy as jnp
-
-        if not isinstance(design, dict):
-            return jnp.asarray(design, jnp.float32)
-        stations = jnp.asarray(design["stations"], jnp.float32)
-        angle = jnp.asarray(design["angle"], jnp.float32).reshape(stations.shape[:-1] + (1,))
-        return jnp.concatenate([stations, angle], axis=-1)
-
-    def unflatten_design(self, flat):
-        """Flat ``(..., n+1)`` -> design dict ``{stations (...,n), angle (...,1)}``."""
-        import jax.numpy as jnp
-
-        flat = jnp.asarray(flat, jnp.float32)
-        n = self.n_stations
-        return {"stations": flat[..., :n], "angle": flat[..., n : n + 1]}
+        # StereoDesign filled with ShapeDtypeStruct; flatten/unflatten are generic (base, via tensor).
+        f = lambda n: jax.ShapeDtypeStruct((n,), np.float32)
+        return StereoDesign(stations=f(self.n_stations), angle=f(1))
 
     def design_bounds(self):
         # station-CENTRE range (footprint must fit inside layer_bounds) + the stereo angle range

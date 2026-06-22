@@ -5,28 +5,31 @@ design, then report held-out validation metrics. No discriminator, no design gra
 well can the regressor reconstruct the target at THIS design?". Train and validation events come from
 disjoint detector pools.
 
-The design is either the config ``design`` (the shared initial physical-design dict, e.g.
-``initial_stereo``) when no ``checkpoint`` is given, or the encoded ``theta`` restored from a
-design-optimization checkpoint (e.g. ``data/lfi``) when ``checkpoint=<dir>`` is passed.
+The design is ALWAYS the config ``design`` (the shared physical-design dict, e.g. ``initial_stereo``);
+it is never read from a checkpoint. The regressor itself is persistent: pass ``checkpoint=<dir>`` to
+save the regressor (parameters + state + optimizer) into that checkpoint every epoch and resume from
+it on the next run, so training accumulates across invocations.
 
-To COMPARE two designs, launch the script twice (same ``seed``, so both regressors share their init
-and event RNG stream and the only difference is the design):
+To COMPARE two designs, point ``design:`` at two different design configs (same ``seed``, so both
+regressors share their init and event RNG stream and the only difference is the design) and give each
+its own checkpoint dir:
 
-    python scripts/regression.py seed=0 report=output/nominal.png
-    python scripts/regression.py seed=0 report=output/lfi.png checkpoint=data/lfi
+    python scripts/regression.py seed=0 checkpoint=output/a design=initial_stereo
+    python scripts/regression.py seed=0 checkpoint=output/b design=some_other_design
 
-Each run writes the report PNG (training-loss + validation curves) and, alongside it, a
-``<report>.metrics.json`` (final per-component validation MSE + the decoded physical design) so the
-two runs can be diffed directly.
+Everything a run produces lands INSIDE its checkpoint dir: the regressor checkpoint, ``losses.png``
+(training-loss + validation curves, refreshed every epoch) and a final ``report.yaml`` (per-component
+validation MSE + the decoded physical design), so the two runs can be diffed directly.
 
-Config: ``config/regress.yaml`` -- ``detector``/``design`` are shared references (``detector: stereo``
+Config: ``config/regression.yaml`` -- ``detector``/``design`` are shared references (``detector: stereo``
 -> ``config/detector/stereo.yaml``; ``design: initial_stereo`` -> ``config/design/initial_stereo.yaml``)
 so they never drift; ``regressor``, ``optimizer`` and the ``training:``/``validation:`` blocks
 (``batch``/``epochs``/``samples``) are this process's own knobs.
 """
 
-import json
 import os
+
+import yaml
 
 import matplotlib
 
@@ -38,8 +41,6 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import nnx
-
-import orbax.checkpoint as ocp
 
 import detopt
 from detopt.utils.config import optimizer as make_optimizer, resolve_device
@@ -77,25 +78,29 @@ def _key(seq):
     return jax.random.PRNGKey(int(seq.spawn(1)[0].generate_state(1)[0]))
 
 
-def _resolve_design(detector, config, checkpoint):
-    """The FIXED encoded design (``theta``) for this run, plus a human-readable source label.
+def _sample_buffer(detector, theta, n, pool, seq, *, sampling_batch, device, progress):
+    """Sample ``n`` RAW events at the fixed design ``theta`` from ``pool`` into a buffer
+    (raw event, mask, raw target). ``combine_encoded`` + ``normalize_target`` run per batch
+    in the train/eval kernels -- the buffer never holds the (wide) combined features."""
+    design_dim = detector.design_dim()
+    M = int(jax.tree.leaves(detector.event_spec())[0].shape[0])  # per-hit count
+    specs = (detector.event_spec(), jax.ShapeDtypeStruct((M,), jnp.int32), detector.target_spec())
 
-    With ``checkpoint=<dir>`` -> the latest ``theta`` saved by a design-optimization run (lfi.py /
-    subgradient.py store ``design = {"theta", "optimizer_state"}``). Otherwise -> ``encode_design`` of
-    the ``design`` config block (the shared initial physical-design dict, e.g. ``initial_stereo``)."""
-    if checkpoint:
-        manager = detopt.utils.io.get_checkpointer(checkpoint)
-        step = manager.latest_step()
-        if step is None:
-            raise FileNotFoundError(f"no checkpoint steps found under {checkpoint!r}")
-        data = manager.restore(step, args=ocp.args.Composite(design=ocp.args.PyTreeRestore()))
-        manager.close()
-        return jnp.asarray(data["design"]["theta"], jnp.float32), f"checkpoint {checkpoint} (step {step})"
-    return jnp.asarray(detector.encode_design(config["design"]), jnp.float32), "initial design (config)"
+    buf = RingBuffer(n, specs, device=device)
+    filled = 0
+    bar = tqdm(total=n, desc=f"sample[{pool}]", disable=not progress)
+    while filled < n:
+        chunk = min(sampling_batch, n - filled)
+        phys = detector.decode_design(jnp.broadcast_to(theta[None, :], (chunk, design_dim)))
+        ev = detector.sample_events(seq.spawn(1)[0], phys, pool=pool)
+        buf.push(ev["X"], ev["mask"], ev["target"])
+        filled += chunk
+        bar.update(chunk)
+    bar.close()
+    return buf
 
 
-def regress(seed, report=None, checkpoint=None, progress=True, **config):
-    report = report or config.get("report")
+def regress(seed, checkpoint=None, restore=True, progress=True, **config):
     device = resolve_device(config.get("device"))
     train_samples = config["training"]["samples"]
     batch = config["training"]["batch"]
@@ -106,7 +111,8 @@ def regress(seed, report=None, checkpoint=None, progress=True, **config):
     steps_per_epoch = max(1, train_samples // batch)
 
     detector = detopt.detector.from_config(config["detector"])
-    theta, design_source = _resolve_design(detector, config, checkpoint)
+    theta = jnp.asarray(detector.encode_design(config["design"]), jnp.float32)  # FIXED design, always from config
+    design_source = "initial design (config)"
     design_dim = detector.design_dim()
     labels = tuple(detector.metric_labels())
 
@@ -121,57 +127,56 @@ def regress(seed, report=None, checkpoint=None, progress=True, **config):
     sample_seq = master.spawn(1)[0]
     train_seq = master.spawn(1)[0]
 
-    model = detopt.nn.from_config(detector, config=config["regressor"], rngs=rngs)
+    # Persistent regressor: when a checkpoint dir is provided, resume the regressor (parameters +
+    # state + optimizer) from it and keep appending epochs so training accumulates across runs. The
+    # design is NOT restored -- it always comes from the config above. The REGRESSOR ARCHITECTURE,
+    # however, is taken from the checkpoint when resuming (config files drift) and from the config
+    # only on a fresh run -- where it is then saved into the checkpoint.
+    manager = detopt.utils.io.get_checkpointer(checkpoint) if checkpoint else None
+    resuming = manager is not None and restore and manager.latest_step() is not None
+    stored = detopt.utils.io.restore_config(manager) if resuming else None
+    if resuming and stored is None:
+        print("warning: checkpoint predates config-saving; using the config-file regressor architecture")
+    regressor_config = stored["regressor"] if stored is not None else config["regressor"]
+
+    model = detopt.nn.from_config(detector, config=regressor_config, rngs=rngs)
     reg_def, params, state = nnx.split(model, nnx.Param, nnx.Variable)
     members = model.ensemble() if hasattr(model, "ensemble") else None
     opt = make_optimizer(config["optimizer"], n_total_steps=steps_per_epoch * epochs)
     opt_state = opt.init(params)
 
-    M, F = detector.combined_event_shape()
-    target_dim = detector.target_shape()[0]
-
-    @jax.jit
-    def prepare(X, targets):
-        """Raw events at the FIXED design -> (combined features, normalized target)."""
-        theta_b = jnp.broadcast_to(theta[None, :], (X.shape[0], design_dim))
-        return detector.combine(detector.normalize(X), theta_b), detector.normalize_target(targets)
+    step_offset = 0
+    if resuming:
+        last = manager.latest_step()
+        params, state, opt_state = detopt.utils.io.restore_checkpoint(manager, last, regressor=(params, state, opt))["regressor"]
+        step_offset = int(last)
+        print(f"resumed persistent regressor from {checkpoint} (step {last})")
 
     def fill(n, pool, seq):
-        """Sample ``n`` events at the fixed design from ``pool`` into a buffer (combined features,
-        mask, normalized target)."""
-        buf = RingBuffer(n, (M, F), (M,), (target_dim,), device=device)
-        filled = 0
-        bar = tqdm(total=n, desc=f"sample[{pool}]", disable=not progress)
-        while filled < n:
-            chunk = min(sampling_batch, n - filled)
-            phys = detector.decode_design(jnp.broadcast_to(theta[None, :], (chunk, design_dim)))
-            ev = detector.sample_events(seq.spawn(1)[0], phys, pool=pool)
-            feats, tnorm = prepare(ev["X"], ev["targets"])
-            buf.push(feats, ev["mask"], tnorm)
-            filled += chunk
-            bar.update(chunk)
-        bar.close()
-        return buf
+        return _sample_buffer(detector, theta, n, pool, seq, sampling_batch=sampling_batch, device=device, progress=progress)
 
-    def _net_loss(params, state, drop_key, feats, mask, targets_norm, count):
+    def _net_loss(params, state, drop_key, event_b, mask_b, target_b, count):
         reg = nnx.merge(reg_def, params, state)
-        pred = _forward(reg, feats, mask, members, count, deterministic=False, rngs=nnx.Rngs(drop_key))
-        loss = jnp.mean(detector.loss(pred, targets_norm))
+        feats = detector.combine_encoded(event_b, theta)  # fixed design (encoded), broadcast per hit
+        pred = _forward(reg, feats, mask_b, members, count, deterministic=False, rngs=nnx.Rngs(drop_key))
+        loss = jnp.mean(detector.loss(pred, detector.normalize_target(target_b)))
         _, _, new_state = nnx.split(reg, nnx.Param, nnx.Variable)
         return loss, new_state
 
     draw = (members or 1) * batch
 
     @jax.jit
-    def train_epoch(params, state, opt_state, key, feats_buf, mask_buf, tgt_buf, n):
+    def train_epoch(params, state, opt_state, key, event_buf, mask_buf, tgt_buf, n):
         """One epoch = ``steps_per_epoch`` scan-folded AdamW gradient steps over the fixed training buffer."""
 
         def step(carry, k):
             params, state, opt_state = carry
             k_idx, k_drop = jax.random.split(k)
             idx = jax.random.randint(k_idx, (draw,), 0, n)
+            event_b = jax.tree.map(lambda a: a[idx], event_buf)  # raw Event minibatch (pytree)
+            target_b = jax.tree.map(lambda a: a[idx], tgt_buf)  # raw Target minibatch (pytree)
             (loss, new_state), grads = jax.value_and_grad(_net_loss, has_aux=True)(
-                params, state, k_drop, feats_buf[idx], mask_buf[idx], tgt_buf[idx], batch
+                params, state, k_drop, event_b, mask_buf[idx], target_b, batch
             )
             updates, opt_state = opt.update(grads, opt_state, params)
             params = optax.apply_updates(params, updates)
@@ -182,23 +187,34 @@ def regress(seed, report=None, checkpoint=None, progress=True, **config):
         return params, state, opt_state, losses
 
     @jax.jit
-    def validate(params, state, feats_buf, mask_buf, tgt_buf):
-        """Per-key validation metric (MSE) over the whole validation buffer."""
+    def validate(params, state, event_buf, mask_buf, tgt_buf):
+        """Per-key validation metric over the whole validation buffer: mean MSE plus the standard
+        error of that mean (sqrt(var / N)), accumulated via sum and sum-of-squares."""
         reg = nnx.merge(reg_def, params, state)
         n_chunks = val_samples // eval_batch
-        shape = lambda a: a[: n_chunks * eval_batch].reshape((n_chunks, eval_batch) + a.shape[1:])
-        feats_b, mask_b, tgt_b = shape(feats_buf), shape(mask_buf), shape(tgt_buf)
+        cut = n_chunks * eval_batch
+        reshape = lambda a: a[:cut].reshape((n_chunks, eval_batch) + a.shape[1:])
+        event_c = jax.tree.map(reshape, event_buf)
+        mask_c = reshape(mask_buf)
+        tgt_c = jax.tree.map(reshape, tgt_buf)
 
         def step(acc, chunk):
-            f, m, t = chunk
-            pred = _forward_shared(reg, f, m, members, deterministic=True)
-            md = detector.metric(pred, _target_for(t, members))
-            return {k: acc[k] + jnp.sum(md[k]) for k in acc}, None
+            s, ss = acc
+            ev_chunk, m, t = chunk
+            feats = detector.combine_encoded(ev_chunk, theta)
+            pred = _forward_shared(reg, feats, m, members, deterministic=True)
+            md = detector.metric(pred, _target_for(detector.normalize_target(t), members))
+            s = {k: s[k] + jnp.sum(md[k]) for k in s}
+            ss = {k: ss[k] + jnp.sum(jnp.square(md[k])) for k in ss}
+            return (s, ss), None
 
-        init = {name: jnp.float32(0.0) for name in labels}
-        acc, _ = jax.lax.scan(step, init, (feats_b, mask_b, tgt_b))
+        zero = lambda: {name: jnp.float32(0.0) for name in labels}
+        (s, ss), _ = jax.lax.scan(step, (zero(), zero()), (event_c, mask_c, tgt_c))
         count = n_chunks * eval_batch * (members or 1)
-        return {k: acc[k] / count for k in labels}
+        mean = {k: s[k] / count for k in labels}
+        var = {k: jnp.maximum(ss[k] / count - jnp.square(mean[k]), 0.0) for k in labels}
+        sem = {k: jnp.sqrt(var[k] / count) for k in labels}  # standard error of the mean MSE
+        return mean, sem
 
     # --- sample the buffers, then train + validate ----------------------------
     train_buf = fill(train_samples, train_pool, sample_seq)
@@ -206,47 +222,199 @@ def regress(seed, report=None, checkpoint=None, progress=True, **config):
     n_train = jnp.int32(len(train_buf))
 
     physical = detector.flatten_design(detector.decode_design(theta))
-    print(f"design source: {design_source}")
-    print(f"design (decoded->physical): {detector.decode_design(theta)}")
+    print(f"decoded design: {detector.decode_design(theta)}")
     print(
         f"train={train_samples} val={val_samples}  epochs={epochs} batch={batch} "
-        f"steps/epoch={steps_per_epoch}  members={members or 1}"
+        f"steps/epoch={steps_per_epoch}  members={members}"
     )
 
+    pbar = tqdm if progress else lambda x, **kwargs: x
+
+    # Real-unit RMSE conversion is detector-owned (it knows its own normalization); fall back to {}
+    # for detectors that don't expose it.
+    real_rmse = getattr(detector, "metric_real_rmse", lambda means, errors=None: {})
+
+    def build_report(final, final_sem, history):
+        return {
+            "seed": int(seed),
+            "design_source": design_source,
+            "design_physical": np.asarray(physical).tolist(),
+            "design_encoded": np.asarray(theta).tolist(),
+            "labels": list(labels),
+            "final_validation": final,  # normalized per-component mean MSE
+            "final_validation_sem": final_sem,  # standard error of each mean MSE (normalized)
+            "final_validation_rmse": real_rmse(final, final_sem),  # real-unit RMSE +/- error (cm / GeV)
+            "history": [{"epoch": e, "train": tr, "val": vv} for e, tr, vv in history],
+        }
+
+    ## l, _ = _net_loss(params, state, _key(train_seq), *train_buf.buffers(), n_train)
+
     history = []
-    for epoch in range(1, epochs + 1):
+    for epoch in pbar(range(1, epochs + 1)):
         params, state, opt_state, losses = train_epoch(params, state, opt_state, _key(train_seq), *train_buf.buffers(), n_train)
         train_loss = float(jnp.mean(losses))
-        val = validate(params, state, *val_buf.buffers())
-        history.append((epoch, train_loss, {k: float(val[k]) for k in labels}))
-        if progress:
-            vstr = " ".join(f"{k}={float(val[k]):.3f}" for k in labels)
-            print(f"epoch {epoch}/{epochs}  train={train_loss:.4f}  val[{vstr}]")
+        mean_val, sem_val = validate(params, state, *val_buf.buffers())
+        final = {k: float(mean_val[k]) for k in labels}
+        final_sem = {k: float(sem_val[k]) for k in labels}
+        history.append((epoch, train_loss, final))
 
-    final = {k: float(val[k]) for k in labels}
+        if manager is not None:
+            detopt.utils.io.save_checkpoint(manager, step_offset + epoch, config={"regressor": regressor_config},
+                                            regressor=(params, state, opt_state))
+            _plot(history, labels, os.path.join(checkpoint, "losses.png"))  # refresh the loss curves each epoch
+            with open(os.path.join(checkpoint, "report.yaml"), "w") as f:  # refresh the report each epoch
+                yaml.safe_dump(build_report(final, final_sem, history), f, sort_keys=False)
+
     print("\nfinal validation MSE (normalized):")
     for k in labels:
-        print(f"  {k:>10s} = {final[k]:.5f}")
+        print(f"  {k:>10s} = {final[k]:.5f} +/- {final_sem[k]:.5f}")
+    rmse = real_rmse(final, final_sem)
+    if rmse:
+        print("\nfinal validation RMSE (real units):")
+        for k, v in rmse.items():
+            print(f"  {k:>10s} = {v['rmse']:.4g} +/- {v.get('error', float('nan')):.2g} {v['unit']}")
 
-    if report:
-        os.makedirs(os.path.dirname(report) or ".", exist_ok=True)
-        metrics_path = os.path.splitext(report)[0] + ".metrics.json"
-        with open(metrics_path, "w") as f:
-            json.dump(
-                {
-                    "seed": int(seed),
-                    "design_source": design_source,
-                    "design_physical": np.asarray(physical).tolist(),
-                    "design_encoded": np.asarray(theta).tolist(),
-                    "labels": list(labels),
-                    "final_validation": final,
-                    "history": [{"epoch": e, "train": tr, "val": vv} for e, tr, vv in history],
-                },
-                f,
-                indent=2,
-            )
-        _plot(history, labels, report)
+    if manager is not None:
+        manager.close()
     return history
+
+
+def _resolve_design(detector, design):
+    """Encoded ``theta`` from a design given on the command line. ``design`` is either an
+    already-resolved design dict (gearup expands the top-level ``design`` key through
+    ``config/design/``) or a bare name / path, which we load from ``config/design/<name>.yaml``
+    (a second comparison design is NOT a config key, so it arrives as a string we resolve here)."""
+    if isinstance(design, str):
+        path = design if os.path.exists(design) else os.path.join("config", "design", f"{design}.yaml")
+        design = detopt.utils.config.load_config(path)
+    return jnp.asarray(detector.encode_design(design), jnp.float32)
+
+
+def validate(seed, checkpoint, compare=None, design_b=None, progress=True, **config):
+    """Load a persistent regressor from ``checkpoint``, sample a validation pool at its design,
+    predict, and histogram the per-quantity prediction errors in REAL units (cm / GeV) -- one
+    subplot per quantity, written to ``<checkpoint>/errors.png``.
+
+    The design is taken from the ARGUMENTS, never from the checkpoint: the primary design is the
+    config ``design:`` (override with ``design=<name>``). Pass ``compare=<dir>`` to overlay a
+    SECOND checkpoint on the same axes, with its own design ``design_b=<name>`` (defaults to the
+    primary design). Both runs are sampled from the SAME event RNG stream, so the only difference
+    between the two curves is the design + the trained regressor:
+
+        python scripts/regression.py validate seed=0 checkpoint=output/a design=initial_stereo \\
+            compare=output/b design_b=stereo-lfi-427
+    """
+    device = resolve_device(config.get("device"))
+    val_samples = config["validation"]["samples"]
+    eval_batch = config["validation"]["batch"]
+    sampling_batch = config["sampling"]["batch"]
+
+    detector = detopt.detector.from_config(config["detector"])
+    master = np.random.SeedSequence(int(seed))
+    rngs = nnx.Rngs(jax.random.PRNGKey(int(master.spawn(1)[0].generate_state(1)[0])))
+    sample_seed = int(master.spawn(1)[0].generate_state(1)[0])  # SHARED across checkpoints -> identical events
+
+    pool_keys = list(detector.pool_split)
+    val_pool = config.get("val_pool", pool_keys[-1] if len(pool_keys) > 1 else pool_keys[0])
+    n_chunks = val_samples // eval_batch
+    pbar = tqdm if progress else lambda x, **kwargs: x
+
+    def errors_for(ckpt, design):
+        theta = _resolve_design(detector, design)
+        manager = detopt.utils.io.get_checkpointer(ckpt)
+        last = manager.latest_step()
+        if last is None:
+            raise SystemExit(f"no regressor checkpoint to validate in {ckpt}")
+        # Architecture from the CHECKPOINT (config files drift); fall back to the config file for
+        # checkpoints that predate config-saving.
+        stored = detopt.utils.io.restore_config(manager)
+        regressor_config = stored["regressor"] if stored is not None else config["regressor"]
+        model = detopt.nn.from_config(detector, config=regressor_config, rngs=rngs)
+        reg_def, params0, state0 = nnx.split(model, nnx.Param, nnx.Variable)
+        members = model.ensemble() if hasattr(model, "ensemble") else None
+        opt = make_optimizer(config["optimizer"], n_total_steps=1)  # only to shape the restored optimizer state
+        params, state, _ = detopt.utils.io.restore_checkpoint(manager, last, regressor=(params0, state0, opt))["regressor"]
+        manager.close()
+
+        @jax.jit
+        def predict(params, state, feats, mask):
+            """Deterministic point prediction (ensemble members averaged) on a normalized batch."""
+            reg = nnx.merge(reg_def, params, state)
+            pred = _forward_shared(reg, feats, mask, members, deterministic=True)
+            return pred if members is None else jnp.mean(pred, axis=0)
+
+        seq = np.random.SeedSequence(sample_seed)  # reset per checkpoint -> same event stream for each design
+        buf = _sample_buffer(
+            detector, theta, val_samples, val_pool, seq, sampling_batch=sampling_batch, device=device, progress=progress
+        )
+        event_buf, mask_buf, tgt_buf = buf.buffers()
+
+        def chunk_pred(i):
+            sl = slice(i * eval_batch, (i + 1) * eval_batch)
+            feats = detector.combine_encoded(jax.tree.map(lambda a: a[sl], event_buf), theta)
+            return np.asarray(predict(params, state, feats, mask_buf[sl]))
+
+        preds = [chunk_pred(i) for i in pbar(range(n_chunks), desc=f"predict[{os.path.basename(os.path.normpath(ckpt))}]")]
+        cut = n_chunks * eval_batch
+        tgt_norm = detector.normalize_target(jax.tree.map(lambda a: a[:cut], tgt_buf))
+        errors = detector.prediction_errors(np.concatenate(preds), np.asarray(tgt_norm))
+        print(f"\n{ckpt}  (step {last}, design {detector.decode_design(theta)}):")
+        for name, (err, unit) in errors.items():
+            print(f"  {name:>10s}  bias={err.mean():+.4g}  std={err.std():.4g}  {unit}")
+        return errors
+
+    runs = [(checkpoint, config["design"])]
+    if compare is not None:
+        runs.append((compare, design_b if design_b is not None else config["design"]))
+
+    # Ordered (label, errors) pairs -- NOT a dict: two runs on the same checkpoint+design share a
+    # basename, and a dict would collapse them into one curve. Disambiguate any repeated label.
+    bases = [os.path.basename(os.path.normpath(ckpt)) for ckpt, _ in runs]
+    labels = [b if bases.count(b) == 1 else f"{b} #{bases[:i].count(b) + 1}" for i, b in enumerate(bases)]
+    series = [(label, errors_for(ckpt, design)) for label, (ckpt, design) in zip(labels, runs)]
+
+    path = os.path.join(checkpoint, "errors.png")
+    _plot_errors(series, path)
+    print(f"\nwrote {path}")
+    return series
+
+
+def _plot_errors(series, path):
+    """One signed-residual (predicted - true) histogram per quantity, in real units, OVERLAID for
+    every run in ``series`` -- an ORDERED list of ``(label, per-quantity {name: (errors, unit)})``
+    pairs (a list, not a dict, so two runs sharing a checkpoint basename still draw as two curves).
+    Histograms are drawn as STEP outlines (so overlaid curves stay legible) over common
+    per-quantity bins and density-normalized so unequal sample counts compare directly; the legend
+    carries each curve's bias (mean) and resolution (std)."""
+    from matplotlib.figure import Figure
+
+    names = list(series[0][1].keys())  # quantities (same across runs)
+    ncol = 3
+    nrow = -(-len(names) // ncol)
+    fig = Figure(figsize=(4 * ncol, 3 * nrow))
+    axes = fig.subplots(nrow, ncol, squeeze=False).ravel()
+    for ax, name in zip(axes, names):
+        unit = series[0][1][name][1]
+        arrays = [(label, np.asarray(errors[name][0])) for label, errors in series]
+        lo = min(a.min() for _, a in arrays)
+        hi = max(a.max() for _, a in arrays)
+        edges = np.linspace(lo, hi, 81)
+        for label, err in arrays:
+            ax.hist(
+                err,
+                bins=edges,
+                histtype="step",
+                linewidth=1.5,
+                density=True,
+                label=f"{label}: bias={err.mean():+.3g}, std={err.std():.3g}",
+            )
+        ax.axvline(0.0, color="k", lw=0.8)
+        ax.set(title=f"{name} [{unit}]", xlabel=f"predicted - true [{unit}]")
+        ax.legend(fontsize=7)
+    for ax in axes[len(names) :]:
+        ax.set_visible(False)
+    fig.tight_layout()
+    fig.savefig(path)
 
 
 def _plot(history, labels, path):
@@ -269,4 +437,4 @@ def _plot(history, labels, path):
 if __name__ == "__main__":
     import gearup
 
-    gearup.gearup(regress).with_config("config/regress.yaml")()
+    gearup.gearup(regress=regress, validate=validate).with_config("config/regression.yaml")()

@@ -178,8 +178,11 @@ def main():
 
         print(f"== {name} ==", flush=True)
         print(f"   cond(A)={cond:.1f}  |b|={residual:.2f}  f_min={f_min:.4g}", flush=True)
-        print(f"   final regret  BO={np.median(bo_regret):.4g}  random={np.median(rand_regret):.4g}"
-              f"  speedup={np.median(rand_regret)/max(np.median(bo_regret), 1e-12):.1f}x", flush=True)
+        print(
+            f"   final regret  BO={np.median(bo_regret):.4g}  random={np.median(rand_regret):.4g}"
+            f"  speedup={np.median(rand_regret)/max(np.median(bo_regret), 1e-12):.1f}x",
+            flush=True,
+        )
         print(f"   ||x_best - x*||  BO median={np.median(bo_dist):.4g}\n", flush=True)
 
     fig.tight_layout()

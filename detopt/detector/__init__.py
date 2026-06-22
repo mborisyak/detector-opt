@@ -10,12 +10,14 @@ from .straw import StrawDetector  # abstract base (no design scheme)
 from .free_straw import FreeStrawDetector, free_design_array
 from .stereo_straw import StereoStrawDetector
 from .stereo_tracking import StereoTracking
+from .stereo_tracking2 import StereoTracking2
 from .debug import DebugDetector
 
 __detectors__: dict[str, type[Detector]] = {
     "straw": FreeStrawDetector,  # the base is abstract; "straw" = the free per-layer design
     "stereo_straw": StereoStrawDetector,
     "stereo_tracking": StereoTracking,  # stereo design, daughter-kinematics target
+    "stereo_tracking2": StereoTracking2,  # + one-hot hit address (station/view/layer/straw) in combine()
     "debug": DebugDetector,
 }
 

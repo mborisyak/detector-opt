@@ -1,0 +1,6 @@
+retina-tubes:
+  n_iters: 1000
+  lr: 0.05
+  s_hi: 30.0
+  drift_sigma: 0.05   # measurement sigma for drift/hits (tubes uses pitch/sqrt12)
+  coef: 0.0           # momentum-prior weight (swept-optimal = 0)

@@ -21,6 +21,7 @@ import numpy as np
 import yaml
 
 import detopt
+from detopt.utils.viz.straw import daughter_polylines
 
 CFG = "config/detector/straw.yaml"
 
@@ -56,13 +57,11 @@ def event_daughters(events, e):
     }, n
 
 
-def _overlay(ax, traj, mc, n_part, proj):
-    """Draw our trajectory polylines + MC hit points in projection ``proj``
-    ('zy' = bending plane, 'zx' = non-bending). ``traj`` is (max_particles,n_t,3)."""
+def _overlay(ax, lines, mc, proj):
+    """Draw our daughter polylines + MC hit points in projection ``proj``
+    ('zy' = bending plane, 'zx' = non-bending). ``lines`` = per-daughter (k,3) [x,y,z]."""
     a, b = (2, 1) if proj == "zy" else (2, 0)  # (z, y) or (z, x)
-    for p in range(min(n_part, traj.shape[0])):
-        t = traj[p]
-        t = t[np.abs(t).sum(1) > 0]  # drop padded steps
+    for t in lines:
         if len(t) > 1:
             ax.plot(t[:, a], t[:, b], lw=1.0, alpha=0.8, zorder=2)
     if len(mc):
@@ -105,13 +104,10 @@ def main(data_path="data/mc/sim_1000-0-V2023.npz", out="output/viz", n_show=6):
         fig, axes = plt.subplots(nrow, ncol, figsize=(7 * ncol, 4 * nrow), squeeze=False)
         for i, e in enumerate(show):
             dd, n = event_daughters(events, e)
-            ie = det._make_input_events(dd)  # this event's particles as a 1-event pool
-            bnd = np.array([[0, n]], dtype=np.int32)
-            traj = np.zeros((1, det.max_particles, det.n_t, 3), dtype=np.float32)
-            _, mask, _ = det._run_solver(bnd, design_b, rng, input_events=ie, trajectories=traj)
+            _, mask, lines = daughter_polylines(det, dd, design_b, rng)
             mc = hits[(he == e) & real]
             ax = axes[i // ncol][i % ncol]
-            _overlay(ax, traj[0], mc, n, proj)
+            _overlay(ax, lines, mc, proj)
             ax.set_xlim(*zlim)  # restrict z-axis to the detector span (ignore stray MC hits)
             # vertical axis spans the full detector extent (height for z-y, width for z-x)
             half = det.layer_height if proj == "zy" else det.layer_width

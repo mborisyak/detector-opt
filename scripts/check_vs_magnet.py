@@ -35,6 +35,7 @@ def _nominal_design(cfg_path="config/bo.yaml"):
 
 
 from detopt.data.ship2numpy import load_ship2numpy_events  # noqa: E402
+from detopt.utils.viz.straw import daughter_polylines  # noqa: E402
 
 MAGNET = sys.argv[1] if len(sys.argv) > 1 else "V13_3500"
 DATA = sys.argv[2] if len(sys.argv) > 2 else "data/mc"
@@ -61,12 +62,8 @@ def event_npart(ev, e):
 
 
 def run_one(det, dd, design, rng):
-    """Solve a single hand-built event dict -> (X, mask, trajectories)."""
-    ie = det._make_input_events(dd)
-    n = len(dd["masses"])
-    traj = np.zeros((1, det.max_particles, det.n_t, 3), dtype=np.float32)
-    X, mask, _ = det._run_solver(np.array([[0, n]], np.int32), design, rng, input_events=ie, trajectories=traj)
-    return X, mask, traj
+    """Solve a single hand-built event dict -> (X, mask, daughter [x,y,z] polylines)."""
+    return daughter_polylines(det, dd, design, rng)
 
 
 def track_at_z(tp, z):
@@ -102,7 +99,7 @@ def main():
             if event_npart(ev, e) == 0 or not np.any((he == e) & real):
                 continue
             dd = event_dd(ev, e)
-            X, mask, traj = run_one(det, dd, design, rng)
+            X, mask, lines = run_one(det, dd, design, rng)
             h = X[0, mask[0].astype(bool)]
             sim_mult.append(len(h))
             for row in h:
@@ -116,11 +113,7 @@ def main():
             mc_y.extend(mc[:, 1].tolist())
             npp = event_npart(ev, e)
             for hh in mc:
-                ds = [
-                    np.hypot(*(track_at_z(traj[0, p], hh[2]) - hh[:2]))
-                    for p in range(min(npp, traj.shape[1]))
-                    if track_at_z(traj[0, p], hh[2]) is not None
-                ]
+                ds = [np.hypot(*(track_at_z(ln, hh[2]) - hh[:2])) for ln in lines if track_at_z(ln, hh[2]) is not None]
                 if ds:
                     zs.append(hh[2])
                     miss.append(min(ds))
@@ -159,12 +152,10 @@ def main():
     ax.hist(miss, bins=np.linspace(0, 20, 60), color="C2")
     ax.set(title="per-z transverse miss", xlabel="cm", yscale="log")
     for i, (dd, mc) in enumerate(overlay[:3]):
-        _, mask, traj = run_one(det, dd, design, rng)
+        _, mask, lines = run_one(det, dd, design, rng)
         a = fig.add_subplot(2, 3, 4 + i, projection="3d")
-        for p in range(min(int(dd["offsets"][1]), traj.shape[1])):
-            t = traj[0, p]
-            t = t[np.abs(t).sum(1) > 0]
-            if len(t):
+        for t in lines:
+            if len(t) > 1:
                 a.plot(t[:, 2], t[:, 0], t[:, 1], lw=1.0)
         if len(mc):
             a.scatter(mc[:, 2], mc[:, 0], mc[:, 1], s=4, c="k", alpha=0.4)

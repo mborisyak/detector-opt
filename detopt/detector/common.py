@@ -4,51 +4,55 @@ Contract (see ``detector-spec.md``). The base declares the interface only;
 every method that encodes an implementation choice is abstract, so concrete
 detectors decide *how*.
 
-  * The detector owns all static configuration -- geometry constants
-    (``n_layers``, ``max_particles``, ...), design constraints (bounds), target
-    normalisation statistics, and its **event source**. It MUST NOT carry a
-    mutable "current design"; design parameters are always passed in as
-    function arguments.
+  * The detector owns all static configuration -- geometry constants, design
+    constraints (bounds), target normalisation statistics, and its **event
+    source**. It MUST NOT carry a mutable "current design"; design parameters
+    are always passed in as function arguments.
 
-  * ``__call__(seed, design) -> (ground_truth, measurements, mask, target)``
-    generates events. ``design`` is **un-encoded** (physical/constrained),
-    shape ``(B, design_dim)``; ``B`` is its leading dimension. For hit-based
-    detectors::
+  * Raw events, targets, ground truth and the physical design are typed
+    **namedtuple records** (``Event``, ``Target``, ``GroundTruth``, ``Design``),
+    each a pytree of possibly mixed-dtype arrays (e.g. int32 hit indices beside a
+    float32 TDC -- no more integers smuggled through floats). The ``*_spec``
+    methods report a record's structure as the SAME namedtuple filled with
+    ``jax.ShapeDtypeStruct`` (per-event, no batch axis), so pools allocate/index
+    them generically with ``jax.tree``.
 
-        ground_truth : (B, ground_truth_dim) float32 -- generator-truth info
-        measurements : (B, M, raw_feature_dim) float32 -- per-hit raw features
-        mask         : (B, M)                int32   -- 1 for real hits, 0 padding
-        target       : (B, target_dim)       float32 -- regression target
+  * ``__call__(seed, design) -> (ground_truth, event, mask, target)`` generates
+    events. ``design`` is **un-encoded** (physical ``Design`` / config Mapping /
+    flat array), leading axis ``B``::
+
+        ground_truth : GroundTruth -- generator truth (== conditioning)
+        event        : Event       -- per-hit raw features (pytree, leaves (B, M, ...))
+        mask         : (B, M) int32 -- 1 for real hits, 0 padding
+        target       : Target      -- regression target
 
     Event generation is host-side (numpy) and non-differentiable.
 
-  * Shape methods (``event_shape``, ``design_shape``, ``combined_event_shape``,
-    ``target_shape``, ``ground_truth_shape``) report per-event shapes, no batch
-    axis. ``normalized_event_shape`` / ``encoded_design_shape`` default to
-    ``event_shape`` / ``design_shape``.
-
   * ``encode_design(d) -> d_enc`` is a bijection from the interior of the
-    constrained space onto unconstrained R^n; ``decode_design`` is its inverse.
-    Both are differentiable / jittable so they can run inside the network loss.
+    constrained space onto unconstrained R^n; it accepts a ``Design`` namedtuple,
+    a config ``Mapping``, or an already-flat physical array. ``decode_design`` is
+    its inverse and returns a ``Design``. Both are differentiable / jittable.
 
-  * ``normalize(X) -> X_norm`` brings raw event features into ~[-1, 1]
-    (invertible via ``denormalize``). ``combine(X_norm, d_enc) -> features``
-    merges a *normalised* event and an *encoded* design into a single
-    design-informed event, differentiable w.r.t. both; the hit ``mask`` is
-    threaded separately by the caller.
+  * ``combine_encoded(event, d_enc) -> features`` merges a *raw* event and an
+    *encoded* design into a single design-informed event -- it normalises/packs
+    the event itself (there is no separate ``normalize``), differentiable w.r.t.
+    the encoded design; the hit ``mask`` is threaded separately by the caller.
+    ``combine(event, design)`` is the convenience wrapper
+    ``combine_encoded(event, encode_design(design))`` used when training from
+    buffers that store the raw physical design.
 
-  * ``normalize_target(target)`` maps targets into the network's prediction
-    space; ``denormalize_predictions(pred)`` is its inverse, back to physical
-    units.
+  * ``normalize_target(Target) -> Array`` maps targets into the network's flat
+    prediction space; ``denormalize_predictions(Array) -> Target`` is its inverse.
+    ``normalize_ground_truth(GroundTruth) -> Array`` standardises the ground truth
+    for the discriminator (no inverse -- ground truth is never predicted).
 
-  * ``loss(pred, target)`` / ``metric(pred, target)`` compare a prediction
-    against the target and return plain per-sample ``(B,)`` arrays. The default
-    is the mean-squared error against the *normalised* target; ``metric``
-    defaults to ``loss``.
+  * ``loss(pred, target)`` / ``metric(pred, target)`` compare a flat prediction
+    array against the flat normalised label and return per-sample ``(B,)`` arrays.
 
-  * The ``*_shape`` methods are the source of truth; the ``*_dim`` accessors
-    (``design_dim``, ``target_dim``, ``raw_feature_dim``, ``combined_feature_dim``)
-    are derived from them for the convenience of the networks.
+  * The ``*_spec`` records are the source of truth; the ``*_dim`` accessors
+    (``design_dim``, ``encoded_design_dim``, ``target_dim``, ``ground_truth_dim``,
+    ``combined_feature_dim``) are derived for the convenience of the networks.
+    ``encoded_design_shape`` and ``combined_event_shape`` stay flat-array shapes.
 """
 
 import math
@@ -66,34 +70,50 @@ def _prod(shape):
     return int(math.prod(shape))
 
 
+def _spec_dim(spec):
+    """Total flattened width of a record spec (a namedtuple / pytree of ShapeDtypeStruct)."""
+    return int(sum(_prod(leaf.shape) for leaf in jax.tree.leaves(spec)))
+
+
 class Detector(object):
+    """
+    Abstract detector interface.
+    """
+
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "Detector":
         return cls(**config)
 
-    def event_shape(self):
+    # ------------------------------------------------------------------ #
+    # Record specs: the SAME namedtuple as the record, filled with
+    # jax.ShapeDtypeStruct (per-event, no batch axis). Source of truth.
+    # ------------------------------------------------------------------ #
+    def event_spec(self):
+        """Raw per-hit event record structure (defined per detector)."""
         raise NotImplementedError()
 
-    def normalized_event_shape(self):
-        return self.event_shape()
-
-    def design_shape(self):
+    def target_spec(self):
+        """Regression target record structure (defined per detector)."""
         raise NotImplementedError()
 
-    def encoded_design_shape(self):
+    def ground_truth_spec(self):
+        """Ground-truth (== conditioning) record structure (defined per detector)."""
+        raise NotImplementedError()
+
+    def design_shape(self) -> Shape:
+        """Flat physical design shape (defined per detector)."""
+        raise NotImplementedError()
+
+    def encoded_design_shape(self) -> Shape:
+        """Encoded (unconstrained) design shape; may differ from ``design_shape``."""
         return self.design_shape()
 
     def combined_event_shape(self):
-        raise NotImplementedError()
-
-    def target_shape(self):
-        raise NotImplementedError()
-
-    def ground_truth_shape(self):
+        """Per-hit feature shape ``(M, F)`` produced by :meth:`combine` (a flat float array)."""
         raise NotImplementedError()
 
     # ------------------------------------------------------------------ #
-    # Dimensions derived from the shapes (no batch axis).
+    # Dimensions derived from the specs / shapes (no batch axis).
     # ------------------------------------------------------------------ #
     def design_dim(self):
         return _prod(self.design_shape())
@@ -102,12 +122,10 @@ class Detector(object):
         return _prod(self.encoded_design_shape())
 
     def target_dim(self):
-        return _prod(self.target_shape())
+        return _spec_dim(self.target_spec())
 
-    @property
-    def raw_feature_dim(self):
-        """Per-hit raw feature count (last axis of ``event_shape``)."""
-        return int(self.event_shape()[-1])
+    def ground_truth_dim(self):
+        return _spec_dim(self.ground_truth_spec())
 
     @property
     def combined_feature_dim(self):
@@ -116,14 +134,15 @@ class Detector(object):
 
     def __call__(self, seed, design, pool=None):
         """
-        Generates events for an un-encoded design. Returns (ground_truth, measurements, mask, target).
+        Generates events for an un-encoded design. Returns (ground_truth, event, mask, target),
+        where event/target/ground_truth are namedtuple records (leaves carry a leading batch axis).
 
         ``pool`` (int|str, default = first pool key) selects which disjoint event pool to
-        sample from -- see ``pool_split`` on the concrete detector. ``None`` uses the default
-        pool (all events when no split was configured).
+        sample from -- see ``pool_split`` on the concrete detector.
         """
         raise NotImplementedError()
 
+    ### TODO: this function belongs to utils
     @staticmethod
     def resolve_pool_split(pool_split):
         """Normalise a ``pool_split`` (Sequence | Mapping | None) into an ordered dict of
@@ -146,36 +165,54 @@ class Detector(object):
         return {k: v / total for k, v in items.items()}
 
     # ------------------------------------------------------------------ #
-    # Physical design as a named dict (e.g. stereo: {stations, angle}); the ENCODED design
-    # stays a single flat vector. ``design_spec`` (``Mapping[str, Shape]``) names the dict's
-    # fields and their per-field shapes; detectors implement the dict<->flat conversion
-    # (``flatten_design`` / ``unflatten_design``), the flat physical<->encoded bijection
-    # (``_encode_flat`` / ``_decode_flat``) and ``design_bounds``.
+    # Physical design as a typed ``Design`` namedtuple (e.g. stereo: ``(stations, angle)``); the
+    # ENCODED design stays a single flat vector. A detector defines ``design_spec`` (the ``Design``
+    # namedtuple filled with ``jax.ShapeDtypeStruct`` -- same shape as ``event_spec``/``target_spec``),
+    # ``design_bounds``, and the flat physical<->encoded bijection (``_encode_flat`` / ``_decode_flat``).
+    # The record<->flat conversion (``flatten_design`` / ``unflatten_design``) is GENERIC here, via the
+    # ``tensor`` codec over the design pytree -- exactly how Event/Target records are packed.
     # ------------------------------------------------------------------ #
-    def design_spec(self) -> Mapping[str, Shape]:
-        """Ordered ``{name: shape}`` of the physical design dict's fields (defined per detector)."""
+    def design_spec(self):
+        """The ``Design`` namedtuple filled with ``jax.ShapeDtypeStruct`` (per-field shape + dtype),
+        in field order. Defined per detector."""
         raise NotImplementedError()
 
     def design_bounds(self):
-        """``{name: (lo, hi)}`` physical per-field bounds (defined per detector)."""
+        """``{name: (lo, hi)}`` physical per-field bounds, keyed by the ``Design`` field names
+        (defined per detector)."""
         raise NotImplementedError()
 
     def flatten_design(self, design):
-        """Design dict -> flat physical array ``(..., design_dim)`` (spec order; defined per
-        detector). A non-dict is returned as-is (already flat)."""
-        raise NotImplementedError()
+        """``Design`` namedtuple / config ``Mapping`` / already-flat array -> flat physical
+        ``(..., design_dim)`` (field order). Generic: packs the design pytree with
+        :func:`tensor.flatten` -- the last axis of each field is its feature, anything before is batch."""
+        import jax.numpy as jnp
+        from collections.abc import Mapping
+        from ..utils import tensor
+
+        spec = self.design_spec()
+        design_type = type(spec)
+        if isinstance(design, Mapping):  # config dict (a single design): one value per field -> its spec shape
+            design = design_type(*(jnp.asarray(design[name], jnp.float32).reshape(leaf.shape) for name, leaf in zip(spec._fields, spec)))
+        elif not isinstance(design, design_type):
+            return jnp.asarray(design, jnp.float32)  # already a flat physical vector
+        ndim = jax.tree.leaves(design)[0].ndim  # fields share leading (batch) axes; the last axis is the feature
+        return tensor.flatten(design, batch_dimensions=tuple(range(ndim - 1)))[0]
 
     def unflatten_design(self, flat):
-        """Flat physical array ``(..., design_dim)`` -> design dict (inverse of
-        :meth:`flatten_design`; defined per detector)."""
-        raise NotImplementedError()
+        """Flat physical ``(..., design_dim)`` -> ``Design`` namedtuple (inverse of
+        :meth:`flatten_design`), via :func:`tensor.unflatten` over ``design_spec``."""
+        import jax.numpy as jnp
+        from ..utils import tensor
+
+        return tensor.unflatten(tensor.structure(self.design_spec()), jnp.asarray(flat, jnp.float32))
 
     def encode_design(self, design):
-        """Physical design (dict or flat array) -> encoded flat vector."""
+        """Physical design (``Design`` namedtuple, config Mapping, or flat array) -> encoded vector."""
         return self._encode_flat(self.flatten_design(design))
 
     def decode_design(self, encoded_design):
-        """Encoded flat vector -> physical design DICT."""
+        """Encoded flat vector -> physical ``Design`` namedtuple."""
         return self.unflatten_design(self._decode_flat(encoded_design))
 
     def _encode_flat(self, design):
@@ -186,22 +223,32 @@ class Detector(object):
         """Encoded vector -> flat physical design array (inverse of :meth:`_encode_flat`)."""
         raise NotImplementedError()
 
-    def normalize(self, X):
+    # ------------------------------------------------------------------ #
+    # Combine: raw event (+ design) -> flat per-hit network features.
+    # ------------------------------------------------------------------ #
+    def combine_encoded(self, event, encoded_design):
+        """Merge a raw ``Event`` and an ENCODED design into ``features (..., M, F)`` (defined per
+        detector). Normalises/packs the event internally; differentiable w.r.t. the encoded design."""
         raise NotImplementedError()
 
-    def denormalize(self, X_norm):
-        raise NotImplementedError()
+    def combine(self, event, design):
+        """Merge a raw ``Event`` and a PHYSICAL design. Default: encode the design, then
+        :meth:`combine_encoded`. Detectors may override how they combine."""
+        return self.combine_encoded(event, self.encode_design(design))
 
-    def combine(self, X_norm, encoded_design):
-        """Merge a normalised event and an encoded design into ``features``."""
-        raise NotImplementedError()
-
+    # ------------------------------------------------------------------ #
+    # Target / ground-truth normalisation.
+    # ------------------------------------------------------------------ #
     def normalize_target(self, target):
-        """Map physical targets into the network's prediction space (~[-1, 1]); defined per detector."""
+        """Physical ``Target`` -> standardised flat array (~[-1, 1]); defined per detector."""
         raise NotImplementedError()
 
     def denormalize_predictions(self, normalised):
-        """Inverse of :meth:`normalize_target`: back to physical units; defined per detector."""
+        """Inverse of :meth:`normalize_target`: flat normalised array -> physical ``Target``."""
+        raise NotImplementedError()
+
+    def normalize_ground_truth(self, ground_truth):
+        """Physical ``GroundTruth`` -> standardised flat array (no inverse -- never predicted)."""
         raise NotImplementedError()
 
     def loss(self, predicted: jax.Array, target: jax.Array) -> jax.Array:

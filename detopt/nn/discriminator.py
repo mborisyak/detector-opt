@@ -31,7 +31,7 @@ class SetDiscriminator(SetRegressor):
 
     @classmethod
     def from_config(cls, detector, config, *, rngs: nnx.Rngs):
-        n_in = int(detector.combined_feature_dim) + int(detector.conditioning_dim())
+        n_in = int(detector.combined_feature_dim) + int(detector.ground_truth_dim())
         return cls(n_features_in=n_in, target_dim=1, rngs=rngs, **config)
 
     def __call__(self, features, mask, conditioning, *, deterministic: bool = True, rngs=None):

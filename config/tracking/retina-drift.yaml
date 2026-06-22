@@ -1,0 +1,7 @@
+retina-drift:
+  n_iters: 1000
+  lr: 0.05
+  s_hi: 30.0
+  drift_sigma: 0.012  # = sigma_spatial; matches the drift-radius smearing (V3, FairShip-realistic)
+  coef: 0.0           # momentum-prior weight (swept-optimal = 0)
+  temperature: 0.1    # tempered retina; plain retina (temp=1) is fragile on the noisy smeared drift radius

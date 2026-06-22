@@ -1,0 +1,8 @@
+retina-tdc:
+  n_iters: 1000
+  lr: 0.05
+  s_hi: 30.0          # cm (TDC residual is in drift-radius space; s_lo = sigma_spatial = 0.012 cm is derived)
+  coef: 0.0           # momentum-prior weight (swept-optimal = 0)
+  temperature: 0.1    # tempered retina exp(-temp*(r/s)^2); plain retina (temp=1) fails on noisy TDC drift,
+                      # temp<1 flattens the response -> robust, matches NLL (per task.md V2 retina remedy)
+

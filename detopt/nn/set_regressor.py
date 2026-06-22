@@ -148,8 +148,7 @@ class EnsembleSetBlock(nnx.Module):
             layers.append(EnsembleLeakyTanh(n_models, h))
             prev = h
         self.shared = nnx.List(layers)
-        self.value_head = EnsembleLinear(n_models, prev, out_dim, rngs=rngs)
-        self.weight_head = EnsembleLinear(n_models, prev, out_dim, rngs=rngs)
+        self.output = EnsembleLinear(n_models, prev, 2 * out_dim, rngs=rngs)
 
     def __call__(self, x, *, deterministic: bool = True, rngs=None):
         h = x
@@ -159,7 +158,11 @@ class EnsembleSetBlock(nnx.Module):
                 h = layer(h, deterministic=deterministic, rngs=rngs)
             else:
                 h = layer(h)
-        return self.value_head(h), self.weight_head(h)
+        h = self.output(h)
+
+        mu, sigma_raw = jnp.split(h, 2, axis=-1)
+
+        return mu, sigma_raw
 
 
 class SetRegressor(Model):

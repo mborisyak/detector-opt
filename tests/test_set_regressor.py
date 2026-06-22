@@ -93,9 +93,7 @@ def test_set_ensemble_regressor_shape_and_members(seed):
     ensemble axis (members are initialised and trained independently).
     """
     N, B, M, F, T = 4, 3, 16, 8, 6
-    reg = detopt.nn.SetRegressor(
-        n_features_in=F, target_dim=T, features=[[16, 16], [16, 8]], n_models=N, rngs=nnx.Rngs(seed)
-    )
+    reg = detopt.nn.SetRegressor(n_features_in=F, target_dim=T, features=[[16, 16], [16, 8]], n_models=N, rngs=nnx.Rngs(seed))
     assert reg.ensemble() == N
 
     rng = np.random.default_rng(seed)

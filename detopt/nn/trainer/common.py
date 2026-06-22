@@ -20,10 +20,12 @@ call occupies a contiguous **window** ``[w0, w0 + n)`` (``w0`` = the pool fill w
 it started); training and evaluation address it by a runtime ``start`` offset, so a
 single compiled kernel serves any window position/fill without recompiling.
 
-Every event carries its own **encoded design** in the pool, and ``combine`` is
-always **design-conditioned**: each event is merged with its own encoded design
-(``combine`` decodes it internally), so the network sees the true detector
-geometry -- and a mixed-design batch (e.g. replay) is handled per event.
+Every event carries its own **raw physical design** in the pool, and ``combine`` is
+always **design-conditioned**: each event is merged with its own design
+(``combine`` encodes it, then ``combine_encoded`` decodes + gathers per-hit), so the
+network sees the true detector geometry -- and a mixed-design batch (e.g. replay) is
+handled per event. Pools store RAW records (events/targets/design); ``combine`` +
+``normalize_target`` run per batch inside the kernels, not at fill time.
 """
 
 from __future__ import annotations
@@ -117,12 +119,12 @@ class Trainer:
         budget = int(budget)
         val_budget = round(budget * self.val_fraction)
         train_budget = budget - val_budget
-        measurement_shape = tuple(detector.event_shape())
-        mask_shape = measurement_shape[:-1]
-        target_shape = tuple(detector.target_shape())
-        design_shape = tuple(detector.encoded_design_shape())  # encoded design / event
-        train_pool = Pool(train_budget, measurement_shape, mask_shape, target_shape, design_shape, device)
-        val_pool = Pool(val_budget, measurement_shape, mask_shape, target_shape, design_shape, device)
+        # Pool slots (positional, pytree): raw Event, mask, raw Target, raw physical Design / event.
+        mask_dim = int(jax.tree.leaves(detector.event_spec())[0].shape[0])  # M (per-hit count)
+        mask_spec = jax.ShapeDtypeStruct((mask_dim,), jnp.int32)
+        specs = (detector.event_spec(), mask_spec, detector.target_spec(), detector.design_spec())
+        train_pool = Pool(train_budget, specs, device)
+        val_pool = Pool(val_budget, specs, device)
         return train_pool, val_pool, train_budget, val_budget
 
     # ------------------------------------------------------------------ #
@@ -156,32 +158,33 @@ class Trainer:
         self._eval_val = self._build_eval(reg_def, self.val_iteration_limit)
 
     # ------------------------------------------------------------------ #
-    # JIT kernels. Buffers are (X, mask, targets, designs); ``designs`` holds each
-    # event's ENCODED design (``combine`` decodes it). The window is addressed by a
-    # runtime ``start`` offset + ``count`` (one compiled kernel serves any window).
+    # JIT kernels. Buffers are (event, mask, target, design); ``design`` holds each
+    # event's RAW PHYSICAL design (``combine`` encodes it, then ``combine_encoded``
+    # decodes + gathers). The window is addressed by a runtime ``start`` offset +
+    # ``count`` (one compiled kernel serves any window). ``combine`` + ``normalize_target``
+    # run here, per batch, on the raw records (not at pool-fill time).
     # ------------------------------------------------------------------ #
     def _make_loss_fn(self, reg_def):
         detector = self.detector
         members = self.n_ensemble
         batch = self.batch
 
-        def loss_fn(params, state, drop_key, X_b, mask_b, design_b, targets_b):
+        def loss_fn(params, state, drop_key, event_b, mask_b, design_b, target_b):
             # deterministic=False -> dropout ACTIVE; the rng is threaded in
             # explicitly (fresh per step) so it lives at the current trace level.
             reg = nnx.merge(reg_def, params, state)
-            X_norm = detector.normalize(X_b)
-            features = detector.combine(X_norm, design_b)  # design_b: per-event ENCODED design
+            features = detector.combine(event_b, design_b)  # design_b: per-event PHYSICAL design
             if members is None:
                 pred = reg(features, mask_b, deterministic=False, rngs=nnx.Rngs(drop_key))
             else:
-                # X_b holds ``members * batch`` independent draws from the window;
+                # event_b holds ``members * batch`` independent draws from the window;
                 # split into one minibatch per member -> (N, batch, ...). Each member
-                # trains on its own batch; combine/normalize stay batch-flat.
+                # trains on its own batch; combine stays batch-flat.
                 feats_e = features.reshape((members, batch) + features.shape[1:])
                 mask_e = mask_b.reshape((members, batch) + mask_b.shape[1:])
                 pred = reg(feats_e, mask_e, deterministic=False, rngs=nnx.Rngs(drop_key))  # (N, batch, T)
                 pred = pred.reshape((members * batch,) + pred.shape[2:])
-            loss = jnp.mean(detector.loss(pred, detector.normalize_target(targets_b)))
+            loss = jnp.mean(detector.loss(pred, detector.normalize_target(target_b)))
             _, _, new_state = nnx.split(reg, nnx.Param, nnx.Variable)
             return loss, new_state
 
@@ -209,17 +212,17 @@ class Trainer:
 
         def train_step(carry, key):
             params, state, opt_state, start, count, buffers = carry
-            X_buf, mask_buf, targets_buf, design_buf = buffers
+            event_buf, mask_buf, target_buf, design_buf = buffers
             key_idx, key_drop = jax.random.split(key)
             idx = sample_indices(key_idx, start, count)
             (loss, new_state), grads = jax.value_and_grad(loss_fn, has_aux=True)(
                 params,
                 state,
                 key_drop,
-                X_buf[idx],
+                jax.tree.map(lambda a: a[idx], event_buf),  # raw Event minibatch (pytree)
                 mask_buf[idx],
-                design_buf[idx],
-                targets_buf[idx],
+                jax.tree.map(lambda a: a[idx], design_buf),  # raw Design minibatch (pytree)
+                jax.tree.map(lambda a: a[idx], target_buf),  # raw Target minibatch (pytree)
             )
             updates, new_opt_state = optimizer.update(grads, opt_state, params)
             new_params = optax.apply_updates(params, updates)
@@ -244,15 +247,16 @@ class Trainer:
 
         @jax.jit
         def eval_pass(params, state, buffers, start):
-            X_buf, mask_buf, targets_buf, design_buf = buffers
-            pool_size = X_buf.shape[0]
+            event_buf, mask_buf, target_buf, design_buf = buffers
+            pool_size = jax.tree.leaves(event_buf)[0].shape[0]
             reg = nnx.merge(reg_def, params, state)
 
             def body(_carry, c):
                 idxs = start + c * eval_batch + jnp.arange(eval_batch, dtype=jnp.int32)
                 safe = jnp.clip(idxs, 0, pool_size - 1)
-                X_norm = detector.normalize(X_buf[safe])
-                features = detector.combine(X_norm, design_buf[safe])  # per-event ENCODED design
+                features = detector.combine(
+                    jax.tree.map(lambda a: a[safe], event_buf), jax.tree.map(lambda a: a[safe], design_buf)
+                )
                 mask_b = mask_buf[safe]
                 if members is None:
                     pred = reg(features, mask_b, deterministic=True)  # dropout OFF
@@ -261,7 +265,8 @@ class Trainer:
                     feats_e = jnp.broadcast_to(features, (members,) + features.shape)
                     mask_e = jnp.broadcast_to(mask_b, (members,) + mask_b.shape)
                     pred = reg(feats_e, mask_e, deterministic=True).mean(axis=0)  # (E, T)
-                return None, detector.loss(pred, detector.normalize_target(targets_buf[safe]))
+                target_b = jax.tree.map(lambda a: a[safe], target_buf)
+                return None, detector.loss(pred, detector.normalize_target(target_b))
 
             _, losses = jax.lax.scan(body, None, jnp.arange(n_chunks))
             return losses.reshape(-1)[:window]  # per-event losses over the window
@@ -271,25 +276,23 @@ class Trainer:
     # ------------------------------------------------------------------ #
     # Event sampling -- the only place the detector is called.
     # ------------------------------------------------------------------ #
-    def _fill_pool(self, design_phys, design_enc, pool, n_to_add, seed_seq):
-        """Generate ``n_to_add`` events at ``design_phys`` and append them.
+    def _fill_pool(self, design, pool, n_to_add, seed_seq):
+        """Generate ``n_to_add`` events at the physical ``Design`` and append them.
 
-        The detector is called with the *physical* design; the stored per-event
-        design is the *encoded* one (``combine`` consumes encoded designs).
+        The detector is called with the (broadcast) physical ``Design``; the stored per-event design
+        is the same raw ``Design`` record (``combine`` encodes it per batch). Events/targets/design
+        are stored as raw namedtuple records (the pool is pytree-aware).
         """
-        design_phys = np.asarray(design_phys, dtype=np.float32)
-        design_enc = np.asarray(design_enc, dtype=np.float32)
         added = 0
         chunk = min(256, n_to_add)
         while added < n_to_add:
             k = min(chunk, n_to_add - added)
-            phys_b = np.broadcast_to(design_phys[None, :], (k, design_phys.shape[0]))
-            enc_b = np.broadcast_to(design_enc[None, :], (k, design_enc.shape[0]))
-            _gt, X, mask, targets = self.detector(seed_seq.spawn(1)[0], phys_b)
-            pool.append(X, mask, targets, enc_b)
+            design_b = jax.tree.map(lambda a: jnp.broadcast_to(jnp.asarray(a)[None], (k,) + jnp.asarray(a).shape), design)
+            _gt, event, mask, target = self.detector(seed_seq.spawn(1)[0], design_b)
+            pool.append(event, mask, target, design_b)
             added += k
 
-    def _sample_round(self, design_phys, design_enc, w0_train, w0_val, n_requested, seed_seq):
+    def _sample_round(self, design, w0_train, w0_val, n_requested, seed_seq):
         """Append one round of train+val events into the shared budget pools.
 
         Returns the number of *train* events added (> 0), ``0`` if this design's
@@ -307,9 +310,9 @@ class Trainer:
         if n_train > tp.n_max - tp.n_current or n_val > vp.n_max - vp.n_current:
             return None
         train_seq, val_seq = seed_seq.spawn(2)
-        self._fill_pool(design_phys, design_enc, tp, n_train, train_seq)
+        self._fill_pool(design, tp, n_train, train_seq)
         if n_val > 0:
-            self._fill_pool(design_phys, design_enc, vp, n_val, val_seq)
+            self._fill_pool(design, vp, n_val, val_seq)
         return n_train
 
     # ------------------------------------------------------------------ #
@@ -349,6 +352,7 @@ class Trainer:
         io.save_training_checkpoint(
             manager,
             epoch,
+            config={"regressor": self.regressor_config},
             parameters=params,
             state=state,
             design=design_tree,

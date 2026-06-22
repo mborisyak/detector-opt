@@ -1,0 +1,6 @@
+nll-tdc:
+  n_iters: 1000
+  lr: 0.05
+  s_hi: 30.0          # cm (TDC residual is in drift-radius space; s_lo = sigma_spatial = 0.012 cm is derived)
+  coef: 0.0           # momentum-prior weight (swept-optimal = 0)
+  pi_noise: 0.02      # uniform-noise mixture fraction

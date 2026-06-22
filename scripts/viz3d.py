@@ -75,18 +75,15 @@ def main(data_path="data/mc/sim_1000-0-V2023.npz", out="output/viz3d", n_show=3,
 
     for e in show:
         dd, n = event_daughters(events, e)
-        ie = det._make_input_events(dd)
-        bnd = np.array([[0, n]], dtype=np.int32)
-        traj = np.zeros((1, det.max_particles, det.n_t, 3), dtype=np.float32)
-        X, mask, traj = det._run_solver(bnd, design_b, rng, input_events=ie, trajectories=traj)
-        title = f"event {e}: {n} HNL daughters (bold) + secondaries, {int(mask[0].sum())} fired straws"
+        X, mask, lines = viz3d.daughter_polylines(det, dd, design_b, rng)
+        title = f"event {e}: {n} HNL daughters, {int(mask[0].sum())} fired straws"
         path = None if interactive else os.path.join(out, f"viz3d_event_{e}.png")
         viz3d.show_event(
             det,
             design,
             X[0],
             mask[0],
-            traj[0],
+            lines,
             n_daughters=n,
             off_screen=not interactive,
             screenshot=path,

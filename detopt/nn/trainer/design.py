@@ -131,7 +131,8 @@ class DesignTrainer(Trainer):
         """
         detector = self.detector
         design_enc = np.asarray(design_enc, dtype=np.float32)
-        design_phys = np.asarray(detector.flatten_design(detector.decode_design(design_enc)), dtype=np.float32)
+        design = detector.decode_design(design_enc)  # physical Design namedtuple (what the pools store)
+        design_phys = np.asarray(detector.flatten_design(design), dtype=np.float32)  # flat, for the checkpoint tree
 
         init_seq, training_seq, data_seq = seed_seq.spawn(3)
 
@@ -153,7 +154,7 @@ class DesignTrainer(Trainer):
         key = jax.random.PRNGKey(int(training_seq.generate_state(1)[0]))
 
         # Initial data (n0 <= iteration_limit, so this only fails on a full budget).
-        if self._sample_round(design_phys, design_enc, w0_train, w0_val, self.n0, data_seq.spawn(1)[0]) is None:
+        if self._sample_round(design, w0_train, w0_val, self.n0, data_seq.spawn(1)[0]) is None:
             return None
 
         round_start = 0  # history index where the current (post-add) round began
@@ -253,8 +254,7 @@ class DesignTrainer(Trainer):
 
                 # (1) large gap, or (3) converged-but-imprecise -> add data.
                 n_added = self._sample_round(
-                    design_phys,
-                    design_enc,
+                    design,
                     w0_train,
                     w0_val,
                     self.n_increment,

@@ -10,12 +10,23 @@ design subclass registered as ``"straw"``; the base :class:`StrawDetector` carri
 no design scheme.
 """
 
+from typing import NamedTuple
+
+import jax
 import numpy as np
 
 from .straw import StrawDetector
 from ..utils.encoding import normal_to_uniform_jax, uniform_to_normal_jax
 
-__all__ = ["FreeStrawDetector", "free_design_array"]
+__all__ = ["FreeStrawDetector", "FreeDesign", "free_design_array"]
+
+
+class FreeDesign(NamedTuple):
+    """Free per-layer design: each layer's z and stereo angle, plus the field strength."""
+
+    layer_z: jax.Array  # (..., n_layers)
+    layer_angle: jax.Array  # (..., n_layers)
+    B: jax.Array  # (..., 1)
 
 
 def free_design_array(
@@ -54,27 +65,9 @@ class FreeStrawDetector(StrawDetector):
         return (2 * self.n_layers + 1,)
 
     def design_spec(self):
-        return {"layer_z": (self.n_layers,), "layer_angle": (self.n_layers,), "B": (1,)}
-
-    def flatten_design(self, design):
-        """Design dict ``{layer_z (...,n), layer_angle (...,n), B (...,1)}`` -> flat ``(..., 2n+1)``
-        (a non-dict passes through unchanged)."""
-        import jax.numpy as jnp
-
-        if not isinstance(design, dict):
-            return jnp.asarray(design, jnp.float32)
-        z = jnp.asarray(design["layer_z"], jnp.float32)
-        angle = jnp.asarray(design["layer_angle"], jnp.float32)
-        B = jnp.asarray(design["B"], jnp.float32).reshape(z.shape[:-1] + (1,))
-        return jnp.concatenate([z, angle, B], axis=-1)
-
-    def unflatten_design(self, flat):
-        """Flat ``(..., 2n+1)`` -> design dict ``{layer_z (...,n), layer_angle (...,n), B (...,1)}``."""
-        import jax.numpy as jnp
-
-        flat = jnp.asarray(flat, jnp.float32)
-        n = self.n_layers
-        return {"layer_z": flat[..., :n], "layer_angle": flat[..., n : 2 * n], "B": flat[..., 2 * n : 2 * n + 1]}
+        # FreeDesign filled with ShapeDtypeStruct; flatten/unflatten are generic (base, via tensor).
+        f = lambda n: jax.ShapeDtypeStruct((n,), np.float32)
+        return FreeDesign(layer_z=f(self.n_layers), layer_angle=f(self.n_layers), B=f(1))
 
     def design_bounds(self):
         return {"layer_z": tuple(self.layer_bounds), "layer_angle": tuple(self.angle_bounds), "B": self.b_bounds()}

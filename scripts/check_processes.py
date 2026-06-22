@@ -123,7 +123,7 @@ def mc_hit_categories(ht, hev, mci, mcev, origin_z, boundary_z, n_events):
     g = mc_start[hev[tracked]] + ht[tracked]
     proc, oz = mci[g, 3], origin_z[g]
     c = np.full(len(g), CATS.index("secondary"), dtype=np.int64)
-    c[proc == 5] = CATS.index("pair")   # in-tracker conversion
+    c[proc == 5] = CATS.index("pair")  # in-tracker conversion
     c[proc == 4] = CATS.index("decay")  # in-tracker decay
     c[proc == 0] = CATS.index("primary")  # true primaries (robust if origin z is missing/NaN)
     c[oz < boundary_z] = CATS.index("primary")  # upstream origin -> incoming particle

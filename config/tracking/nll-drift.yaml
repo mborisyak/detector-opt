@@ -1,0 +1,7 @@
+nll-drift:
+  n_iters: 1000
+  lr: 0.05
+  s_hi: 30.0
+  drift_sigma: 0.012  # = sigma_spatial; matches the drift-radius smearing (V3, FairShip-realistic)
+  coef: 0.0           # momentum-prior weight (swept-optimal = 0)
+  pi_noise: 0.02      # uniform-noise mixture fraction

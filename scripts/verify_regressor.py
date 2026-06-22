@@ -95,51 +95,47 @@ def verify(seed, output=None, progress=True, **config):
     opt = make_optimizer(config["training"]["optimizer"])
     opt_state = opt.init(params)
 
-    M, F = detector.combined_event_shape()
-    target_dim = int(detector.target_shape()[0])
-
-    @jax.jit
-    def prepare(X, targets):
-        """Raw events at the FIXED design -> (combined features, normalized target)."""
-        theta_b = jnp.broadcast_to(theta[None, :], (X.shape[0], design_dim))
-        return detector.combine(detector.normalize(X), theta_b), detector.normalize_target(targets)
+    M = int(jax.tree.leaves(detector.event_spec())[0].shape[0])  # per-hit count
+    specs = (detector.event_spec(), jax.ShapeDtypeStruct((M,), jnp.int32), detector.target_spec())
 
     def fill(n, pool, seq):
-        """Sample ``n`` events at the fixed design from ``pool`` into a buffer (combined features,
-        mask, normalized target)."""
-        buf = RingBuffer(n, (M, F), (M,), (target_dim,), device=device)
+        """Sample ``n`` RAW events at the fixed design from ``pool`` into a buffer (raw event,
+        mask, raw target). ``combine_encoded`` + ``normalize_target`` run per batch in the kernels."""
+        buf = RingBuffer(n, specs, device=device)
         filled = 0
         bar = tqdm(total=n, desc=f"sample[{pool}]", disable=not progress)
         while filled < n:
             chunk = min(sample_chunk, n - filled)
             phys = detector.decode_design(jnp.broadcast_to(theta[None, :], (chunk, design_dim)))
             ev = detector.sample_events(seq.spawn(1)[0], phys, pool=pool)
-            feats, tnorm = prepare(ev["X"], ev["targets"])
-            buf.push(feats, ev["mask"], tnorm)
+            buf.push(ev["X"], ev["mask"], ev["target"])
             filled += chunk
             bar.update(chunk)
         bar.close()
         return buf
 
-    def _net_loss(params, state, drop_key, feats, mask, targets_norm, count):
+    def _net_loss(params, state, drop_key, event_b, mask_b, target_b, count):
         reg = nnx.merge(reg_def, params, state)
-        pred = _forward(reg, feats, mask, members, count, deterministic=False, rngs=nnx.Rngs(drop_key))
-        loss = jnp.mean(detector.loss(pred, targets_norm))  # buffer targets are already normalized
+        feats = detector.combine_encoded(event_b, theta)  # fixed design (encoded), broadcast per hit
+        pred = _forward(reg, feats, mask_b, members, count, deterministic=False, rngs=nnx.Rngs(drop_key))
+        loss = jnp.mean(detector.loss(pred, detector.normalize_target(target_b)))
         _, _, new_state = nnx.split(reg, nnx.Param, nnx.Variable)
         return loss, new_state
 
     draw = (members or 1) * batch
 
     @jax.jit
-    def train_chunk(params, state, opt_state, key, feats_buf, mask_buf, tgt_buf, n):
+    def train_chunk(params, state, opt_state, key, event_buf, mask_buf, tgt_buf, n):
         """``val_every`` scan-folded SGD steps over the fixed training buffer."""
 
         def step(carry, k):
             params, state, opt_state = carry
             k_idx, k_drop = jax.random.split(k)
             idx = jax.random.randint(k_idx, (draw,), 0, n)
+            event_b = jax.tree.map(lambda a: a[idx], event_buf)  # raw Event minibatch
+            target_b = jax.tree.map(lambda a: a[idx], tgt_buf)  # raw Target minibatch
             (loss, new_state), grads = jax.value_and_grad(_net_loss, has_aux=True)(
-                params, state, k_drop, feats_buf[idx], mask_buf[idx], tgt_buf[idx], batch
+                params, state, k_drop, event_b, mask_buf[idx], target_b, batch
             )
             updates, opt_state = opt.update(grads, opt_state, params)
             params = optax.apply_updates(params, updates)
@@ -149,21 +145,23 @@ def verify(seed, output=None, progress=True, **config):
         return params, state, opt_state, losses
 
     @jax.jit
-    def validate(params, state, feats_buf, mask_buf, tgt_buf):
+    def validate(params, state, event_buf, mask_buf, tgt_buf):
         """Per-key validation metric (MSE) over the whole validation buffer."""
         reg = nnx.merge(reg_def, params, state)
         n_chunks = val_samples // eval_batch
-        shape = lambda a: a[: n_chunks * eval_batch].reshape((n_chunks, eval_batch) + a.shape[1:])
-        feats_b, mask_b, tgt_b = shape(feats_buf), shape(mask_buf), shape(tgt_buf)
+        cut = n_chunks * eval_batch
+        reshape = lambda a: a[:cut].reshape((n_chunks, eval_batch) + a.shape[1:])
+        event_c, mask_c, tgt_c = jax.tree.map(reshape, event_buf), reshape(mask_buf), jax.tree.map(reshape, tgt_buf)
 
         def step(acc, chunk):
-            f, m, t = chunk
-            pred = _forward_shared(reg, f, m, members, deterministic=True)
-            md = detector.metric(pred, _target_for(t, members))
+            ev_chunk, m, t = chunk
+            feats = detector.combine_encoded(ev_chunk, theta)
+            pred = _forward_shared(reg, feats, m, members, deterministic=True)
+            md = detector.metric(pred, _target_for(detector.normalize_target(t), members))
             return {k: acc[k] + jnp.sum(md[k]) for k in acc}, None
 
         init = {name: jnp.float32(0.0) for name in labels}
-        acc, _ = jax.lax.scan(step, init, (feats_b, mask_b, tgt_b))
+        acc, _ = jax.lax.scan(step, init, (event_c, mask_c, tgt_c))
         count = n_chunks * eval_batch * (members or 1)
         return {k: acc[k] / count for k in labels}
 

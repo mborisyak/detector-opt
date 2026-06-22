@@ -15,8 +15,10 @@ __all__ = ["design_trajectory_meta", "plot_design_trajectory"]
 
 def design_trajectory_meta(detector):
     """The detector's ``design_spec`` + ``design_bounds`` as json-able metadata, aligned with the
-    flat physical-design vector the trajectory stores."""
-    spec = [[name, int(np.prod(shape))] for name, shape in detector.design_spec().items()]
+    flat physical-design vector the trajectory stores. ``design_spec`` is a ``Design`` namedtuple of
+    ``jax.ShapeDtypeStruct`` (field order = flat-vector order); ``design_bounds`` is keyed by field name."""
+    spec_record = detector.design_spec()
+    spec = [[name, int(np.prod(leaf.shape))] for name, leaf in zip(spec_record._fields, spec_record)]
     bounds = {name: [float(lo), float(hi)] for name, (lo, hi) in detector.design_bounds().items()}
     return {"spec": spec, "bounds": bounds}
 

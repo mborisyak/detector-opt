@@ -34,7 +34,7 @@ def main(buffer=32768, val_buffer=8192, eps=0.1, train_steps=6000, batch=512, co
     dd = int(det.design_dim())
     M = det.max_hits_per_event
     F = det.combined_feature_dim
-    labels = [f"y{i}" for i in range(int(det.target_shape()[0]))]  # per-axis target components (net outputs)
+    labels = [f"y{i}" for i in range(int(det.target_dim()))]  # per-axis target components (net outputs)
     nd = cfg["nominal_design"]
     theta0 = jnp.asarray(det.encode_design(nd), jnp.float32)
     keys = list(det.pool_split)
@@ -43,17 +43,21 @@ def main(buffer=32768, val_buffer=8192, eps=0.1, train_steps=6000, batch=512, co
     counts = np.array([det.n_stations, det.n_views_per_station, det.n_layers_per_view, det.n_straws], np.float32)
     print(f"M={M} F={F} input_dim={M * F}  design_dim={dd}  eps={eps}  pools train={train_pool!r}/val={val_pool!r}")
 
-    def featurize(X, mask, theta, key):
-        # Real combine() features, but with padded slots given RANDOM geometry + TDC=-1
+    def featurize(event, mask, theta, key):
+        # Real combine_encoded() features, but with padded slots given RANDOM geometry + TDC=-1
         # (a plain MLP processes every slot, unlike the DeepSet's masked aggregation).
         # Returns UNpermuted (B, M, F); permutation is applied per-step (augmentation).
-        B = X.shape[0]
-        m = jnp.asarray(mask).astype(bool)[..., None]  # (B,M,1)
-        X = jnp.asarray(X)
-        rand_idx = jnp.floor(jax.random.uniform(key, (B, M, 4)) * jnp.asarray(counts))  # random station/view/...
-        X = jnp.concatenate([jnp.where(m, X[..., :4], rand_idx), X[..., 4:5]], axis=-1)  # randomize padded geometry
-        feats = det.combine(det.normalize(X), theta)  # (B,M,F): [TDC, z, yL, yR, field]
-        feats = feats.at[..., 0].set(jnp.where(m[..., 0], feats[..., 0], -1.0))  # TDC=-1 for padded
+        m = jnp.asarray(mask).astype(bool)  # (B, M)
+        B, Mh = m.shape
+        ri = jnp.floor(jax.random.uniform(key, (B, Mh, 4)) * jnp.asarray(counts)).astype(jnp.int32)  # random address
+        ev = event._replace(  # randomize the discrete address of PADDED slots
+            station=jnp.where(m, jnp.asarray(event.station), ri[..., 0]),
+            view=jnp.where(m, jnp.asarray(event.view), ri[..., 1]),
+            layer=jnp.where(m, jnp.asarray(event.layer), ri[..., 2]),
+            straw=jnp.where(m, jnp.asarray(event.straw), ri[..., 3]),
+        )
+        feats = det.combine_encoded(ev, theta)  # (B,M,F): [TDC, z, yL, yR, field]
+        feats = feats.at[..., 0].set(jnp.where(m, feats[..., 0], -1.0))  # TDC=-1 for padded
         return feats  # (B, M, F)
 
     def permute_flat(feats, key):  # per-event hit permutation -> flatten (B, M*F)
@@ -70,7 +74,7 @@ def main(buffer=32768, val_buffer=8192, eps=0.1, train_steps=6000, batch=512, co
             out = det.sample_events(int(rng.integers(1 << 30)), det.decode_design(theta), pool=pool)
             key, kf = jax.random.split(key)
             Fs.append(featurize(out["X"], out["mask"], theta, kf))
-            Ts.append(jnp.asarray(det.normalize_target(out["targets"])))
+            Ts.append(jnp.asarray(det.normalize_target(out["target"])))
             got += c
         return jnp.concatenate(Fs), jnp.concatenate(Ts)
 

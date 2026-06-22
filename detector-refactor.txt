@@ -1,0 +1,17 @@
+We need to make a change in detector API.
+1. Normalization of events (X) occurs only in combination with combine. Normalize / denormalize or similar methods
+are gone for the events, combine now handles normalization/packing of events and normalization/packing of the design.
+2. Our new combine method in StereoTracking2 produces events with large dimensionality.
+All buffers and pools should now store raw events, raw designs, raw labels, raw ground truth. Combine happens on a training / validation batch
+right before feeding it into the network.
+3. StrawTracker right now produces raw events with floats encoding integer values. This is bad. To combat this and future similar
+cases (and simplify code), we need to introduce arbitrary events, preferably as namedtuple so that they hold mix-type arrays.
+All pools/buffers need to be updated to hold arbitrary events. To ease allocation,
+some of the current detector *_shape neeed to be replaced with *_spec that return a pytree with jax.ShapeDtypeStruct.
+4. In general, raw events, targets, ground truth and design are namedtuples, in this document,
+let's refer to them as Event, Target, GroundTruth, Design. Replace *_shape with *_spec for these events.
+encode_design receives a named_tuple and returns flat array, decode_design: Array -> Design.
+encoded_design_shape and combined_event_shape stay as they correspond to flat Array.
+normalize_target: Target -> Array, denormalize_predictions: Array -> Target.
+New method: normalize_ground_truth: GroundTruth -> Array (denormalization is not neccessary as never predicted).
+loss now receives normalized labels, predictions come from NN raw. Same with metrics.

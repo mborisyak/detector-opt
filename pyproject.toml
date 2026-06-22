@@ -28,6 +28,7 @@ requires-python = '>=3.9'
 [project.optional-dependencies]
 dev = [
     'pytest>=5.3.2',
+    'yapf>=0.40.0',
 ]
 
 [project.urls]
@@ -36,5 +37,21 @@ Homepage = 'https://github.com/mborisyak/detector-opt'
 [tool.setuptools.packages.find]
 exclude = ['contrib', 'examples', 'docs', 'tests']
 
-[tool.black]
-line-length = 128
+# Formatter: yapf (NOT black -- black forces 4-space and splatters calls one-arg-per-line).
+# 2-space indent; keep a call on one line if it fits column_limit (the heuristics below stop the
+# black-style vertical explosion). Run: `yapf -ir detopt scripts tests`.
+[tool.yapf]
+based_on_style = "pep8"
+indent_width = 2
+continuation_indent_width = 2
+column_limit = 128
+# When a call doesn't fit, keep it PACKED in the dangling style -- `f(\n  a, b,\n  c\n)` -- a 2-3 line
+# fill, NOT one argument per line: dangle the open paren, never force a split before a named/kwarg
+# (that was what exploded calls with `kw=val` args), pack commas, dedent the closing paren.
+split_before_first_argument = true
+split_before_named_assigns = false
+dedent_closing_brackets = true
+coalesce_brackets = true
+split_all_comma_separated_values = false
+split_all_top_level_comma_separated_values = false
+disable_ending_comma_heuristic = true

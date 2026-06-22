@@ -96,4 +96,4 @@ def save_all_data(seed, output, chunk_size=1000, **config):
 if __name__ == "__main__":
     import gearup
 
-    gearup.gearup(save=save_all_data).with_config("config/regress.yaml")()
+    gearup.gearup(save=save_all_data).with_config("config/regression.yaml")()

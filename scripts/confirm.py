@@ -135,6 +135,9 @@ def evaluate(checkpoint, seed: int = 0, step=None, **config):
     manager = io.get_checkpointer(checkpoint)
     used_step = manager.latest_step() if step is None else step
     params_pure, state_pure, design, aux = io.restore_training_checkpoint(manager, step)
+    # Architecture from the CHECKPOINT (config files drift); fall back to the config file if absent.
+    stored = io.restore_config(manager, used_step)
+    regressor_config = stored["regressor"] if stored is not None else config["regressor"]
 
     design_enc = np.asarray(design["encoded"], dtype=np.float32)
     phys = np.asarray(detector.flatten_design(detector.decode_design(design_enc)), dtype=np.float32)
@@ -146,20 +149,19 @@ def evaluate(checkpoint, seed: int = 0, step=None, **config):
         print(f"  checkpoint recorded loss: train={rec_t:.4f} val={rec_v:.4f}")
 
     # Rebuild the architecture and load the saved weights into it (pure dict -> nnx).
-    reg = regressor_from_config(detector, config=config["regressor"], rngs=nnx.Rngs(seed))
+    reg = regressor_from_config(detector, config=regressor_config, rngs=nnx.Rngs(seed))
     graphdef, params, state = nnx.split(reg, nnx.Param, nnx.Variable)
     nnx.replace_by_pure_dict(params, params_pure)
     nnx.replace_by_pure_dict(state, state_pure)
     params, state = jax.device_put(params, device), jax.device_put(state, device)
 
     @jax.jit
-    def eval_batch(params, state, X, mask, targets):
+    def eval_batch(params, state, event, mask, target):
         net = nnx.merge(graphdef, params, state)
-        X_norm = detector.normalize(X)
-        # The design's true ENCODED design (1-D -> combine broadcasts per event).
-        feats = detector.combine(X_norm, design_enc)
+        # The design's true ENCODED design (1-D -> combine_encoded broadcasts per event).
+        feats = detector.combine_encoded(event, design_enc)
         pred = net(feats, mask, deterministic=True)  # dropout off
-        return detector.loss(pred, detector.normalize_target(targets))  # per-event (B,)
+        return detector.loss(pred, detector.normalize_target(target))  # per-event (B,)
 
     budget = int(config["training"]["budget"])
     chunk = int(config["training"].get("eval_batch", 2048))
@@ -169,8 +171,8 @@ def evaluate(checkpoint, seed: int = 0, step=None, **config):
     total = total_sq = 0.0
     n = 0
     while n < budget:
-        _gt, X, mask, targets = detector(seq.spawn(1)[0], phys_b, split="val")
-        losses = np.asarray(eval_batch(params, state, X, mask, targets), dtype=np.float64)
+        _gt, event, mask, target = detector(seq.spawn(1)[0], phys_b, pool="val")
+        losses = np.asarray(eval_batch(params, state, event, mask, target), dtype=np.float64)
         total += losses.sum()
         total_sq += (losses**2).sum()
         n += losses.shape[0]
