@@ -2,9 +2,9 @@ detector: stereo
 design: initial_stereo
 
 regressor:
-  induced-set-regressor:
+  set-regressor:
     features: [ [ 64, 32 ], [ 64, 32 ]]
-    induced: 8
+    #induced: 8
 
 optimizer:
   adamw:
