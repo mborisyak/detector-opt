@@ -1,0 +1,29 @@
+detector: stereo_layerwise
+design: initial_stereo
+
+regressor:
+  predictive-mixture-regressor:
+    features: [ [ 64, 32 ], [ 64, 32 ] ]
+    aux_weight: 0.3
+    head_features: [ 64 ]
+    n_components: 4
+    mixture_weight: 0.1
+
+optimizer:
+  adamw:
+    learning_rate:
+      cosine_decay_schedule:
+        init_value: 1.0e-3
+    weight_decay: 1.0e-6
+
+sampling:
+  batch: 1024
+
+training:
+  batch: 32
+  epochs: 2048
+  samples: 65536
+
+validation:
+  batch: 128
+  samples: 16384

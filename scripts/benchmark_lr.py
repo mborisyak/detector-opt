@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from detopt.detector.debug import DebugDetector
+from detopt.detector import Stereo4Feature
 from detopt.nn.trainer import DesignTrainer
 
 PEAK, FLOOR = 1.0e-3, 1.0e-5
@@ -45,7 +45,7 @@ def make_schedules(steps_per_epoch):
 
 def run(seed=0, n_max_cap=16384):
     device = jax.devices("cuda")[0]
-    det = DebugDetector()
+    det = Stereo4Feature(engine="simplified")
     # Config numbers (config/bo_debug.yaml), bounded n_max_cap for a quick test.
     common = dict(
         regressor_config={"set-regressor": {"features": [[64, 64], [64, 32]], "p_dropout": 0.1}},

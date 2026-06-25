@@ -4,7 +4,7 @@
 # combine(), the design is descended by the discriminator score-function
 # (REINFORCE) estimator. The `lfi:` block replaces `subgradient:`; a
 # `discriminator:` net and its optimizer are added.
-detector: stereo
+detector: stereo_tracking
 
 # Initial (nominal) design -> the starting encoded theta (a named physical-design dict).
 # Field is FIXED at max_B (not a design dof: it collapsed to ~0 / was near-flat in the HNL runs).

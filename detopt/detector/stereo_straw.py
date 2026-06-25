@@ -19,7 +19,7 @@ from typing import NamedTuple
 import jax
 import numpy as np
 
-from .straw import StrawDetector
+from .straw import Pool, StrawDetector
 from ..utils.encoding import normal_to_uniform_jax, uniform_to_normal_jax
 
 __all__ = ["StereoStrawDetector", "StereoDesign"]
@@ -29,7 +29,7 @@ class StereoDesign(NamedTuple):
     """Compact stereo design: per-station z centres + one shared stereo angle (field fixed)."""
 
     stations: jax.Array  # (..., n_stations)
-    angle: jax.Array  # (..., 1)
+    view_angle: jax.Array  # (..., 1)  stereo view angle in radians (FairShip's `view_angle`)
 
 
 class StereoStrawDetector(StrawDetector):
@@ -50,12 +50,12 @@ class StereoStrawDetector(StrawDetector):
         magnet_half_cm: float = 140.0,  # magnet z half-width (FairShip YokeDepth)
         station_width: float = 100.0,  # station z full-width (= 2 x FairShip strawtubes station_length 50)
         station_clearance: float = 0.0,  # minimum z gap between adjacent station footprints (0 = may touch)
-        # Physics / field -- FairShip V2023 MainSpectrometerField (NEGATIVE polarity, int Bx dz = -1.07
-        # T.m over the 208 cm width). The old +0.20 default had the wrong sign (tracks bent the opposite
-        # way -> 12-18 cm divergence from FairShip downstream of the magnet); with these our crossings
-        # match FairShip's MC hits to sub-3 mm at all 4 stations. Faithfulness tracks int Bx dz + sign,
-        # not the width (283/-0.151 and 208/-0.205 are equally faithful; both give int Bx dz = -1.07).
-        max_B: float = -0.205,
+        # Physics / field -- FairShip V2023 MainSpectrometerField (NEGATIVE polarity). Parametrized by the
+        # FIELD INTEGRAL int Bx dz (T.m, the magnet's bending power) + the Gaussian width B_sigma (cm); the
+        # on-axis peak is DERIVED (max_B = field_integral / (B_sigma*sqrt(2pi))). int Bx dz = -1.07 T.m is
+        # the faithful value (the sign matters -- the old +0.20 peak bent the wrong way -> 12-18 cm
+        # divergence downstream); the width is not separately faithful (208 & 283 cm both give -1.07 T.m).
+        field_integral: float = -1.069,  # T.m, int Bx dz  (== -0.205 T peak x 208 cm)
         z0: float = 8957.0,
         B_sigma: float = 208.0,
         layer_bounds: tuple = (8000.0, 10000.0),
@@ -78,8 +78,16 @@ class StereoStrawDetector(StrawDetector):
         # overridden here. To recompute from data, edit the base defaults to None.
         data_dir=None,
         boundary_z=None,
-        pool_split=None,
+        engine: str = "realistic",  # 'realistic' (C ODE solver) | 'simplified' (analytic straight->bend->straight)
+        # The no-data analytic INPUT-EVENT source (momentum_mean/vertex_mean/hnl_mass/...) is generic HNL
+        # physics owned by the BASE StrawDetector and forwarded through -- it is NOT a stereo-geometry
+        # concern, so this class doesn't name it.
+        **kwargs,
     ):
+        # Derive the on-axis Gaussian peak (T) from the field integral (T.m) + width (cm). z is in cm
+        # while int Bx dz is quoted in T.m, hence the 100x: peak * B_sigma[cm] * sqrt(2pi) = int Bx dz[T.cm]
+        # = 100 * int Bx dz[T.m].
+        max_B = field_integral * 100.0 / (B_sigma * np.sqrt(2.0 * np.pi))
         super().__init__(
             n_stations=int(n_stations_upstream) + int(n_stations_downstream),
             n_views_per_station=4,  # fixed [0, +a, -a, 0] stereo layout
@@ -107,8 +115,10 @@ class StereoStrawDetector(StrawDetector):
             scatter_xX0=scatter_xX0,
             data_dir=data_dir,
             boundary_z=boundary_z,
-            pool_split=pool_split,
+            engine=engine,
+            **kwargs,  # the no-data analytic INPUT-EVENT params (momentum_mean/...) -> base StrawDetector
         )
+        self.field_integral = float(field_integral)  # T.m, int Bx dz (config param; self.max_B is derived)
         self.n_stations_upstream = int(n_stations_upstream)
         self.stereo_bound = (float(stereo_bound[0]), float(stereo_bound[1]))
         self.magnet_half_cm = float(magnet_half_cm)
@@ -134,6 +144,8 @@ class StereoStrawDetector(StrawDetector):
         self._layer_station = np.array(st, dtype=np.int64)
         self._layer_zoff = np.array(zoff, dtype=np.float32)
         self._layer_anglesign = np.array(sign, dtype=np.float32)
+        # The event SOURCE (data gather OR the no-data analytic HNL generator) lives entirely in the base
+        # StrawDetector -- this class is ONLY the stereo geometry parametrization.
 
     def _station_lo_hi(self, k, prev_z):
         """Coupled ``(lo, hi)`` bound on the station-CENTRE z at global index ``k``.
@@ -171,40 +183,45 @@ class StereoStrawDetector(StrawDetector):
     def design_spec(self):
         # StereoDesign filled with ShapeDtypeStruct; flatten/unflatten are generic (base, via tensor).
         f = lambda n: jax.ShapeDtypeStruct((n,), np.float32)
-        return StereoDesign(stations=f(self.n_stations), angle=f(1))
+        return StereoDesign(stations=f(self.n_stations), view_angle=f(1))
 
     def design_bounds(self):
         # station-CENTRE range (footprint must fit inside layer_bounds) + the stereo angle range
         lo, hi = self.layer_bounds
         return {
             "stations": (lo + 0.5 * self.station_width, hi - 0.5 * self.station_width),
-            "angle": (self.stereo_bound[0], self.stereo_bound[1]),
+            "view_angle": (self.stereo_bound[0], self.stereo_bound[1]),
         }
 
-    def _expand(self, design, xp):
-        """Compact ``[station_z(n_stations), a]`` -> per-layer ``(positions, angles)``.
-
-        ``xp`` is ``numpy`` or ``jax.numpy``; batched on the leading axis.
-        """
-        design = xp.asarray(design)
-        single = design.ndim == 1
-        if single:
-            design = design[None, :]
+    def _as_stereo_design(self, design, xp):
+        """Normalize a physical design -- a :class:`StereoDesign` namedtuple OR its flat
+        ``[station_z(n_stations), view_angle]`` array -- to a BATCHED ``StereoDesign``. The ONE positional
+        split (the flat<->named boundary) lives HERE; the geometry + combine then read ``.stations`` /
+        ``.view_angle`` by name, never by index. ``xp`` is ``numpy`` / ``jax.numpy``."""
+        if isinstance(design, StereoDesign):
+            return design
+        d = xp.asarray(design)
+        d = d if d.ndim == 2 else d[None, :]
         ns = self.n_stations
-        station_z = design[:, :ns]  # (B, ns)
-        alpha = design[:, ns : ns + 1]  # (B, 1)
-        positions = station_z[:, self._layer_station] + self._layer_zoff  # (B, n_layers)
-        angles = alpha * self._layer_anglesign  # (B, n_layers)
+        return StereoDesign(stations=d[:, :ns], view_angle=d[:, ns:ns + 1])
+
+    def _expand(self, design, xp):
+        """Per-detector ``StereoDesign(stations, view_angle)`` -- or its flat encoding -- expanded to
+        per-layer ``(positions, angles)``. ``xp`` is ``numpy`` / ``jax.numpy``; batched on the leading
+        axis (a 1-D flat input is squeezed back on output)."""
+        single = not isinstance(design, StereoDesign) and xp.asarray(design).ndim == 1
+        d = self._as_stereo_design(design, xp)
+        positions = d.stations[:, self._layer_station] + self._layer_zoff  # (B, n_layers)
+        angles = d.view_angle * self._layer_anglesign                       # (B, n_layers)
         if single:
             positions, angles = positions[0], angles[0]
         return positions, angles
 
     def _design_to_geometry(self, design):
-        design = np.asarray(design, np.float32)
-        d2 = design[None, :] if design.ndim == 1 else design
-        positions, angles = self._expand(d2, np)
+        d = self._as_stereo_design(design, np)  # StereoDesign (batched); accepts a namedtuple or flat array
+        positions, angles = self._expand(d, np)
         # Field is fixed at max_B (not a design dof).
-        Bs = np.full(d2.shape[0], self.max_B, dtype=np.float32)
+        Bs = np.full(d.stations.shape[0], self.max_B, dtype=np.float32)
         return positions.astype(np.float32), angles.astype(np.float32), Bs
 
     # ------------------------------------------------------------------ #

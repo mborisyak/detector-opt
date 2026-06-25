@@ -1,10 +1,9 @@
-detector: stereo
+detector: stereo_tracking
 design: initial_stereo
 
 regressor:
   set-regressor:
     features: [ [ 64, 32 ], [ 64, 32 ]]
-    #induced: 8
 
 optimizer:
   adamw:

@@ -14,7 +14,7 @@ import detopt
 def save_all_data(seed, output, chunk_size=1000, **config):
 
     detector = detopt.detector.from_config(config["detector"])
-    enc = detector.get_encoded_current_design()
+    enc = detector.encode_design(config["design"])  # design ALWAYS from config (detector holds none)
     enc = enc.reshape(1, -1)
 
     # Load data to get total number of events

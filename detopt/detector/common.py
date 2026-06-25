@@ -82,6 +82,24 @@ class Detector(object):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "Detector":
+        """Build the detector from a (yaml-parsed) ``config`` dict, passing its entries straight into
+        ``__init__``. Validates the keys against the constructor signature(s) across the MRO, so an
+        unknown or mistyped key raises instead of being silently splatted. The single concrete factory
+        for every detector (no subclass override)."""
+        import inspect
+
+        allowed = set()
+        for klass in cls.__mro__:
+            init = klass.__dict__.get("__init__")
+            if init is None:
+                continue
+            for name, p in inspect.signature(init).parameters.items():
+                if name == "self" or p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
+                    continue
+                allowed.add(name)
+        unknown = set(config) - allowed
+        if unknown:
+            raise ValueError(f"unknown {cls.__name__} config key(s): {sorted(unknown)}")
         return cls(**config)
 
     # ------------------------------------------------------------------ #
@@ -132,37 +150,17 @@ class Detector(object):
         """Per-hit feature count produced by :meth:`combine`."""
         return int(self.combined_event_shape()[-1])
 
-    def __call__(self, seed, design, pool=None):
-        """
-        Generates events for an un-encoded design. Returns (ground_truth, event, mask, target),
-        where event/target/ground_truth are namedtuple records (leaves carry a leading batch axis).
-
-        ``pool`` (int|str, default = first pool key) selects which disjoint event pool to
-        sample from -- see ``pool_split`` on the concrete detector.
-        """
+    def __call__(self, design, event_index):
+        """Simulate the events at the integer ``event_index`` for ``design`` -- a DETERMINISTIC function
+        (same ``(design, event_index)`` -> same output). Returns ``(ground_truth, event, mask, target)``,
+        namedtuple records (leaves carry a leading batch axis). No internal sampling or pools: the scripts
+        own the randomness + the train/val split (see :func:`detopt.utils.events.shuffled_event_index`)."""
         raise NotImplementedError()
 
-    ### TODO: this function belongs to utils
-    @staticmethod
-    def resolve_pool_split(pool_split):
-        """Normalise a ``pool_split`` (Sequence | Mapping | None) into an ordered dict of
-        ``{key: fraction}`` with fractions summing to 1. A ``Sequence`` keys by position
-        (``0, 1, ...``); ``None`` is a single pool ``{0: 1.0}`` over all events. Pool keys
-        are int or str; the first key is the default pool."""
-        from collections.abc import Mapping, Sequence
-
-        if pool_split is None:
-            return {0: 1.0}
-        if isinstance(pool_split, Mapping):
-            items = {k: float(v) for k, v in pool_split.items()}
-        elif isinstance(pool_split, Sequence) and not isinstance(pool_split, (str, bytes)):
-            items = {i: float(v) for i, v in enumerate(pool_split)}
-        else:
-            raise TypeError(f"pool_split must be a Sequence, Mapping, or None; got {type(pool_split)}")
-        total = sum(items.values())
-        if total <= 0:
-            raise ValueError(f"pool_split fractions must sum to > 0; got {items}")
-        return {k: v / total for k, v in items.items()}
+    def size(self):
+        """Number of available events -- a finite int (data-backed) or ``None`` (infinite, e.g. an
+        analytic source). Scripts use it to build a shuffled ``event_index``."""
+        raise NotImplementedError()
 
     # ------------------------------------------------------------------ #
     # Physical design as a typed ``Design`` namedtuple (e.g. stereo: ``(stations, angle)``); the
@@ -226,15 +224,28 @@ class Detector(object):
     # ------------------------------------------------------------------ #
     # Combine: raw event (+ design) -> flat per-hit network features.
     # ------------------------------------------------------------------ #
-    def combine_encoded(self, event, encoded_design):
+    def combine_encoded(self, event, encoded_design, mask=None):
         """Merge a raw ``Event`` and an ENCODED design into ``features (..., M, F)`` (defined per
-        detector). Normalises/packs the event internally; differentiable w.r.t. the encoded design."""
+        detector). Normalises/packs the event internally; differentiable w.r.t. the encoded design.
+
+        ``mask`` (the per-hit validity mask) is OPTIONAL: hit-wise combines ignore it (padded hits
+        carry index 0 and are zeroed downstream by the regressor mask). Combines whose element axis
+        is NOT the hit axis (e.g. layer-wise, which scatters hits into a per-layer grid) REQUIRE it
+        to distinguish real hits from padding, and raise if it is ``None``."""
         raise NotImplementedError()
 
-    def combine(self, event, design):
-        """Merge a raw ``Event`` and a PHYSICAL design. Default: encode the design, then
-        :meth:`combine_encoded`. Detectors may override how they combine."""
-        return self.combine_encoded(event, self.encode_design(design))
+    def combine(self, event, design, mask=None):
+        """Merge a raw ``Event`` and a PHYSICAL design: encode it, then :meth:`combine_encoded`. NEVER
+        overridden -- the feature layout varies through ``combine_encoded``. (The FairShip replay is NOT
+        design-blind: the caller passes the geometry the data was recorded at -- it already has it.)"""
+        return self.combine_encoded(event, self.encode_design(design), mask=mask)
+
+    def element_mask(self, event, mask):
+        """Per-ELEMENT validity mask ``(..., n_elements)`` for the regressor aggregation -- the element
+        axis matches :meth:`combine_encoded`, so each combine leaf IMPLEMENTS it: a hit-wise combine
+        returns the hit ``mask`` unchanged (element == hit); a layer-wise combine returns the all-valid
+        per-layer mask. Abstract here (it varies with the combine)."""
+        raise NotImplementedError()
 
     # ------------------------------------------------------------------ #
     # Target / ground-truth normalisation.

@@ -1,0 +1,27 @@
+detector: stereo_hits
+design: initial_stereo
+
+regressor:
+  continuous-conv-regressor:
+    features: [ [ 64 ], [ 64 ] ]   # block value widths (all equal for kernel_per_block=false)
+    kernel_features: [ 32 ]        # kernel-net hidden widths
+    kernel_per_block: false        # true -> a kernel net per block (last_k -> new_k)
+
+optimizer:
+  adamw:
+    learning_rate:
+      cosine_decay_schedule:
+        init_value: 1.0e-3
+    weight_decay: 1.0e-6
+
+sampling:
+  batch: 1024
+
+training:
+  batch: 32
+  epochs: 2048
+  samples: 65536
+
+validation:
+  batch: 128
+  samples: 16384

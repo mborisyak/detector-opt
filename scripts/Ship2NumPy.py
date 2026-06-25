@@ -24,6 +24,10 @@ Acceptance / selection
   daughters leave straw MC hits in all 4 tracking stations.  Hits from a
   daughter's descendants (e.g. a track created when the daughter scatters)
   count as the original daughter's.
+* With ``--reco-only`` an event is exported only if FairShip reconstructed an HNL
+  candidate for it (the ShipAna selection: both daughters Ndf >= measCut, MC-matched
+  to the same HNL, Doca <= DOCA_CUT).  Requires the matching ``*_rec.root`` file; with
+  ``--reco`` the kept events' ``reco`` rows are therefore all finite.
 * A particle is snapshotted if it was born upstream of the boundary and is
   still alive past it ("born before, decayed after").  Its decay z is taken
   from the production vertex of its daughters (``+inf`` if it has none).
@@ -183,6 +187,14 @@ def parse_args():
              "the DOCA/vertex fit uses), matched to the true HNL with the ShipAna "
              "selection. Requires the matching *_rec.root file and loads the "
              "geometry and field map to re-extrapolate FitTracks.",
+    )
+    parser.add_argument(
+        "--reco-only", dest="reco_only", action="store_true",
+        help="Export ONLY events FairShip reconstructed, i.e. with an HNL candidate "
+             "passing the ShipAna selection (both daughters Ndf >= measCut, MC-matched "
+             "to the same HNL, Doca <= DOCA_CUT). Requires the matching *_rec.root file. "
+             "Combine with --reco to dump kinematics (every kept event's reco row is then "
+             "finite); without --reco it filters using the candidate test alone.",
     )
     return parser.parse_args()
 
@@ -574,7 +586,7 @@ def snapshot_at_boundary(track, z_boundary):
 
 
 def process_file(input_file, geo_override, boundary_spec, event_offset, store,
-                 full_mc, rec, reco, require_all4):
+                 full_mc, rec, reco, reco_only, require_all4):
     """Append rows for one ROOT file; return the number of accepted events."""
     truth = store["truth"]
     particles = store["particles"]
@@ -605,14 +617,15 @@ def process_file(input_file, geo_override, boundary_spec, event_offset, store,
     # --full-mc but only opportunistic for --rec.
     rec_ok = False       # report reco efficiency (--rec)
     reco_dump = False     # dump reconstructed HNL kinematics (--reco)
+    reco_filter = False   # export only FairShip-reconstructed events (--reco-only)
     has_digi = False
-    if rec or full_mc or reco:
+    if rec or full_mc or reco or reco_only:
         rec_file = input_file[:-5] + "_rec.root"  # ".root" -> "_rec.root"
         if not os.path.exists(rec_file):
-            if full_mc or reco:
+            if full_mc or reco or reco_only:
                 raise FileNotFoundError(
-                    f"--full-mc/--reco require the reconstruction file {rec_file}, "
-                    "but it was not found"
+                    f"--full-mc/--reco/--reco-only require the reconstruction file "
+                    f"{rec_file}, but it was not found"
                 )
             print(f"  warning: no {rec_file}; reco efficiency not counted")
         else:
@@ -623,7 +636,7 @@ def process_file(input_file, geo_override, boundary_spec, event_offset, store,
                     f"{rec_file} has no Digi_strawtubesHits branch; cannot dump "
                     "straw TDC for --full-mc"
                 )
-            if rec or reco:
+            if rec or reco or reco_only:
                 use_pr = bool(sTree.GetBranch("FitTracks_PR"))
                 meas_cut = MEAS_CUT_PR if use_pr else MEAS_CUT
                 fit_name = "FitTracks_PR" if use_pr else "FitTracks"
@@ -631,6 +644,7 @@ def process_file(input_file, geo_override, boundary_spec, event_offset, store,
                 part_name = "Particles_PR" if use_pr else "Particles"
                 rec_ok = rec
                 reco_dump = reco
+                reco_filter = reco_only
                 if rec:
                     store["rec_available"] = True
                 if reco:
@@ -684,6 +698,26 @@ def process_file(input_file, geo_override, boundary_spec, event_offset, store,
                 and crosses_finite_tracker(d2, z_boundary, half_width, half_height)):
             continue
 
+        # --- reconstruction (dump and/or --reco-only filter) ------------------
+        # Determine the reconstruction BEFORE committing any of this event's rows,
+        # so --reco-only can drop a non-reconstructed event cleanly. When dumping
+        # kinematics (--reco) the candidate IS the reco row; otherwise the cheaper
+        # candidate test (no genfit extrapolation) decides.
+        reco_row = None
+        if reco_dump:
+            reco_row = reco_hnl_for_event(
+                getattr(sTree, part_name), getattr(sTree, fit_name),
+                getattr(sTree, f2mc_name), mc_tracks, daughters,
+                meas_cut, DOCA_CUT,
+            )
+        if reco_filter:
+            reconstructed = (reco_row is not None) if reco_dump else has_hnl_candidate(
+                getattr(sTree, part_name), getattr(sTree, fit_name),
+                getattr(sTree, f2mc_name), mc_tracks, meas_cut, DOCA_CUT,
+            )
+            if not reconstructed:
+                continue  # FairShip did not reconstruct this event -> do not export it
+
         # --- ground truth row -------------------------------------------------
         hnl = mc_tracks[hnl_id]
         v1 = (d1.GetStartX(), d1.GetStartY(), d1.GetStartZ())
@@ -703,14 +737,10 @@ def process_file(input_file, geo_override, boundary_spec, event_offset, store,
         ])
 
         # --- reconstructed HNL candidate row (optional) -----------------------
-        # One row per accepted event, aligned with `truth`; all-NaN when no
-        # matched candidate passes the ShipAna selection.
+        # One row per accepted event, aligned with `truth` (computed above). All-NaN
+        # when no matched candidate passes the ShipAna selection; with --reco-only only
+        # reconstructed events reach here, so every dumped row is finite.
         if reco_dump:
-            reco_row = reco_hnl_for_event(
-                getattr(sTree, part_name), getattr(sTree, fit_name),
-                getattr(sTree, f2mc_name), mc_tracks, daughters,
-                meas_cut, DOCA_CUT,
-            )
             store["reco"].append(reco_row if reco_row is not None else [math.nan] * 19)
 
         # --- particle snapshots at the boundary -------------------------------
@@ -808,7 +838,7 @@ def main():
         event_offset += process_file(
             input_file, options.geo_file, options.boundary,
             event_offset, store, options.full_mc, options.rec,
-            options.reco, options.require_all4,
+            options.reco, options.reco_only, options.require_all4,
         )
 
     z_boundary, half_width, half_height = store["boundary"]

@@ -311,8 +311,7 @@ def train_and_evaluate(
       * at the end, computes the BO objective as the exact MSE over **every
         event** in the pool's final val partition (sequential, no random).
     """
-    detector.update_from_yaml_design(design_params)
-    design = detector.get_encoded_current_design()
+    design = detector.encode_design(design_params)  # design ALWAYS supplied (detector holds none)
 
     if init_state is None:
         regressor_def, r_params, r_state, opt_state, optimizer = _init_regressor_state(detector, config, seed)

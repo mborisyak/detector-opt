@@ -120,12 +120,13 @@ typedef struct {
   npy_float layer_width, layer_height;  // fixed straw half-length (x) / half-height (y), from Layout
 } Geometry;
 
-/* Mutable dense output, written in place: padded (n, M, 5) hits + (n, M) mask
- * (mask[e,i]=1 for a real hit, 0 for padding -- the per-event count is just
- * mask[e].sum()) and the (n, n_tracks, m, 3) per-track trajectory crossings. */
+/* Mutable dense output, written in place: padded (n, M, 4) integer hit addresses
+ * [station, view, layer, straw] + (n, M) TDC where tdc < 0 (-1) marks NO hit -- the TDC
+ * doubles as the mask (the per-event count is (out_tdc[e] >= 0).sum()) -- plus the
+ * (n, n_tracks, m, 3) per-track trajectory crossings. */
 typedef struct {
-  npy_float *X;
-  int *mask;
+  npy_uint32 *hits_idx;  // (n, M, 4) [station, view, layer, straw]
+  npy_float *out_tdc;    // (n, M) min-subtracted TDC; < 0 (caller inits to -1) = padding / no hit
   // Optional per-hit TMCProcess code of the particle that caused the hit, parallel
   // to mask ((n, M) int32); NULL to skip. The first particle to fire a straw owns
   // the hit (later crossings of the same straw are deduped, so do not overwrite it).
@@ -218,13 +219,13 @@ static void emit_event(const SimConfig *cfg, HitBuffers *out, int event_idx, Tdc
     const int rem = (per_station > 0) ? k % per_station : 0;
     const int view = (cfg->n_lpv > 0) ? rem / cfg->n_lpv : 0;
     const int lpv = (cfg->n_lpv > 0) ? rem % cfg->n_lpv : 0;
-    const npy_intp base = (npy_intp)event_idx * cfg->M * 5 + (npy_intp)i * 5;
-    out->X[base + 0] = (npy_float)station;
-    out->X[base + 1] = (npy_float)view;
-    out->X[base + 2] = (npy_float)lpv;
-    out->X[base + 3] = (npy_float)straw_i;
-    out->X[base + 4] = out->tdc[idx] - min_tdc;  // time relative to the first signal in the event
-    out->mask[(npy_intp)event_idx * cfg->M + i] = 1;
+    const npy_intp ai = (npy_intp)event_idx * cfg->M * 4 + (npy_intp)i * 4;
+    out->hits_idx[ai + 0] = (npy_uint32)station;
+    out->hits_idx[ai + 1] = (npy_uint32)view;
+    out->hits_idx[ai + 2] = (npy_uint32)lpv;
+    out->hits_idx[ai + 3] = (npy_uint32)straw_i;
+    // TDC relative to the first signal in the event (>= 0 for a real hit; padding stays the caller's -1).
+    out->out_tdc[(npy_intp)event_idx * cfg->M + i] = out->tdc[idx] - min_tdc;
     if (out->process_ids != NULL) out->process_ids[(npy_intp)event_idx * cfg->M + i] = out->proc[idx];
   }
   for (int i = 0; i < n_fired; ++i) out->tdc[out->fired_idx[i]] = STRAW_TDC_EMPTY;  // sparse-clear
@@ -1148,15 +1149,15 @@ static PyObject *solve(PyObject *self, PyObject *args) {
   // Init-once objects: SimParams/Layout/InputEvents/Scratch + optional DebugBuffers.
   PyObject *py_sim_params = NULL, *py_layout = NULL, *py_input_events = NULL, *py_scratch = NULL, *py_debug = NULL;
   // Explicit per-call arrays: seeds, (n,2) boundaries, the per-layer design (z + angle
-  // + peak B), the non-debug outputs X/mask, the per-track trajectory outputs
-  // z_planes/traj/n_cross/part_idx (z_planes+traj None to skip) and the `primaries` flag.
+  // + peak B), the non-debug outputs hits_idx (n,M,4) u32 + tdc (n,M) f32 (tdc<0 = no hit), the
+  // per-track trajectory z_planes/traj/n_cross/part_idx (z_planes+traj None to skip), `primaries`.
   PyObject *py_seeds = NULL, *py_boundaries = NULL, *py_layers = NULL, *py_angles = NULL, *py_B = NULL;
-  PyObject *py_X = NULL, *py_mask = NULL;
+  PyObject *py_hits_idx = NULL, *py_tdc = NULL;
   PyObject *py_z_planes = NULL, *py_traj = NULL, *py_n_cross = NULL, *py_part_idx = NULL, *py_primaries = NULL;
 
   if (!PyArg_UnpackTuple(
           args, "straw_solve", 17, 17, &py_sim_params, &py_layout, &py_input_events, &py_scratch,
-          &py_seeds, &py_boundaries, &py_layers, &py_angles, &py_B, &py_X, &py_mask,
+          &py_seeds, &py_boundaries, &py_layers, &py_angles, &py_B, &py_hits_idx, &py_tdc,
           &py_z_planes, &py_traj, &py_n_cross, &py_part_idx, &py_primaries, &py_debug)) {
     return NULL;
   }
@@ -1197,16 +1198,22 @@ static PyObject *solve(PyObject *self, PyObject *args) {
   }
   const npy_uint32 *seeds = (const npy_uint32 *)PyArray_DATA((PyArrayObject *)py_seeds);
 
-  // Non-debug dense outputs: X (n, M, 5), mask (n, M). M = X.shape[1]. (No counts --
-  // the per-event hit count is mask[e].sum().)
-  if (!PyArray_Check(py_X) || PyArray_NDIM((PyArrayObject *)py_X) != 3 ||
-      PyArray_DIM((PyArrayObject *)py_X, 0) != n_batch || PyArray_DIM((PyArrayObject *)py_X, 2) != 5) {
-    PyErr_SetString(PyExc_TypeError, "X must be a (n, M, 5) float32 array");
+  // Non-debug dense outputs: hits_idx (n, M, 4) uint32 [station,view,layer,straw] + tdc (n, M) float32,
+  // where tdc < 0 marks no hit (the caller inits tdc to -1; tdc >= 0 IS the per-event mask). M = M dim.
+  if (!PyArray_Check(py_hits_idx) || PyArray_TYPE((PyArrayObject *)py_hits_idx) != NPY_UINT32 ||
+      PyArray_NDIM((PyArrayObject *)py_hits_idx) != 3 ||
+      PyArray_DIM((PyArrayObject *)py_hits_idx, 0) != n_batch || PyArray_DIM((PyArrayObject *)py_hits_idx, 2) != 4) {
+    PyErr_SetString(PyExc_TypeError, "hits_idx must be a (n, M, 4) uint32 array");
     return NULL;
   }
-  out.X = (npy_float *)PyArray_DATA((PyArrayObject *)py_X);
-  out.mask = (int *)PyArray_DATA((PyArrayObject *)py_mask);
-  cfg.M = (int)PyArray_DIM((PyArrayObject *)py_X, 1);
+  if (!PyArray_Check(py_tdc) || PyArray_TYPE((PyArrayObject *)py_tdc) != NPY_FLOAT32 ||
+      PyArray_NDIM((PyArrayObject *)py_tdc) != 2 || PyArray_DIM((PyArrayObject *)py_tdc, 0) != n_batch) {
+    PyErr_SetString(PyExc_TypeError, "tdc must be a (n, M) float32 array");
+    return NULL;
+  }
+  out.hits_idx = (npy_uint32 *)PyArray_DATA((PyArrayObject *)py_hits_idx);
+  out.out_tdc = (npy_float *)PyArray_DATA((PyArrayObject *)py_tdc);
+  cfg.M = (int)PyArray_DIM((PyArrayObject *)py_hits_idx, 1);
 
   // Per-track trajectory (z_planes + traj None to skip): z_planes (m,) f32, traj
   // (n, n_tracks, m, 3) f32, n_cross (n, n_tracks) i32, part_idx (n, n_tracks) i32.

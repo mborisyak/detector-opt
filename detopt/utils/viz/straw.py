@@ -43,19 +43,26 @@ def daughter_polylines(detector, dd, design, rng, *, z_grid=None, m=None):
     if z_grid is None:
         lo, hi = detector.layer_bounds
         z_grid = np.linspace(float(lo), float(hi), 400)
-    ie = detector._make_input_events(dd)
+    from detopt.detector.straw import Pool
+
+    pool = Pool(dd["masses"], dd["charges"], dd["positions"], dd["momenta"], dd["times"])
     n = len(np.asarray(dd["masses"]))
     m = n if m is None else int(m)
     zp = np.ascontiguousarray(z_grid, dtype=np.float32)
     traj = np.zeros((1, m, zp.shape[0], 3), dtype=np.float32)
     n_cross = np.zeros((1, m), dtype=np.int32)
     part_idx = np.full((1, m), -1, dtype=np.int32)
-    X, mask, _ = detector._run_solver(
-        np.array([[0, n]], np.int32), design, rng, input_events=ie, z_planes=zp,
+    layers, angles, Bs = detector._design_to_geometry(design)
+    hits_idx, tdc, _ = detector._run_solver(
+        pool, np.array([[0, n]], np.int32), layers, angles, Bs,
+        rng.integers(1, 2**32, size=1, dtype=np.uint32), z_planes=zp,
         traj=traj, n_cross=n_cross, part_idx=part_idx, primaries=True,
     )
     lines = [traj[0, s, : int(n_cross[0, s])] for s in range(m)]  # each (n_cross, 3) ordered (x, y, z) polyline
-    return X, mask, lines
+    # show_event consumes the dense (1, M, 5) [station, view, layer, straw, tdc] layout (padding tdc = -1,
+    # masked out below) -- reassemble it from the engine's hits_idx + tdc buffers.
+    X = np.concatenate([hits_idx.astype(np.float32), np.asarray(tdc, np.float32)[..., None]], axis=-1)
+    return X, (tdc >= 0).astype(np.int32), lines
 
 
 def _require_pyvista():

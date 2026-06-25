@@ -1,6 +1,8 @@
-# NOTE: ragged-layout model (own combine + segment_sum over event_indices).
-# NOT YET PORTED to the new Detector padded (B, M, F) contract; superseded
-# by detopt/nn/set_regressor.py for the supervised path.
+# ⛔️ BROKEN / QUARANTINED -- DO NOT USE. Ragged-layout models (own combine + segment_sum over
+# event_indices) NOT PORTED to the new Detector padded (B, M, F) contract; superseded by
+# detopt/nn/set_regressor.py. `Regressor.__init__(detector)` calls the dead `event_shape()` /
+# `design_shape()` API, so construction fails (test_regressor.py is a known failure). Kept for
+# reference only -- intentionally NOT imported or registered in detopt/nn/__init__.py.
 import inspect
 import math
 from multiprocessing import Event

@@ -142,8 +142,7 @@ def regress(
 
     # Initialize detector (needed for design and normalization parameters)
     detector = detopt.detector.from_config(config["detector"])
-    print(f"Current design: {detector.get_current_design()}")
-    enc = detector.get_encoded_current_design()
+    enc = detector.encode_design(config["design"])  # design ALWAYS from config (detector holds none)
     enc = enc.reshape(1, -1)
     print(f"Encoded design: {enc}")
     print(f"Design parameters: {detector.get_design(enc)}")

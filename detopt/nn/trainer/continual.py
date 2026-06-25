@@ -5,12 +5,12 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
-from .design import DesignTrainer
+from .design import _DesignBase
 
 __all__ = ["ContinualTrainer"]
 
 
-class ContinualTrainer(DesignTrainer):
+class ContinualTrainer(_DesignBase):
     """Continually trains ONE network across all designs, with experience replay.
 
     Same shared budget pools, design-conditioned features, and convergence
@@ -29,21 +29,16 @@ class ContinualTrainer(DesignTrainer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._running = None  # (params, state, opt_state) persisted across designs
-        self._init_seed = self.seed  # the run seed, stored by Trainer.__init__
+        # ONE persistent network, continued across every design (the continual strategy IS the warm
+        # start). Built eagerly here -- never lazily on the first train() call -- so no jax array is
+        # cached behind a None. _persist_network writes the continued net back after each design.
+        _, params, state = self._build_regressor(self.seed)
+        opt_state = self.optimizer.init(params)
+        d = self.device
+        self._running = (jax.device_put(params, d), jax.device_put(state, d), jax.device_put(opt_state, d))
 
-    def _init_design_network(self, init_seq, init_params, init_state):
-        # Continual: build the network once, then keep continuing it. Warm-start
-        # args are ignored (the persistent net IS the warm start).
-        if self._running is None:
-            _, params, state = self._build_regressor(self._init_seed)
-            opt_state = self.optimizer.init(params)
-            d = self.device
-            self._running = (
-                jax.device_put(params, d),
-                jax.device_put(state, d),
-                jax.device_put(opt_state, d),
-            )
+    def _init_design_network(self, init_seq, init_params):
+        # The persistent net is the network for every design; warm-start args are ignored.
         return self._running
 
     def _persist_network(self, params, state, opt_state):

@@ -10,7 +10,7 @@ import numpy as np
 import optax
 
 from detopt.bo import BayesianOptimizer
-from detopt.detector.debug import DebugDetector
+from analytic import analytic_detector
 from detopt.nn.trainer import ContinualTrainer, DesignTrainer, FullBudgetTrainer
 
 _GP = dict(
@@ -64,7 +64,7 @@ def test_bo_gp_proposal_reproducible():
 
 
 def _design_trainer(seed):
-    det = DebugDetector()
+    det = analytic_detector()
     return DesignTrainer(
         det,
         regressor_config={"set-regressor": {"features": [[16, 16]], "p_dropout": 0.1}},
@@ -87,7 +87,7 @@ def _design_trainer(seed):
 
 
 def _loss(trainer, train_seed):
-    det = DebugDetector()
+    det = analytic_detector()
     design = np.zeros(det.design_dim(), dtype=np.float32)
     return float(trainer.train(design, np.random.SeedSequence(train_seed)).objective_loss)
 
@@ -103,7 +103,7 @@ def test_design_trainer_reproducible_by_train_seed():
 
 
 def _continual(seed):
-    det = DebugDetector()
+    det = analytic_detector()
     return ContinualTrainer(
         det,
         regressor_config={"set-regressor": {"features": [[16, 16]], "p_dropout": 0.1}},
@@ -137,7 +137,7 @@ def test_continual_trainer_seed_stored_and_propagated():
 
 
 def _fullbudget(seed):
-    det = DebugDetector()
+    det = analytic_detector()
     return FullBudgetTrainer(
         det,
         regressor_config={"set-regressor": {"features": [[16, 16]], "p_dropout": 0.1}},

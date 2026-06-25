@@ -1,0 +1,43 @@
+# Full default config for the `stereo_image` detector (StereoTrackingImage): EVERY __init__ parameter across
+# the class hierarchy, written at its default value. A reference / starting point -- copy and edit.
+# Required parameters (no default) are left null and MUST be set. `engine: simplified` + `data_dir:
+# null` is the no-data analytic source; `engine: realistic` needs a `data_dir`.
+stereo_image:
+  tdc_scale: 62.0
+  tdc_clip: 10000.0
+  n_stations_upstream: 2
+  n_stations_downstream: 2
+  n_layers_per_view: 2
+  n_straws_per_layer: 316
+  straw_pitch: 2.0
+  straw_length: 400.0
+  layer_z_gap: 1.732
+  view_z_gap: 5.0
+  stereo_bound: [0.0, 0.2]
+  magnet_half_cm: 140.0
+  station_width: 100.0
+  station_clearance: 0.0
+  field_integral: -1.069
+  z0: 8957.0
+  B_sigma: 208.0
+  layer_bounds: [8000.0, 10000.0]
+  dt: null
+  max_dt: 1.0
+  max_time: 200.0
+  max_particles: 5
+  max_hits_per_event: 384
+  material: 'kapton'
+  wall_thickness: 0.0036
+  delta_Tcut: 0.28
+  lambda_conv_cm: 95.0
+  enable_decay: true
+  noise_rate: 0.0
+  scatter_xX0: 0.00025
+  data_dir: null
+  boundary_z: null
+  engine: 'realistic'
+  hnl_momentum_mean: [0.0, 0.0, 46.7]
+  hnl_momentum_sigma: [0.54, 0.65, 28.2]
+  hnl_vertex_mean: [0.0, 0.0, 6206.0]
+  hnl_vertex_sigma: [76.0, 101.0, 1366.0]
+  hnl_mass: 1.0

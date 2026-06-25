@@ -20,14 +20,14 @@ exhausts the shared budget is reported as ``budget``.
 import numpy as np
 import optax
 
-from detopt.detector.debug import DebugDetector
+from detopt.detector import Stereo4Feature
 from detopt.nn.trainer import DesignTrainer
 
 DROPOUTS = [0.0, 0.1, 0.3]
 
 
 def run(seed=0, n_models=4, budget=400_000, iteration_limit=16384, loss_precision=2.0e-2):
-    det = DebugDetector()
+    det = Stereo4Feature(engine="simplified")
     # Nominal design: zeros in ENCODED space decode to the midpoint of every bound.
     design = np.zeros(det.design_dim(), dtype=np.float32)
     rows = []

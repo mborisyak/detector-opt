@@ -1,6 +1,5 @@
-import math
 import os
-import subprocess
+import warnings
 from typing import NamedTuple
 
 import jax
@@ -20,8 +19,22 @@ from ..utils import tensor
 from ..data import load_ship2numpy_events
 from . import straw_detector
 from .common import Detector
+from .propagation import RealisticEngine, SimplifiedEngine
+from ..utils.det_random import det_uniforms, box_muller
 
-__all__ = ["StrawDetector", "StrawEvent", "HNLTarget", "StrawGroundTruth", "MATERIALS", "material_constants"]
+__all__ = ["StrawDetector", "StrawEvent", "HNLTarget", "DaughterTarget", "StrawGroundTruth", "Pool",
+           "MATERIALS", "material_constants", "four_feature_combine", "four_feature_shape"]
+
+
+class Pool(NamedTuple):
+    """A particle pool the detector hands to a :class:`PropagationEngine` -- just the numpy arrays. The
+    realistic engine packs them into the C ``InputEvents`` inside its ``solve`` (a few cheap header checks
+    in C, no caching); the analytic engine reads ``positions``/``momenta``/``charges`` directly."""
+    masses: np.ndarray
+    charges: np.ndarray
+    positions: np.ndarray
+    momenta: np.ndarray
+    times: np.ndarray
 
 
 class StrawEvent(NamedTuple):
@@ -45,10 +58,20 @@ class StrawEvent(NamedTuple):
 
 
 class HNLTarget(NamedTuple):
-    """HNL regression target: decay vertex (cm) + HNL momentum (GeV)."""
+    """HNL regression target: decay vertex (cm) + HNL momentum (GeV). (Superseded by DaughterTarget as the
+    unified regression target; kept for the conditioning/ground-truth packing + back-compat.)"""
 
     vertex: jax.Array  # (..., 3)
     momentum: jax.Array  # (..., 3)
+
+
+class DaughterTarget(NamedTuple):
+    """The UNIFIED regression target for every detector: shared decay vertex (cm) + the two daughters'
+    momenta (GeV). The HNL momentum is the sum p1 + p2 (a derived prediction)."""
+
+    vertex: jax.Array  # (..., 3)
+    p1: jax.Array  # (..., 3)
+    p2: jax.Array  # (..., 3)
 
 
 class StrawGroundTruth(NamedTuple):
@@ -77,6 +100,22 @@ _MAX_SOLVER_STEPS = 200_000
 _STRAW_TDC_EMPTY = 1.0e30
 _SOLVER_MAX_DEPTH = 64  # secondary-cascade safety bound (faithful cascade self-terminates)
 
+# HNL -> 2-body decay daughters (the no-data analytic input-event source; generic, not geometry).
+_MUON_MASS = 0.105658  # GeV
+_PION_MASS = 0.139570  # GeV
+
+
+def _boost(p_rest, E_rest, P_hnl, E_hnl, M):
+    """Boost rest-frame 3-momenta (`p_rest`, energy `E_rest`) into the lab where the HNL has momentum
+    `P_hnl` (n,3) and energy `E_hnl` (n,). Batched; used by the no-data analytic event source."""
+    beta = P_hnl / E_hnl[:, None]
+    b2 = np.sum(beta**2, axis=1)
+    gamma = E_hnl / M
+    bp = np.sum(beta * p_rest, axis=1)
+    coeff = np.where(b2 > 1e-12, (gamma - 1.0) * bp / np.where(b2 > 1e-12, b2, 1.0), 0.0)
+    return (p_rest + beta * (coeff + gamma * E_rest)[:, None]).astype(np.float32)
+
+
 _K_HALF = 0.307075 / 2.0  # MeV mol^-1 cm^2
 MATERIALS = {
     "kapton": (0.51264, 1.42, 28.56),  # polyimide film -- FairShip straw wall (default)
@@ -92,6 +131,10 @@ def material_constants(material):
 
 
 class StrawDetector(Detector):
+    # The loaded ground-truth field used as the (unified) regression target: the daughter 9-vec
+    # [vertex, p1, p2]. One objective for every straw detector -- never overridden.
+    _targets_field = "daughter_targets"
+
     def __init__(
         self,
         # Geometry hierarchy (structural counts + fixed hardware; NO nominal design)
@@ -144,9 +187,18 @@ class StrawDetector(Detector):
         # (single-mass sample). None -> recompute from the loaded `conditioning`.
         mass_mean=0.5,
         mass_sigma=0.5,
-        data_dir=None,  # ship2numpy event file, preloaded once (None = no event source)
+        data_dir=None,  # ship2numpy event file, preloaded once (None -> the no-data analytic source)
         boundary_z=None,  # crossing-plane z (cm); None -> read from the file
-        pool_split=None,  # Sequence|Mapping of normalized fractions -> disjoint event pools (None = one pool)
+        engine="realistic",  # propagation engine: 'realistic' (C ODE solver) | 'simplified' (analytic)
+        # No-data analytic INPUT-EVENT source (data_dir=None): HNL momentum/vertex Gaussians -> 2-body
+        # decay -> 2 daughters. Generic HNL physics (NOT a geometry concern) -- the base owns it. The
+        # `hnl_` prefix keeps these GENERATION distributions distinct from the target-NORMALIZATION
+        # `momentum_mean`/`decay_mean`/... above.
+        hnl_momentum_mean: tuple = (0.0, 0.0, 46.7),
+        hnl_momentum_sigma: tuple = (0.54, 0.65, 28.2),
+        hnl_vertex_mean: tuple = (0.0, 0.0, 6206.0),
+        hnl_vertex_sigma: tuple = (76.0, 101.0, 1366.0),
+        hnl_mass: float = 1.0,
     ):
         """
         :param max_B: maximal strength of the magnetic field;
@@ -246,108 +298,71 @@ class StrawDetector(Detector):
         # by dt_step > 0); this is just a guard, decoupled from n_t.
         self.max_steps = _MAX_SOLVER_STEPS
 
-        # Event source: preload the file once into immutable per-event arrays and
-        # sample from them by seed. No train/val split, no mutable loader state --
-        # that does not belong to the detector. Mirrors DebugDetector, which
-        # generates events on demand from a seed (here drawn from a preloaded pool).
+        # Event source: preload the file once into immutable per-event arrays, addressed by
+        # event_index. No train/val split, no rng, no mutable loader state -- that belongs to the
+        # scripts, not the detector (the analytic subclass generates events from the index instead).
         self._events = None
         self._n_events = 0
         self.boundary_z = float(boundary_z) if boundary_z is not None else None
-        if data_dir is not None:
+        if data_dir is not None and engine != "relay":
             self._events = load_ship2numpy_events(data_dir, boundary_z=boundary_z)
             self._n_events = self._events["n_events"]
             self.boundary_z = self._events["boundary_z"]
 
-        # Disjoint event pools (e.g. train/val): partition the loaded events into index
-        # subsets by normalized fraction, after a deterministic shuffle (so pools are random
-        # and not biased by file/run order). `pool=` on generate_events/sample_events/__call__
-        # selects one. The first key is the default pool.
-        self.pool_split = self.resolve_pool_split(pool_split)
-        self._pools = {}
-        if self._n_events > 0:
-            perm = np.random.default_rng(0xC0FFEE).permutation(self._n_events)
-            start = 0
-            for k, frac in self.pool_split.items():
-                end = self._n_events if k == list(self.pool_split)[-1] else start + int(round(frac * self._n_events))
-                self._pools[k] = perm[start:end]
-                start = end
-        self._default_pool = next(iter(self.pool_split))
+        # Loaded particle pool (just the numpy arrays); None for a no-data (analytic) detector.
+        ev = self._events
+        self._pool = (Pool(ev["masses"], ev["charges"], ev["positions"], ev["momenta"], ev["times"])
+                      if ev is not None else None)
 
-        # Init-once C objects (constants + structural counts) + the reused per-straw
-        # scratch (sparse set; tdc starts at the empty sentinel). Built once, passed to
-        # every solve(); the design + outputs vary per call.
-        self._sim_params = straw_detector.SimParams(
-            self.max_dt,
-            self.max_time,
-            self.dt_fixed,
-            self.max_steps,
-            _SOLVER_MAX_DEPTH,
-            self.scatter_xX0,
-            self.lambda_conv_cm,
-            self.noise_rate,
-            self.enable_decay,
-            self.delta_const,
-            self.wall_thickness,
-            self.delta_Tcut,
-            self.enable_eloss,
-            self.eloss_wall_coef,
-            self.eloss_gas_const,
-            self.eloss_I,
-            self.eloss_min_ke,
+        # The propagation engine -- identical across all straw detectors, so it is built here in the base.
+        # The REALISTIC engine owns the C SimParams/Layout/Scratch; the simplified one is pure numpy. The
+        # detector holds none of that C state.
+        geometry = dict(
+            n_views_per_station=self.n_views_per_station, n_layers_per_view=self.n_layers_per_view,
+            n_straws=self.n_straws, n_layers=self.n_layers, max_hits_per_event=self.max_hits_per_event,
+            layer_width=self.layer_width, layer_height=self.layer_height, straw_pitch=self.straw_pitch,
+            layer_y_offset=self.layer_y_offset, B_sigma=self.B_sigma, z0=self.z0,
         )
-        self._layout = straw_detector.Layout(
-            self.n_views_per_station,
-            self.n_layers_per_view,
-            self.n_straws,
-            self.n_layers,
-            self.max_hits_per_event,
-            self.layer_y_offset,
-            self.layer_width,
-            self.layer_height,
-            self.z0,
-            self.B_sigma,  # fixed geometry/field constants (not optimised)
-        )
-        # Reused per-straw sparse-set scratch, wrapped in the C Scratch object (tdc starts
-        # at the empty sentinel; the numpy arrays are held alive by self._scratch).
-        n_cells = self.n_layers * self.n_straws
-        self._tdc = np.full(n_cells, _STRAW_TDC_EMPTY, dtype=np.float32)
-        self._proc = np.zeros(n_cells, dtype=np.int32)
-        self._fired_idx = np.zeros(n_cells, dtype=np.int32)
-        self._scratch = straw_detector.Scratch(self._tdc, self._proc, self._fired_idx)
-        # The validated, ref-held particle pool (only when an event source is loaded).
-        self._input_events = self._make_input_events(self._events) if self._events is not None else None
+        if engine == "realistic":
+            sim_params = straw_detector.SimParams(
+                self.max_dt, self.max_time, self.dt_fixed, self.max_steps, _SOLVER_MAX_DEPTH,
+                self.scatter_xX0, self.lambda_conv_cm, self.noise_rate, self.enable_decay, self.delta_const,
+                self.wall_thickness, self.delta_Tcut, self.enable_eloss, self.eloss_wall_coef,
+                self.eloss_gas_const, self.eloss_I, self.eloss_min_ke,
+            )
+            layout = straw_detector.Layout(
+                self.n_views_per_station, self.n_layers_per_view, self.n_straws, self.n_layers,
+                self.max_hits_per_event, self.layer_y_offset, self.layer_width, self.layer_height,
+                self.z0, self.B_sigma,
+            )
+            self.engine = RealisticEngine(sim_params, layout, **geometry)
+        elif engine == "simplified":
+            self.engine = SimplifiedEngine(**geometry)
+        elif engine == "relay":
+            self.engine = None  # special ENGINE-LESS source: replay packed FairShip data (see _load_relay)
+        else:
+            raise ValueError(f"unknown engine {engine!r} (expected 'realistic', 'simplified' or 'relay')")
 
-        # Resolve target-normalization constants (derive any left None from data).
+        # No-data analytic INPUT-EVENT source: with no loaded pool, _events_at SYNTHESIZES events from the
+        # HNL distributions (generic physics; works through EITHER engine -- source x engine independent).
+        self.hnl_momentum_mean = np.asarray(hnl_momentum_mean, dtype=np.float32)
+        self.hnl_momentum_sigma = np.asarray(hnl_momentum_sigma, dtype=np.float32)
+        self.hnl_vertex_mean = np.asarray(hnl_vertex_mean, dtype=np.float32)
+        self.hnl_vertex_sigma = np.asarray(hnl_vertex_sigma, dtype=np.float32)
+        self.hnl_mass = float(hnl_mass)
+        M, m1, m2 = self.hnl_mass, _MUON_MASS, _PION_MASS  # 2-body decay kinematics, fixed by the masses
+        self._decay_E1 = (M**2 + m1**2 - m2**2) / (2.0 * M)        # daughter-1 rest-frame energy
+        self._decay_E2 = (M**2 + m2**2 - m1**2) / (2.0 * M)        # daughter-2 rest-frame energy
+        self._decay_pstar = float(np.sqrt(max(self._decay_E1**2 - m1**2, 0.0)))  # rest-frame momentum
+        self._analytic = self._events is None
+
+        # Relay source: replay packed REAL FairShip hits at the fixed design (engine='relay'); no solver.
+        self._relay = engine == "relay"
+        if self._relay:
+            self._load_relay(data_dir)
+
+        # Resolve target-normalization constants (derive any left None from data; warns when it does).
         self._resolve_target_norm()
-
-    @staticmethod
-    def _make_input_events(ev):
-        """Wrap a pool dict (masses/charges/positions/momenta/times) in the C InputEvents
-        object (validates + holds refs once). Used for the loaded pool and by single-event
-        callers that build their own per-event arrays."""
-        return straw_detector.InputEvents(ev["masses"], ev["charges"], ev["positions"], ev["momenta"], ev["times"])
-
-    @classmethod
-    def from_config(cls, config):
-        """Build the detector from a (yaml-parsed) ``config`` dict, passing its
-        entries straight into ``__init__``. Unlike the base blind-splat, this
-        validates the keys against the constructor signature(s) so an unknown or
-        mistyped key raises instead of being silently ignored."""
-        import inspect
-
-        allowed = set()
-        for klass in cls.__mro__:
-            init = klass.__dict__.get("__init__")
-            if init is None:
-                continue
-            for name, p in inspect.signature(init).parameters.items():
-                if name == "self" or p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
-                    continue
-                allowed.add(name)
-        unknown = set(config) - allowed
-        if unknown:
-            raise ValueError(f"unknown {cls.__name__} config key(s): {sorted(unknown)}")
-        return cls(**config)
 
     # ------------------------------------------------------------------ #
     # Event source
@@ -375,13 +390,9 @@ class StrawDetector(Detector):
         return StrawEvent(station=i, view=i, layer=i, straw=i, tdc=jax.ShapeDtypeStruct((M,), np.float32))
 
     def target_spec(self):
-        # HNL regression target: decay vertex (cm) + HNL momentum (GeV). StereoTracking overrides.
+        # The unified daughter 9-vec target: shared decay vertex + the two daughters' momenta.
         f = lambda n: jax.ShapeDtypeStruct((n,), np.float32)
-        return HNLTarget(vertex=f(3), momentum=f(3))
-
-    def combined_event_shape(self):
-        # combine() -> [TDC, norm_layer_z, wire_y_left, wire_y_right]  (field fixed -> not a feature)
-        return (self.max_hits_per_event, 4)
+        return DaughterTarget(vertex=f(3), p1=f(3), p2=f(3))
 
     def ground_truth_spec(self):
         # Ground truth == conditioning: HNL mass + momentum + decay vertex (retires the old
@@ -414,6 +425,10 @@ class StrawDetector(Detector):
                     "target normalization has None entries but no data source to derive them from; "
                     "pass `data_dir` or supply decay_mean/decay_sigma/momentum_mean/momentum_sigma."
                 )
+            derived = [n for n, a in zip(("decay_mean", "decay_sigma", "momentum_mean", "momentum_sigma"), args)
+                       if a is None]
+            warnings.warn(f"StrawDetector: deriving target-norm {derived} from the loaded data -- a data swap "
+                          "will silently re-scale the loss; pass them explicitly to pin the scale.", stacklevel=2)
             t = self._events["targets"]  # (N, 6)
             d_mean, d_std, m_mean, m_std = t[:, :3].mean(0), t[:, :3].std(0), t[:, 3:].mean(0), t[:, 3:].std(0)
         else:
@@ -431,6 +446,7 @@ class StrawDetector(Detector):
         if self._mass_mean_arg is None or self._mass_sigma_arg is None:
             if self._events is None or self._events.get("conditioning") is None:
                 raise ValueError("mass normalization is None but no `conditioning` data to derive it from.")
+            warnings.warn("StrawDetector: deriving HNL mass-norm from the loaded data's conditioning.", stacklevel=2)
             mass = self._events["conditioning"][:, 0]
             mm = mass.mean() if self._mass_mean_arg is None else self._mass_mean_arg
             ms = mass.std() if self._mass_sigma_arg is None else self._mass_sigma_arg
@@ -444,6 +460,7 @@ class StrawDetector(Detector):
         if self._daughter_momentum_mean_arg is None or self._daughter_momentum_sigma_arg is None:
             if self._events is None or self._events.get("daughter_targets") is None:
                 raise ValueError("daughter-momentum normalization is None but no `daughter_targets` data to derive it from.")
+            warnings.warn("StrawDetector: deriving daughter-momentum norm from the loaded data.", stacklevel=2)
             dt = self._events["daughter_targets"]
             p = np.concatenate([dt[:, 3:6], dt[:, 6:9]], axis=0)  # pooled -> symmetric over daughters
             dm_mean = p.mean(0) if self._daughter_momentum_mean_arg is None else self._daughter_momentum_mean_arg
@@ -454,19 +471,12 @@ class StrawDetector(Detector):
         self.daughter_momentum_sigma = np.maximum(np.asarray(dm_std, dtype=np.float32), 1e-3)
 
     def _target_norm_parts(self):
-        """``(mean_parts, std_parts)`` for the network regression target, selected by
-        ``_targets_field`` (a subclass sets it to pick which sampled ground truth the net
-        predicts); concatenated to standardize. Default ``"targets"`` is the HNL
-        ``[vertex(3), momentum(3)]``; ``"daughter_targets"`` is ``[vertex(3), p1(3), p2(3)]`` (the
-        vertex reuses ``decay_*``; both daughter momenta share ``daughter_momentum_*``)."""
-        if getattr(self, "_targets_field", "targets") == "daughter_targets":
-            return (
-                (self.decay_mean, self.daughter_momentum_mean, self.daughter_momentum_mean),
-                (self.decay_sigma, self.daughter_momentum_sigma, self.daughter_momentum_sigma),
-            )
+        """``(mean_parts, std_parts)`` for the unified daughter target ``[vertex(3), p1(3), p2(3)]``,
+        concatenated to standardize: the vertex by ``decay_*``, both daughter momenta by
+        ``daughter_momentum_*``."""
         return (
-            (self.decay_mean, self.momentum_mean),
-            (self.decay_sigma, self.momentum_sigma),
+            (self.decay_mean, self.daughter_momentum_mean, self.daughter_momentum_mean),
+            (self.decay_sigma, self.daughter_momentum_sigma, self.daughter_momentum_sigma),
         )
 
     def _target_norm_arrays(self):
@@ -493,22 +503,34 @@ class StrawDetector(Detector):
         return tensor.unflatten(tensor.structure(self.target_spec()), phys)
 
     def prediction_errors(self, predicted_norm, target_norm):
-        """Signed real-unit residuals ``predicted - true`` per quantity, for error histograms.
-        Both inputs are NORMALIZED ``(N, 6)`` arrays; returns an ordered ``{label: (errors(N,),
-        unit)}`` -- vertex in cm, HNL momentum in GeV."""
+        """Signed real-unit residuals ``predicted - true``, for error histograms. The two daughters are
+        PERMUTATION-INVARIANT (matched by the loss-minimizing assignment, then POOLED into ``p_{x,y,z}``,
+        ``(2N, 3)`` in GeV); the HNL momentum ``p_hnl_{x,y,z}`` is the daughter-SUM residual (``N``, GeV);
+        the vertex is cm (``N``). Inputs are NORMALIZED ``(N, 9)``."""
         import numpy as np
 
-        pred = self.denormalize_predictions(predicted_norm)  # HNLTarget
+        pred = self.denormalize_predictions(predicted_norm)  # DaughterTarget
         true = self.denormalize_predictions(target_norm)
-        v = np.asarray(pred.vertex) - np.asarray(true.vertex)
-        p = np.asarray(pred.momentum) - np.asarray(true.momentum)
+        vertex = np.asarray(pred.vertex) - np.asarray(true.vertex)
+        p1p, p2p = np.asarray(pred.p1), np.asarray(pred.p2)
+        p1t, p2t = np.asarray(true.p1), np.asarray(true.p2)
+        l_direct = np.sum((p1p - p1t) ** 2 + (p2p - p2t) ** 2, axis=-1)
+        l_swap = np.sum((p2p - p1t) ** 2 + (p1p - p2t) ** 2, axis=-1)
+        swap = (l_swap < l_direct)[:, None]
+        err1 = np.where(swap, p2p - p1t, p1p - p1t)  # residual against true daughter 1
+        err2 = np.where(swap, p1p - p2t, p2p - p2t)  # residual against true daughter 2
+        mom = np.concatenate([err1, err2], axis=0)   # pooled over both daughters -> (2N, 3)
+        hnl = (p1p + p2p) - (p1t + p2t)              # HNL momentum (daughter sum) residual -> (N, 3)
         return {
-            "vertex_x": (v[:, 0], "cm"),
-            "vertex_y": (v[:, 1], "cm"),
-            "vertex_z": (v[:, 2], "cm"),
-            "p_x": (p[:, 0], "GeV"),
-            "p_y": (p[:, 1], "GeV"),
-            "p_z": (p[:, 2], "GeV"),
+            "vertex_x": (vertex[:, 0], "cm"),
+            "vertex_y": (vertex[:, 1], "cm"),
+            "vertex_z": (vertex[:, 2], "cm"),
+            "p_x": (mom[:, 0], "GeV"),
+            "p_y": (mom[:, 1], "GeV"),
+            "p_z": (mom[:, 2], "GeV"),
+            "p_hnl_x": (hnl[:, 0], "GeV"),
+            "p_hnl_y": (hnl[:, 1], "GeV"),
+            "p_hnl_z": (hnl[:, 2], "GeV"),
         }
 
     # ------------------------------------------------------------------ #
@@ -533,37 +555,82 @@ class StrawDetector(Detector):
         return f"MSE (normalized {self.target_dim()}-vec target)"
 
     def metric_labels(self):
-        """Keys of the metric() dict, in display order."""
-        return ("loss", "vertex_x", "vertex_y", "vertex_z", "p_x", "p_y", "p_z")
+        """Keys of the metric() dict, in display order: overall loss, vertex, the shared daughter
+        momentum ``p_{x,y,z}``, and the HNL momentum ``p_hnl_{x,y,z}`` (the daughter sum)."""
+        return ("loss", "vertex_x", "vertex_y", "vertex_z",
+                "p_x", "p_y", "p_z", "p_hnl_x", "p_hnl_y", "p_hnl_z")
 
     def loss(self, predicted, target):
-        """Per-sample ``(...,)`` mean-squared error between predictions and the ALREADY-NORMALIZED
-        6-vec target ``[vertex(3), momentum(3)]`` (the caller standardises via
-        :meth:`normalize_target`; predictions are in that same space). Broadcasts over any leading
-        axes (e.g. ``(members, B)``)."""
+        """The UNIFIED per-sample objective on the NORMALIZED daughter 9-vec ``[vertex, p1, p2]``: vertex
+        MSE + PERMUTATION-INVARIANT daughter-momenta MSE (the cheaper of the two daughter assignments) +
+        HNL-momentum MSE on the daughter sum, scaled by 0.5 (i.e. the MEAN ``0.5(p1+p2)``, so the sum sits
+        on the daughter normalization scale before its weight). Weighted 0.5 / 0.25 / 0.25 (sums to 1,
+        ~6-vec scale). The caller standardises via :meth:`normalize_target`; predictions live in that space.
+        Broadcasts over any leading axes (e.g. ``(members, B)``)."""
         import jax.numpy as jnp
 
-        predicted = jnp.asarray(predicted, jnp.float32)
-        target = jnp.asarray(target, jnp.float32)
-        return jnp.mean(jnp.square(predicted - target), axis=-1)
+        vp, vt = predicted[..., :3], target[..., :3]
+        p1p, p2p = predicted[..., 3:6], predicted[..., 6:9]
+        p1t, p2t = target[..., 3:6], target[..., 6:9]
+        loss_vertex = 0.5 * jnp.mean(jnp.square(vp - vt), axis=-1)
+        loss_daughters = 0.25 * jnp.minimum(
+            jnp.mean(jnp.square(p1p - p1t) + jnp.square(p2p - p2t), axis=-1),
+            jnp.mean(jnp.square(p2p - p1t) + jnp.square(p1p - p2t), axis=-1),
+        )
+        loss_hnl = 0.25 * jnp.mean(jnp.square(0.5 * ((p1p + p2p) - (p1t + p2t))), axis=-1)
+        return loss_vertex + loss_daughters + loss_hnl
 
     def metric(self, predicted, target):
-        """Per-sample diagnostics dict on the normalized target: overall ``loss`` plus per-component
-        squared error -- ``vertex_{x,y,z}`` and the momentum ``p_{x,y,z}``."""
+        """Per-sample diagnostics on the normalized daughter target: overall ``loss`` + per-component
+        squared error -- ``vertex_{x,y,z}``, the SHARED daughter momentum ``p_{x,y,z}`` (summed over the
+        two daughters under the best assignment), and the HNL momentum ``p_hnl_{x,y,z}`` (daughter sum)."""
         import jax.numpy as jnp
 
-        predicted = jnp.asarray(predicted, jnp.float32)
-        target = jnp.asarray(target, jnp.float32)
-        se = jnp.square(predicted - target)
+        vp, vt = predicted[..., :3], target[..., :3]
+        p1p, p2p = predicted[..., 3:6], predicted[..., 6:9]
+        p1t, p2t = target[..., 3:6], target[..., 6:9]
+        vertex = jnp.square(vp - vt)
+        l1 = jnp.square(p1p - p1t) + jnp.square(p2p - p2t)
+        l2 = jnp.square(p2p - p1t) + jnp.square(p1p - p2t)
+        swap = jnp.sum(l1, axis=-1) > jnp.sum(l2, axis=-1)
+        momenta = 0.5 * (
+          (1 - swap)[..., None] * l1 + swap[..., None] * l2
+        )
+        hnl = 0.5 * jnp.square((p1p + p2p) - (p1t + p2t))
         return {
             "loss": self.loss(predicted, target),
-            "vertex_x": se[..., 0],
-            "vertex_y": se[..., 1],
-            "vertex_z": se[..., 2],
-            "p_x": se[..., 3],
-            "p_y": se[..., 4],
-            "p_z": se[..., 5],
+            "vertex_x": vertex[..., 0], "vertex_y": vertex[..., 1], "vertex_z": vertex[..., 2],
+            "p_x": momenta[..., 0], "p_y": momenta[..., 1], "p_z": momenta[..., 2],
+            "p_hnl_x": hnl[..., 0], "p_hnl_y": hnl[..., 1], "p_hnl_z": hnl[..., 2],
         }
+
+    def metric_real_rmse(self, metric_means, metric_errors=None):
+        """Sample-averaged normalized per-component metric (from :meth:`metric`) -> real-unit RMSE.
+        ``vertex_{x,y,z}`` are single normalized squared errors -> RMSE = ``sqrt(mse) * decay_sigma`` (cm).
+        ``p_{x,y,z}`` are SUMMED over the two daughters -> per-daughter RMSE = ``sqrt(mse/2) *
+        daughter_momentum_sigma`` (GeV). ``p_hnl_{x,y,z}`` (the daughter sum, one quantity) ->
+        ``sqrt(mse) * daughter_momentum_sigma`` (GeV). ``loss`` has no single unit and is omitted. If
+        ``metric_errors`` (the SEM on each mean MSE) is given, propagate to the RMSE error."""
+        import numpy as np
+
+        ds = np.asarray(self.decay_sigma, np.float64)
+        dps = np.asarray(self.daughter_momentum_sigma, np.float64)
+        spec = {  # key: (sigma, n_daughters_summed, unit)
+            "vertex_x": (ds[0], 1, "cm"), "vertex_y": (ds[1], 1, "cm"), "vertex_z": (ds[2], 1, "cm"),
+            "p_x": (dps[0], 2, "GeV"), "p_y": (dps[1], 2, "GeV"), "p_z": (dps[2], 2, "GeV"),
+            "p_hnl_x": (dps[0], 1, "GeV"), "p_hnl_y": (dps[1], 1, "GeV"), "p_hnl_z": (dps[2], 1, "GeV"),
+        }
+        out = {}
+        for k, (sigma, n, unit) in spec.items():
+            if k not in metric_means:
+                continue
+            mse = float(metric_means[k])
+            entry = {"rmse": float(np.sqrt(mse / n) * sigma), "unit": unit}
+            if metric_errors is not None and k in metric_errors:
+                sem = float(metric_errors[k])
+                entry["error"] = float(sigma * sem / (2.0 * np.sqrt(n * mse))) if mse > 0 else float("inf")
+            out[k] = entry
+        return out
 
     # ------------------------------------------------------------------ #
     # Design -> geometry (abstract; the design scheme lives in subclasses)
@@ -578,109 +645,145 @@ class StrawDetector(Detector):
         return (0.0, self.max_B) if self.max_B > 0 else (self.max_B, 0.0)
 
     def _design_to_geometry(self, design):
-        """Map a *physical* design into per-layer ``(layers, angles, widths,
-        heights, Bs)`` for the C solver. Defined by the design subclass."""
+        """Map a *physical* design (the Design NAMEDTUPLE, or a flat array as a conversion intermediate)
+        into per-layer ``(layers, angles, Bs)`` for the C solver. Defined by the design subclass; it reads
+        the design's fields BY NAME (never positional-slices a carried flat)."""
         raise NotImplementedError("_design_to_geometry is defined by the design subclass")
+
+    def _resolve_design(self, design, n):
+        """Normalize ``design`` (a Design namedtuple / config Mapping / flat physical array) to the Design
+        NAMEDTUPLE with every field broadcast to a leading ``(n, ...)`` event axis. The flat<->namedtuple
+        conversion happens ONCE here; downstream (:meth:`_design_to_geometry`) carries the namedtuple, so
+        no raw flat unencoded design is ever stored or threaded through the simulation."""
+        nt = self.unflatten_design(self.flatten_design(design))  # -> Design namedtuple (fields 1-D or (b, ...))
+
+        def batch(x):
+            x = np.asarray(x, np.float32)
+            x = x[None] if x.ndim == 1 else x  # ensure a leading event axis
+            return np.broadcast_to(x, (n,) + x.shape[1:])
+
+        return jax.tree.map(batch, nt)
 
     # ------------------------------------------------------------------ #
     # Event generation
     # ------------------------------------------------------------------ #
-    def generate_events(self, rng, n, pool=None):
-        """Sample ``n`` events (with replacement) from the requested disjoint event pool
-        (``pool`` int|str, default = first pool key).
+    def size(self):
+        """Number of available events: the loaded FairShip replay rows (engine='relay'), the finite
+        data-backed count, or ``None`` (infinite -- the analytic source). Scripts use it to build a
+        shuffled event_index (and to decide whether `n` oversamples)."""
+        if self._relay:
+            return self._relay_n
+        return self._n_events if self._events is not None else None
 
-        Returns ``(boundaries, targets, conditioning)``: a ``(n, 2)`` int32 array of
-        ``[start, end)`` spans into the shared, uncopied pool (``self._input_events``) --
-        no ragged gather -- the 6-vector regression targets, and the ``(n, 4)`` HNL
-        conditioning ``[mass, p(3)]`` for the sampled events.
-        """
+    # ------------------------------------------------------------------ #
+    # Relay source (engine='relay'): replay packed REAL FairShip hits, no solver.
+    # ------------------------------------------------------------------ #
+    def _load_relay(self, data_dir):
+        """Load + pack ONE FairShip digi file (a small replay sample) from ``data_dir`` -- engine='relay'.
+        No design is stored: combine receives the geometry the data was recorded at (the caller passes it);
+        event SELECTION is the caller's (external ``event_index``)."""
+        import os
+        from ..data.fairship_loader import load_fairship_digi, pack_fairship_events
+
+        if data_dir is None:
+            raise ValueError("engine='relay' requires data_dir (the FairShip digi directory to replay)")
+        data, _nf = load_fairship_digi(n_files=1, data_glob=os.path.join(data_dir, "*.npz"))
+        event, mask, _rows, truth = pack_fairship_events(
+            data, n_stations=self.n_stations, n_views_per_station=self.n_views_per_station,
+            n_layers_per_view=self.n_layers_per_view, n_straws=self.n_straws,
+            max_hits=self.max_hits_per_event, tdc_clip=getattr(self, "tdc_clip", 1.0e4))
+        self._relay_event, self._relay_mask, self._relay_truth = event, mask, truth
+        # daughter target 9-vec [vertex(3), p1(3), p2(3)] from the FairShip truth (15-vec).
+        self._relay_daughter = np.concatenate([truth[:, 4:7], truth[:, 8:11], truth[:, 12:15]], axis=1).astype(np.float32)
+        self._relay_n = int(mask.shape[0])
+
+    def _gather_relay(self, idx):
+        """Replay the packed events at ``idx`` -> ``(ground_truth, event, mask, target)`` (produce order)."""
+        import jax
+        event = jax.tree.map(lambda a: a[idx], self._relay_event)  # StrawEvent (B, M)
+        target = self._pack_target(self._relay_daughter[idx])  # DaughterTarget
+        truth = self._relay_truth[idx]
+        # StrawGroundTruth (== conditioning): [mass, momentum(3)] + decay vertex (truth[:, 4:7]).
+        ground_truth = self._pack_ground_truth(truth[:, 4:], truth[:, 0:4])
+        return ground_truth, event, np.asarray(self._relay_mask[idx], np.int32), target
+
+    def events_for_rows(self, rows):
+        """Deterministic ordered relay access (for tracking_nn-style eval): the packed ``(event, mask,
+        target)`` for ``rows`` (truth row indices), in order."""
+        _gt, event, mask, target = self._gather_relay(np.asarray(rows))
+        return event, mask, target
+
+    def _events_at(self, event_index):
+        """Return ``(pool, boundaries, targets, conditioning)`` for the integer ``event_index``: GATHER from
+        the loaded data pool, or -- with no data source -- SYNTHESIZE the events (generic HNL physics). The
+        event SOURCE (data or synthetic) is a base concern; the GEOMETRY parametrization is the subclass's.
+        No detector state, no pools."""
+        idx = np.asarray(event_index, np.int64).reshape(-1)
         if self._events is None:
-            raise RuntimeError("StrawDetector has no event source; pass `data_dir` in the detector config.")
+            return self._synthesize(idx)
         ev = self._events
         offsets = ev["offsets"]  # (n_events+1,)
-        pool_idx = self._pools[self._default_pool if pool is None else pool]  # event indices in this pool
-        idx = pool_idx[rng.integers(0, len(pool_idx), size=int(n))]  # with replacement, within the pool
         boundaries = np.stack([offsets[idx], offsets[idx + 1]], axis=1).astype(np.int32)
         conditioning = (
             ev["conditioning"][idx] if "conditioning" in ev else np.zeros((len(idx), 4), dtype=np.float32)
-        )  # raw HNL [mass, p(3)] from the data file; the decay vertex (from `targets`) completes the GroundTruth
-        # `_targets_field` lets a subclass pick a different regression target (e.g. the
-        # tracking detector uses "daughter_targets"); defaults to the HNL 6-vec "targets".
-        targets = ev[getattr(self, "_targets_field", "targets")][idx]
-        return boundaries, targets, conditioning
+        )  # raw HNL [mass, p(3)]; the decay vertex (from `targets`) completes the GroundTruth
+        targets = ev[self._targets_field][idx]  # "targets" (HNL 6-vec) or "daughter_targets" (subclass)
+        return self._pool, boundaries, targets, conditioning
 
-    def _run_solver(
-        self,
-        boundaries,
-        design,
-        rng,
-        input_events=None,
-        z_planes=None,
-        traj=None,
-        n_cross=None,
-        part_idx=None,
-        primaries=True,
-        process_ids=None,
-        tree=None,
-    ):
-        """Run the C straw solver for ``design`` over the events selected by
-        ``boundaries`` ((n, 2) ``[start, end)`` spans) into the shared particle pool
-        ``input_events`` (the cached ``self._input_events`` if None). The solver writes
-        the dense ``X (n, M, 5)`` + ``mask (n, M)`` directly. Returns ``(X, mask, traj)``.
+    def _synthesize(self, event_index):
+        """No-data analytic INPUT-EVENT source: synthesize the events at ``event_index`` -- HNL
+        momentum/vertex Gaussians -> 2-body decay (muon + pion) -> 2 daughters -- per index. Returns a
+        fresh ``(pool, boundaries, targets, conditioning)`` with ``boundaries[i] = [2i, 2i+2)``. GENERIC
+        HNL physics, independent of the geometry parametrization."""
+        n = event_index.shape[0]
+        u = det_uniforms(self._seeds(event_index), 9)                          # (n, 9) in [0,1)
+        g = box_muller(u[:, :6]).reshape(n, 2, 3)                              # (n,2,3) standard normals
+        vertex = (self.hnl_vertex_mean + self.hnl_vertex_sigma * g[:, 0]).astype(np.float32)
+        P = (self.hnl_momentum_mean + self.hnl_momentum_sigma * g[:, 1]).astype(np.float64)  # HNL lab momentum
+        M, m1, m2 = self.hnl_mass, _MUON_MASS, _PION_MASS
+        E = np.sqrt(np.sum(P**2, axis=1) + M**2)
+        E1, E2, p_star = self._decay_E1, self._decay_E2, self._decay_pstar
+        cos_t = 2.0 * u[:, 6] - 1.0                                            # isotropic decay direction
+        phi = 2.0 * np.pi * u[:, 7]
+        sin_t = np.sqrt(np.maximum(1.0 - cos_t**2, 0.0))
+        d = np.stack([sin_t * np.cos(phi), sin_t * np.sin(phi), cos_t], axis=1)
+        p1 = _boost(p_star * d, E1, P, E, M)                                   # (n,3) daughter 1
+        p2 = _boost(-p_star * d, E2, P, E, M)                                  # (n,3) daughter 2
+        q1 = np.where(u[:, 8] < 0.5, -1.0, 1.0).astype(np.float32)             # opposite charges
+        q2 = -q1
+        masses = np.tile(np.array([m1, m2], np.float32), n)
+        charges = np.stack([q1, q2], axis=1).reshape(-1).astype(np.float32)
+        positions = np.repeat(vertex, 2, axis=0).astype(np.float32)
+        momenta = np.stack([p1, p2], axis=1).reshape(-1, 3).astype(np.float32)
+        pool = Pool(masses, charges, positions, momenta, np.zeros(2 * n, np.float32))
+        boundaries = np.stack([np.arange(0, 2 * n, 2), np.arange(2, 2 * n + 1, 2)], axis=1).astype(np.int32)
+        Pf = P.astype(np.float32)
+        # The regression target follows _targets_field: daughters [vertex, p1, p2] (9) or HNL [vertex, P] (6).
+        if self._targets_field == "daughter_targets":
+            targets = np.concatenate([vertex, p1, p2], axis=1).astype(np.float32)
+        else:
+            targets = np.concatenate([vertex, Pf], axis=1).astype(np.float32)
+        conditioning = np.concatenate([np.full((n, 1), M, np.float32), Pf], axis=1).astype(np.float32)
+        return pool, boundaries, targets, conditioning
 
-        Per-track trajectory (all caller-allocated, filled in place; pass ``None`` to skip):
-        with ``z_planes (m,)`` reference z's, ``traj (n, n_tracks, m, 3)`` gets each slot's
-        ordered ``(x, y, z)`` in-aperture plane crossings, ``n_cross (n, n_tracks)`` the count
-        per slot, and ``part_idx (n, n_tracks)`` the input-particle index per slot (-1 if a
-        secondary). ``primaries`` True -> only primaries' trajectories (slot = input index);
-        False -> all particles. The debug buffers (``process_ids (n, M)``, ``tree`` dict) are
-        separate; all of these are optional and never affect ``X``/``mask``.
-        """
-        ie = input_events if input_events is not None else self._input_events
-        if ie is None:
-            raise RuntimeError("StrawDetector has no event source; pass input_events or `data_dir`.")
-        boundaries = np.ascontiguousarray(boundaries, dtype=np.int32)
-        layers, angles, Bs = self._design_to_geometry(design)  # widths/heights/z0/B_sigma are fixed (Layout)
+    def _run_solver(self, pool, boundaries, layers, angles, Bs, seeds, *,
+                    z_planes=None, traj=None, n_cross=None, part_idx=None, primaries=False,
+                    process_ids=None, tree=None):
+        """Allocate the output buffers and run the propagation engine over `pool` (a :class:`Pool`) at the
+        events `boundaries` ((n,2) [start,end) particle spans), with the per-event geometry (`layers`,
+        `angles`, `Bs`) + per-event `seeds`. Returns `(hits_idx, tdc, traj)`: `hits_idx (n,M,4) uint32`
+        [station,view,layer,straw] + `tdc (n,M) f32` (< 0 = no hit; init to -1). The engine fills them in
+        place + handles the optional trajectory (`z_planes`/`traj`/...) and debug (`process_ids`/`tree`)."""
         n_events = boundaries.shape[0]
-
-        Bs_arr = Bs.astype(np.float32)
-        # One independent uint32 seed per event -> reproducible + parallel-safe.
-        seeds = rng.integers(1, 2**32, size=n_events, dtype=np.uint32)
-
         M = self.max_hits_per_event
-        X = np.zeros((n_events, M, 5), dtype=np.float32)
-        mask = np.zeros((n_events, M), dtype=np.int32)
-
-        debug = None
-        if process_ids is not None or tree is not None:
-            debug = straw_detector.DebugBuffers(
-                process_ids,
-                None if tree is None else tree["int"],
-                None if tree is None else tree["float"],
-                None if tree is None else tree["event"],
-                None if tree is None else tree["count"],
-            )
-
-        straw_detector.solve(
-            self._sim_params,
-            self._layout,
-            ie,
-            self._scratch,
-            seeds,
-            boundaries,
-            layers,
-            angles,
-            Bs_arr,
-            X,
-            mask,
-            z_planes,
-            traj,
-            n_cross,
-            part_idx,
-            int(bool(primaries)),
-            debug,
+        hits_idx = np.zeros((n_events, M, 4), dtype=np.uint32)
+        tdc = np.full((n_events, M), -1.0, dtype=np.float32)
+        self.engine.solve(
+            pool, np.ascontiguousarray(boundaries, np.int32), layers, angles, Bs, hits_idx, tdc,
+            seeds=seeds, z_planes=z_planes, traj=traj, n_cross=n_cross, part_idx=part_idx,
+            primaries=primaries, process_ids=process_ids, tree=tree,
         )
-        return X, mask, traj
+        return hits_idx, tdc, traj
 
     def simulate_debug(self, daughter_data, design, rng):
         """Run the solver with all debug outputs on (for sim-vs-MC matching).
@@ -695,17 +798,21 @@ class StrawDetector(Detector):
         parent_id, n_hits`` (int) + ``momentum (P, 3), position (P, 3), t0 (P,)`` (float) +
         ``event_index (P,)``.
         """
-        design = np.asarray(design, dtype=np.float32)
-        design = design[None, :] if design.ndim == 1 else design
-        n_events = design.shape[0]
+        flat = np.asarray(self.flatten_design(design), np.float32)
+        n_events = 1 if flat.ndim == 1 else flat.shape[0]
+        design = self._resolve_design(design, n_events)  # -> batched Design namedtuple (no carried flat)
 
-        # Build a transient InputEvents from the given per-event pool; boundaries select
-        # the events (default: a single event spanning the whole pool).
-        ie = self._make_input_events(daughter_data)
+        # Build a transient Pool from the given per-event particle arrays; boundaries select
+        # the events (default: a single event spanning the whole pool). The engine packs the C
+        # InputEvents internally.
+        pool = Pool(daughter_data["masses"], daughter_data["charges"], daughter_data["positions"],
+                    daughter_data["momenta"], daughter_data["times"])
         boundaries = daughter_data.get("boundaries")
         if boundaries is None:
             n_part = len(np.asarray(daughter_data["masses"]))
             boundaries = np.tile(np.array([[0, n_part]], dtype=np.int32), (n_events, 1))
+        layers, angles, Bs = self._design_to_geometry(design)
+        seeds = rng.integers(1, 2**32, size=n_events, dtype=np.uint32)
 
         process_ids = np.zeros((n_events, self.max_hits_per_event), dtype=np.int32)
         # Debug MC tree, flat across the batch; cap = n_events * max_particles (max_particles
@@ -718,20 +825,16 @@ class StrawDetector(Detector):
             "event": np.zeros((cap,), dtype=np.int32),
             "count": np.zeros((1,), dtype=np.int32),  # shared write cursor / final count
         }
-        X, mask, _ = self._run_solver(
-            boundaries,
-            design,
-            rng,
-            input_events=ie,
-            process_ids=process_ids,
-            tree=tree,
+        hits_idx, tdc, _ = self._run_solver(
+            pool, boundaries, layers, angles, Bs, seeds,
+            primaries=True, process_ids=process_ids, tree=tree,
         )
 
         p = int(tree["count"][0])  # number of particles actually recorded
         ti, tf = tree["int"][:p], tree["float"][:p]
         return {
-            "X": X,
-            "mask": mask,
+            "X": self._pack_event(hits_idx, tdc),
+            "mask": (tdc >= 0).astype(np.int32),
             "process_ids": process_ids,
             "pdg": ti[:, 0],
             "process_id": ti[:, 1],
@@ -743,60 +846,61 @@ class StrawDetector(Detector):
             "event_index": tree["event"][:p],
         }
 
-    def sample_events(self, seed, design, pool=None, z_planes=None, n_tracks=2, primaries=True):
-        """Generate events and return a rich dict.
+    @staticmethod
+    def _seeds(event_index):
+        """Per-event uint32 seeds = a hash of ``event_index`` -- DESIGN-INDEPENDENT, so perturbing the
+        design at a fixed index gives common random numbers (low-variance design gradient) and a repeated
+        index reproduces the identical event. Never 0 (the C RNG wants a nonzero seed)."""
+        h = (np.asarray(event_index, np.uint64) + np.uint64(1)) * np.uint64(2654435761)
+        h ^= h >> np.uint64(16)
+        s = (h & np.uint64(0xFFFFFFFF)).astype(np.uint32)
+        return np.where(s == np.uint32(0), np.uint32(1), s)
 
-        ``design`` is the *physical* (un-encoded) design ``(B, design_dim)`` (or
-        ``(design_dim,)`` for a single event). Batch size ``B`` is inferred. ``pool``
-        (int|str) selects the disjoint event pool to sample from (default = first key).
-
-        If ``z_planes`` (a ``(m,)`` array of reference z's, cm) is given, the dict also
-        carries the per-track trajectory ``traj (B, n_tracks, m, 3)`` -- each slot's ordered
-        ``(x, y, z)`` in-aperture plane crossings -- with ``n_cross (B, n_tracks)`` (crossings
-        per slot) and ``part_idx (B, n_tracks)`` (input-particle index per slot, -1 if a
-        secondary). ``primaries`` True records only primaries (slot = input index, e.g. the
-        two HNL daughters); False records all particles incl. secondaries.
-        """
-        design = np.asarray(self.flatten_design(design), dtype=np.float32)  # Design/Mapping/array -> flat physical
-        if design.ndim == 1:
-            design = design[None, :]
-        n_events = design.shape[0]
-
-        rng = np.random.default_rng(seed)
-        boundaries, targets, conditioning = self.generate_events(rng, n_events, pool=pool)
+    def _simulate(self, design, event_index, *, z_planes=None, n_tracks=2, primaries=False):
+        """Core simulation, shared by :meth:`__call__` and the tracker subclass: resolve ``design`` to the
+        per-event geometry, gather/generate the events at ``event_index`` (:meth:`_events_at`), run the
+        engine, and pack. Returns a dict with the fired-straw ``StrawEvent`` (``"X"``), the ``mask``
+        (``tdc >= 0``), ``target``, ``ground_truth`` (+ the optional per-track trajectory when ``z_planes``
+        is given). DETERMINISTIC in ``(design, event_index)``. ``design`` is one design (broadcast across
+        ``event_index``) or a batched ``(n, design_dim)`` design (one per event)."""
+        event_index = np.asarray(event_index, np.int64).reshape(-1)
+        n = event_index.shape[0]
+        design = self._resolve_design(design, n)  # -> batched Design namedtuple (no carried flat)
+        pool, boundaries, targets, conditioning = self._events_at(event_index)
+        layers, angles, Bs = self._design_to_geometry(design)
 
         traj = n_cross = part_idx = zp = None
         if z_planes is not None:
-            zp = np.ascontiguousarray(z_planes, dtype=np.float32)
+            zp = np.ascontiguousarray(z_planes, np.float32)
             m = zp.shape[0]
-            traj = np.zeros((n_events, int(n_tracks), m, 3), dtype=np.float32)
-            n_cross = np.zeros((n_events, int(n_tracks)), dtype=np.int32)
-            part_idx = np.full((n_events, int(n_tracks)), -1, dtype=np.int32)
-        X, mask, _ = self._run_solver(
-            boundaries, design, rng, z_planes=zp, traj=traj, n_cross=n_cross, part_idx=part_idx, primaries=primaries
+            traj = np.zeros((n, int(n_tracks), m, 3), np.float32)
+            n_cross = np.zeros((n, int(n_tracks)), np.int32)
+            part_idx = np.full((n, int(n_tracks)), -1, np.int32)
+        hits_idx, tdc, _ = self._run_solver(
+            pool, boundaries, layers, angles, Bs, self._seeds(event_index),
+            z_planes=zp, traj=traj, n_cross=n_cross, part_idx=part_idx, primaries=primaries,
         )
-
         return {
-            "X": self._pack_event(X),  # StrawEvent (raw int address + float TDC)
-            "mask": mask,
+            "X": self._pack_event(hits_idx, tdc),  # StrawEvent (int address + float TDC)
+            "mask": (tdc >= 0).astype(np.int32),   # derived from tdc (< 0 = padding)
             "target": self._pack_target(targets),  # HNLTarget / DaughterTarget
-            "ground_truth": self._pack_ground_truth(targets, conditioning),  # StrawGroundTruth (== conditioning)
-            "traj": traj,  # (B, n_tracks, m, 3) or None
-            "n_cross": n_cross,  # (B, n_tracks) or None
-            "part_idx": part_idx,  # (B, n_tracks) or None
+            "ground_truth": self._pack_ground_truth(targets, conditioning),  # StrawGroundTruth
+            "traj": traj, "n_cross": n_cross, "part_idx": part_idx,
         }
 
-    def _pack_event(self, X):
-        """Pack the solver's ``(n, M, 5)`` float buffer [station, view, layer, straw, tdc] into a
-        ``StrawEvent`` -- the index columns become int32, the TDC stays float32 (host-side numpy)."""
-        X = np.asarray(X)
-        idx = lambda c: np.rint(X[..., c]).astype(np.int32)
-        return StrawEvent(station=idx(0), view=idx(1), layer=idx(2), straw=idx(3), tdc=X[..., 4].astype(np.float32))
+    def _pack_event(self, hits_idx, tdc):
+        """Pack the engine's ``hits_idx (n, M, 4) uint32`` [station, view, layer, straw] + ``tdc (n, M)``
+        float32 into a ``StrawEvent`` -- addresses to int32 (already integers), TDC stays float32 (a
+        ``tdc < 0`` row is padding -- the network mask is ``tdc >= 0``)."""
+        hi = np.asarray(hits_idx)
+        return StrawEvent(station=hi[..., 0].astype(np.int32), view=hi[..., 1].astype(np.int32),
+                          layer=hi[..., 2].astype(np.int32), straw=hi[..., 3].astype(np.int32),
+                          tdc=np.asarray(tdc, np.float32))
 
     def _pack_target(self, targets):
-        """Pack the HNL target array ``(n, 6)`` [vertex, momentum] into an ``HNLTarget``."""
+        """Pack the daughter target array ``(n, 9)`` [vertex, p1, p2] into a ``DaughterTarget``."""
         t = np.asarray(targets)
-        return HNLTarget(vertex=t[..., :3], momentum=t[..., 3:6])
+        return DaughterTarget(vertex=t[..., :3], p1=t[..., 3:6], p2=t[..., 6:9])
 
     def _pack_ground_truth(self, targets, conditioning):
         """``StrawGroundTruth`` (== conditioning): HNL mass + momentum (from the data conditioning
@@ -804,165 +908,98 @@ class StrawDetector(Detector):
         c, t = np.asarray(conditioning), np.asarray(targets)
         return StrawGroundTruth(mass=c[..., 0:1], momentum=c[..., 1:4], vertex=t[..., :3])
 
-    def _trajectory_to_event(self, traj, n_cross, design, hits_xy=False, drift_r=False, tdc=False,
-                             digi=None, digi_mask=None, smear_seed=0):
-        """Build a tracking ``StrawEvent`` from the solver's per-track trajectory
-        (``traj (B, n_tracks, m, 3)``, ``n_cross (B, n_tracks)``). Each recorded crossing becomes one
-        hit: its ``(station, view, layer-in-view)`` address + nearest ``straw`` are quantised from the
-        ``(x, y, z)`` crossing (same geometry as :meth:`combine_encoded`), and -- under the flags --
-        ``x, y`` (the exact crossing, ``hits_xy``); ``drift_r`` (perpendicular crossing->wire distance,
-        re-derived host-side from ``(x, y)`` then SMEARED by ``N(0, sigma_spatial)`` to be FairShip-
-        realistic, ``drift_r``); and ``tdc`` (the real digitised TDC, looked up from the ``digi`` packed
-        StrawEvent by straw address -- ``NaN`` where the crossing has no matching fired straw). Returns
-        ``(StrawEvent, mask)`` with leaves ``(B, M)``, ``M = n_tracks * m``. Uniform design across batch."""
-        traj = np.asarray(traj, np.float32)
-        n_cross = np.asarray(n_cross)
-        B, T, m, _ = traj.shape
-        flat_design = np.asarray(self.flatten_design(design), np.float32)
-        flat_design = flat_design[None] if flat_design.ndim == 1 else flat_design
-        positions, angles, _ = self._design_to_geometry(flat_design)
-        lz, ang0 = np.asarray(positions[0], np.float32), np.asarray(angles[0], np.float32)  # uniform design
-        n_layers = lz.shape[0]
-        order = np.argsort(lz)
-        # crossing z -> global layer index k (z == lz[k] exactly, copied from z_planes by the solver)
-        rank = np.clip(np.searchsorted(lz[order], traj[..., 2]), 0, n_layers - 1)
-        k = order[rank]  # (B, T, m) global layer index
-        per_station = self.n_views_per_station * self.n_layers_per_view
-        station, within = k // per_station, k % per_station
-        view, lpv = within // self.n_layers_per_view, within % self.n_layers_per_view
-        tan = np.tan(ang0[k])
-        cos = 1.0 / np.sqrt(1.0 + tan * tan)
-        xx, yy = traj[..., 0], traj[..., 1]
-        c = yy - xx * tan  # sheared (wire-frame) coordinate, constant along a wire
-        y_stagger = np.where((lpv & 1) == 1, 0.5 * self.layer_y_offset, -0.5 * self.layer_y_offset)
-        pitch, height, ns = self.straw_pitch, self.layer_height, self.n_straws
-        straw = np.clip(np.round((c + height - y_stagger) / pitch - 0.5), 0, ns - 1)
-        wire = (straw + 0.5) * pitch - height + y_stagger  # nearest wire-centre sheared y
-        dr = np.abs(c - wire) * cos  # drift radius (perpendicular crossing->wire), re-derived from (x, y)
-        if drift_r:  # FairShip-realistic measurement: smear by the single-hit spatial resolution
-            rng = np.random.default_rng(smear_seed)
-            dr = np.abs(dr + rng.normal(0.0, 0.012, dr.shape))  # 0.012 cm = straw_detector.c STRAW_SIGMA_SPATIAL
-        flat = lambda a: a.reshape(B, T * m)
-        event = StrawEvent(
-            station=flat(station.astype(np.int32)),
-            view=flat(view.astype(np.int32)),
-            layer=flat(lpv.astype(np.int32)),
-            straw=flat(straw.astype(np.int32)),
-            tdc=flat(self._match_tdc(k, straw, n_cross, digi, digi_mask)) if tdc
-            else flat(np.zeros((B, T, m), np.float32)),  # real TDC by address (V2) else unused
-            x=flat(xx) if hits_xy else None,
-            y=flat(yy) if hits_xy else None,
-            drift_r=flat(dr.astype(np.float32)) if drift_r else None,
-        )
-        mask = flat((np.arange(m)[None, None, :] < n_cross[:, :, None]).astype(np.int32))
-        return event, mask
+    def __call__(self, design, event_index):
+        """Simulate the events at the integer ``event_index`` ``(n,)`` for ``design``, returning the
+        ``(ground_truth, event, mask, target)`` namedtuple records (leaves carry the leading batch axis).
 
-    def _match_tdc(self, k, straw, n_cross, digi, digi_mask):
-        """Real digitised TDC for each trajectory crossing, looked up from the digitised ``digi`` packed
-        StrawEvent by global straw key (event, global-layer, straw). ``NaN`` where a crossing has no fired
-        straw (capped out / shared). ``k``, ``straw`` are ``(B, T, m)``; returns ``(B, T, m)`` float32."""
-        B, T, m = k.shape
-        per_station, nlpv, ns = self.n_views_per_station * self.n_layers_per_view, self.n_layers_per_view, self.n_straws
-        kpl = self.n_layers * ns  # key span per event
-        ck = (np.arange(B)[:, None, None] * kpl + k * ns + straw.astype(np.int64)).reshape(-1)  # crossing keys
-        dk_layer = np.asarray(digi.station) * per_station + np.asarray(digi.view) * nlpv + np.asarray(digi.layer)
-        dk = (np.arange(B)[:, None] * kpl + dk_layer * ns + np.asarray(digi.straw)).astype(np.int64)  # (B, Md)
-        keep = np.asarray(digi_mask) > 0
-        dk_f, dt_f = dk[keep], np.asarray(digi.tdc, np.float32)[keep]  # fired digitised straws
-        o = np.argsort(dk_f, kind="stable")
-        dk_s, dt_s = dk_f[o], dt_f[o]
-        pos = np.clip(np.searchsorted(dk_s, ck), 0, max(dk_s.shape[0] - 1, 0))
-        hit = (dk_s.shape[0] > 0) & (dk_s[pos] == ck)
-        return np.where(hit, dt_s[pos], np.nan).reshape(B, T, m).astype(np.float32)
+        DETERMINISTIC: the same ``(design, event_index)`` always yields the same output (the per-event RNG
+        is seeded from ``event_index``). ``design`` is one design (broadcast across ``event_index``) or a
+        batched ``(n, design_dim)`` design (one design per event). ``event`` is the fired-straw
+        ``StrawEvent`` (address + TDC); the per-hit ``(x, y)``/``drift_r`` truth lives in the separate
+        tracker detector. NEVER overridden -- the production is the :meth:`_produce` hook."""
+        return self._produce(design, event_index)
 
-    def __call__(self, seed, design, pool=None, hits_xy=False, drift_r=False, tdc=False, n_tracks=2, primaries=True):
-        """Generate events for an un-encoded ``design`` ``(B, design_dim)``.
-
-        Returns ``(ground_truth, event, mask, target)`` namedtuple records (leaves carry the
-        leading batch axis). ``pool`` selects the disjoint event pool (default = first key).
-
-        Default: ``event`` is the realistic fired-straw ``StrawEvent`` (address + TDC). With
-        ``hits_xy``, ``drift_r`` and/or ``tdc`` set, instead returns a TRACKING event built from the
-        per-track trajectory crossings (``n_tracks`` slots, ``primaries`` -> daughters only), carrying the
-        exact ``(x, y)`` crossing (``hits_xy``), the smeared ``drift_r`` (``drift_r``), and the real
-        digitised ``tdc`` matched to each crossing's fired straw (``tdc``)."""
-        if not (hits_xy or drift_r or tdc):
-            out = self.sample_events(seed, design, pool=pool)
-            return out["ground_truth"], out["X"], out["mask"], out["target"]
-        flat_design = np.asarray(self.flatten_design(design), np.float32)
-        fd = flat_design[None] if flat_design.ndim == 1 else flat_design
-        layer_z = np.asarray(self._design_to_geometry(fd)[0][0], np.float32)  # uniform-design layer z's
-        out = self.sample_events(seed, design, pool=pool, z_planes=layer_z, n_tracks=n_tracks, primaries=primaries)
-        event, mask = self._trajectory_to_event(out["traj"], out["n_cross"], design, hits_xy=hits_xy,
-                                                 drift_r=drift_r, tdc=tdc, digi=out["X"], digi_mask=out["mask"])
-        return out["ground_truth"], event, mask, out["target"]
+    def _produce(self, design, event_index):
+        """Produce the ``(ground_truth, event, mask, target)`` records for ``event_index``. Default: the
+        SIMULATED path (run the C/numpy solver via :meth:`_simulate`). The design-blind RELAY source
+        (engine='relay') instead GATHERS the packed FairShip events (no solver) -- handled here so there is
+        no replay subclass. The single variation point of ``__call__``."""
+        if self._relay:
+            return self._gather_relay(np.asarray(event_index, np.int64))
+        out = self._simulate(design, event_index)
+        return out["ground_truth"], out["X"], out["mask"], out["target"]
 
     # Design encoding: the base Detector wraps the subclass `_encode_flat`/`_decode_flat`
     # (flat physical <-> encoded) with the dict<->flat conversion; the design subclass owns
     # the bounds, `design_spec`, `design_bounds`, and the flat encode/decode to N(0,1).
 
     # ------------------------------------------------------------------ #
-    # Combine: raw StrawEvent + ENCODED design -> per-hit network features.
-    # combine_encoded owns event normalisation (the TDC standardisation constants live here);
-    # the base Detector.combine wraps it as combine_encoded(event, encode_design(design)).
+    # Combine: ABSTRACT here (Detector declares combine_encoded/combined_event_shape/element_mask). Each
+    # combine LEAF builds its own per-hit/-layer features; the shared 4-feature logic is the module
+    # function `four_feature_combine` below. The TDC standardisation constants live here (event
+    # normalisation is straw-wide, used by that function).
     # ------------------------------------------------------------------ #
     _TDC_MEAN = 440.0
     _TDC_STD = 80.0
 
-    def combine_encoded(self, event, encoded_design):
-        """Raw ``StrawEvent`` + ENCODED design -> per-hit features (all *normalised*):
-
-            [TDC, norm(layer z), wire_y_left, wire_y_right]
-
-        The TDC is standardised here (this method owns event normalisation). Each hit's
-        ``(station, view, layer-in-view)`` integers index the **decoded** design at the hit's own
-        global layer to gather that layer's z and stereo angle. Rather than handing the network
-        ``(straw_y, angle)`` separately, we encode the (tilted) sense wire as its two y-endpoints at
-        the FIXED x-ends of the parallelogram (``x = +/- layer_width``; sheared geometry
-        ``Y = y - x*tan(angle)`` is constant along the wire) -- the natural input for stereo
-        triangulation -> track fit -> curvature -> momentum -- differentiable w.r.t. the design
-        through the decode+gather. The hit ``mask`` is threaded separately by the caller.
-        """
-        import jax.numpy as jnp
-
-        station = jnp.asarray(event.station, jnp.int32)
-        view = jnp.asarray(event.view, jnp.int32)
-        layer_in_view = jnp.asarray(event.layer, jnp.int32)
-        straw = jnp.asarray(event.straw, jnp.float32)  # float: indexes the continuous wire-centre y
-        tdc = (jnp.asarray(event.tdc, jnp.float32) - self._TDC_MEAN) / self._TDC_STD
-
-        B, M = station.shape
-        per_station = self.n_views_per_station * self.n_layers_per_view
-        layer = station * per_station + view * self.n_layers_per_view + layer_in_view  # (B, M) global layer idx
-
-        # Decode design and gather each hit's own layer geometry.
-        d_enc = jnp.asarray(encoded_design, dtype=jnp.float32)
-        if d_enc.ndim == 1:
-            d_enc = jnp.broadcast_to(d_enc[None, :], (B, d_enc.shape[0]))
-        positions, angles, _B = self._decode_to_layer_geometry(d_enc)  # (B,n),(B,n),(B,); field unused (fixed)
-
-        z_hit = jnp.take_along_axis(positions, layer, axis=1)  # (B, M)
-        angle_hit = jnp.take_along_axis(angles, layer, axis=1)  # (B, M)
-        # Half-pitch stagger: even layer-in-view -> -h, odd -> +h (matches the C solver).
-        y_stagger = jnp.where((layer_in_view & 1) == 1, 0.5 * self.layer_y_offset, -0.5 * self.layer_y_offset)
-        straw_y = (straw + 0.5) * self.straw_pitch - self.layer_height + y_stagger  # wire centre y (at x=0)
-
-        z_mid = 0.5 * (self.layer_bounds[0] + self.layer_bounds[1])
-        z_half = max(0.5 * (self.layer_bounds[1] - self.layer_bounds[0]), 1e-6)
-        norm_z = (z_hit - z_mid) / z_half
-
-        # Wire y at the fixed x-ends (+/- layer_width); the x's are constant so omitted. Y-scale
-        # bounds |y| over all straws and the steepest stereo angle so the features stay ~[-1,1].
-        dy = self.layer_width * jnp.tan(angle_hit)  # (B, M) y-offset from x=0 to x=+width
-        a_max = max(abs(self.angle_bounds[0]), abs(self.angle_bounds[1]))
-        y_scale = max(self.layer_height + self.layer_width * float(np.tan(a_max)), 1e-6)
-        wire_y_left = (straw_y - dy) / y_scale
-        wire_y_right = (straw_y + dy) / y_scale
-
-        return jnp.stack([tdc, norm_z, wire_y_left, wire_y_right], axis=-1)
-
     def _decode_to_layer_geometry(self, d_enc):
         """Encoded design ``(B, design_dim)`` -> per-layer ``(positions(B,n),
-        angles(B,n), B_field(B))``, used by :meth:`combine`. Defined by the
+        angles(B,n), B_field(B))``, used by :func:`four_feature_combine`. Defined by the
         design subclass (it owns how the design expands into per-layer geometry)."""
         raise NotImplementedError("_decode_to_layer_geometry is defined by the design subclass")
+
+
+def four_feature_combine(det, event, encoded_design, mask=None):
+    """The shared 4-feature combine: raw ``StrawEvent`` + ENCODED design -> per-hit features (normalised)
+    ``[TDC, norm(layer z), wire_y_left, wire_y_right]``. Geometry-AGNOSTIC: it gathers each hit's own layer
+    geometry through ``det._decode_to_layer_geometry`` (the design subclass owns that decode), so every
+    4-feature combine leaf (``FreeStrawDetector``, ``Stereo4Feature``, incl. its ``engine='relay'`` mode) calls this.
+    ``mask`` is accepted for the uniform signature but ignored (the element axis IS the hit axis; padded
+    hits are zeroed downstream by the regressor mask).
+
+    The sense wire is encoded as its two y-endpoints at the FIXED x-ends of the parallelogram (the sheared
+    geometry ``Y = y - x*tan(angle)`` is constant along the wire) -- the natural input for stereo
+    triangulation -> track fit -> curvature -> momentum, differentiable w.r.t. the design through the
+    decode+gather."""
+    import jax.numpy as jnp
+
+    station = jnp.asarray(event.station, jnp.int32)
+    view = jnp.asarray(event.view, jnp.int32)
+    layer_in_view = jnp.asarray(event.layer, jnp.int32)
+    straw = jnp.asarray(event.straw, jnp.float32)  # float: indexes the continuous wire-centre y
+    tdc = (jnp.asarray(event.tdc, jnp.float32) - det._TDC_MEAN) / det._TDC_STD
+
+    B, M = station.shape
+    per_station = det.n_views_per_station * det.n_layers_per_view
+    layer = station * per_station + view * det.n_layers_per_view + layer_in_view  # (B, M) global layer idx
+
+    # Decode design and gather each hit's own layer geometry.
+    d_enc = jnp.asarray(encoded_design, dtype=jnp.float32)
+    if d_enc.ndim == 1:
+        d_enc = jnp.broadcast_to(d_enc[None, :], (B, d_enc.shape[0]))
+    positions, angles, _B = det._decode_to_layer_geometry(d_enc)  # (B,n),(B,n),(B,); field unused (fixed)
+
+    z_hit = jnp.take_along_axis(positions, layer, axis=1)  # (B, M)
+    angle_hit = jnp.take_along_axis(angles, layer, axis=1)  # (B, M)
+    # Half-pitch stagger: even layer-in-view -> -h, odd -> +h (matches the C solver).
+    y_stagger = jnp.where((layer_in_view & 1) == 1, 0.5 * det.layer_y_offset, -0.5 * det.layer_y_offset)
+    straw_y = (straw + 0.5) * det.straw_pitch - det.layer_height + y_stagger  # wire centre y (at x=0)
+
+    z_mid = 0.5 * (det.layer_bounds[0] + det.layer_bounds[1])
+    z_half = max(0.5 * (det.layer_bounds[1] - det.layer_bounds[0]), 1e-6)
+    norm_z = (z_hit - z_mid) / z_half
+
+    # Wire y at the fixed x-ends (+/- layer_width); the x's are constant so omitted. Y-scale bounds |y|
+    # over all straws and the steepest stereo angle so the features stay ~[-1, 1].
+    dy = det.layer_width * jnp.tan(angle_hit)  # (B, M) y-offset from x=0 to x=+width
+    a_max = max(abs(det.angle_bounds[0]), abs(det.angle_bounds[1]))
+    y_scale = max(det.layer_height + det.layer_width * float(np.tan(a_max)), 1e-6)
+    wire_y_left = (straw_y - dy) / y_scale
+    wire_y_right = (straw_y + dy) / y_scale
+
+    return jnp.stack([tdc, norm_z, wire_y_left, wire_y_right], axis=-1)
+
+
+def four_feature_shape(det):
+    """The 4-feature combine's ``combined_event_shape``: one element per hit, 4 features."""
+    return (det.max_hits_per_event, 4)

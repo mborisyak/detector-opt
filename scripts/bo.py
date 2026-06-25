@@ -75,11 +75,11 @@ def bo(output, seed: int, **config):
 
     # The trainer owns the budget-sized event pools (train + val); the run ends
     # when they fill. Designs append into them (windowed) across iterations.
-    budget = trainer.train_pool.n_max + trainer.val_pool.n_max
+    budget = trainer.train_pool.capacity + trainer.val_pool.capacity
     root_seq = np.random.SeedSequence(int(seed))  # per-design RNG via spawn
 
-    proposed_encoded = []  # row-aligned with trained_params/states (warm-start)
-    trained_params, trained_states = [], []
+    proposed_encoded = []  # row-aligned with trained_params (warm-start)
+    trained_params = []
     results = []
     best_loss, best_design = np.inf, None
 
@@ -109,27 +109,23 @@ def bo(output, seed: int, **config):
         # L2) previously trained design.
         # Warm-start applies only to the per-design DesignTrainer strategies; the
         # "meta" ContinualTrainer carries its own persistent network.
-        init_params = init_state = None
+        init_params = None
         warm_from = None
-        if trained_params and nn_init_strategy in ("continue", "closest"):
+        if len(trained_params) > 0 and nn_init_strategy in ("continue", "closest"):
             if nn_init_strategy == "continue":
                 warm_from = len(trained_params) - 1
             else:  # closest
                 dists = np.linalg.norm(np.asarray(proposed_encoded) - x_prop[None, :], axis=1)
                 warm_from = int(np.argmin(dists))
                 print(f"  [warm-start] closest = iter {warm_from} (dist={float(dists[warm_from]):.3f})")
-            init_params, init_state = (
-                trained_params[warm_from],
-                trained_states[warm_from],
-            )
+            init_params = trained_params[warm_from]
 
-        used = trainer.train_pool.n_current + trainer.val_pool.n_current
+        used = trainer.train_pool.current + trainer.val_pool.current
         print(f"[iter {i+1}] training... ({budget - used} detector calls left)")
         result = trainer.train(
             x_prop,
             root_seq.spawn(1)[0],
             init_params=init_params,
-            init_state=init_state,
             on_epoch=_on_epoch,
             step=i,
         )
@@ -141,7 +137,6 @@ def bo(output, seed: int, **config):
         bo_opt.append(x_prop, loss, noise=result.objective_std)
         proposed_encoded.append(x_prop)
         trained_params.append(result.params)
-        trained_states.append(result.state)
 
         improved = loss < best_loss
         if improved:
@@ -174,7 +169,7 @@ def bo(output, seed: int, **config):
                     "best_loss": float(best_loss),
                     "best_design": best_design,
                     "n_iterations_completed": i + 1,
-                    "detector_calls_used": int(trainer.train_pool.n_current + trainer.val_pool.n_current),
+                    "detector_calls_used": int(trainer.train_pool.current + trainer.val_pool.current),
                     "method": "JAX-GP+EI",
                 },
                 f,

@@ -14,13 +14,12 @@ from .activation import LeakyTanh
 __all__ = ["InducedSetRegressor"]
 
 
-def cross_attention(xs, inducing, scale_features, *, mask_xs=None):
+def cross_attention(xs, inducing, scale_pos, scale_neg, *, mask_xs=None):
   # xs: (*, n, t)
   # is: (*, m, t)
   # K: (*, n, m, t)
-  K = jax.nn.sigmoid(
-    scale_features * (xs[..., :, None, :] - inducing[..., None, :, :])
-  ) * mask_xs[..., None, None]
+  diff = xs[..., :, None, :] - inducing[..., None, :, :]
+  K = jax.nn.sigmoid(scale_pos * diff) * jax.nn.sigmoid(scale_neg * diff) * mask_xs[..., None, None]
 
   inducing_total = jnp.sum(K, axis=-2) + 1
   xs_total = jnp.sum(K, axis=-3) + 1
@@ -74,16 +73,6 @@ class InducedSetRegressor(Model):
   coefficient to 0 to drop its comparison.
   """
 
-  @classmethod
-  def from_config(cls, detector: Detector, config, *, rngs: nnx.Rngs):
-    return cls(
-      input_shape=detector.combined_event_shape(),
-      target_shape=(detector.target_dim(),),
-      ground_truth_shape=(detector.ground_truth_dim(),),
-      rngs=rngs,
-      **config,
-    )
-
   def __init__(
     self,
     input_shape: Sequence[int],
@@ -104,7 +93,8 @@ class InducedSetRegressor(Model):
 
     self.initial_inducing_points = nnx.Param(jnp.zeros(shape=(induced, n_in)))
 
-    feature_masks = []
+    scales_pos = []
+    scales_neg = []
     main: list[Block] = []
     induction: list[Block] = []
 
@@ -113,23 +103,25 @@ class InducedSetRegressor(Model):
       main.append(Block(2 * n_in, block_def, p_dropout=p_dropout, rngs=rngs))
       induction.append(Block(2 * n_in, block_def, p_dropout=p_dropout, rngs=rngs))
 
-      fmask = nnx.Param(jnp.ones(shape=(n_in,)), )
-      feature_masks.append(fmask)
+      scale_pos = nnx.Param(jnp.zeros(shape=(n_in,)), )
+      scale_neg = nnx.Param(jnp.zeros(shape=(n_in,)), )
+      scales_pos.append(scale_pos)
+      scales_neg.append(scale_neg)
 
       n_in = int(block_def[-1])
 
     self.main = nnx.List(main)
     self.induction = nnx.List(induction)
-    self.main_feature_masks = nnx.List(feature_masks)
+    self.scales_pos = nnx.List(scales_pos)
+    self.scales_neg = nnx.List(scales_neg)
 
     *head_hidden, head_output = head_def
     self.head = Block(2 * n_in, (*head_hidden, 2 * head_output), p_dropout=p_dropout, rngs=rngs)
-    self.head_feature_mask = nnx.Param(jnp.ones(shape=(n_in,)), )
+    self.head_scale_pos = nnx.Param(jnp.zeros(shape=(n_in,)), )
+    self.head_scale_neg = nnx.Param(jnp.zeros(shape=(n_in,)), )
 
     self.output = nnx.Linear(head_output, n_t, rngs=rngs)
 
-  def ensemble(self) -> None:
-    return None
 
   def __call__(self, features, mask, *, deterministic: bool = True, rngs=None):
     n_b, *_ = features.shape
@@ -137,16 +129,17 @@ class InducedSetRegressor(Model):
     inducing = self.initial_inducing_points[...]
     inducing = jnp.broadcast_to(inducing[None], shape=(n_b, *inducing.shape))
 
-    for block_x, block_inducing, fmask in zip(self.main, self.induction, self.main_feature_masks):
-      x_inducing, inducing_x = cross_attention(x, inducing, mask_features=fmask, mask_xs=mask)
+    for block_x, block_inducing, s_pos, s_neg in zip(self.main, self.induction, self.scales_pos, self.scales_neg):
+      x_inducing, inducing_x = cross_attention(x, inducing, s_pos, s_neg, mask_xs=mask)
       x = jnp.concatenate([x, x_inducing], axis=-1)
       inducing = jnp.concatenate([inducing, inducing_x], axis=-1)
 
       x = block_x(x, deterministic=deterministic, rngs=rngs)
       inducing = block_inducing(inducing, deterministic=deterministic, rngs=rngs)
 
-    fmask = self.head_feature_mask[...]
-    x_inducing, _ = cross_attention(x, inducing, mask_xs=mask, mask_features=fmask)
+    s_pos = self.head_scale_pos[...]
+    s_neg = self.head_scale_neg[...]
+    x_inducing, _ = cross_attention(x, inducing, s_pos, s_neg, mask_xs=mask)
     x = jnp.concatenate([x, x_inducing], axis=-1)
 
     xw = self.head(x)

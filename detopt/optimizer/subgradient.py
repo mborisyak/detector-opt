@@ -16,22 +16,10 @@ __all__ = ["Subgradient"]
 
 
 class Subgradient(Optimizer):
-    @classmethod
-    def from_config(cls, detector: Detector, config, *, rngs: nnx.Rngs):
-        if "optimizer_regressor" in config:
-            config["optimizer_regressor"] = utils.config.optimizer(config["optimizer_regressor"])
-
-        if "optimizer_design" in config:
-            config["optimizer_design"] = utils.config.optimizer(config["optimizer_design"])
-
-        config["regressor"] = nn.from_config(detector, config["regressor"], rngs=rngs)
-
-        return cls(detector=detector, **config)
-
     def __init__(
         self,
         detector: Detector,
-        regressor: nn.Regressor,
+        regressor: nn.Model,
         batch_size: int,
         n_steps_regressor: int,
         design_eps: float = 0.1,

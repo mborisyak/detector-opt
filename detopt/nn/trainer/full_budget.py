@@ -11,7 +11,7 @@ import numpy as np
 import optax
 
 from ...utils.training import masked_mean_sem
-from .common import Trainer, TrainResult
+from .common import Trainer, TrainResult, fresh_design_network, window_sample_indices
 
 __all__ = ["FullBudgetTrainer"]
 
@@ -100,6 +100,12 @@ class FullBudgetTrainer(Trainer):
             seed=seed,
         )
 
+    def _sample_indices(self, key, start, count):
+        return window_sample_indices(self, key, start, count)  # uniform over the full budget window
+
+    def _init_design_network(self, init_seq, init_params):
+        return fresh_design_network(self, init_seq, init_params)  # fresh, single design
+
     def train(self, design_enc, seed_seq, *, on_epoch=None) -> TrainResult:
         """Train a fresh regressor on the full budget for ``max_epochs`` epochs.
 
@@ -110,18 +116,18 @@ class FullBudgetTrainer(Trainer):
         detector = self.detector
         design_enc = np.asarray(design_enc, dtype=np.float32)
         design = detector.decode_design(design_enc)  # physical Design namedtuple (what the pools store)
-        init_seq, training_seq, data_seq = seed_seq.spawn(3)
+        init_seq, training_seq = seed_seq.spawn(2)
 
         # Fresh, randomly initialised regressor + optimiser (cosine-scheduled LR).
-        params, state, opt_state = self._init_design_network(init_seq, None, None)
+        params, state, opt_state = self._init_design_network(init_seq, None)
 
-        # Populate EVERYTHING up front: the whole budget under this single design.
+        # Populate EVERYTHING up front: the whole budget under this single design (the disjoint
+        # train/val event indices were drawn once in __init__).
         tp, vp = self.train_pool, self.val_pool
-        train_seq, val_seq = data_seq.spawn(2)
-        self._fill_pool(design, tp, tp.n_max, train_seq)
-        self._fill_pool(design, vp, vp.n_max, val_seq)
+        self._fill_pool(design, tp, tp.capacity, self._train_index)
+        self._fill_pool(design, vp, vp.capacity, self._val_index)
         start = jnp.int32(0)
-        train_count, val_count = int(tp.n_current), int(vp.n_current)
+        train_count, val_count = int(tp.current), int(vp.current)
 
         key = jax.random.PRNGKey(int(training_seq.generate_state(1)[0]))
         train_hist, val_hist = [], []
@@ -170,5 +176,5 @@ class FullBudgetTrainer(Trainer):
 
         objective_loss = 0.5 * (train_mean + val_mean)
         objective_std = 0.5 * float(np.hypot(train_sem, val_sem))
-        spent = tp.n_current + vp.n_current
-        return TrainResult(objective_loss, objective_std, spent, params, state)
+        spent = tp.current + vp.current
+        return TrainResult(objective_loss, objective_std, spent, params)

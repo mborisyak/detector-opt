@@ -24,6 +24,7 @@ import jax.numpy as jnp
 
 import detopt
 from detopt.detector import straw_detector
+from detopt.detector.straw import Pool
 import track_fit as T
 import fairship_retina as FR  # _errs, _master_table, _pred9
 
@@ -45,8 +46,9 @@ def _load_reco(n_files):
 
 
 def _input_events(pa, ei, bz, ev_rows):
-    """Build solver ``InputEvents`` from the two daughters (first 2 particles) of each event, plus the
-    ``(n,2)`` [start,end) boundaries into that flat particle list. Mass/momentum -> MeV (solver units)."""
+    """Build a solver ``Pool`` from the two daughters (first 2 particles) of each event, plus the
+    ``(n,2)`` [start,end) boundaries into that flat particle list. Mass/momentum -> MeV (solver units).
+    (The engine packs the C ``InputEvents`` from the ``Pool`` per solve.)"""
     order = np.argsort(ei, kind="stable")
     ei_s = ei[order]
     mass, charge, pos, mom, t0, bnds, base = [], [], [], [], [], [], 0
@@ -61,14 +63,14 @@ def _input_events(pa, ei, bz, ev_rows):
             t0.append(pa[r, 7])
         bnds.append([base, base + len(rows)])
         base += len(rows)
-    ie = straw_detector.InputEvents(
+    pool = Pool(
         np.asarray(mass, np.float32), np.asarray(charge, np.float32),
         np.asarray(pos, np.float32), np.asarray(mom, np.float32), np.asarray(t0, np.float32),
     )
-    return ie, np.asarray(bnds, np.int32)
+    return pool, np.asarray(bnds, np.int32)
 
 
-def _crossings(det, ie, bnds, design, layer_z, batch=4096):
+def _crossings(det, pool, bnds, design, layer_z, batch=4096):
     """Run the solver in batches, returning each daughter's exact crossings ``tracks (n,2,32,2)`` and
     ``track_mask (n,2,32)`` at the layer planes (boundaries index the full ``ie``, so batching is safe).
 
@@ -80,14 +82,15 @@ def _crossings(det, ie, bnds, design, layer_z, batch=4096):
     lz = np.asarray(layer_z, np.float32)
     tracks = np.zeros((n, 2, m, 2), np.float32)
     tmask = np.zeros((n, 2, m), np.int32)
-    rng = np.random.default_rng(0)
     for i in range(0, n, batch):
         b = bnds[i : i + batch]
         nb = b.shape[0]
         traj = np.zeros((nb, 2, m, 3), np.float32)
         ncr = np.zeros((nb, 2), np.int32)
         pid = np.full((nb, 2), -1, np.int32)
-        det._run_solver(b, np.repeat(design[None], nb, 0), rng, input_events=ie, z_planes=lz, traj=traj, n_cross=ncr, part_idx=pid, primaries=True)
+        layers, angles, Bs = det._design_to_geometry(np.repeat(design[None], nb, 0))  # per-event geometry
+        det._run_solver(pool, b, layers, angles, Bs, det._seeds(i + np.arange(nb)),
+                        z_planes=lz, traj=traj, n_cross=ncr, part_idx=pid, primaries=True)
         valid = np.arange(m)[None, None, :] < ncr[:, :, None]  # (nb,2,m) filled crossing slots
         p = np.clip(np.searchsorted(lz, traj[..., 2]), 0, m - 1)  # plane index per crossing slot
         ei = np.broadcast_to((i + np.arange(nb))[:, None, None], (nb, 2, m))[valid]
@@ -148,7 +151,8 @@ def _no_material(det):
     det.delta_Tcut = 1.0e9
     det.lambda_conv_cm = 1.0e12  # no photon conversion
     det.noise_rate = 0.0
-    det._sim_params = straw_detector.SimParams(
+    # The realistic engine OWNS the C SimParams -- rebuild it there to apply the material-off physics.
+    det.engine._sim_params = straw_detector.SimParams(
         det.max_dt, det.max_time, det.dt_fixed, det.max_steps, 64,
         det.scatter_xX0, det.lambda_conv_cm, det.noise_rate, det.enable_decay,
         det.delta_const, det.wall_thickness, det.delta_Tcut, det.enable_eloss,
@@ -157,7 +161,7 @@ def _no_material(det):
 
 
 def run(n_files=20, dt=0.4, n_steps=160, n_iters=1000, lr=0.05, coef=1.0, s_hi=30.0, drift_sigma=0.05, material=True, optimizer="adam", **config):
-    det = detopt.detector.StereoTracking()
+    det = detopt.detector.Stereo4Feature()
     if not material:
         _no_material(det)
         print("MATERIAL INTERACTIONS OFF: no scattering / energy-loss / delta-rays / conversion / decay")
@@ -174,8 +178,8 @@ def run(n_files=20, dt=0.4, n_steps=160, n_iters=1000, lr=0.05, coef=1.0, s_hi=3
     ev_rows = np.nonzero(reco_ok)[0]
     print(f"loaded {nf} files: {truth.shape[0]} events, {reco_ok.sum()} reconstructed by FairShip; pushing daughters through OUR solver")
 
-    ie, bnds = _input_events(pa, ei, bz, ev_rows)
-    tracks, tmask = _crossings(det, ie, bnds, design, layer_z.astype(np.float32))
+    pool, bnds = _input_events(pa, ei, bz, ev_rows)
+    tracks, tmask = _crossings(det, pool, bnds, design, layer_z.astype(np.float32))
     print(f"  our sim: mean planes crossed/daughter = {tmask.sum(2).mean():.1f}/32")
     seeds, hl, hYw, hYe, hr, hv = _build_hits(tracks, tmask, layer_z, layer_tan, det.n_straws, det.straw_pitch, z_start, det.z0)
     seeds, hl, hYw, hYe, hr, hv = (jnp.asarray(a) for a in (seeds, hl, hYw, hYe, hr, hv))

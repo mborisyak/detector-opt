@@ -2,7 +2,7 @@
 # minus the `bo:` block; adds a `subgradient:` block. The design lives in encoded
 # space and is descended by an analytic gradient through combine() over a RingBuffer.
 detector:
-  stereo_straw:
+  stereo_tracking:
     n_stations_upstream: 2
     n_stations_downstream: 2
     n_layers_per_view: 2
@@ -14,7 +14,7 @@ detector:
     magnet_half_cm: 140.0   # magnet z half-width (FairShip YokeDepth)
     station_width: 100.0    # station z full-width (2 x FairShip station_length); coupled non-overlap encoding
     station_clearance: 50.0 # minimum z gap between adjacent station footprints (0 = may touch)
-    max_B: -0.151
+    field_integral: -1.071  # T.m, int Bx dz (-0.151 T peak derived w/ B_sigma=283)
     z0: 8957.0
     B_sigma: 283.0
     layer_bounds: [8200.0, 9750.0]
@@ -24,13 +24,12 @@ detector:
     max_time: 300.0
     material: kapton
     data_dir: "data/mc"
-    pool_split: {train: 0.45, design: 0.45, val: 0.1}   # disjoint pools: net / design gradient / held-out validation
 
 # Initial (nominal) design -> the starting encoded theta. Field is FIXED at max_B (not a
 # design dof: it collapsed to ~0 / was a near-flat objective in the HNL runs).
 nominal_design:
   stations: [8407.0, 8607.0, 9307.0, 9507.0]
-  angle: 0.0798
+  view_angle: 0.0798
 
 regressor:
   set-regressor:

@@ -2,6 +2,7 @@ import numpy as np
 
 f32_array = np.ndarray[tuple[int, ...], np.dtype[np.float32]]
 i32_array = np.ndarray[tuple[int, ...], np.dtype[np.int32]]
+u32_array = np.ndarray[tuple[int, ...], np.dtype[np.uint32]]
 
 # Init-once solver objects (opaque); built in straw.py and passed straight back to solve().
 class SimParams: ...
@@ -24,8 +25,8 @@ def solve(
     layers: f32_array,  # (n, n_layers)
     angles: f32_array,  # (n, n_layers)
     B: f32_array,  # (n,)
-    X: f32_array,  # (n, M, 5) out
-    mask: i32_array,  # (n, M) out
+    hits_idx: u32_array,  # (n, M, 4) out: [station, view, layer, straw]
+    tdc: f32_array,  # (n, M) out: min-subtracted TDC, < 0 = no hit (init -1; tdc>=0 is the mask)
     z_planes: f32_array | None,  # (m,) reference z's (= max crossings per track slot)
     traj: f32_array | None,  # (n, n_tracks, m, 3) out: ordered (x, y, z) plane crossings per slot
     n_cross: i32_array | None,  # (n, n_tracks) out: number of crossings recorded per slot

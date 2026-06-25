@@ -7,9 +7,14 @@ from flax import nnx
 
 import jax
 
-from detopt.detector.debug import DebugDetector
+from analytic import analytic_detector, DESIGN
 from detopt.nn import from_config
 from detopt.nn.trainer import ContinualTrainer, DesignTrainer, TrainResult
+
+
+# Test design (the detector holds none): flat [station_z(4), view_tilt(4), field_strength].
+# FairShip-matched geometry: SST stations at 8407, 8607 | 9307, 9507; nominal B ~ 0.178 T.
+_DEBUG_DESIGN = DESIGN
 
 
 def _adam(lr=1e-3):
@@ -20,7 +25,7 @@ def _adam(lr=1e-3):
 
 def test_dropout_active_only_when_training(seed):
     """deterministic=True -> dropout OFF (identical); False -> ON (outputs differ)."""
-    det = DebugDetector()
+    det = analytic_detector()
     reg = from_config(
         det,
         config={"set-regressor": {"features": [[16, 16]], "p_dropout": 0.5}},
@@ -43,7 +48,7 @@ def test_dropout_active_only_when_training(seed):
 
 
 def _small_trainer(loss_precision, *, n0, n_increment, iteration_limit, budget, seed):
-    det = DebugDetector()
+    det = analytic_detector()
     return det, DesignTrainer(
         det,
         regressor_config={"set-regressor": {"features": [[16, 16]], "p_dropout": 0.1}},
@@ -82,7 +87,7 @@ def test_design_trainer_converges(seed):
     # Accept invariant: the loss estimate's own SEM is within precision.
     assert result.objective_std <= loss_precision + 1e-6
     assert 0 < result.spent
-    assert result.params is not None and result.state is not None
+    assert result.params is not None
 
 
 def test_design_trainer_crashes_when_iteration_limit_exceeded(seed):
@@ -104,14 +109,14 @@ def test_pool_accumulates_across_designs(seed):
     det, trainer = _small_trainer(0.5, n0=256, n_increment=128, iteration_limit=512, budget=20_000, seed=seed)
     design = np.zeros(det.design_dim(), dtype=np.float32)
     assert trainer.train(design, np.random.SeedSequence(seed)) is not None
-    after_first = trainer.train_pool.n_current
+    after_first = trainer.train_pool.current
     assert trainer.train(design, np.random.SeedSequence(seed + 1)) is not None
-    after_second = trainer.train_pool.n_current
+    after_second = trainer.train_pool.current
     assert 0 < after_first < after_second  # the second design appended more data
 
 
 def _small_continual(loss_precision, *, n0, n_increment, iteration_limit, budget, seed):
-    det = DebugDetector()
+    det = analytic_detector()
     return det, ContinualTrainer(
         det,
         regressor_config={"set-regressor": {"features": [[16, 16]], "p_dropout": 0.1}},
@@ -139,12 +144,12 @@ def test_continual_trainer_persists_and_replays(seed):
     assert trainer._running is None
     assert trainer.train(design, np.random.SeedSequence(seed)) is not None
     assert trainer._running is not None  # network persisted across the call
-    after_first = trainer.train_pool.n_current
+    after_first = trainer.train_pool.current
     # The next design continues the SAME network (init returns the persisted tuple).
-    assert trainer._init_design_network(np.random.SeedSequence(0), None, None) is trainer._running
+    assert trainer._init_design_network(np.random.SeedSequence(0), None) is trainer._running
     # ... and appends to the pool, so history is available for replay.
     assert trainer.train(design, np.random.SeedSequence(seed + 1)) is not None
-    assert trainer.train_pool.n_current > after_first
+    assert trainer.train_pool.current > after_first
 
 
 def test_continual_replay_sampling():
@@ -169,15 +174,15 @@ def test_trainers_are_design_conditioned():
     """No design scramble: the per-event PHYSICAL design fed to ``combine`` reaches the network, so
     the shared loss kernel (used by every trainer) gives a different loss for the real design than
     for a shifted one. The pool now stores raw events + raw physical design; ``combine`` encodes it."""
-    det = DebugDetector()
+    det = analytic_detector()
     _, trainer = _small_trainer(0.5, n0=256, n_increment=128, iteration_limit=512, budget=20_000, seed=0)
     reg_def, params, state = trainer._build_regressor(0)
     loss_fn = trainer._make_loss_fn(reg_def)
 
     B = 16
-    design = det.get_current_design_array()
+    design = _DEBUG_DESIGN
     phys = np.broadcast_to(design[None, :], (B, det.design_dim())).astype(np.float32)
-    _gt, event, mask, target = det(np.random.SeedSequence(0), phys)
+    _gt, event, mask, target = det(phys, np.arange(B))
 
     key = jax.random.PRNGKey(0)
     design_real = jnp.asarray(phys)  # per-event PHYSICAL design (combine encodes it)

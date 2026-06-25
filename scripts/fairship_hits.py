@@ -49,18 +49,10 @@ def make_bx(field):
 
 
 def _load(n_files):
-    need = "reco"
-    fs = [f for f in sorted(glob.glob("data/mc/*.npz")) if need in np.load(f, allow_pickle=True).files][: int(n_files)]
-    cols = {k: [] for k in ("truth", "reco", "digi_straw", "digi_invalid", "digi_event_index", "hits", "hit_track", "digi_tdc")}
-    off = 0
-    for f in fs:
-        d = np.load(f, allow_pickle=True)
-        for k in cols:
-            cols[k].append(np.asarray(d[k]))
-        cols["digi_event_index"][-1] = cols["digi_event_index"][-1] + off
-        off += d["truth"].shape[0]
-    out = {k: np.concatenate(v) for k, v in cols.items()}
-    return out, len(fs)
+    # Shared loader (detopt.data.fairship_loader) + the MC hit cloud this script also needs.
+    from detopt.data.fairship_loader import load_fairship_digi
+    return load_fairship_digi(int(n_files), columns=(
+        "truth", "reco", "digi_straw", "digi_invalid", "digi_event_index", "hits", "hit_track", "digi_tdc"))
 
 
 def _calibrate(ds, hits, valid):

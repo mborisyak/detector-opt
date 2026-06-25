@@ -1,0 +1,22 @@
+detector: stereo_layerwise
+design: initial_stereo
+
+regressor:
+  double-set-regressor:
+    features: [ [ 64, 32 ], [ 64, 32 ] ]
+    global_dim: 32
+    n_straws: 316
+    n_stations: 4
+    n_views_per_station: 4
+    n_layers_per_view: 2
+
+optimizer:
+  adamw:
+    learning_rate:
+      cosine_decay_schedule:
+        init_value: 1.0e-3
+    weight_decay: 1.0e-6
+
+sampling: { batch: 1024 }
+training: { batch: 32, epochs: 2048, samples: 65536 }
+validation: { batch: 128, samples: 16384 }

@@ -12,7 +12,7 @@ two per-daughter bending observables:
     is along x), so this is the physical sagitta the spectrometer measures.
 
 It samples events at the config design, asks the C solver for each daughter's ground-truth ``(x, y)``
-crossing of every layer plane (``sample_events(..., z_planes=layer_z, m_tracks=2)``), plots both
+crossing of every layer plane (``_simulate(..., z_planes=layer_z, n_tracks=2)``), plots both
 histograms, and prints summary statistics.
 
     python scripts/measure_bending.py seed=0 n_events=4096
@@ -28,6 +28,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 import detopt  # noqa: E402
+from detopt.utils.events import shuffled_event_index  # noqa: E402
 
 
 def measure(seed=0, n_events=4096, out="bending.png", **config):
@@ -40,7 +41,8 @@ def measure(seed=0, n_events=4096, out="bending.png", **config):
     design = np.broadcast_to(phys[None, :], (int(n_events), phys.shape[0]))  # one row per event
 
     # Push the two daughters through; tracks[e, d, k] = (x, y) crossing of plane k by daughter d.
-    out_ev = detector.sample_events(int(seed), design, z_planes=layer_z, n_tracks=2)
+    event_index = shuffled_event_index(detector.size(), int(n_events), int(seed))
+    out_ev = detector._simulate(design, event_index, z_planes=layer_z, n_tracks=2)
     traj, ncr = out_ev["traj"], out_ev["n_cross"]  # (n,2,P,3) ordered (x,y,z) crossings, (n,2) counts
     n, _, P, _ = traj.shape
     lz = np.asarray(layer_z, np.float32)

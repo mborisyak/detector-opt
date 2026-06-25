@@ -31,7 +31,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from .common import Model
+from .common import Model, Shape
 
 __all__ = [
     "SetRegressor",
@@ -181,29 +181,21 @@ class SetRegressor(Model):
     p_dropout : optional dropout rate for the shared MLPs.
     """
 
-    @classmethod
-    def from_config(cls, detector, config, *, rngs: nnx.Rngs):
-        return cls(
-            n_features_in=int(detector.combined_feature_dim),
-            target_dim=int(detector.target_dim()),
-            rngs=rngs,
-            **config,
-        )
-
     def __init__(
         self,
-        n_features_in: int,
-        target_dim: int,
+        input_shape: Shape,
+        target_shape: Shape,
+        ground_truth_shape: Shape,
         features: Sequence[Sequence[int]],
         n_models: int | None = None,
         p_dropout: float | None = None,
         *,
         rngs: nnx.Rngs,
     ):
-        # Do not call Model.__init__ -- it reads detector-specific shapes we don't use.
+        # The universal shapes: per-hit feature count = input_shape[-1], target dim = target_shape[0].
         self.rngs = rngs
-        self.n_features_in = int(n_features_in)
-        self.target_dim = int(target_dim)
+        self.n_features_in = int(input_shape[-1])
+        self.target_dim = int(target_shape[0])
         self.n_models = None if n_models is None else int(n_models)
         if self.n_models is not None and self.n_models < 1:
             raise ValueError("n_models must be None or an int >= 1")

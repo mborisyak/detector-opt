@@ -22,6 +22,7 @@ import numpy as np
 import jax.numpy as jnp
 
 import detopt
+from detopt.utils.events import shuffled_event_index
 
 # combine() -> [TDC, norm(layer z), wire_y_left, wire_y_right]
 FEATURE_LABELS = ("tdc", "norm_z", "wire_y_left", "wire_y_right")
@@ -36,13 +37,16 @@ def measure(seed=0, n_events=2048, **config):
     phys = np.asarray(detector.flatten_design(detector.decode_design(theta)), np.float32)
     design = np.broadcast_to(phys[None, :], (n_events, phys.shape[0]))  # one row per event
 
-    rng = np.random.default_rng(int(seed))
-    boundaries, _, _ = detector.generate_events(rng, int(n_events))
+    event_index = shuffled_event_index(detector.size(), int(n_events), int(seed))
+    pool, boundaries, _t, _c = detector._events_at(event_index)
+    layers, angles, Bs = detector._design_to_geometry(design)
     process_ids = np.zeros((n_events, M), dtype=np.int32)
-    X, mask, _ = detector._run_solver(boundaries, design, rng, process_ids=process_ids)
+    hits_idx, tdc, _ = detector._run_solver(pool, boundaries, layers, angles, Bs,
+                                            detector._seeds(event_index), process_ids=process_ids)
+    mask = (tdc >= 0).astype(np.int32)
 
     theta_b = jnp.broadcast_to(theta[None, :], (n_events, detector.encoded_design_dim()))
-    event = detector._pack_event(X)  # raw solver (n, M, 5) float -> StrawEvent
+    event = detector._pack_event(hits_idx, tdc)  # -> StrawEvent
     feats = np.asarray(detector.combine_encoded(event, theta_b))  # (n, M, F)
 
     pairwise = [[] for _ in range(F)]  # all same-event daughter-pair |Δ| per feature

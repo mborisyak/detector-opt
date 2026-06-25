@@ -1,159 +1,118 @@
-"""Stereo straw detector whose regression target is the two DAUGHTER particles' kinematics
-instead of the HNL's.
+"""The stereo straw detector with the 4-FEATURE combine -- the default stereo detector.
 
-Same stereo design (``[station_z(n), stereo_angle]``, field fixed at ``max_B``) and same HNL
-conditioning as :class:`StereoStrawDetector`; it only PICKS a different sampled ground truth as
-the network target -- the two daughters' ``[decay_vertex(3), product1_p(3), product2_p(3)]``
-(9-vec, the daughters share the decay vertex) -- by setting ``_targets_field``. The base
-``StrawDetector`` owns the normalization constants, target shape and metric labels for both
-fields; only the LOSS is daughter-specific and lives here.
+A combine LEAF: stereo geometry (``StereoStrawDetector``) + the unified daughter objective (the base
+``StrawDetector``) + the per-hit 4-feature combine ``[TDC, norm z, wire_y_left, wire_y_right]``, shared
+with ``FreeStrawDetector`` through the module function :func:`four_feature_combine`. Its siblings under
+``StereoStrawDetector`` (``StereoLayerWise`` / ``Image`` / ``Hits``) only differ in the combine.
 
-The two daughters are PERMUTATION-INVARIANT (their labelling p1/p2 is arbitrary), so the loss is
-the minimum over the two assignments of predicted->true momenta (the shared vertex is not
-permuted). The base normalizes both momentum slots with the SAME constants, so the swap is exact.
+``StereoTrackerTruth`` extends it with per-hit TRUTH measurements for tracker experiments.
 """
 
-from typing import NamedTuple
-
-import jax
 import numpy as np
 
 from .stereo_straw import StereoStrawDetector
+from .straw import StrawEvent, DaughterTarget, four_feature_combine, four_feature_shape
 
-__all__ = ["StereoTracking", "DaughterTarget"]
-
-
-class DaughterTarget(NamedTuple):
-    """Daughter-tracking target: shared decay vertex (cm) + the two daughters' momenta (GeV)."""
-
-    vertex: jax.Array  # (..., 3)
-    p1: jax.Array  # (..., 3)
-    p2: jax.Array  # (..., 3)
+__all__ = ["Stereo4Feature", "DaughterTarget", "StereoTrackerTruth"]
 
 
-class StereoTracking(StereoStrawDetector):
-    # Pick the daughter ground truth (loader field) as the network target instead of the HNL 6-vec.
-    _targets_field = "daughter_targets"
+class Stereo4Feature(StereoStrawDetector):
+    """Stereo geometry + the 4-feature per-hit combine (the default stereo detector)."""
 
-    def target_spec(self):
-        # Daughter 9-vec: shared decay vertex + the two daughters' momenta.
-        f = lambda n: jax.ShapeDtypeStruct((n,), np.float32)
-        return DaughterTarget(vertex=f(3), p1=f(3), p2=f(3))
+    def combine_encoded(self, event, encoded_design, mask=None):
+        return four_feature_combine(self, event, encoded_design, mask=mask)
 
-    def _pack_target(self, targets):
-        """Pack the daughter target array ``(n, 9)`` [vertex, p1, p2] into a ``DaughterTarget``."""
-        t = np.asarray(targets)
-        return DaughterTarget(vertex=t[..., :3], p1=t[..., 3:6], p2=t[..., 6:9])
+    def combined_event_shape(self):
+        return four_feature_shape(self)
 
-    def metric_labels(self):
-        """Keys of the metric() dict, in display order (p_{x,y,z} is shared over the daughters)."""
-        return ("loss", "vertex_x", "vertex_y", "vertex_z", "p_x", "p_y", "p_z")
+    def element_mask(self, event, mask):
+        return mask  # element == hit (padded hits are gated by the regressor's hit mask)
 
-    def loss(self, predicted, target):
-        """Per-sample MSE on the normalized 9-vec, PERMUTATION-INVARIANT over the two daughters:
-        the shared vertex is matched directly; the momenta are matched by the cheaper of the two
-        assignments (p1<->p1,p2<->p2) vs (p1<->p2,p2<->p1). Mean over all 9 components, so on the
-        same scale as the 6-vec base MSE. Broadcasts over any leading axes (e.g. ``(members, B)``)."""
-        import jax.numpy as jnp
 
-        vp, vt = predicted[..., :3], target[..., :3]
-        p1p, p2p = predicted[..., 3:6], predicted[..., 6:9]
-        p1t, p2t = target[..., 3:6], target[..., 6:9]
+class StereoTrackerTruth(Stereo4Feature):
+    """``Stereo4Feature`` + per-hit TRUTH measurements for tracker experiments: each layer-plane crossing's
+    exact ``(x, y)``, the re-derived (smeared) ``drift_r``, and the matched digitised ``tdc``. The base
+    ``__call__`` is the clean fired-straw event (inherited, no experiment flags); the TRUTH tracking event
+    is the SEPARATE :meth:`tracking_event` (so ``__call__`` keeps the uniform ``(design, event_index)``
+    signature -- it is not overridden)."""
 
-        loss_vertex = 0.5 * jnp.mean(jnp.square(vp - vt), axis=-1)
-        loss_momenta = 0.25 * jnp.minimum(
-            jnp.mean(jnp.square(p1p - p1t) + jnp.square(p2p - p2t), axis=-1),
-            jnp.mean(jnp.square(p2p - p1t) + jnp.square(p1p - p2t), axis=-1),
+    def tracking_event(self, design, event_index, *, n_tracks=2, primaries=True,
+                       hits_xy=True, drift_r=True, tdc=True, smear_seed=0):
+        """Simulate the events at ``event_index``, RECORDING each track's plane crossings, and return
+        ``(ground_truth, tracking_event, mask, target)`` where ``tracking_event`` is a ``StrawEvent``
+        carrying the per-hit ``(x, y)`` / ``drift_r`` / matched-``tdc`` truth (``M = n_tracks * m``)."""
+        layer_z = np.asarray(self._design_to_geometry(self._resolve_design(design, 1))[0][0], np.float32)
+        out = self._simulate(design, event_index, z_planes=layer_z, n_tracks=n_tracks, primaries=primaries)
+        event, mask = self._trajectory_to_event(out["traj"], out["n_cross"], design, hits_xy=hits_xy,
+                                                 drift_r=drift_r, tdc=tdc, digi=out["X"], digi_mask=out["mask"],
+                                                 smear_seed=smear_seed)
+        return out["ground_truth"], event, mask, out["target"]
+
+    def _trajectory_to_event(self, traj, n_cross, design, hits_xy=False, drift_r=False, tdc=False,
+                             digi=None, digi_mask=None, smear_seed=0):
+        """Build a tracking ``StrawEvent`` from the solver's per-track trajectory
+        (``traj (B, n_tracks, m, 3)``, ``n_cross (B, n_tracks)``). Each recorded crossing becomes one
+        hit: its ``(station, view, layer-in-view)`` address + nearest ``straw`` are quantised from the
+        ``(x, y, z)`` crossing (same geometry as :meth:`combine_encoded`), and -- under the flags --
+        ``x, y`` (the exact crossing, ``hits_xy``); ``drift_r`` (perpendicular crossing->wire distance,
+        re-derived host-side from ``(x, y)`` then SMEARED by ``N(0, sigma_spatial)`` to be FairShip-
+        realistic, ``drift_r``); and ``tdc`` (the real digitised TDC, looked up from the ``digi`` packed
+        StrawEvent by straw address -- ``NaN`` where the crossing has no matching fired straw). Returns
+        ``(StrawEvent, mask)`` with leaves ``(B, M)``, ``M = n_tracks * m``. Uniform design across batch."""
+        traj = np.asarray(traj, np.float32)
+        n_cross = np.asarray(n_cross)
+        B, T, m, _ = traj.shape
+        positions, angles, _ = self._design_to_geometry(self._resolve_design(design, 1))
+        lz, ang0 = np.asarray(positions[0], np.float32), np.asarray(angles[0], np.float32)  # uniform design
+        n_layers = lz.shape[0]
+        order = np.argsort(lz)
+        # crossing z -> global layer index k (z == lz[k] exactly, copied from z_planes by the solver)
+        rank = np.clip(np.searchsorted(lz[order], traj[..., 2]), 0, n_layers - 1)
+        k = order[rank]  # (B, T, m) global layer index
+        per_station = self.n_views_per_station * self.n_layers_per_view
+        station, within = k // per_station, k % per_station
+        view, lpv = within // self.n_layers_per_view, within % self.n_layers_per_view
+        tan = np.tan(ang0[k])
+        cos = 1.0 / np.sqrt(1.0 + tan * tan)
+        xx, yy = traj[..., 0], traj[..., 1]
+        c = yy - xx * tan  # sheared (wire-frame) coordinate, constant along a wire
+        y_stagger = np.where((lpv & 1) == 1, 0.5 * self.layer_y_offset, -0.5 * self.layer_y_offset)
+        pitch, height, ns = self.straw_pitch, self.layer_height, self.n_straws
+        straw = np.clip(np.round((c + height - y_stagger) / pitch - 0.5), 0, ns - 1)
+        wire = (straw + 0.5) * pitch - height + y_stagger  # nearest wire-centre sheared y
+        dr = np.abs(c - wire) * cos  # drift radius (perpendicular crossing->wire), re-derived from (x, y)
+        if drift_r:  # FairShip-realistic measurement: smear by the single-hit spatial resolution
+            rng = np.random.default_rng(smear_seed)
+            dr = np.abs(dr + rng.normal(0.0, 0.012, dr.shape))  # 0.012 cm = straw_detector.c STRAW_SIGMA_SPATIAL
+        flat = lambda a: a.reshape(B, T * m)
+        event = StrawEvent(
+            station=flat(station.astype(np.int32)),
+            view=flat(view.astype(np.int32)),
+            layer=flat(lpv.astype(np.int32)),
+            straw=flat(straw.astype(np.int32)),
+            tdc=flat(self._match_tdc(k, straw, n_cross, digi, digi_mask)) if tdc
+            else flat(np.zeros((B, T, m), np.float32)),  # real TDC by address (V2) else unused
+            x=flat(xx) if hits_xy else None,
+            y=flat(yy) if hits_xy else None,
+            drift_r=flat(dr.astype(np.float32)) if drift_r else None,
         )
+        mask = flat((np.arange(m)[None, None, :] < n_cross[:, :, None]).astype(np.int32))
+        return event, mask
 
-        return loss_vertex + loss_momenta
-
-    def metric(self, predicted, target):
-        """Per-sample diagnostics dict on the normalized target: overall ``loss`` plus per-component
-        squared error -- ``vertex_{x,y,z}`` and the SHARED daughter momentum ``p_{x,y,z}``, which is
-        ``0.5 * (matched p1 + matched p2)`` under the best (loss-minimizing) daughter assignment."""
-        import jax.numpy as jnp
-
-        vp, vt = predicted[..., :3], target[..., :3]
-        p1p, p2p = predicted[..., 3:6], predicted[..., 6:9]
-        p1t, p2t = target[..., 3:6], target[..., 6:9]
-
-        vertex = jnp.square(vp - vt)
-        l1_p = jnp.square(p1p - p1t) + jnp.square(p2p - p2t)
-        l2_p = jnp.square(p2p - p1t) + jnp.square(p1p - p2t)
-        swap = jnp.sum(l1_p, axis=-1) > jnp.sum(l2_p, axis=-1)
-
-        momenta = (1 - swap)[..., None] * l1_p + swap[..., None] * l2_p
-
-        return {
-            "loss": self.loss(predicted, target),
-            "vertex_x": vertex[..., 0],
-            "vertex_y": vertex[..., 1],
-            "vertex_z": vertex[..., 2],
-            "p_x": momenta[..., 0],
-            "p_y": momenta[..., 1],
-            "p_z": momenta[..., 2],
-        }
-
-    def prediction_errors(self, predicted_norm, target_norm):
-        """Signed real-unit residuals ``predicted - true`` per quantity, for error histograms.
-        The two daughters are PERMUTATION-INVARIANT, so each sample's momenta are matched by the
-        loss-minimizing assignment (as in :meth:`metric`) before differencing, then both matched
-        daughters are POOLED into ``p_{x,y,z}``. Inputs are NORMALIZED ``(N, 9)``; returns
-        ``{label: (errors, unit)}`` -- vertex in cm (N), momentum in GeV (2N, both daughters)."""
-        import numpy as np
-
-        pred = self.denormalize_predictions(predicted_norm)  # DaughterTarget
-        true = self.denormalize_predictions(target_norm)
-        vertex = np.asarray(pred.vertex) - np.asarray(true.vertex)
-        p1p, p2p = np.asarray(pred.p1), np.asarray(pred.p2)
-        p1t, p2t = np.asarray(true.p1), np.asarray(true.p2)
-        l_direct = np.sum((p1p - p1t) ** 2 + (p2p - p2t) ** 2, axis=-1)
-        l_swap = np.sum((p2p - p1t) ** 2 + (p1p - p2t) ** 2, axis=-1)
-        swap = (l_swap < l_direct)[:, None]
-        err1 = np.where(swap, p2p - p1t, p1p - p1t)  # residual against true daughter 1
-        err2 = np.where(swap, p1p - p2t, p2p - p2t)  # residual against true daughter 2
-        mom = np.concatenate([err1, err2], axis=0)  # pooled over both daughters -> (2N, 3)
-        return {
-            "vertex_x": (vertex[:, 0], "cm"),
-            "vertex_y": (vertex[:, 1], "cm"),
-            "vertex_z": (vertex[:, 2], "cm"),
-            "p_x": (mom[:, 0], "GeV"),
-            "p_y": (mom[:, 1], "GeV"),
-            "p_z": (mom[:, 2], "GeV"),
-        }
-
-    def metric_real_rmse(self, metric_means, metric_errors=None):
-        """Sample-averaged normalized per-component metric (from :meth:`metric`) -> real-unit RMSE.
-
-        ``vertex_{x,y,z}`` are single normalized squared errors, so RMSE = ``sqrt(mse) * decay_sigma``
-        in cm. ``p_{x,y,z}`` are the SUMMED squared error over the two daughters, so the per-daughter
-        RMSE is ``sqrt(mse / 2) * daughter_momentum_sigma`` in GeV. ``loss`` (a mixed normalized
-        quantity) has no single physical unit and is omitted.
-
-        If ``metric_errors`` (the standard error on each mean MSE) is given, its 1-sigma uncertainty
-        is propagated to the RMSE: with ``RMSE = sqrt(mse/n)*sigma``, ``d(RMSE) = sigma * sem /
-        (2*sqrt(n*mse))`` -- reported as ``error`` (cm / GeV)."""
-        import numpy as np
-
-        ds = np.asarray(self.decay_sigma, np.float64)
-        dps = np.asarray(self.daughter_momentum_sigma, np.float64)
-        spec = {  # key: (sigma, n_daughters_summed, unit)
-            "vertex_x": (ds[0], 1, "cm"),
-            "vertex_y": (ds[1], 1, "cm"),
-            "vertex_z": (ds[2], 1, "cm"),
-            "p_x": (dps[0], 2, "GeV"),
-            "p_y": (dps[1], 2, "GeV"),
-            "p_z": (dps[2], 2, "GeV"),
-        }
-        out = {}
-        for k, (sigma, n, unit) in spec.items():
-            if k not in metric_means:
-                continue
-            mse = float(metric_means[k])
-            entry = {"rmse": float(np.sqrt(mse / n) * sigma), "unit": unit}
-            if metric_errors is not None and k in metric_errors:
-                sem = float(metric_errors[k])
-                entry["error"] = float(sigma * sem / (2.0 * np.sqrt(n * mse))) if mse > 0 else float("inf")
-            out[k] = entry
-        return out
+    def _match_tdc(self, k, straw, n_cross, digi, digi_mask):
+        """Real digitised TDC for each trajectory crossing, looked up from the digitised ``digi`` packed
+        StrawEvent by global straw key (event, global-layer, straw). ``NaN`` where a crossing has no fired
+        straw (capped out / shared). ``k``, ``straw`` are ``(B, T, m)``; returns ``(B, T, m)`` float32."""
+        B, T, m = k.shape
+        per_station, nlpv, ns = self.n_views_per_station * self.n_layers_per_view, self.n_layers_per_view, self.n_straws
+        kpl = self.n_layers * ns  # key span per event
+        ck = (np.arange(B)[:, None, None] * kpl + k * ns + straw.astype(np.int64)).reshape(-1)  # crossing keys
+        dk_layer = np.asarray(digi.station) * per_station + np.asarray(digi.view) * nlpv + np.asarray(digi.layer)
+        dk = (np.arange(B)[:, None] * kpl + dk_layer * ns + np.asarray(digi.straw)).astype(np.int64)  # (B, Md)
+        keep = np.asarray(digi_mask) > 0
+        dk_f, dt_f = dk[keep], np.asarray(digi.tdc, np.float32)[keep]  # fired digitised straws
+        o = np.argsort(dk_f, kind="stable")
+        dk_s, dt_s = dk_f[o], dt_f[o]
+        pos = np.clip(np.searchsorted(dk_s, ck), 0, max(dk_s.shape[0] - 1, 0))
+        hit = (dk_s.shape[0] > 0) & (dk_s[pos] == ck)
+        return np.where(hit, dt_s[pos], np.nan).reshape(B, T, m).astype(np.float32)

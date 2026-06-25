@@ -13,6 +13,10 @@ import detopt
 pytestmark = pytest.mark.skip(reason="deprecated detopt.optimizer.Subgradient path; use scripts/subgradient.py")
 
 
+# Test design (the detector holds none): flat [station_z(4), view_tilt(4), field_strength].
+_DEBUG_DESIGN = np.array([225.0, 250.0, 350.0, 375.0, -12.0, -4.0, 4.0, 12.0, 0.3], np.float32)
+
+
 def test_subgradient(seed):
     rngs = nnx.Rngs(seed + 1)
 
@@ -21,7 +25,7 @@ def test_subgradient(seed):
 
     opt = detopt.optimizer.Subgradient(detector, regressor, batch_size=7, n_steps_regressor=3)
 
-    design = detector.get_current_design_array()
+    design = _DEBUG_DESIGN
 
     for i in range(100):
         design = opt.step(seed=seed + i, design=design)

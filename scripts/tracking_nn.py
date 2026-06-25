@@ -36,7 +36,6 @@ from detopt.utils.config import optimizer as make_optimizer
 
 import tracking as TR  # scripts/tracking.py: solver/render/cut helpers (scripts/ is on sys.path)
 import oursim_retina as O  # _load_reco / _input_events / _no_material (sim-regime event loading)
-import fairship_hits as FH  # _load (FairShip's own digitized hits, for the FairShip regime)
 import regression as REG  # _forward_shared (ensemble-averaged forward; checkpoint I/O is in utils.io)
 
 REGIMES = [
@@ -87,8 +86,10 @@ def _nn_pred9(detector, theta, predict_norm, event, mask, chunk):
     B = mask.shape[0]
     preds = []
     for i in range(0, B, chunk):
-        feats = detector.combine_encoded(TR._slice_event(event, i, i + chunk), theta)
-        preds.append(np.asarray(predict_norm(feats, jnp.asarray(mask[i:i + chunk]))))
+        ev = TR._slice_event(event, i, i + chunk)
+        m = jnp.asarray(mask[i:i + chunk])
+        feats = detector.combine_encoded(ev, theta, mask=m)
+        preds.append(np.asarray(predict_norm(feats, detector.element_mask(ev, m))))
     pred = detector.denormalize_predictions(np.concatenate(preds, 0))  # DaughterTarget (vertex, p1, p2)
     return np.concatenate([np.asarray(pred.vertex), np.asarray(pred.p1), np.asarray(pred.p2)], axis=-1)
 
@@ -108,9 +109,9 @@ def _sim_digi(config, design_flat, n_files, n_events, material):
     true9 = np.concatenate([truth[:, 4:7], truth[:, 8:11], truth[:, 12:15]], axis=1)
     reco_ok = ~np.isnan(reco).any(1)
     rows = np.arange(min(int(n_events), truth.shape[0]))
-    ie, bnds = O._input_events(pa, ei, bz, rows)
+    pool, bnds = O._input_events(pa, ei, bz, rows)
     n_tracks, primaries = (TR.PHYS_N_TRACKS, False) if material else (2, True)
-    _traj, _ncr, digi, digi_mask = TR._solver_trajectory(det, ie, bnds, design_flat, layer_z, n_tracks, primaries)
+    _traj, _ncr, digi, digi_mask = TR._solver_trajectory(det, pool, bnds, design_flat, layer_z, n_tracks, primaries)
     return digi, digi_mask, true9[rows], reco_ok[rows]
 
 
@@ -119,39 +120,15 @@ def _fairship_digi(detector, n_files, n_events):
     -- ALL valid digis per event (the M earliest-TDC, matching our solver's emission), address mapped to
     our 0-based layout, TDC relative to the event's earliest hit. Returns ``(event, mask, true9, reco_ok)``.
     A domain shift: the network was trained on our sim, not FairShip's readout."""
-    data, _nf = FH._load(n_files)
-    ds, tdc = np.asarray(data["digi_straw"]), np.asarray(data["digi_tdc"], np.float64)
-    deidx, valid = np.asarray(data["digi_event_index"]), ~np.asarray(data["digi_invalid"])
-    truth, reco = np.asarray(data["truth"]), np.asarray(data["reco"])
+    from detopt.data.fairship_loader import load_fairship_digi, pack_fairship_events
+    data, _nf = load_fairship_digi(n_files)
+    event, mask, rows, truth = pack_fairship_events(
+        data, n_stations=detector.n_stations, n_views_per_station=detector.n_views_per_station,
+        n_layers_per_view=detector.n_layers_per_view, n_straws=detector.n_straws,
+        max_hits=detector.max_hits_per_event, n_events=n_events)
     true9 = np.concatenate([truth[:, 4:7], truth[:, 8:11], truth[:, 12:15]], axis=1).astype(np.float32)
-    reco_ok = ~np.isnan(reco).any(1)
-    rows = np.arange(min(int(n_events), truth.shape[0]))
-    M, ns = detector.max_hits_per_event, detector.n_straws
-    # FairShip address (station 1..4, straw 1..316) -> our 0-based; view/layer already 0-based.
-    st = np.clip(ds[:, 0].astype(np.int64) - 1, 0, detector.n_stations - 1)
-    vw = np.clip(ds[:, 1].astype(np.int64), 0, detector.n_views_per_station - 1)
-    ly = np.clip(ds[:, 2].astype(np.int64), 0, detector.n_layers_per_view - 1)
-    sw = np.clip(ds[:, 3].astype(np.int64) - 1, 0, ns - 1)
-    o = np.argsort(deidx[valid], kind="stable")  # group valid digis by event
-    e_s = deidx[valid][o]
-    st_s, vw_s, ly_s, sw_s, td_s = st[valid][o], vw[valid][o], ly[valid][o], sw[valid][o], tdc[valid][o]
-    cols = {k: np.zeros((len(rows), M), dt) for k, dt in
-            (("station", np.int32), ("view", np.int32), ("layer", np.int32), ("straw", np.int32), ("tdc", np.float32))}
-    mask = np.zeros((len(rows), M), np.int32)
-    for r, e in enumerate(rows):
-        lo, hi = np.searchsorted(e_s, e, "left"), np.searchsorted(e_s, e, "right")
-        if hi <= lo:
-            continue
-        sel = lo + np.argsort(td_s[lo:hi])[:M]  # the M earliest-TDC hits, like the solver's emission
-        n = sel.shape[0]
-        cols["station"][r, :n], cols["view"][r, :n] = st_s[sel], vw_s[sel]
-        cols["layer"][r, :n], cols["straw"][r, :n] = ly_s[sel], sw_s[sel]
-        t = td_s[sel] - td_s[sel].min()  # FairShip TDC is absolute -> relative to the event's earliest hit
-        cols["tdc"][r, :n] = np.clip(t, 0.0, 1.0e4).astype(np.float32)  # guard pathological outlier TDCs
-        mask[r, :n] = 1
-    event = StrawEvent(station=cols["station"], view=cols["view"], layer=cols["layer"],
-                       straw=cols["straw"], tdc=cols["tdc"])
-    return event, mask, true9[rows], reco_ok[rows]
+    reco_ok = (~np.isnan(np.asarray(data["reco"])).any(1))[rows]
+    return event, mask, true9, reco_ok
 
 
 # --------------------------------------------------------------------------- #

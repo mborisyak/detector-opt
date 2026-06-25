@@ -60,16 +60,21 @@ def _event_nparticles(events, e):
 
 def hitset_and_times(det, events, idx, seed):
     """Return {(st,vw,lv,straw): time} over `idx` events for one detector."""
+    from detopt.detector.straw import Pool
+
     design = _nominal_design(det)[None, :]
+    layers, angles, Bs = det._design_to_geometry(design)
     out = {}
     for e in idx:
         dd = _event_dd(events, e)
-        ie = det._make_input_events(dd)
+        pool = Pool(dd["masses"], dd["charges"], dd["positions"], dd["momenta"], dd["times"])
         n = len(dd["masses"])
-        X, mask, _ = det._run_solver(np.array([[0, n]], np.int32), design, np.random.default_rng(seed), input_events=ie)
-        h = X[0, mask[0].astype(bool)]
-        for row in h:
-            out[(e, int(row[0]), int(row[1]), int(row[2]), int(row[3]))] = float(row[4])
+        seeds = det._seeds(np.array([e]))  # per-event deterministic seed (same for both detectors)
+        hits_idx, tdc, _ = det._run_solver(pool, np.array([[0, n]], np.int32), layers, angles, Bs, seeds)
+        m = tdc[0] >= 0
+        hi, td = hits_idx[0, m], tdc[0, m]
+        for j in range(hi.shape[0]):
+            out[(e, int(hi[j, 0]), int(hi[j, 1]), int(hi[j, 2]), int(hi[j, 3]))] = float(td[j])
     return out
 
 

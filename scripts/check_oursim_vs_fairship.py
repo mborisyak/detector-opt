@@ -43,7 +43,7 @@ def run(n_files=10, max_B=None, **config):
     ev_rows = np.nonzero(~np.isnan(reco).any(1))[0]
 
     fz, ftan, fab = FR._calibrate_geometry(ds, hits, valid)  # FairShip geometry from its own hit cloud
-    det = detopt.detector.StereoTracking()
+    det = detopt.detector.Stereo4Feature()
     OS._no_material(det)
     if max_B is not None:
         det.max_B = float(max_B)  # override field to test the FairShip-matched bend
@@ -52,8 +52,8 @@ def run(n_files=10, max_B=None, **config):
     design = np.asarray(det.flatten_design(yaml.safe_load(open("config/design/initial_stereo.yaml"))), np.float32)
     layers, angles, _ = det._design_to_geometry(design[None])
     oz, otan = np.asarray(layers[0], np.float64), np.asarray(angles[0], np.float64)
-    ie, bnds = OS._input_events(pa, EI, bz, ev_rows)
-    tracks, tmask = OS._crossings(det, ie, bnds, design, oz.astype(np.float32))
+    pool, bnds = OS._input_events(pa, EI, bz, ev_rows)
+    tracks, tmask = OS._crossings(det, pool, bnds, design, oz.astype(np.float32))
 
     n, _, nz = tmask.shape
     gg = np.broadcast_to(np.arange(nz), (n, 2, nz))

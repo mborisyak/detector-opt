@@ -22,7 +22,7 @@ import jax.nn as jnn
 from flax import nnx
 
 from ..detector import Detector
-from .common import Model
+from .common import Model, Shape
 from .set_regressor import EnsembleSetBlock, EnsembleLinear, masked_weighted_aggregate
 
 __all__ = ["PairSetRegressor"]
@@ -37,29 +37,20 @@ class PairSetRegressor(Model):
     coefficient to 0 to drop its comparison.
     """
 
-    @classmethod
-    def from_config(cls, detector, config, *, rngs: nnx.Rngs):
-        return cls(
-            n_features_in=int(detector.combined_feature_dim),
-            target_dim=int(detector.target_dim()),
-            rngs=rngs,
-            **config,
-        )
-
     def __init__(
         self,
-        n_features_in: int,
-        target_dim: int,
+        input_shape: Shape,
+        target_shape: Shape,
+        ground_truth_shape: Shape,
         features: Sequence[Sequence[int]],
         coefficients: Sequence[float] | None = None,
         p_dropout: float | None = None,
         *,
         rngs: nnx.Rngs,
     ):
-        # Do not call Model.__init__ -- it reads detector-specific shapes we don't use.
         self.rngs = rngs
-        self.n_features_in = int(n_features_in)
-        self.target_dim = int(target_dim)
+        self.n_features_in = int(input_shape[-1])
+        self.target_dim = int(target_shape[0])
 
         coeffs = [1.0] * self.n_features_in if coefficients is None else list(coefficients)
         if len(coeffs) != self.n_features_in:
@@ -76,8 +67,6 @@ class PairSetRegressor(Model):
         self.blocks = nnx.List(blocks)
         self.output = EnsembleLinear(None, int(features[-1][-1]), self.target_dim, rngs=rngs)
 
-    def ensemble(self) -> None:
-        return None
 
     def _pairs(self, features, mask):
         """``(B, M, F), (B, M)`` -> pair features ``(B, M*M, 3F)`` and pair mask ``(B, M*M)``."""
@@ -113,16 +102,6 @@ class TrackerRegressor(Model):
     pair-comparison ``tanh(coeff_f * Δfeature)`` (``None`` -> all ones). Set a feature's
     coefficient to 0 to drop its comparison.
     """
-
-    @classmethod
-    def from_config(cls, detector: Detector, config, *, rngs: nnx.Rngs):
-        return cls(
-            input_shape=detector.combined_event_shape(),
-            target_shape=(detector.target_dim(),),
-            ground_truth_shape=(detector.ground_truth_dim(),),
-            rngs=rngs,
-            **config,
-        )
 
     def __init__(
         self,
@@ -162,8 +141,6 @@ class TrackerRegressor(Model):
 
         self.output = nnx.Linear(head_output, n_t, rngs=rngs)
 
-    def ensemble(self) -> None:
-        return None
 
     def __call__(self, features, mask, *, deterministic: bool = True, rngs=None):
         n_b, *_ = features.shape

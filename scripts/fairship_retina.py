@@ -147,7 +147,7 @@ def _master_table(results, on):
 
 
 def run(n_files=20, dt=0.4, n_steps=160, n_iters=1000, lr=0.05, coef=1.0, s_hi=30.0, drift_sigma=0.02, M=256, **config):
-    det = detopt.detector.StereoTracking()  # for the target normalization + permutation-matched metric only
+    det = detopt.detector.Stereo4Feature()  # for the target normalization + permutation-matched metric only
     sigma_hit = det.straw_pitch / np.sqrt(12.0)
     truth, reco, ds, inv, deidx, hits, nf = _load(n_files)
     valid = ~inv

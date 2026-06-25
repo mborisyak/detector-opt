@@ -1,6 +1,6 @@
 """Convert our physical designs into FairShip SST geometry configs.
 
-Our designs (``config/design/*.yaml``) are ``{stations: [z(cm) x4], angle: rad}``. FairShip's SST
+Our designs (``config/design/*.yaml``) are ``{stations: [z(cm) x4], view_angle: rad}``. FairShip's SST
 schema (``FairShip/geometry/strawtubes_config.yaml``) holds the stereo angle as ``view_angle`` in
 DEGREES; the patched ``shipDet_conf.py`` also reads a TOP-LEVEL ``stations:`` list and feeds it to
 ``strawtubes.SetzPositions`` (falling back to ``geometry_config.py``'s ``TrackStation{1..4}.z`` when
@@ -25,7 +25,7 @@ OUT_DIR = "FairShip/geometry"  # one strawtubes_config_<design>.yaml per design,
 def convert(design_path, template_lines):
     """Return (converted SST yaml text, stations, view_angle_deg) for one design."""
     design = yaml.safe_load(open(design_path))
-    view_angle_deg = math.degrees(float(design["angle"]))
+    view_angle_deg = math.degrees(float(design["view_angle"]))
     name = os.path.basename(design_path)
     stations = [float(z) for z in design["stations"]]
     out = []

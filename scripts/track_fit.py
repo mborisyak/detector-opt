@@ -39,6 +39,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 import detopt  # noqa: E402
+from detopt.utils.events import shuffled_event_index  # noqa: E402
 
 # Track-fit math (Boris propagator, |p| readout, drift-circle residual, closest-approach vertex, retina
 # seed lines) is canonical in the detector package now; import it (underscore aliases keep callers --
@@ -202,7 +203,8 @@ def run_pipeline(
     intBdl = abs(detector.max_B) * np.sqrt(2 * np.pi) * detector.B_sigma / 100.0  # T*m
 
     design = np.broadcast_to(phys[None, :], (int(n_events), phys.shape[0]))
-    ev = detector.sample_events(int(seed), design, z_planes=layer_z.astype(np.float32), n_tracks=2)
+    event_index = shuffled_event_index(detector.size(), int(n_events), int(seed))
+    ev = detector._simulate(design, event_index, z_planes=layer_z.astype(np.float32), n_tracks=2)
     X, mask = ev["X"], ev["mask"]
     # The solver now emits an ordered per-track trajectory; scatter it back to the per-plane
     # tracks/tmask layout _build_event expects (each crossing matched to its plane by its z).
@@ -564,7 +566,8 @@ def run_retina_pipeline(
     z_start = z_start_of(layer_z)
 
     design = np.broadcast_to(phys[None, :], (int(n_events), phys.shape[0]))
-    ev = detector.sample_events(int(seed), design)  # no z_planes: the retina needs no truth crossings
+    event_index = shuffled_event_index(detector.size(), int(n_events), int(seed))
+    ev = detector._simulate(design, event_index)  # no z_planes: the retina needs no truth crossings
     X, mask = ev["X"], ev["mask"]
     tr = ev["target"]  # DaughterTarget; true 9-vec [vertex(3), p1(3), p2(3)] -- used ONLY to score resolution
     targets = np.concatenate([np.asarray(tr.vertex), np.asarray(tr.p1), np.asarray(tr.p2)], axis=-1)

@@ -1,0 +1,30 @@
+detector: stereo_image
+design: initial_stereo
+
+regressor:
+  conv-regressor:
+    n_stations: 4
+    n_views_per_station: 4
+    n_layers_per_view: 2
+    straw_kernel: 5                       # straw-conv width M (1 x M, VALID)
+    channels: [ 16, 16, 32, 32, 64, 64 ]  # per conv: straw/layer/straw/view/straw/station
+
+optimizer:
+  adamw:
+    learning_rate:
+      cosine_decay_schedule:
+        init_value: 1.0e-3
+
+    weight_decay: 1.0e-6
+
+sampling:
+  batch: 1024
+
+training:
+  batch: 32
+  epochs: 2048
+  samples: 65536
+
+validation:
+  batch: 128
+  samples: 16384

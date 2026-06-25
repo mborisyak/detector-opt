@@ -25,6 +25,7 @@ import jax.numpy as jnp
 import optax
 
 import detopt
+from detopt.utils.events import disjoint_index_streams
 
 
 def main(buffer=32768, val_buffer=8192, eps=0.1, train_steps=6000, batch=512, config="config/lfi.yaml"):
@@ -37,11 +38,10 @@ def main(buffer=32768, val_buffer=8192, eps=0.1, train_steps=6000, batch=512, co
     labels = [f"y{i}" for i in range(int(det.target_dim()))]  # per-axis target components (net outputs)
     nd = cfg["nominal_design"]
     theta0 = jnp.asarray(det.encode_design(nd), jnp.float32)
-    keys = list(det.pool_split)
-    train_pool, val_pool = keys[0], (keys[1] if len(keys) > 1 else keys[0])
+    train_stream, val_stream = disjoint_index_streams(det.size(), [0.8], 0)  # disjoint train/val event sets
     rng = np.random.default_rng(0)
     counts = np.array([det.n_stations, det.n_views_per_station, det.n_layers_per_view, det.n_straws], np.float32)
-    print(f"M={M} F={F} input_dim={M * F}  design_dim={dd}  eps={eps}  pools train={train_pool!r}/val={val_pool!r}")
+    print(f"M={M} F={F} input_dim={M * F}  design_dim={dd}  eps={eps}")
 
     def featurize(event, mask, theta, key):
         # Real combine_encoded() features, but with padded slots given RANDOM geometry + TDC=-1
@@ -65,21 +65,21 @@ def main(buffer=32768, val_buffer=8192, eps=0.1, train_steps=6000, batch=512, co
         perm = jnp.argsort(jax.random.uniform(key, (B, M)), axis=1)
         return jnp.take_along_axis(feats, perm[..., None], axis=1).reshape(B, M * F)
 
-    def fill(n, pool, key):
+    def fill(n, stream, key):
         Fs, Ts = [], []
         got = 0
         while got < n:
             c = min(2048, n - got)
             theta = theta0[None, :] + eps * jax.random.normal(jax.random.PRNGKey(int(rng.integers(1 << 30))), (c, dd))
-            out = det.sample_events(int(rng.integers(1 << 30)), det.decode_design(theta), pool=pool)
+            _gt, event, mask, target = det(det.decode_design(theta), stream.next_block(c))
             key, kf = jax.random.split(key)
-            Fs.append(featurize(out["X"], out["mask"], theta, kf))
-            Ts.append(jnp.asarray(det.normalize_target(out["target"])))
+            Fs.append(featurize(event, mask, theta, kf))
+            Ts.append(jnp.asarray(det.normalize_target(target)))
             got += c
         return jnp.concatenate(Fs), jnp.concatenate(Ts)
 
-    Xtr, Ytr = fill(buffer, train_pool, jax.random.PRNGKey(1))
-    Xva, Yva = fill(val_buffer, val_pool, jax.random.PRNGKey(2))
+    Xtr, Ytr = fill(buffer, train_stream, jax.random.PRNGKey(1))
+    Xva, Yva = fill(val_buffer, val_stream, jax.random.PRNGKey(2))
     print(f"train buffer {Xtr.shape}  val {Xva.shape}")
 
     # dense MLP

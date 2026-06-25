@@ -52,7 +52,7 @@ def run(n_files=10, **config):
     ds, inv = np.concatenate(ds), np.concatenate(inv)
     ev_rows = np.nonzero(~np.isnan(reco).any(1))[0]
 
-    det = detopt.detector.StereoTracking()
+    det = detopt.detector.Stereo4Feature()
     OS._no_material(det)
     pitch, nstr = det.straw_pitch, det.n_straws
     design = np.asarray(det.flatten_design(yaml.safe_load(open("config/design/initial_stereo.yaml"))), np.float32)
@@ -61,8 +61,8 @@ def run(n_files=10, **config):
     oz, otan, _ = FR._calibrate_geometry(ds, hits, ~inv)
     oz, otan = np.asarray(oz, np.float64), np.asarray(otan, np.float64)
     nz = oz.shape[0]
-    ie, bnds = OS._input_events(pa, EI, bz, ev_rows)
-    tracks, tmask = OS._crossings(det, ie, bnds, design, oz.astype(np.float32))  # our clean daughter crossings at FairShip planes
+    pool, bnds = OS._input_events(pa, EI, bz, ev_rows)
+    tracks, tmask = OS._crossings(det, pool, bnds, design, oz.astype(np.float32))  # our clean daughter crossings at FairShip planes
 
     # OUR crossings -> (sheared-Y c, straw) per (event, plane)
     n = bnds.shape[0]

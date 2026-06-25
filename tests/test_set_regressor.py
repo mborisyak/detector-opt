@@ -6,6 +6,7 @@ import jax.numpy as jnp
 from flax import nnx
 
 import detopt
+from analytic import analytic_detector
 
 
 def test_set_regressor_shape_and_mask_independence(seed):
@@ -14,8 +15,9 @@ def test_set_regressor_shape_and_mask_independence(seed):
     B, M = 4, 32
 
     reg = detopt.nn.SetRegressor(
-        n_features_in=n_features_in,
-        target_dim=target_dim,
+        input_shape=(M, n_features_in),
+        target_shape=(target_dim,),
+        ground_truth_shape=(1,),
         features=[[16, 24], [24, 12]],
         p_dropout=None,
         rngs=nnx.Rngs(seed),
@@ -39,8 +41,9 @@ def test_set_regressor_shape_and_mask_independence(seed):
 def test_set_regressor_is_detector_agnostic(seed):
     """Constructed and called without any detector reference."""
     reg = detopt.nn.SetRegressor(
-        n_features_in=5,
-        target_dim=3,
+        input_shape=(7, 5),
+        target_shape=(3,),
+        ground_truth_shape=(1,),
         features=[[8, 8]],
         rngs=nnx.Rngs(seed),
     )
@@ -82,7 +85,8 @@ def test_set_regressor_factory_from_detector(seed):
 
 def test_single_model_reports_no_ensemble(seed):
     """A plain SetRegressor declares itself a single model."""
-    reg = detopt.nn.SetRegressor(n_features_in=5, target_dim=3, features=[[8]], rngs=nnx.Rngs(seed))
+    reg = detopt.nn.SetRegressor(input_shape=(7, 5), target_shape=(3,), ground_truth_shape=(1,),
+                                 features=[[8]], rngs=nnx.Rngs(seed))
     assert reg.ensemble() is None
 
 
@@ -93,7 +97,8 @@ def test_set_ensemble_regressor_shape_and_members(seed):
     ensemble axis (members are initialised and trained independently).
     """
     N, B, M, F, T = 4, 3, 16, 8, 6
-    reg = detopt.nn.SetRegressor(n_features_in=F, target_dim=T, features=[[16, 16], [16, 8]], n_models=N, rngs=nnx.Rngs(seed))
+    reg = detopt.nn.SetRegressor(input_shape=(M, F), target_shape=(T,), ground_truth_shape=(1,),
+                                 features=[[16, 16], [16, 8]], n_models=N, rngs=nnx.Rngs(seed))
     assert reg.ensemble() == N
 
     rng = np.random.default_rng(seed)
@@ -108,7 +113,8 @@ def test_set_ensemble_regressor_shape_and_members(seed):
 def test_set_ensemble_regressor_mask_independence(seed):
     """Padded slots must not influence any member's prediction."""
     N, B, M, F, T = 3, 2, 32, 5, 4
-    reg = detopt.nn.SetRegressor(n_features_in=F, target_dim=T, features=[[12, 12]], n_models=N, rngs=nnx.Rngs(seed))
+    reg = detopt.nn.SetRegressor(input_shape=(M, F), target_shape=(T,), ground_truth_shape=(1,),
+                                 features=[[12, 12]], n_models=N, rngs=nnx.Rngs(seed))
     rng = np.random.default_rng(seed)
     feats = jnp.asarray(rng.standard_normal((N, B, M, F)).astype("float32"))
     mask = jnp.asarray(np.concatenate([np.ones((N, B, M // 2)), np.zeros((N, B, M // 2))], axis=2).astype("int32"))
@@ -121,7 +127,7 @@ def test_set_ensemble_regressor_mask_independence(seed):
 
 def test_set_ensemble_regressor_factory_and_ensemble_query(seed):
     """``from_config`` builds the ensemble and reports its member count."""
-    detector = detopt.detector.DebugDetector()
+    detector = analytic_detector()
     reg = detopt.nn.from_config(
         detector,
         config={"set-regressor": {"features": [[8, 8]], "n_models": 5}},

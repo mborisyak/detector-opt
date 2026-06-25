@@ -22,7 +22,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from detopt.detector.debug import DebugDetector
+from detopt.detector import Stereo4Feature
 from detopt.nn.trainer import DesignTrainer
 from detopt.utils.training import extrapolated_floor, is_plateaued, masked_mean_sem
 
@@ -31,7 +31,7 @@ LOOKAHEAD = 100
 
 def _train_curve(seed, n0, max_epochs):
     """One continuous run on a fixed 10*n0 dataset; returns the per-epoch curve."""
-    det = DebugDetector()
+    det = Stereo4Feature(engine="simplified")
     trainer = DesignTrainer(
         det,
         regressor_config={"set-regressor": {"features": [[64, 64], [64, 32]], "p_dropout": 0.1}},
@@ -52,11 +52,12 @@ def _train_curve(seed, n0, max_epochs):
     design_enc = np.zeros(det.design_dim(), dtype=np.float32)
     design_phys = np.asarray(det.flatten_design(det.decode_design(design_enc)), dtype=np.float32)
 
-    init_seq, train_seq, val_seq, run_seq = np.random.SeedSequence(seed).spawn(4)
+    init_seq, run_seq = np.random.SeedSequence(seed).spawn(2)
     tp, vp = trainer.train_pool, trainer.val_pool
-    trainer._fill_pool(design_phys, design_enc, tp, "train", 10 * n0, train_seq)
-    trainer._fill_pool(design_phys, design_enc, vp, "val", round(10 * n0 * 0.25), val_seq)
-    tcount, vcount = int(tp.n_current), int(vp.n_current)
+    # The trainer drew disjoint train/val event indices in __init__; fill from those (design-conditioned).
+    trainer._fill_pool(design_phys, tp, 10 * n0, trainer._train_index)
+    trainer._fill_pool(design_phys, vp, round(10 * n0 * 0.25), trainer._val_index)
+    tcount, vcount = int(tp.current), int(vp.current)
 
     params, state, opt_state = trainer._init_design_network(init_seq, None, None)
     zero = jnp.int32(0)

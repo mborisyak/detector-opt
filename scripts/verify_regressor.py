@@ -5,9 +5,9 @@ under it, train ONLY the regressor on that buffer, and report held-out validatio
 discriminator, no design gradient -- just "how well can the regressor reconstruct the target at this
 design?". Train and validation events come from disjoint detector pools.
 
-Config: ``config/subgradient.yaml`` (detector + regressor + training.optimizer + nominal_design +
-pool_split). The design defaults to ``nominal_design``; override with a ``design:`` config key (a
-named physical-design dict). The ``verify:`` block sets the buffer sizes / training budget.
+Config: ``config/subgradient.yaml`` (detector + regressor + training.optimizer + nominal_design). The
+design defaults to ``nominal_design``; override with a ``design:`` config key (a named physical-design
+dict). The ``verify:`` block sets the buffer sizes / training budget.
 
     python scripts/verify_regressor.py seed=0 verify.train_samples=65536 verify.steps=8000
 """
@@ -28,6 +28,7 @@ from flax import nnx
 import detopt
 from detopt.utils.config import optimizer as make_optimizer, resolve_device
 from detopt.utils.pools import RingBuffer
+from detopt.utils.events import shuffled_event_index, split_disjoint
 
 
 # --------------------------------------------------------------------------- #
@@ -50,6 +51,18 @@ def _forward_shared(reg, feats, mask, members, *, deterministic):
     fe = jnp.broadcast_to(feats[None], (members,) + feats.shape)
     me = jnp.broadcast_to(mask[None], (members,) + mask.shape)
     return reg(fe, me, deterministic=deterministic)
+
+
+def _forward_loss(reg, loss_fn, feats, mask, target, members, batch, *, deterministic, rngs=None):
+    """TRAIN loss path: ``(members*batch, ...)`` minibatch -> per-sample loss ``(members*batch,)``.
+    The MODEL owns the forward (``reg.loss``); each member gets its own slice (mirrors ``_forward``)."""
+    if members is None:
+        return reg.loss(loss_fn, feats, mask, target, deterministic=deterministic, rngs=rngs)
+    feats_e = feats.reshape((members, batch) + feats.shape[1:])
+    mask_e = mask.reshape((members, batch) + mask.shape[1:])
+    target_e = target.reshape((members, batch) + target.shape[1:])
+    loss = reg.loss(loss_fn, feats_e, mask_e, target_e, deterministic=deterministic, rngs=rngs)
+    return loss.reshape((members * batch,) + loss.shape[2:])
 
 
 def _target_for(targets_norm, members):
@@ -78,16 +91,14 @@ def verify(seed, output=None, progress=True, **config):
     design_dim = int(detector.design_dim())
     labels = tuple(detector.metric_labels())
 
-    # Disjoint pools: train the regressor on 'train', validate on a held-out pool (the last key,
-    # so a {train, design, val} split validates on 'val'; clamped if fewer pools exist).
-    pool_keys = list(detector.pool_split)
-    train_pool = config.get("train_pool", pool_keys[0])
-    val_pool = config.get("val_pool", pool_keys[-1] if len(pool_keys) > 1 else pool_keys[0])
-
     master = np.random.SeedSequence(int(seed))
     rngs = nnx.Rngs(jax.random.PRNGKey(int(master.spawn(1)[0].generate_state(1)[0])))
-    sample_seq = master.spawn(1)[0]
     train_seq = master.spawn(1)[0]
+    # The script owns the train/val split: a shuffled, DISJOINT pair of event-index sets over the budget.
+    train_index, val_index = split_disjoint(
+        shuffled_event_index(detector.size(), train_samples + val_samples, master.spawn(1)[0]),
+        train_samples / max(train_samples + val_samples, 1),
+    )
 
     model = detopt.nn.from_config(detector, config=config["regressor"], rngs=rngs)
     reg_def, params, state = nnx.split(model, nnx.Param, nnx.Variable)
@@ -98,17 +109,20 @@ def verify(seed, output=None, progress=True, **config):
     M = int(jax.tree.leaves(detector.event_spec())[0].shape[0])  # per-hit count
     specs = (detector.event_spec(), jax.ShapeDtypeStruct((M,), jnp.int32), detector.target_spec())
 
-    def fill(n, pool, seq):
-        """Sample ``n`` RAW events at the fixed design from ``pool`` into a buffer (raw event,
-        mask, raw target). ``combine_encoded`` + ``normalize_target`` run per batch in the kernels."""
+    def fill(event_index):
+        """Simulate the events at ``event_index`` at the FIXED design into a buffer (raw event, mask, raw
+        target). ``combine_encoded`` + ``normalize_target`` run per batch in the kernels."""
+        event_index = np.asarray(event_index, np.int64)
+        n = event_index.shape[0]
         buf = RingBuffer(n, specs, device=device)
         filled = 0
-        bar = tqdm(total=n, desc=f"sample[{pool}]", disable=not progress)
+        bar = tqdm(total=n, desc="sample", disable=not progress)
         while filled < n:
             chunk = min(sample_chunk, n - filled)
+            idx = event_index[filled:filled + chunk]
             phys = detector.decode_design(jnp.broadcast_to(theta[None, :], (chunk, design_dim)))
-            ev = detector.sample_events(seq.spawn(1)[0], phys, pool=pool)
-            buf.push(ev["X"], ev["mask"], ev["target"])
+            _gt, event, mask, target = detector(phys, idx)
+            buf.push(event, mask, target)
             filled += chunk
             bar.update(chunk)
         bar.close()
@@ -116,9 +130,10 @@ def verify(seed, output=None, progress=True, **config):
 
     def _net_loss(params, state, drop_key, event_b, mask_b, target_b, count):
         reg = nnx.merge(reg_def, params, state)
-        feats = detector.combine_encoded(event_b, theta)  # fixed design (encoded), broadcast per hit
-        pred = _forward(reg, feats, mask_b, members, count, deterministic=False, rngs=nnx.Rngs(drop_key))
-        loss = jnp.mean(detector.loss(pred, detector.normalize_target(target_b)))
+        feats = detector.combine_encoded(event_b, theta, mask=mask_b)  # fixed design (encoded), per hit
+        emask = detector.element_mask(event_b, mask_b)  # per-element mask (== hit mask, unless layer-wise)
+        loss = jnp.mean(_forward_loss(reg, detector.loss, feats, emask, detector.normalize_target(target_b),
+                                      members, count, deterministic=False, rngs=nnx.Rngs(drop_key)))
         _, _, new_state = nnx.split(reg, nnx.Param, nnx.Variable)
         return loss, new_state
 
@@ -155,8 +170,9 @@ def verify(seed, output=None, progress=True, **config):
 
         def step(acc, chunk):
             ev_chunk, m, t = chunk
-            feats = detector.combine_encoded(ev_chunk, theta)
-            pred = _forward_shared(reg, feats, m, members, deterministic=True)
+            feats = detector.combine_encoded(ev_chunk, theta, mask=m)
+            emask = detector.element_mask(ev_chunk, m)
+            pred = _forward_shared(reg, feats, emask, members, deterministic=True)
             md = detector.metric(pred, _target_for(detector.normalize_target(t), members))
             return {k: acc[k] + jnp.sum(md[k]) for k in acc}, None
 
@@ -166,8 +182,8 @@ def verify(seed, output=None, progress=True, **config):
         return {k: acc[k] / count for k in labels}
 
     # --- sample the buffers, then train + validate ----------------------------
-    train_buf = fill(train_samples, train_pool, sample_seq)
-    val_buf = fill(val_samples, val_pool, sample_seq)
+    train_buf = fill(train_index)
+    val_buf = fill(val_index)
     n_train = jnp.int32(len(train_buf))
 
     print(f"design (encoded->physical): {detector.decode_design(theta)}")

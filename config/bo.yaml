@@ -1,7 +1,7 @@
 # Extended-budget BO run on the stereo straw detector over the FairShip ship2numpy
 # events, warm-starting each design's network from the nearest previously trained one.
 detector:
-  stereo_straw:
+  stereo_tracking:
     n_stations_upstream: 2    # stations upstream of the magnet (z < z0)
     n_stations_downstream: 2  # stations downstream of the magnet (z > z0)
     n_layers_per_view: 2
@@ -11,7 +11,7 @@ detector:
     layer_z_gap: 1.732
     view_z_gap: 5.0
     magnet_half_cm: 140.0  # exclude the spectrometer magnet (FairShip YokeDepth 1.4 m) from station bounds
-    max_B: -0.151          # T; on-axis peak Bx of FairShip MainSpectrometerField.root (negative polarity; bends in -y)
+    field_integral: -1.071 # T.m, int Bx dz (FairShip MainSpectrometerField, negative polarity; -0.151 T peak derived w/ B_sigma=283)
     z0: 8957.0             # magnet centre (FairShip c.z = 89.57 m, map z_local=0)
     B_sigma: 283.0         # cm; proper-Gaussian std-dev matched to MainSpectrometerField on-axis Bx(z) (int Bx dz ~ -1.07 T.m)
     layer_bounds: [8200.0, 9750.0]
@@ -21,18 +21,17 @@ detector:
     max_time: 300.0
     material: kapton
     data_dir: "data/mc"  # 36k events across the 50 files; boundary crossings are upstream of the magnet (magnet-independent)
-    pool_split: {train: 0.9, val: 0.1}   # disjoint event pools (train / held-out val)
 
 # Nominal (initial/baseline) design -- NOT detector state. A named physical-design dict the
 # detector encodes via encode_design (BO itself seeds from random proposals).
 nominal_design:
   stations: [8407.0, 8607.0, 9307.0, 9507.0]
-  angle: 0.0798
+  view_angle: 0.0798
 
 regressor:
   set-regressor:
     features: [[24, 32], [32, 24]]
-    n_models: 8   # ensemble of 8 (omit n_models for a single net)
+    n_models: null   # ensemble of 8 (omit n_models for a single net)
     p_dropout: 0.1
 
 device: cuda

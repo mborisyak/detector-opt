@@ -15,7 +15,7 @@ from typing import NamedTuple
 import jax
 import numpy as np
 
-from .straw import StrawDetector
+from .straw import StrawDetector, four_feature_combine, four_feature_shape
 from ..utils.encoding import normal_to_uniform_jax, uniform_to_normal_jax
 
 __all__ = ["FreeStrawDetector", "FreeDesign", "free_design_array"]
@@ -72,18 +72,24 @@ class FreeStrawDetector(StrawDetector):
     def design_bounds(self):
         return {"layer_z": tuple(self.layer_bounds), "layer_angle": tuple(self.angle_bounds), "B": self.b_bounds()}
 
-    def _design_to_geometry(self, design):
-        """Physical ``[positions(n), angles(n), B]`` -> per-layer
-        ``(layers, angles, Bs)`` for the C solver (widths/heights/z0/B_sigma are fixed Layout fields)."""
-        design = np.asarray(design, dtype=np.float32)
-        if design.ndim == 1:
-            design = design[None, :]
-        m = self.n_layers
+    def _as_free_design(self, design):
+        """Normalize a physical design -- a ``FreeDesign`` namedtuple (the nominal form) OR its flat
+        ``[layer_z(n), layer_angle(n), B]`` array (the one-shot conversion intermediate) -- to a BATCHED
+        ``FreeDesign``. The fields are read BY NAME downstream (never positional-sliced off a flat)."""
+        if isinstance(design, FreeDesign):
+            f = lambda a: np.asarray(a, np.float32) if np.asarray(a).ndim == 2 else np.asarray(a, np.float32)[None, :]
+            return FreeDesign(layer_z=f(design.layer_z), layer_angle=f(design.layer_angle), B=f(design.B))
+        d = np.asarray(design, np.float32)
+        d = d if d.ndim == 2 else d[None, :]
+        n = self.n_layers
+        return FreeDesign(layer_z=d[:, :n], layer_angle=d[:, n:2 * n], B=d[:, 2 * n:2 * n + 1])
 
-        layers = design[:, :m].astype(np.float32)
-        angles = design[:, m : 2 * m].astype(np.float32)
-        Bs = design[:, 2 * m].astype(np.float32)
-        return layers, angles, Bs
+    def _design_to_geometry(self, design):
+        """``FreeDesign`` / flat physical -> per-layer ``(layers, angles, Bs)`` for the C solver
+        (widths/heights/z0/B_sigma are fixed Layout fields)."""
+        d = self._as_free_design(design)
+        return (np.ascontiguousarray(d.layer_z, np.float32), np.ascontiguousarray(d.layer_angle, np.float32),
+                np.ascontiguousarray(np.asarray(d.B)[:, 0], np.float32))
 
     # ------------------------------------------------------------------ #
     # Encode/decode (constrained <-> N(0,1)), differentiable
@@ -114,3 +120,15 @@ class FreeStrawDetector(StrawDetector):
         phys = self._decode_flat(d_enc)
         n = self.n_layers
         return phys[:, :n], phys[:, n : 2 * n], phys[:, 2 * n]
+
+    # ------------------------------------------------------------------ #
+    # Combine: the shared 4-feature per-hit combine (element == hit).
+    # ------------------------------------------------------------------ #
+    def combine_encoded(self, event, encoded_design, mask=None):
+        return four_feature_combine(self, event, encoded_design, mask=mask)
+
+    def combined_event_shape(self):
+        return four_feature_shape(self)
+
+    def element_mask(self, event, mask):
+        return mask  # element == hit (padded hits are gated by the regressor's hit mask)

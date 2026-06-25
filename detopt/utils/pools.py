@@ -21,96 +21,106 @@ __all__ = ["Pool", "RingBuffer"]
 
 
 def _alloc(spec, capacity, device):
-    """Allocate a zeroed buffer for one slot: prepend ``capacity`` to every leaf's shape.
-    ``spec`` is a record (namedtuple of ShapeDtypeStruct) or a plain ShapeDtypeStruct."""
-    return jax.tree.map(
-        lambda s: jax.device_put(jnp.zeros((int(capacity),) + tuple(s.shape), s.dtype), device),
-        spec,
+  """Allocate a zeroed buffer for one slot: prepend ``capacity`` to every leaf's shape.
+  ``spec`` is a record (namedtuple of ShapeDtypeStruct) or a plain ShapeDtypeStruct."""
+  return jax.tree.map(
+    lambda s: jnp.zeros(shape=(capacity, *s.shape), dtype=s.dtype, device=device),
+    spec,
+  )
+
+
+def batch_dim(item):
+  """Leading (batch) length of a chunk -- the leading axis of any one of its leaves."""
+  n, = set(s.shape[0] for s in jax.tree.leaves(item))
+  return n
+
+class Buffered:
+  def __init__(self, capacity, specs, device=None):
+    self.capacity = capacity
+    self.device = device
+    self.specs = tuple(specs)
+
+    self._buffers = jax.tree.map(
+      lambda s: jnp.zeros(shape=(capacity, *s.shape), dtype=s.dtype, device=device),
+      specs
     )
 
+    def assign(buffers, index, values):
+      return jax.tree.map(
+        lambda b, v: b.at[index].set(v),
+        buffers, values
+      )
 
-def _leading_len(item):
-    """Leading (batch) length of a chunk -- the leading axis of any one of its leaves."""
-    return int(jax.tree.leaves(item)[0].shape[0])
+    self.assign = jax.jit(assign, donate_argnums=(0,))
 
+  def buffers(self):
+    """The stored slots as a positional tuple of pytrees (full capacity)."""
+    return self._buffers
 
-class Pool:
-    """Append-only per-event buffers (a positional tuple of pytree slots), sized from specs.
+class Pool(Buffered):
+  """Append-only per-event buffers (a positional tuple of pytree slots), sized from specs.
 
-    ``n_current`` is a runtime cursor; events are written contiguously and training kernels
-    read the fixed-shape buffers gated on ``n_current``, so one compiled kernel handles a
-    growing pool. The pool never calls the detector -- scripts sample events explicitly (so the
-    detector calls stay visible) and append them here. Storing the raw physical design per event
-    lets one pool span many designs (it accumulates across BO iterations) and lets the network's
-    ``combine`` be design-conditioned -- each event is combined with its own design.
-    """
+  ``n_current`` is a runtime cursor; events are written contiguously and training kernels
+  read the fixed-shape buffers gated on ``n_current``, so one compiled kernel handles a
+  growing pool. The pool never calls the detector -- scripts sample events explicitly (so the
+  detector calls stay visible) and append them here. Storing the raw physical design per event
+  lets one pool span many designs (it accumulates across BO iterations) and lets the network's
+  ``combine`` be design-conditioned -- each event is combined with its own design.
+  """
 
-    def __init__(self, n_max, specs, device=None):
-        self.n_max = int(n_max)
-        self.device = device
-        self.specs = tuple(specs)
-        self.slots = [_alloc(spec, self.n_max, device) for spec in self.specs]
-        self.n_current = 0
+  def __init__(self, capacity, specs, device=None):
+    super().__init__(capacity, specs, device=device)
+    self.current = 0
 
-    def append(self, *chunk):
-        """Append a chunk of ``n`` examples (one positional item per slot, matching the specs)."""
-        n = _leading_len(chunk[0])
-        if self.n_current + n > self.n_max:
-            raise RuntimeError(f"Pool overflow: {self.n_current} + {n} > {self.n_max}")
-        s = self.n_current
-        self.slots = [
-            jax.tree.map(lambda b, c: b.at[s : s + n].set(jnp.asarray(c)), buf, item) for buf, item in zip(self.slots, chunk)
-        ]
-        self.n_current += n
+  def append(self, *chunk):
+    """Append a chunk of ``n`` examples (one positional item per slot, matching the specs)."""
+    n = batch_dim(chunk[0])
+    if self.current + n > self.capacity:
+      raise RuntimeError(f"Pool overflow: {self.current} + {n} > {self.capacity}")
 
-    def buffers(self):
-        """The stored slots as a positional tuple of pytrees (full capacity)."""
-        return tuple(self.slots)
+    index = jnp.arange(self.current, self.current + n, dtype=jnp.int32)
+    self._buffers = self.assign(self._buffers, index, chunk)
+    self.current += n
 
+  def __len__(self):
+    return self.current
 
-class RingBuffer:
-    """Fixed-capacity FIFO ring of recent examples (a positional tuple of pytree slots).
+class RingBuffer(Buffered):
+  """Fixed-capacity FIFO ring of recent examples (a positional tuple of pytree slots).
 
-    Unlike :class:`Pool` (append-only, sized to the whole budget), the ring keeps only the most
-    recent ``capacity`` examples: ``push`` overwrites the oldest once full via a modular cursor.
-    ``state``/``load_state`` round-trip the slots + cursor so the ring survives a checkpoint.
-    """
+  Unlike :class:`Pool` (append-only, sized to the whole budget), the ring keeps only the most
+  recent ``capacity`` examples: ``push`` overwrites the oldest once full via a modular cursor.
+  ``state``/``load_state`` round-trip the slots + cursor so the ring survives a checkpoint.
+  """
 
-    def __init__(self, capacity, specs, device=None):
-        self.capacity = int(capacity)
-        self.device = device
-        self.specs = tuple(specs)
-        self.slots = [_alloc(spec, self.capacity, device) for spec in self.specs]
-        self.cursor = 0  # next write position (mod capacity)
-        self.n_filled = 0  # number of valid rows so far (<= capacity)
+  def __init__(self, capacity, specs, device=None):
+    super().__init__(capacity, specs, device=device)
+    self.current = 0
+    self.cursor = 0  # next write position (mod capacity)
+    self.filled = 0  # number of valid rows so far (<= capacity)
 
-    def push(self, *chunk):
-        """Write a chunk of ``n`` examples (one positional item per slot), overwriting the oldest
-        once the ring is full."""
-        n = _leading_len(chunk[0])
-        if n > self.capacity:  # an oversized chunk: keep only its last `capacity` rows
-            chunk = tuple(jax.tree.map(lambda c: c[-self.capacity :], item) for item in chunk)
-            n = self.capacity
-        idx = (self.cursor + jnp.arange(n)) % self.capacity
-        self.slots = [
-            jax.tree.map(lambda b, c: b.at[idx].set(jnp.asarray(c)), buf, item) for buf, item in zip(self.slots, chunk)
-        ]
-        self.cursor = int((self.cursor + n) % self.capacity)
-        self.n_filled = int(min(self.n_filled + n, self.capacity))
+  def push(self, *chunk):
+    """Write a chunk of ``n`` examples (one positional item per slot), overwriting the oldest
+    once the ring is full."""
+    n = batch_dim(chunk[0])
+    if n > self.capacity:  # an oversized chunk: keep only its last `capacity` rows
+      import warnings
+      warnings.warn('The chuck is larger than the ring buffer. Undefined behaviour might occur.')
 
-    def buffers(self):
-        """The stored slots as a positional tuple of pytrees (full capacity)."""
-        return tuple(self.slots)
+    index = (self.cursor + jnp.arange(n)) % self.capacity
+    self.assign(self._buffers, index, chunk)
+    self.cursor = (self.cursor + n) % self.capacity
+    self.filled = min(self.filled + n, self.capacity)
 
-    def __len__(self):
-        return self.n_filled
+  def __len__(self):
+    return self.filled
 
-    def state(self):
-        """Serialisable snapshot (slots + cursor) for checkpointing."""
-        return {"slots": tuple(self.slots), "cursor": np.int32(self.cursor), "n_filled": np.int32(self.n_filled)}
+  def state(self):
+    """Serialisable snapshot (slots + cursor) for checkpointing."""
+    return {"slots": tuple(self.slots), "cursor": np.int32(self.cursor), "n_filled": np.int32(self.filled)}
 
-    def load_state(self, state):
-        """Restore from a :meth:`state` snapshot."""
-        self.slots = [jax.tree.map(lambda a: jax.device_put(jnp.asarray(a), self.device), slot) for slot in state["slots"]]
-        self.cursor = int(state["cursor"])
-        self.n_filled = int(state["n_filled"])
+  def load_state(self, state):
+    """Restore from a :meth:`state` snapshot."""
+    self.slots = [jax.tree.map(lambda a: jax.device_put(jnp.asarray(a), self.device), slot) for slot in state["slots"]]
+    self.cursor = int(state["cursor"])
+    self.filled = int(state["n_filled"])

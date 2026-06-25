@@ -1,5 +1,5 @@
 """FairShip verification: our own 2-track trackers (retina + NLL/MAP, ``detopt.tracking``) over raw
-``StrawEvent`` records of the ``StereoTracking`` sim, across the four measurement targets and both cut
+``StrawEvent`` records of the ``Stereo4Feature`` sim, across the four measurement targets and both cut
 regimes, compared to FairShip. ``report`` writes report.txt with two master tables (physical units + R^2),
 each split into four regime blocks (material OFF/ON x our-cuts/FairShip-cuts); ``track`` runs one config.
 
@@ -19,7 +19,7 @@ from detopt.detector.straw import StrawEvent
 import oursim_retina as O  # _load_reco / _input_events / _no_material (data pipeline reuse)
 import fairship_hits  # third regime: our trackers on FairShip's own hits (real field map)
 
-DETECTOR_CFG = "config/detector/stereo.yaml"
+DETECTOR_CFG = "config/detector/stereo_tracker_truth.yaml"  # StereoTrackerTruth: per-hit (x,y)/drift_r/tdc
 DESIGN_CFG = "config/design/initial_stereo.yaml"
 
 # FairShip ShipAna / Ship2NumPy selection (scripts/fairship_select.py): per daughter track >= 25 straw
@@ -42,26 +42,27 @@ def _slice_event(event, i, j):
                       drift_r=sl(event.drift_r))
 
 
-def _solver_trajectory(det, ie, bnds, design, layer_z, n_tracks, primaries, batch=4096):
+def _solver_trajectory(det, pool, bnds, design, layer_z, n_tracks, primaries, batch=4096):
     """Solve the selected events, returning the per-track trajectory (``traj``, ``n_cross``) AND the
     digitised hits (packed ``StrawEvent`` ``digi`` + ``digi_mask``) -- the latter carries the real TDC
     that V2 looks up by straw address. ``primaries=False`` also records secondaries as noise tracks."""
     n, m = bnds.shape[0], layer_z.shape[0]
     traj = np.zeros((n, n_tracks, m, 3), np.float32)
     ncr = np.zeros((n, n_tracks), np.int32)
-    Xs, masks = [], []
-    rng = np.random.default_rng(0)
+    Hs, Ts = [], []
     for i in range(0, n, batch):
         b = bnds[i:i + batch]
         nb = b.shape[0]
         tj, nc = np.zeros((nb, n_tracks, m, 3), np.float32), np.zeros((nb, n_tracks), np.int32)
         pi = np.full((nb, n_tracks), -1, np.int32)
-        X, mk, _ = det._run_solver(b, np.repeat(design[None], nb, 0), rng, input_events=ie, z_planes=layer_z,
-                                   traj=tj, n_cross=nc, part_idx=pi, primaries=primaries)
+        layers, angles, Bs = det._design_to_geometry(np.repeat(design[None], nb, 0))  # per-event geometry
+        hits_idx, tdc, _ = det._run_solver(pool, b, layers, angles, Bs, det._seeds(i + np.arange(nb)),
+                                           z_planes=layer_z, traj=tj, n_cross=nc, part_idx=pi, primaries=primaries)
         traj[i:i + nb], ncr[i:i + nb] = tj, nc
-        Xs.append(np.asarray(X))
-        masks.append(np.asarray(mk))
-    return traj, ncr, det._pack_event(np.concatenate(Xs, 0)), np.concatenate(masks, 0)
+        Hs.append(np.asarray(hits_idx))
+        Ts.append(np.asarray(tdc))
+    H, Tdc = np.concatenate(Hs, 0), np.concatenate(Ts, 0)
+    return traj, ncr, det._pack_event(H, Tdc), (Tdc >= 0).astype(np.int32)
 
 
 def load_tracking_data(det, design, n_files, n_events, material, n_tracks, primaries):
@@ -80,8 +81,8 @@ def load_tracking_data(det, design, n_files, n_events, material, n_tracks, prima
     reco9 = np.concatenate([reco[:, 4:7], reco[:, 7:10], reco[:, 13:16]], axis=1)
     reco_ok = ~np.isnan(reco).any(1)
     rows = np.arange(min(int(n_events), truth.shape[0]))
-    ie, bnds = O._input_events(pa, ei, bz, rows)
-    traj, ncr, digi, digi_mask = _solver_trajectory(det, ie, bnds, design, layer_z, n_tracks, primaries)
+    pool, bnds = O._input_events(pa, ei, bz, rows)
+    traj, ncr, digi, digi_mask = _solver_trajectory(det, pool, bnds, design, layer_z, n_tracks, primaries)
     event, mask = det._trajectory_to_event(traj, ncr, design, hits_xy=True, drift_r=True, tdc=True,
                                            digi=digi, digi_mask=digi_mask)
     fired = (mask > 0)
@@ -143,7 +144,7 @@ def _render(cols, results, row_names):
 
 _LEGEND = (
     "FairShip verification: our retina/NLL trackers (4 targets) vs FairShip, on data/mc.\n"
-    "Three regimes (hit source varies, all else fixed): our StereoTracking sim material OFF, our sim\n"
+    "Three regimes (hit source varies, all else fixed): our Stereo4Feature sim material OFF, our sim\n"
     "material ON, and FairShip's OWN digitized daughter hits (real spectrometer field map + geometry\n"
     "calibrated from the MC hit cloud).\n"
     "Columns: R=retina N=NLL | Tu=tubes(V1, wire centre) TD=TDC(V2, raw readout, network proxy)\n"

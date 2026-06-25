@@ -18,12 +18,15 @@ __all__ = ["load_fairship_digi", "pack_fairship_events"]
 _DEFAULT_COLUMNS = ("truth", "reco", "digi_straw", "digi_invalid", "digi_event_index", "digi_tdc")
 
 
-def load_fairship_digi(n_files, data_glob="data/mc/*.npz", columns=_DEFAULT_COLUMNS):
-    """Concatenate the first ``n_files`` npz files (those carrying a ``reco`` field) under ``data_glob``.
+def load_fairship_digi(n_files=None, data_glob="data/mc/*.npz", columns=_DEFAULT_COLUMNS):
+    """Concatenate the npz files (those carrying a ``reco`` field) under ``data_glob``. ``n_files=None``
+    loads ALL of them; otherwise the first ``n_files``.
 
     Returns ``(data, n_files_used)`` where ``data`` maps each requested column to a concatenated array.
     ``digi_event_index`` is offset per file so it indexes the concatenated ``truth`` rows globally."""
-    files = [f for f in sorted(glob.glob(data_glob)) if "reco" in np.load(f, allow_pickle=True).files][: int(n_files)]
+    files = [f for f in sorted(glob.glob(data_glob)) if "reco" in np.load(f, allow_pickle=True).files]
+    if n_files is not None:
+        files = files[: int(n_files)]
     cols = {k: [] for k in columns}
     offset = 0
     for f in files:

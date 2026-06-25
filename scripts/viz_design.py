@@ -35,15 +35,15 @@ BO_CFG = "config/bo.yaml"
 
 def build_detector(data_dir):
     """StereoStrawDetector from the geometry block of config/bo.yaml."""
-    cfg = yaml.safe_load(open(BO_CFG))["detector"]["stereo_straw"]
+    cfg = yaml.safe_load(open(BO_CFG))["detector"]["stereo_tracking"]
     cfg = {**cfg, "data_dir": data_dir}
     return StereoStrawDetector(**cfg)
 
 
 def load_design(path, det):
-    """Read {stations, angle} -> flat physical design array [station_z(n), angle]."""
+    """Read {stations, view_angle} -> flat physical design array [station_z(n), view_angle]."""
     d = yaml.safe_load(open(path))
-    return np.asarray([*d["stations"], float(d["angle"])], np.float32)
+    return np.asarray([*d["stations"], float(d["view_angle"])], np.float32)
 
 
 def layer_z(det, design):
@@ -135,7 +135,7 @@ def main(target="all", data_dir="data/mc", out="output/design", n_events=200):
         design = load_design(p, det)
         events = sample_trajectories(det, design, data_dir, n_events, rng)  # solved at THIS design
         name = os.path.splitext(os.path.basename(p))[0]
-        title = f"{name}: z-y projection (angle={design[-1]:.4f} rad)"
+        title = f"{name}: z-y projection (view_angle={design[-1]:.4f} rad)"
         print(f"{name}: overlaying {len(events)} simulated events")
         draw(det, design, events, title, os.path.join(out, f"zy_{name}.png"))
 

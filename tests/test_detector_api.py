@@ -82,7 +82,7 @@ def test_shape_invariants():
     assert isinstance(es, StrawEvent)
     assert es.station.shape == (d.max_hits_per_event,) and es.station.dtype == np.int32
     assert es.tdc.dtype == np.float32
-    assert d.target_dim() == 6  # HNL [vertex(3), momentum(3)]
+    assert d.target_dim() == 9  # unified daughter target [vertex(3), p1(3), p2(3)]
     assert d.ground_truth_dim() == 7  # [mass(1), p(3), vertex(3)]
     # design = positions(n_layers) + angles(n_layers) + B(1)
     assert d.design_dim() == 2 * d.n_layers + 1
@@ -161,18 +161,21 @@ def test_combine_differentiable_wrt_design():
 def test_target_roundtrip_and_record_type():
     """normalize_target(Target) -> flat array; denormalize_predictions(array) -> Target."""
     d = _make_detector()
-    from detopt.detector.straw import HNLTarget
+    from detopt.detector.straw import DaughterTarget
 
     rng = np.random.default_rng(7)
-    t = HNLTarget(
-        vertex=rng.standard_normal((5, 3)).astype(np.float32), momentum=rng.standard_normal((5, 3)).astype(np.float32)
+    t = DaughterTarget(
+        vertex=rng.standard_normal((5, 3)).astype(np.float32),
+        p1=rng.standard_normal((5, 3)).astype(np.float32),
+        p2=rng.standard_normal((5, 3)).astype(np.float32),
     )
     tn = d.normalize_target(t)
-    assert tn.shape == (5, d.target_dim())
+    assert tn.shape == (5, d.target_dim())  # 9
     back = d.denormalize_predictions(tn)
-    assert isinstance(back, HNLTarget)
+    assert isinstance(back, DaughterTarget)
     np.testing.assert_allclose(np.asarray(back.vertex), np.asarray(t.vertex), rtol=1e-3, atol=1e-3)
-    np.testing.assert_allclose(np.asarray(back.momentum), np.asarray(t.momentum), rtol=1e-3, atol=1e-3)
+    np.testing.assert_allclose(np.asarray(back.p1), np.asarray(t.p1), rtol=1e-3, atol=1e-3)
+    np.testing.assert_allclose(np.asarray(back.p2), np.asarray(t.p2), rtol=1e-3, atol=1e-3)
 
 
 def test_normalize_ground_truth():
@@ -187,23 +190,28 @@ def test_normalize_ground_truth():
     assert out.shape == (4, d.ground_truth_dim())  # [mass, p(3), vertex(3)] = 7
 
 
-def test_loss_is_array_and_matches_mse():
+def test_loss_is_array_and_matches_objective():
     d = _make_detector()
     rng = np.random.default_rng(3)
-    # loss compares predictions against the ALREADY-NORMALIZED target (the caller normalizes).
-    target = jnp.asarray(rng.standard_normal((5, 6)).astype("float32"))
-    pred = jnp.asarray(rng.standard_normal((5, 6)).astype("float32"))
+    # the UNIFIED daughter objective on the ALREADY-NORMALIZED 9-vec: vertex + perm-inv daughters + HNL-sum.
+    target = jnp.asarray(rng.standard_normal((5, 9)).astype("float32"))
+    pred = jnp.asarray(rng.standard_normal((5, 9)).astype("float32"))
     out = d.loss(pred, target)
-    expected = jnp.mean(jnp.square(pred - target), axis=-1)
-    np.testing.assert_allclose(np.asarray(out), np.asarray(expected), rtol=1e-5)
+    vp, vt = pred[:, :3], target[:, :3]
+    p1p, p2p, p1t, p2t = pred[:, 3:6], pred[:, 6:9], target[:, 3:6], target[:, 6:9]
+    lv = 0.5 * jnp.mean(jnp.square(vp - vt), -1)
+    ld = 0.25 * jnp.minimum(jnp.mean(jnp.square(p1p - p1t) + jnp.square(p2p - p2t), -1),
+                            jnp.mean(jnp.square(p2p - p1t) + jnp.square(p1p - p2t), -1))
+    lh = 0.25 * jnp.mean(jnp.square(0.5 * ((p1p + p2p) - (p1t + p2t))), -1)
+    np.testing.assert_allclose(np.asarray(out), np.asarray(lv + ld + lh), rtol=1e-5)
     assert out.shape == (5,)
 
 
 def test_metric_is_per_sample_dict():
     d = _make_detector()
     rng = np.random.default_rng(4)
-    target = jnp.asarray(rng.standard_normal((5, 6)).astype("float32"))
-    pred = jnp.asarray(rng.standard_normal((5, 6)).astype("float32"))
+    target = jnp.asarray(rng.standard_normal((5, 9)).astype("float32"))
+    pred = jnp.asarray(rng.standard_normal((5, 9)).astype("float32"))
     m = d.metric(pred, target)
     assert set(m) == set(d.metric_labels())  # keys == declared labels
     for v in m.values():
@@ -212,8 +220,8 @@ def test_metric_is_per_sample_dict():
 
 
 def test_no_split_or_mutable_state():
-    """The detector mirrors DebugDetector: no train/val split, no loader, no
-    'current yaml design' state -- design is always passed in."""
+    """No train/val split, no loader, no 'current yaml design' state -- the design is always passed in,
+    and the train/val split lives in the scripts (the detector is a deterministic function)."""
     d = _make_detector()
     assert "split" not in inspect.signature(d.__call__).parameters
     for removed in ("loader", "get_current_yaml_design", "encode_yaml_design", "yaml_design_shape"):
@@ -242,8 +250,8 @@ def test_simulate_debug_outputs():
 
     Secondary channels are off here for a clean, deterministic 2-primary event (the
     physics rates are matched/validated elsewhere); this just checks the API surface.
-    ``simulate_debug`` / ``_run_solver`` return the RAW ``(n, M, 5)`` float buffer (the
-    typed ``Event`` packing happens only in ``sample_events`` / ``__call__``).
+    ``simulate_debug`` packs the ``StrawEvent`` + the derived ``mask`` (``tdc >= 0``); ``_run_solver``
+    returns the raw ``hits_idx``/``tdc`` buffers the engine fills.
     """
     d = detopt.detector.FreeStrawDetector(
         n_stations=4,
@@ -286,34 +294,29 @@ def test_simulate_debug_outputs():
     assert set(np.unique(out["process_ids"][mask]).tolist()) <= {0}
     assert int(mask.sum()) <= int(out["n_hits"].sum())
 
-    # the operational solver path: build a transient InputEvents from the pool + a
-    # (1,2) boundary span; returns (X, mask, None) with X width = max_hits_per_event.
-    ie = d._make_input_events(dd)
+    # the operational solver path: build a Pool from the synthetic event + a (1,2) boundary span;
+    # the engine fills hits_idx (1, M, 4) uint32 + tdc (1, M) f32 (M = max_hits_per_event).
+    from detopt.detector.straw import Pool
+
+    pool = Pool(dd["masses"], dd["charges"], dd["positions"], dd["momenta"], dd["times"])
     boundaries = np.array([[0, len(dd["masses"])]], dtype=np.int32)
-    X, m, traj = d._run_solver(boundaries, design, np.random.default_rng(0), input_events=ie)
-    assert X.shape == (1, 64, 5) and m.shape == (1, 64) and traj is None
+    layers, angles, Bs = d._design_to_geometry(design)
+    hits_idx, tdc, traj = d._run_solver(pool, boundaries, layers, angles, Bs, np.array([1], np.uint32))
+    assert hits_idx.shape == (1, 64, 4) and tdc.shape == (1, 64) and traj is None
 
 
-def test_pool_split_resolve():
-    """resolve_pool_split normalizes Sequence/Mapping/None into fractions summing to 1."""
-    from detopt.detector.common import Detector
+def test_call_is_deterministic_by_event_index():
+    """The new contract: ``detector(design, event_index)`` is a DETERMINISTIC function -- the same index
+    reproduces the event, a repeated index reproduces it within the batch, and ``size()`` reports the
+    event count (``None`` for the infinite analytic source)."""
+    from analytic import analytic_detector, DESIGN
 
-    assert Detector.resolve_pool_split(None) == {0: 1.0}
-    r = Detector.resolve_pool_split([3, 1])  # Sequence -> int keys, normalized
-    assert set(r) == {0, 1} and abs(sum(r.values()) - 1.0) < 1e-6 and abs(r[0] - 0.75) < 1e-6
-    r = Detector.resolve_pool_split({"train": 0.9, "val": 0.1})
-    assert abs(r["train"] - 0.9) < 1e-6 and abs(r["val"] - 0.1) < 1e-6
-
-
-def test_debug_detector_pools_disjoint():
-    """DebugDetector pools are independent event streams: different pools -> different events."""
-    d = detopt.detector.DebugDetector(pool_split={"train": 0.8, "val": 0.2})
-    assert list(d.pool_split) == ["train", "val"]
-    design = np.zeros((64, d.design_dim()), np.float32)
+    d = analytic_detector()
+    assert d.size() is None  # analytic = infinite source
     flat = lambda t: np.concatenate([np.asarray(x) for x in t], axis=-1)  # Target record -> flat array
-    _, _, _, t_train = d(0, design, pool="train")
-    _, _, _, t_val = d(0, design, pool="val")
-    assert not np.allclose(flat(t_train), flat(t_val))
-    # the default pool (no arg) matches the first key
-    _, _, _, t_default = d(0, design)
-    assert np.allclose(flat(t_default), flat(t_train))
+    _, e1, _, t1 = d(DESIGN, np.array([3, 3, 7]))
+    _, e2, _, t2 = d(DESIGN, np.array([3, 3, 7]))
+    assert np.array_equal(np.asarray(e1.tdc), np.asarray(e2.tdc))            # reproducible across calls
+    assert np.array_equal(np.asarray(e1.tdc)[0], np.asarray(e1.tdc)[1])      # repeated index -> identical
+    assert not np.allclose(flat(t1)[0], flat(t1)[2])                          # different index -> different
+    assert np.allclose(flat(t1), flat(t2))                                    # whole batch reproducible

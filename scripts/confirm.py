@@ -29,6 +29,7 @@ import numpy as np
 
 import detopt
 from detopt.nn.trainer import FullBudgetTrainer
+from detopt.utils.events import shuffled_event_index
 from detopt.utils.viz.bo import plot_confirmation
 
 
@@ -159,19 +160,21 @@ def evaluate(checkpoint, seed: int = 0, step=None, **config):
     def eval_batch(params, state, event, mask, target):
         net = nnx.merge(graphdef, params, state)
         # The design's true ENCODED design (1-D -> combine_encoded broadcasts per event).
-        feats = detector.combine_encoded(event, design_enc)
-        pred = net(feats, mask, deterministic=True)  # dropout off
-        return detector.loss(pred, detector.normalize_target(target))  # per-event (B,)
+        feats = detector.combine_encoded(event, design_enc, mask=mask)
+        emask = detector.element_mask(event, mask)
+        return net.loss(detector.loss, feats, emask, detector.normalize_target(target),
+                        deterministic=True)  # per-event (B,)
 
     budget = int(config["training"]["budget"])
     chunk = int(config["training"].get("eval_batch", 2048))
     phys_b = np.broadcast_to(phys[None, :], (chunk, phys.shape[0]))
-    seq = np.random.SeedSequence(seed)
-    print(f"Evaluating on ~{budget} fresh events at this design (no training)...")
+    event_index = shuffled_event_index(detector.size(), budget, seed)  # held-out events at the fixed design
+    print(f"Evaluating on ~{budget} held-out events at this design (no training)...")
     total = total_sq = 0.0
     n = 0
     while n < budget:
-        _gt, event, mask, target = detector(seq.spawn(1)[0], phys_b, pool="val")
+        idx = event_index[n:n + chunk]
+        _gt, event, mask, target = detector(phys_b[:idx.shape[0]], idx)
         losses = np.asarray(eval_batch(params, state, event, mask, target), dtype=np.float64)
         total += losses.sum()
         total_sq += (losses**2).sum()

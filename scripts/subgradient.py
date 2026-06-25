@@ -39,6 +39,7 @@ from flax import nnx
 import detopt
 from detopt.utils.config import optimizer as make_optimizer, resolve_device
 from detopt.utils.pools import RingBuffer
+from detopt.utils.events import disjoint_index_streams
 
 
 # Checkpointing is the uniform machinery in detopt.utils.io (save_checkpoint / restore_config /
@@ -47,11 +48,12 @@ from detopt.utils.pools import RingBuffer
 
 
 def _initial_theta(detector, config):
-    """Initial encoded design: the config ``nominal_design`` for the stereo detector, or the
-    detector's own nominal design (e.g. DebugDetector) when shapes don't match."""
-    nd = config.get("nominal_design")
+    """Initial encoded design -- ALWAYS from config (the detector holds NO design state)."""
+    nd = config.get("design", config.get("nominal_design"))
     if nd is None:
-        nd = detector.get_current_design_array()
+        raise ValueError(
+            "subgradient needs an initial design in config ('design' or 'nominal_design'); "
+            "the detector holds no current/nominal design.")
     return jnp.asarray(detector.encode_design(nd), jnp.float32)
 
 
@@ -81,6 +83,29 @@ def _forward_shared(reg, feats, mask, members, *, deterministic):
     return reg(fe, me, deterministic=deterministic)
 
 
+def _forward_loss(reg, loss_fn, feats, mask, target, members, batch, *, deterministic, rngs=None):
+    """TRAIN loss path: (members*batch, ...) minibatch -> per-sample loss (members*batch,). The MODEL
+    owns the forward (``reg.loss``); each member gets its own slice (mirrors ``_forward``)."""
+    if members is None:
+        return reg.loss(loss_fn, feats, mask, target, deterministic=deterministic, rngs=rngs)
+    feats_e = feats.reshape((members, batch) + feats.shape[1:])
+    mask_e = mask.reshape((members, batch) + mask.shape[1:])
+    target_e = target.reshape((members, batch) + target.shape[1:])
+    loss = reg.loss(loss_fn, feats_e, mask_e, target_e, deterministic=deterministic, rngs=rngs)
+    return loss.reshape((members * batch,) + loss.shape[2:])
+
+
+def _forward_shared_loss(reg, loss_fn, feats, mask, target, members, *, deterministic):
+    """EVAL / DESIGN-GRAD loss path: ONE batch fed to every member (broadcast) -> per-sample loss
+    ``(members, batch)`` or ``(batch,)``. The target is broadcast here (replaces ``_target_for``)."""
+    if members is None:
+        return reg.loss(loss_fn, feats, mask, target, deterministic=deterministic)
+    fe = jnp.broadcast_to(feats[None], (members,) + feats.shape)
+    me = jnp.broadcast_to(mask[None], (members,) + mask.shape)
+    te = jnp.broadcast_to(target[None], (members,) + target.shape)
+    return reg.loss(loss_fn, fe, me, te, deterministic=deterministic)
+
+
 def _target_for(targets_norm, members):
     """Broadcast a normalized target batch to match :func:`_forward_shared`'s output."""
     return targets_norm if members is None else jnp.broadcast_to(targets_norm[None], (members,) + targets_norm.shape)
@@ -102,7 +127,7 @@ def _jsonable(aux):
     }
 
 
-def optimize(seed, output, progress=True, restore=True, **config):
+def optimize(seed, output, progress=True, restore=True, init_from=None, **config):
     os.makedirs(output, exist_ok=True)
     device = resolve_device(config.get("device"))
     sg = config["subgradient"]
@@ -129,12 +154,9 @@ def optimize(seed, output, progress=True, restore=True, **config):
     design_meta = detopt.utils.viz.design.design_trajectory_meta(detector)
     # Three disjoint detector event pools: train the network on 'train', take the design gradient on
     # 'design', validate on held-out 'val' (each kept separate so the design step and validation see
-    # events the network never trained on). Defaults to the detector's first three pool keys, clamped
-    # if fewer are configured (single pool -> no separation).
-    pool_keys = list(detector.pool_split)
-    train_pool = sg.get("train_pool", pool_keys[0])
-    design_pool = sg.get("design_pool", pool_keys[min(1, len(pool_keys) - 1)])
-    val_pool = sg.get("val_pool", pool_keys[min(2, len(pool_keys) - 1)])
+    # events the network never trained on). The script owns the split: three DISJOINT endless event-index
+    # streams over a shuffled partition of [0, detector.size()) (or fresh draws for the analytic source).
+    cut_fractions = sg.get("split", [0.45, 0.45])  # -> train / design / val (the remainder)
 
     # Deterministic seeding: a master SeedSequence -> one child for the network init,
     # then exactly one child per epoch (each epoch derives ALL its randomness from its
@@ -144,6 +166,9 @@ def optimize(seed, output, progress=True, restore=True, **config):
     init_seq = master.spawn(1)[0]
     warmup_seq = master.spawn(1)[0]  # always spawned (consistent stream); used only on a fresh run
     prefill_seq = master.spawn(1)[0]  # always spawned (consistent stream); fills the ring before every run
+    stream_seq = master.spawn(1)[0]   # always spawned (consistent stream); seeds the event-index streams
+    train_stream, design_stream, val_stream = disjoint_index_streams(
+        detector.size(), cut_fractions, int(stream_seq.generate_state(1)[0]))
     rngs = nnx.Rngs(jax.random.PRNGKey(int(init_seq.generate_state(1)[0])))
 
     # --- build the (ensemble) regressor + optimizers --------------------------
@@ -152,10 +177,19 @@ def optimize(seed, output, progress=True, restore=True, **config):
     # before the model is built.
     manager = detopt.utils.io.get_checkpointer(output)
     resuming = restore and manager.latest_step() is not None
+    # init_from: WARM-START the REGRESSOR params from a DIFFERENT checkpoint (e.g. a pretrained network),
+    # then optimize a FRESH design from config -- distinct from resume (fresh optimizers, step 0). Ignored
+    # when resuming. The regressor architecture comes from the init checkpoint.
+    init_mgr = detopt.utils.io.get_checkpointer(init_from) if (init_from is not None and not resuming) else None
     stored = detopt.utils.io.restore_config(manager) if resuming else None
     if resuming and stored is None:
         print("warning: checkpoint predates config-saving; using the config-file regressor architecture")
-    regressor_config = stored["regressor"] if stored is not None else config["regressor"]
+    if stored is not None:
+        regressor_config = stored["regressor"]
+    elif init_mgr is not None:
+        regressor_config = detopt.utils.io.restore_config(init_mgr)["regressor"]
+    else:
+        regressor_config = config["regressor"]
     model = detopt.nn.from_config(detector, config=regressor_config, rngs=rngs)
     reg_def, params0, state0 = nnx.split(model, nnx.Param, nnx.Variable)
     members = model.ensemble() if hasattr(model, "ensemble") else None
@@ -177,19 +211,21 @@ def optimize(seed, output, progress=True, restore=True, **config):
     ring = RingBuffer(ring_capacity, raw_specs, device=device)
     val_ring = RingBuffer(val_batches * val_batch, raw_specs, device=device)
 
-    def _sample_raw(seq, theta_pert, pool):
-        """Sample raw events at the (per-event perturbed) encoded design ``theta_pert``; return
-        ``(event, mask, target, design)`` -- the per-event physical ``Design`` record completes the row."""
+    def _sample_raw(theta_pert, event_index):
+        """Simulate raw events at the (per-event perturbed) encoded design ``theta_pert`` at the given
+        ``event_index``; return ``(event, mask, target, design)`` -- the per-event physical ``Design``
+        record completes the row. (Per-event design + per-event index, both ``(n, ...)``.)"""
         phys = detector.decode_design(theta_pert)  # Design namedtuple (batched)
-        _gt, event, mask, target = detector(seq.spawn(1)[0], phys, pool=pool)
+        _gt, event, mask, target = detector(phys, event_index)
         return event, mask, target, phys
 
     # --- jitted kernels -------------------------------------------------------
     def _net_loss(params, state, drop_key, event, mask, target, design, count):
         reg = nnx.merge(reg_def, params, state)
-        feats = detector.combine(event, design)  # per-event PHYSICAL design -> encode + gather
-        pred = _forward(reg, feats, mask, members, count, deterministic=False, rngs=nnx.Rngs(drop_key))
-        loss = jnp.mean(detector.loss(pred, detector.normalize_target(target)))
+        feats = detector.combine(event, design, mask=mask)  # per-event PHYSICAL design -> encode + gather
+        emask = detector.element_mask(event, mask)  # per-element mask (== hit mask, unless layer-wise)
+        loss = jnp.mean(_forward_loss(reg, detector.loss, feats, emask, detector.normalize_target(target),
+                                      members, count, deterministic=False, rngs=nnx.Rngs(drop_key)))
         _, _, new_state = nnx.split(reg, nnx.Param, nnx.Variable)
         return loss, new_state
 
@@ -241,10 +277,11 @@ def optimize(seed, output, progress=True, restore=True, **config):
 
         def design_loss(theta):
             reg = nnx.merge(reg_def, params, state)
-            feats = detector.combine_encoded(event_f, theta)  # (design_batch, M, F) -- only theta-path
+            feats = detector.combine_encoded(event_f, theta, mask=mask_f)  # (design_batch, M, F) theta-path
+            emask = detector.element_mask(event_f, mask_f)
             tnorm = detector.normalize_target(target_f)  # (design_batch, T)
-            pred = _forward_shared(reg, feats, mask_f, members, deterministic=True)
-            return jnp.mean(detector.loss(pred, _target_for(tnorm, members)))
+            return jnp.mean(_forward_shared_loss(reg, detector.loss, feats, emask, tnorm, members,
+                                                 deterministic=True))
 
         loss, dgrad = jax.value_and_grad(design_loss)(theta)
         updates, design_opt_state = design_opt.update(dgrad, design_opt_state, theta)
@@ -266,8 +303,9 @@ def optimize(seed, output, progress=True, restore=True, **config):
 
         def step(acc, chunk):
             ev, m, t, d = chunk
-            feats = detector.combine(ev, d)
-            pred = _forward_shared(reg, feats, m, members, deterministic=True)  # (members, val_batch, T) or (val_batch, T)
+            feats = detector.combine(ev, d, mask=m)
+            emask = detector.element_mask(ev, m)
+            pred = _forward_shared(reg, feats, emask, members, deterministic=True)  # (members, val_batch, T) or (val_batch, T)
             md = detector.metric(pred, _target_for(detector.normalize_target(t), members))
             return {k: acc[k] + jnp.sum(md[k]) for k in acc}, None
 
@@ -279,6 +317,11 @@ def optimize(seed, output, progress=True, restore=True, **config):
     # --- state init / resume --------------------------------------------------
     theta = _initial_theta(detector, config)
     params, state = params0, state0
+    if init_mgr is not None:  # warm-start the regressor params (design stays fresh from config)
+        il = init_mgr.latest_step()
+        params, state, _ = detopt.utils.io.restore_checkpoint(init_mgr, il, regressor=(params0, state0, reg_opt))["regressor"]
+        init_mgr.close()
+        print(f"initialized regressor params from {init_from} (step {il}); fresh design + optimizers, step 0")
     reg_opt_state = reg_opt.init(params)
     design_opt_state = design_opt.init(theta)
     starting_epoch = 0
@@ -337,7 +380,7 @@ def optimize(seed, output, progress=True, restore=True, **config):
         while filled < warmup_samples:
             chunk = min(samples, warmup_samples - filled)
             theta_pert = theta[None, :] + warmup_design_eps * jax.random.normal(_key(warmup_seq), (chunk, design_dim))
-            warm_ring.push(*_sample_raw(warmup_seq, theta_pert, train_pool))
+            warm_ring.push(*_sample_raw(theta_pert, train_stream.next_block(chunk)))
             filled += chunk
 
         # Pretrain on the one-shot warm buffer: it is both the "fresh" and the "ring" source.
@@ -364,7 +407,7 @@ def optimize(seed, output, progress=True, restore=True, **config):
     while filled < ring_capacity:
         chunk = min(samples, ring_capacity - filled)
         theta_pert = theta[None, :] + design_eps * jax.random.normal(_key(prefill_seq), (chunk, design_dim))
-        ring.push(*_sample_raw(prefill_seq, theta_pert, train_pool))
+        ring.push(*_sample_raw(theta_pert, train_stream.next_block(chunk)))
         filled += chunk
 
     # --- the optimization loop: `epochs` x (`steps` design steps each) --------
@@ -378,7 +421,7 @@ def optimize(seed, output, progress=True, restore=True, **config):
             # count toward both sources -- "completely fair"). theta stays a jax array; numpy only at
             # the C-detector boundary (decode -> phys).
             theta_pert = theta[None, :] + design_eps * jax.random.normal(_key(epoch_seq), (samples, design_dim))
-            fresh = _sample_raw(epoch_seq, theta_pert, train_pool)  # (event, mask, target, design_phys)
+            fresh = _sample_raw(theta_pert, train_stream.next_block(samples))  # (event, mask, target, design_phys)
             ring.push(*fresh)
 
             # (4) network: `substeps` scan-folded SGD steps; each minibatch = `batch` from the
@@ -392,7 +435,7 @@ def optimize(seed, output, progress=True, restore=True, **config):
             # drawn from the separate 'design' pool (held out from network training). The design's
             # own physical-design column is unused -- the gradient path re-combines with live theta.
             theta_cur = jnp.broadcast_to(theta[None, :], (design_batch, design_dim))
-            event_f, mask_f, target_f, _des = _sample_raw(epoch_seq, theta_cur, design_pool)
+            event_f, mask_f, target_f, _des = _sample_raw(theta_cur, design_stream.next_block(design_batch))
             theta, design_opt_state, _dloss, dgrad = design_step(
                 theta, design_opt_state, event_f, mask_f, target_f, params, state
             )
@@ -401,7 +444,7 @@ def optimize(seed, output, progress=True, restore=True, **config):
         # combined examples), then scan-fold per-axis predictions over the whole buffer.
         theta_v = jnp.broadcast_to(theta[None, :], (val_batch, design_dim))  # theta fixed across the fill
         for _ in range(val_batches):
-            val_ring.push(*_sample_raw(epoch_seq, theta_v, val_pool))
+            val_ring.push(*_sample_raw(theta_v, val_stream.next_block(val_batch)))
         val = validate(params, state, *val_ring.buffers())  # {metric_key: scalar}
 
         train_losses[epoch] = step_losses.mean()

@@ -1,6 +1,6 @@
-# NOTE: ragged-layout model (own combine + segment_sum over event_indices).
-# NOT YET PORTED to the new Detector padded (B, M, F) contract; superseded
-# by detopt/nn/set_regressor.py for the supervised path.
+# ⛔️ BROKEN / QUARANTINED -- DO NOT USE. Ragged-layout VAEs (CVAE / DeepSetVAE / MLPVAE) NOT PORTED to
+# the new Detector padded (B, M, F) contract (test_generator.py is a known failure). Kept for reference
+# only -- intentionally NOT imported or registered in detopt/nn/__init__.py.
 import inspect
 from typing import Sequence
 

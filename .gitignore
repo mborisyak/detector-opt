@@ -129,8 +129,8 @@ release/
 *.webm
 *.html
 
-data/
-output/
+/data/
+/output/
 
 *.md
 !README.md

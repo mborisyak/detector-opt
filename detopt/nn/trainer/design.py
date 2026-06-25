@@ -32,12 +32,17 @@ import numpy as np
 import optax
 
 from ...utils.training import is_plateaued, masked_mean_sem
-from .common import Trainer, TrainResult, _round_down
+from .common import Trainer, TrainResult, _round_down, window_sample_indices, fresh_design_network
 
 __all__ = ["DesignTrainer"]
 
 
-class DesignTrainer(Trainer):
+class _DesignBase(Trainer):
+    """The per-design training LOOP (window-growing convergence) + factory, shared by the per-design
+    strategy (:class:`DesignTrainer`) and the continual strategy (:class:`ContinualTrainer`). The network
+    LIFECYCLE (``_sample_indices`` / ``_init_design_network``) is ABSTRACT here -- each strategy IMPLEMENTS
+    it, so neither overrides a concrete default."""
+
     @classmethod
     def from_config(cls, detector, config, *, checkpoint_dir=None, seed=0):
         """Build a trainer from a full run-config dict.
@@ -115,7 +120,6 @@ class DesignTrainer(Trainer):
         seed_seq,
         *,
         init_params=None,
-        init_state=None,
         on_epoch=None,
         step=0,
     ) -> TrainResult | None:
@@ -123,8 +127,8 @@ class DesignTrainer(Trainer):
 
         Appends this design's events into the shared budget pools (a fresh window)
         and trains within that window. ``seed_seq`` is a
-        :class:`numpy.random.SeedSequence`; ``init_params`` / ``init_state``
-        optionally warm-start from a previously trained design.
+        :class:`numpy.random.SeedSequence`; ``init_params`` optionally warm-starts
+        the params from a previously trained design (the buffer state stays fresh).
 
         Returns a :class:`TrainResult`, or ``None`` if the shared budget pool is
         exhausted (the design did not complete).
@@ -134,16 +138,16 @@ class DesignTrainer(Trainer):
         design = detector.decode_design(design_enc)  # physical Design namedtuple (what the pools store)
         design_phys = np.asarray(detector.flatten_design(design), dtype=np.float32)  # flat, for the checkpoint tree
 
-        init_seq, training_seq, data_seq = seed_seq.spawn(3)
+        init_seq, training_seq = seed_seq.spawn(2)
 
         # Network for this design (base: fresh / optionally warm-started; the
         # continual trainer keeps and continues the same one across designs).
-        params, state, opt_state = self._init_design_network(init_seq, init_params, init_state)
+        params, state, opt_state = self._init_design_network(init_seq, init_params)
 
         tp, vp = self.train_pool, self.val_pool
         # This design's window starts at the current pool fill. The offsets handed
         # to the kernels are 0-d int32 jax.Array (dynamic -> no recompile).
-        w0_train, w0_val = tp.n_current, vp.n_current
+        w0_train, w0_val = tp.current, vp.current
         w0_train_j, w0_val_j = jnp.int32(w0_train), jnp.int32(w0_val)
 
         manager = self._checkpoint_manager(step)
@@ -154,7 +158,7 @@ class DesignTrainer(Trainer):
         key = jax.random.PRNGKey(int(training_seq.generate_state(1)[0]))
 
         # Initial data (n0 <= iteration_limit, so this only fails on a full budget).
-        if self._sample_round(design, w0_train, w0_val, self.n0, data_seq.spawn(1)[0]) is None:
+        if self._sample_round(design, w0_train, w0_val, self.n0) is None:
             return None
 
         round_start = 0  # history index where the current (post-add) round began
@@ -166,8 +170,8 @@ class DesignTrainer(Trainer):
         plot_ctx = ThreadPoolExecutor(max_workers=1) if on_epoch is not None else nullcontext()
         with plot_ctx as plot_pool:
             while True:
-                train_count = tp.n_current - w0_train  # filled rows of the window
-                val_count = vp.n_current - w0_val
+                train_count = tp.current - w0_train  # filled rows of the window
+                val_count = vp.current - w0_val
                 key, subkey = jax.random.split(key)
                 params, state, opt_state, _ = self._train_epoch(
                     params,
@@ -247,7 +251,7 @@ class DesignTrainer(Trainer):
                             f"  [converged] train={train_mean:.4f} val={val_mean:.4f} "
                             f"diff={diff:.4f} err={err:.4f} diff+err={diff + err:.4f} "
                             f"prec={self.loss_precision:.4f} | "
-                            f"window={train_count} pool={tp.n_current}/{tp.n_max}"
+                            f"window={train_count} pool={tp.current}/{tp.capacity}"
                         )
                         break
                     # (3) converged but diff+err >= precision -> fall through to grow.
@@ -258,7 +262,6 @@ class DesignTrainer(Trainer):
                     w0_train,
                     w0_val,
                     self.n_increment,
-                    data_seq.spawn(1)[0],
                 )
                 if n_added is None:
                     return None  # shared budget pool exhausted mid-design
@@ -273,12 +276,23 @@ class DesignTrainer(Trainer):
                     )
                 round_start = len(train_loss_history)
                 epoch_in_round = 0
-                print(f"  [grow] window -> {tp.n_current - w0_train}, pool {tp.n_current}/{tp.n_max}")
+                print(f"  [grow] window -> {tp.current - w0_train}, pool {tp.current}/{tp.capacity}")
                 continue
 
             if manager is not None:
                 manager.wait_until_finished()
             self._persist_network(params, state, opt_state)  # continual: keep it
             objective_loss, objective_std = objective
-            spent = (tp.n_current - w0_train) + (vp.n_current - w0_val)
-            return TrainResult(objective_loss, objective_std, spent, params, state)
+            spent = (tp.current - w0_train) + (vp.current - w0_val)
+            return TrainResult(objective_loss, objective_std, spent, params)
+
+
+class DesignTrainer(_DesignBase):
+    """The standard per-design strategy: a FRESH network per design, minibatches drawn uniformly over the
+    current window (history-ignoring)."""
+
+    def _sample_indices(self, key, start, count):
+        return window_sample_indices(self, key, start, count)
+
+    def _init_design_network(self, init_seq, init_params):
+        return fresh_design_network(self, init_seq, init_params)

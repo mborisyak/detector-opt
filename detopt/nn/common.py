@@ -26,16 +26,20 @@ Shape: TypeAlias = Sequence[int]
 
 class Model(nnx.Module):
     @classmethod
-    def from_config(
-        cls,
-        input_shape: Shape,
-        target_shape: Shape,
-        ground_truth_shape: Shape,
-        config,
-        *,
-        rngs: nnx.Rngs,
-    ):
-        return cls(input_shape, target_shape, ground_truth_shape, rngs=rngs, **config)
+    def from_config(cls, detector: Detector, config, *, rngs: nnx.Rngs):
+        """The single factory for every Model: derive the universal external SHAPES from the detector --
+        the per-hit/-element feature shape ``input_shape``, the ``target_shape`` and ``ground_truth_shape``
+        -- and pass them + the config hyper-parameters to ``__init__``. Each Model takes the SAME three
+        shapes and derives its own specifics (``input_shape[-1]`` etc.). Models that genuinely need the
+        detector's geometry FACTORIZATION beyond these shapes (the hierarchical + legacy regressors) keep
+        their own detector-based factory."""
+        return cls(
+            detector.combined_event_shape(),
+            (detector.target_dim(),),
+            (detector.ground_truth_dim(),),
+            rngs=rngs,
+            **config,
+        )
 
     def __init__(
         self,
@@ -61,6 +65,18 @@ class Model(nnx.Module):
         evaluation.
         """
         return None
+
+    def loss(self, loss_fn, features, mask, target, *, deterministic=True, rngs=None):
+        """Per-sample loss for this model -- the MODEL owns the forward, so a subclass can
+        inject network-specific loss terms (e.g. deep supervision over a per-element output).
+
+        ``loss_fn`` is the detector's per-sample loss ``(predicted, target) -> (...,)`` (it reduces
+        only over the target's last axis and broadcasts leading axes). The default simply forwards
+        once and applies it; the returned array is per-sample (NOT reduced), matching the leading
+        axes of ``target`` -- so call sites keep owning the reduction (train means it, design-grad
+        / validation keep it per-event), exactly as a bare ``loss_fn(self(...), target)`` would.
+        """
+        return loss_fn(self(features, mask, deterministic=deterministic, rngs=rngs), target)
 
     def regularization(self):
         _, parameters, _ = nnx.split(self, nnx.Param, ...)

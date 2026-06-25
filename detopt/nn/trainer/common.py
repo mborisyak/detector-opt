@@ -40,6 +40,7 @@ import optax
 from flax import nnx
 
 from ...utils.pools import Pool
+from ...utils.events import shuffled_event_index
 
 __all__ = ["Trainer", "TrainResult"]
 
@@ -49,7 +50,6 @@ class TrainResult(NamedTuple):
     objective_std: float  # 0.5 * sqrt(train_sem^2 + val_sem^2) -- est_sem
     spent: int  # detector calls this design added to the pools (train + val)
     params: object  # trained regressor params (for warm-starting later designs)
-    state: object  # trained regressor non-param state
 
 
 def _round_down(n0: int, n_increment: int, limit: int) -> int:
@@ -57,6 +57,32 @@ def _round_down(n0: int, n_increment: int, limit: int) -> int:
     if limit < n0:
         return n0
     return n0 + ((limit - n0) // n_increment) * n_increment
+
+
+# ---------------------------------------------------------------------------- #
+# The PER-DESIGN lifecycle (shared by DesignTrainer + FullBudgetTrainer), as module functions so each
+# strategy IMPLEMENTS the abstract Trainer hooks by delegating here -- rather than overriding a concrete
+# default that the continual strategy would then have to re-override.
+# ---------------------------------------------------------------------------- #
+def window_sample_indices(trainer, key, start, count):
+    """Uniform minibatch indices over the current design's filled window ``[start, start+count)`` --
+    HISTORY-IGNORING. ``start`` / ``count`` are 0-d int32 ``jax.Array`` (dynamic, so the kernel never
+    recompiles as the window moves/grows). Draws ``members * batch`` (``trainer.draw_batch``): for an
+    ensemble the loss reshapes these into ``members`` i.i.d. minibatches over the same window."""
+    return start + jax.random.randint(key, (trainer.draw_batch,), 0, jnp.maximum(count, 1))
+
+
+def fresh_design_network(trainer, init_seq, init_params):
+    """A FRESH network per design (optionally warm-started), optimiser reset -- ``(params, state,
+    opt_state)`` on the trainer's device. Warm-start carries PARAMS only; the non-param buffer
+    state (rng counters) is always freshly built -- it is never read during train (the dropout key
+    is threaded fresh) or eval (deterministic), so carrying it forward would be meaningless."""
+    _, params, state = trainer._build_regressor(int(init_seq.generate_state(1)[0]))
+    if init_params is not None:
+        params = init_params
+    opt_state = trainer.optimizer.init(params)
+    d = trainer.device
+    return (jax.device_put(params, d), jax.device_put(state, d), jax.device_put(opt_state, d))
 
 
 class Trainer:
@@ -108,7 +134,14 @@ class Trainer:
 
         # ONE pool pair sized to the whole budget; the architecture is fixed, so the
         # train + train/val eval kernels are built once.
-        self.train_pool, self.val_pool, _, _ = self._make_pools(detector, budget, device)
+        self.train_pool, self.val_pool, train_budget, val_budget = self._make_pools(detector, budget, device)
+        # Shuffled, DISJOINT train/val event indices over the budget -- the script-side ownership of the
+        # split (the detector is a deterministic function of (design, event_index), no internal pools).
+        # Built ONCE; designs accumulate into the pools, consuming these indices in fill order (oversampled
+        # by wrapping when budget > detector.size()).
+        budget_index = shuffled_event_index(detector.size(), train_budget + val_budget, self.seed)
+        self._train_index = budget_index[:train_budget]
+        self._val_index = budget_index[train_budget:]
         self._build_kernels(seed)
 
     def _make_pools(self, detector, budget, device):
@@ -173,36 +206,31 @@ class Trainer:
             # deterministic=False -> dropout ACTIVE; the rng is threaded in
             # explicitly (fresh per step) so it lives at the current trace level.
             reg = nnx.merge(reg_def, params, state)
-            features = detector.combine(event_b, design_b)  # design_b: per-event PHYSICAL design
+            features = detector.combine(event_b, design_b, mask=mask_b)  # design_b: per-event PHYSICAL design
+            emask = detector.element_mask(event_b, mask_b)  # per-element mask (== hit mask, unless layer-wise)
+            target = detector.normalize_target(target_b)
+            # The MODEL owns the forward (reg.loss) so it can inject net-specific loss terms.
             if members is None:
-                pred = reg(features, mask_b, deterministic=False, rngs=nnx.Rngs(drop_key))
+                per = reg.loss(detector.loss, features, emask, target, deterministic=False, rngs=nnx.Rngs(drop_key))
             else:
                 # event_b holds ``members * batch`` independent draws from the window;
                 # split into one minibatch per member -> (N, batch, ...). Each member
                 # trains on its own batch; combine stays batch-flat.
                 feats_e = features.reshape((members, batch) + features.shape[1:])
-                mask_e = mask_b.reshape((members, batch) + mask_b.shape[1:])
-                pred = reg(feats_e, mask_e, deterministic=False, rngs=nnx.Rngs(drop_key))  # (N, batch, T)
-                pred = pred.reshape((members * batch,) + pred.shape[2:])
-            loss = jnp.mean(detector.loss(pred, detector.normalize_target(target_b)))
+                mask_e = emask.reshape((members, batch) + emask.shape[1:])
+                target_e = target.reshape((members, batch) + target.shape[1:])
+                per = reg.loss(detector.loss, feats_e, mask_e, target_e, deterministic=False, rngs=nnx.Rngs(drop_key))
+            loss = jnp.mean(per)
             _, _, new_state = nnx.split(reg, nnx.Param, nnx.Variable)
             return loss, new_state
 
         return loss_fn
 
     def _sample_indices(self, key, start, count):
-        """Minibatch indices for one train step.
-
-        Base trainer: uniform over the current design's filled window
-        ``[start, start + count)`` -- it **ignores history**. ``start`` / ``count``
-        are 0-d int32 ``jax.Array`` (dynamic, so the kernel never recompiles as the
-        window moves or grows). Subclasses override to mix in past iterations.
-
-        Draws ``members * batch`` indices: for an ensemble the loss reshapes these
-        into ``members`` independent minibatches (all i.i.d. over the same window),
-        one per member; for a single model ``members == 1`` (just ``batch``).
-        """
-        return start + jax.random.randint(key, (self.draw_batch,), 0, jnp.maximum(count, 1))
+        """Minibatch indices for one train step (``members * batch``). ABSTRACT -- the strategy implements
+        it: the per-design trainers draw uniformly over the current window (:func:`window_sample_indices`),
+        the continual trainer mixes in replay from past iterations."""
+        raise NotImplementedError()
 
     def _build_train_epoch(self, reg_def):
         optimizer = self.optimizer
@@ -254,19 +282,21 @@ class Trainer:
             def body(_carry, c):
                 idxs = start + c * eval_batch + jnp.arange(eval_batch, dtype=jnp.int32)
                 safe = jnp.clip(idxs, 0, pool_size - 1)
-                features = detector.combine(
-                    jax.tree.map(lambda a: a[safe], event_buf), jax.tree.map(lambda a: a[safe], design_buf)
-                )
+                ev = jax.tree.map(lambda a: a[safe], event_buf)
                 mask_b = mask_buf[safe]
+                features = detector.combine(ev, jax.tree.map(lambda a: a[safe], design_buf), mask=mask_b)
+                emask = detector.element_mask(ev, mask_b)
+                target_b = detector.normalize_target(jax.tree.map(lambda a: a[safe], target_buf))
                 if members is None:
-                    pred = reg(features, mask_b, deterministic=True)  # dropout OFF
+                    # MODEL owns the forward (net-specific loss terms apply, e.g. deep supervision).
+                    per = reg.loss(detector.loss, features, emask, target_b, deterministic=True)
                 else:
-                    # Every member sees the SAME eval batch; average their predictions.
+                    # Every member sees the SAME eval batch; average member PREDICTIONS, then loss.
                     feats_e = jnp.broadcast_to(features, (members,) + features.shape)
-                    mask_e = jnp.broadcast_to(mask_b, (members,) + mask_b.shape)
+                    mask_e = jnp.broadcast_to(emask, (members,) + emask.shape)
                     pred = reg(feats_e, mask_e, deterministic=True).mean(axis=0)  # (E, T)
-                target_b = jax.tree.map(lambda a: a[safe], target_buf)
-                return None, detector.loss(pred, detector.normalize_target(target_b))
+                    per = detector.loss(pred, target_b)
+                return None, per
 
             _, losses = jax.lax.scan(body, None, jnp.arange(n_chunks))
             return losses.reshape(-1)[:window]  # per-event losses over the window
@@ -276,24 +306,29 @@ class Trainer:
     # ------------------------------------------------------------------ #
     # Event sampling -- the only place the detector is called.
     # ------------------------------------------------------------------ #
-    def _fill_pool(self, design, pool, n_to_add, seed_seq):
+    def _fill_pool(self, design, pool, n_to_add, index_array):
         """Generate ``n_to_add`` events at the physical ``Design`` and append them.
 
-        The detector is called with the (broadcast) physical ``Design``; the stored per-event design
-        is the same raw ``Design`` record (``combine`` encodes it per batch). Events/targets/design
-        are stored as raw namedtuple records (the pool is pytree-aware).
+        The event indices are the next slice of ``index_array`` taken at the pool's CURRENT fill
+        (``pool.n_current`` is the cursor), so the detector call ``detector(design, event_index)`` is
+        deterministic. The detector gets the (broadcast) physical ``Design``; the stored per-event design
+        is that same raw ``Design`` record (``combine`` encodes it per batch). Events/targets/design are
+        stored as raw namedtuple records (the pool is pytree-aware).
         """
         added = 0
         chunk = min(256, n_to_add)
         while added < n_to_add:
             k = min(chunk, n_to_add - added)
+            start = pool.current  # cursor into index_array (the pool fill advances it via append)
+            ev_idx = index_array[start:start + k]
             design_b = jax.tree.map(lambda a: jnp.broadcast_to(jnp.asarray(a)[None], (k,) + jnp.asarray(a).shape), design)
-            _gt, event, mask, target = self.detector(seed_seq.spawn(1)[0], design_b)
+            _gt, event, mask, target = self.detector(design_b, ev_idx)
             pool.append(event, mask, target, design_b)
             added += k
 
-    def _sample_round(self, design, w0_train, w0_val, n_requested, seed_seq):
-        """Append one round of train+val events into the shared budget pools.
+    def _sample_round(self, design, w0_train, w0_val, n_requested):
+        """Append one round of train+val events into the shared budget pools (from the disjoint
+        ``self._train_index`` / ``self._val_index``).
 
         Returns the number of *train* events added (> 0), ``0`` if this design's
         window is full (it needs more than ``iteration_limit`` -> caller crashes),
@@ -301,35 +336,26 @@ class Trainer:
         """
         tp, vp = self.train_pool, self.val_pool
         # Window cap (a partial final add to land exactly on iteration_limit is OK).
-        n_train = min(int(n_requested), self.iteration_limit - (tp.n_current - w0_train))
+        n_train = min(int(n_requested), self.iteration_limit - (tp.current - w0_train))
         if n_train <= 0:
             return 0  # window full: design needs > iteration_limit -> caller crashes
         n_val = round(n_train * self._val_ratio)
-        n_val = max(0, min(n_val, self.val_iteration_limit - (vp.n_current - w0_val)))
+        n_val = max(0, min(n_val, self.val_iteration_limit - (vp.current - w0_val)))
         # Budget: the whole round must fit the pools, else the run is over.
-        if n_train > tp.n_max - tp.n_current or n_val > vp.n_max - vp.n_current:
+        if n_train > tp.capacity - tp.current or n_val > vp.capacity - vp.current:
             return None
-        train_seq, val_seq = seed_seq.spawn(2)
-        self._fill_pool(design, tp, n_train, train_seq)
+        self._fill_pool(design, tp, n_train, self._train_index)
         if n_val > 0:
-            self._fill_pool(design, vp, n_val, val_seq)
+            self._fill_pool(design, vp, n_val, self._val_index)
         return n_train
 
     # ------------------------------------------------------------------ #
     # Network lifecycle (overridden by ContinualTrainer to persist the net).
     # ------------------------------------------------------------------ #
-    def _init_design_network(self, init_seq, init_params, init_state):
-        """A fresh network per design (optionally warm-started); optimiser reset."""
-        _, params, state = self._build_regressor(int(init_seq.generate_state(1)[0]))
-        if init_params is not None:
-            params, state = init_params, init_state
-        opt_state = self.optimizer.init(params)
-        d = self.device
-        return (
-            jax.device_put(params, d),
-            jax.device_put(state, d),
-            jax.device_put(opt_state, d),
-        )
+    def _init_design_network(self, init_seq, init_params):
+        """The network for a design: ``(params, state, opt_state)``. ABSTRACT -- the strategy implements it:
+        a FRESH per-design net (:func:`fresh_design_network`) or the persistent continual net."""
+        raise NotImplementedError()
 
     def _persist_network(self, params, state, opt_state):
         """Base trainer keeps nothing -- each design is independent."""
