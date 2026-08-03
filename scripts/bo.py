@@ -45,6 +45,31 @@ def bo(output, seed: int, **config):
     if nn_init_strategy not in VALID_INIT_STRATEGIES:
         raise ValueError(f"nn_init_strategy {nn_init_strategy!r} not in {VALID_INIT_STRATEGIES}")
 
+    # Skip a run that already finished (so make.sh / reruns are idempotent). New runs record a
+    # "completed" flag; for legacy results.json without it, >= 90% of the budget spent is treated as
+    # complete (the final design's partial spend keeps calls below budget even on clean completion).
+    # An INCOMPLETE previous run is restarted from scratch -- bo.py has no mid-run resume.
+    results_path = os.path.join(output, "results.json")
+    if os.path.exists(results_path):
+        with open(results_path) as f:
+            prior = json.load(f)
+        budget = int(config["training"]["budget"])
+        used = int(prior.get("detector_calls_used", 0))
+        completed = prior.get("completed")
+        if completed is None:  # legacy file: infer from budget use
+            completed = used >= round(0.9 * budget)
+        if completed:
+            print(
+                f"[skip] {results_path}: run already completed "
+                f"({prior.get('n_iterations_completed', 0)} iterations, best={prior.get('best_loss', float('nan')):.5f}, "
+                f"{used}/{budget} detector calls). Delete results.json to re-run."
+            )
+            return prior.get("best_loss"), prior.get("best_design"), prior.get("results")
+        print(
+            f"[warning] {results_path}: previous run is INCOMPLETE ({used}/{budget} detector calls); "
+            f"bo.py has no mid-run resume -- restarting from scratch (overwrites results.json)."
+        )
+
     os.makedirs(output, exist_ok=True)
     plots_dir = os.path.join(output, "plots")
     os.makedirs(plots_dir, exist_ok=True)
@@ -82,6 +107,24 @@ def bo(output, seed: int, **config):
     trained_params = []
     results = []
     best_loss, best_design = np.inf, None
+
+    def _save_results(n_completed, completed):
+        """Dump results.json; ``completed`` marks a run whose budget pool filled (reruns skip it)."""
+        with open(os.path.join(output, "results.json"), "w") as f:
+            json.dump(
+                {
+                    "results": results,
+                    "best_loss": float(best_loss),
+                    "best_design": best_design,
+                    "n_iterations_completed": n_completed,
+                    "detector_calls_used": int(trainer.train_pool.current + trainer.val_pool.current),
+                    "method": "JAX-GP+EI",
+                    "completed": completed,
+                },
+                f,
+                indent=2,
+                default=float,
+            )
 
     print(f"BO: running until the budget pool fills " f"(budget={budget} detector calls, n_init={n_init}, d={d})")
 
@@ -162,25 +205,13 @@ def bo(output, seed: int, **config):
                 "warm_start_from": warm_from,
             }
         )
-        with open(os.path.join(output, "results.json"), "w") as f:
-            json.dump(
-                {
-                    "results": results,
-                    "best_loss": float(best_loss),
-                    "best_design": best_design,
-                    "n_iterations_completed": i + 1,
-                    "detector_calls_used": int(trainer.train_pool.current + trainer.val_pool.current),
-                    "method": "JAX-GP+EI",
-                },
-                f,
-                indent=2,
-                default=float,
-            )
+        _save_results(i + 1, completed=False)
 
         # Refresh the convergence plot after every completed iteration.
         plot_convergence(results, output)
         i += 1
 
+    _save_results(i, completed=True)  # the budget pool filled -- reruns skip this output
     plot_convergence(results, output)
     print(f"\nBest loss: {best_loss:.6f}")
     return best_loss, best_design, results

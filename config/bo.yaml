@@ -20,7 +20,7 @@ detector:
     max_dt: 1.0
     max_time: 300.0
     material: kapton
-    data_dir: "data/mc"  # 36k events across the 50 files; boundary crossings are upstream of the magnet (magnet-independent)
+    data_dir: "data/mc-100K"  # 36k events across the 50 files; boundary crossings are upstream of the magnet (magnet-independent)
 
 # Nominal (initial/baseline) design -- NOT detector state. A named physical-design dict the
 # detector encodes via encode_design (BO itself seeds from random proposals).
@@ -46,7 +46,7 @@ training:
   # Mandatory unconditional epochs after every data addition.
   warmup_epochs: 32
   # Extended shared detector-call budget for the whole BO run.
-  budget: 524288
+  budget: 424288 #524288
   # Per-design upper limit on data (also sets epoch = iteration_limit / batch).
   iteration_limit: 65536
 
@@ -62,6 +62,16 @@ training:
       b2: 0.999
       eps: 1.0e-8
       weight_decay: 1.0e-3
+
+# Independent trajectory verification (scripts/verify_trajectory.py): re-score <= n_points designs
+# of a finished run's results.json (uniform in cumulative detector calls, always the last) on a
+# 6:2:2 train/val/test split; best-val network scored once on the held-out test buffer.
+verify:
+  n_points: 10
+  epochs: 8         # one epoch = one pass over the train buffer
+  val_every_epochs: 1     # validate (whole val buffer) every this many epochs
+  eval_batch: 512   # eval chunk; 512 keeps the 8-member ensemble's eval activations inside 8GB VRAM
+  sample_batch: 1024
 
 bo:
   # No fixed iteration count -- the run continues until the shared detector-call

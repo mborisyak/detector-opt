@@ -108,7 +108,7 @@ class RingBuffer(Buffered):
       warnings.warn('The chuck is larger than the ring buffer. Undefined behaviour might occur.')
 
     index = (self.cursor + jnp.arange(n)) % self.capacity
-    self.assign(self._buffers, index, chunk)
+    self._buffers = self.assign(self._buffers, index, chunk)
     self.cursor = (self.cursor + n) % self.capacity
     self.filled = min(self.filled + n, self.capacity)
 
