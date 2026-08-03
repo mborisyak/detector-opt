@@ -32,6 +32,7 @@ recomputed (a settings mismatch recomputes everything -- the old data answers a 
 
 import json
 import os
+import threading
 from functools import partial
 
 import matplotlib
@@ -312,7 +313,7 @@ def verify(trajectory, seed: int = 0, output=None, progress=True, **config):
       pt = next(entry for entry in record["points"] if entry["point"] == p)
       plot_path = os.path.join(plots_dir, f"verification_{p:03d}.png")
       if not os.path.exists(plot_path):  # e.g. produced under an older plot naming
-        _plot_learning(pt["history"], pt["test_loss"], pt["test_sem"], p, plot_path)
+        _plot_learning(pt["history"], pt["reported_loss"], pt["test_loss"], pt["test_sem"], p, plot_path)
       print(
         f"[point {rank + 1}/{len(chosen)}] iteration {p} already verified: test={pt['test_loss']:.4f} -- skipped", flush=True
       )
@@ -339,6 +340,7 @@ def verify(trajectory, seed: int = 0, output=None, progress=True, **config):
     best = None  # (val_loss, epoch, params, state)
     history = []  # [epoch, train_loss (interval mean), val_loss]
     train_loss = float("nan")
+    plot_path = os.path.join(plots_dir, f"verification_{p:03d}.png")
     epoch = 0
     while epoch < epochs:
       params, state, opt_state, losses = train_epoch(
@@ -350,6 +352,8 @@ def verify(trajectory, seed: int = 0, output=None, progress=True, **config):
       history.append([epoch, train_loss, val_loss])
       if best is None or val_loss < best[0]:
         best = (val_loss, epoch, params, state)
+      # Live learning curves, refreshed after every eval epoch (fire-and-forget daemon render).
+      threading.Thread(target=_plot_learning, args=(list(history), reported, None, None, p, plot_path), daemon=True).start()
       if progress:
         print(f"  epoch {epoch}/{epochs}  train={train_loss:.4f}  val={val_loss:.4f}  best={best[0]:.4f}@{best[1]}", flush=True)
 
@@ -359,7 +363,7 @@ def verify(trajectory, seed: int = 0, output=None, progress=True, **config):
       f"  -> best val={best_val:.4f} (epoch {best_epoch})  TEST={test['loss']:.4f}±{test['loss_sem']:.4f}  "
       f"reported={reported:.4f}  delta(test-reported)={test['loss'] - reported:+.4f}", flush=True,
     )
-    _plot_learning(history, test["loss"], test["loss_sem"], p, os.path.join(plots_dir, f"verification_{p:03d}.png"))
+    _plot_learning(history, reported, test["loss"], test["loss_sem"], p, plot_path)
 
     record["points"].append({
       "point": int(p),
@@ -420,22 +424,31 @@ def _plot_comparison(record, path):
   fig.savefig(path, dpi=140)
 
 
-def _plot_learning(history, test_loss, test_sem, iteration, path):
-  """Per-point learning curves: train + validation loss per epoch, with the final TEST score as a
-  horizontal dashed line (value ± SEM in the legend)."""
+# Serialise plotting: matplotlib is not thread-safe, so the per-epoch daemon renders and the final
+# synchronous one must not run concurrently (mirrors scripts/subgradient.py).
+_PLOT_LOCK = threading.Lock()
+
+
+def _plot_learning(history, reported, test_loss, test_sem, iteration, path):
+  """Per-point learning curves: train + validation loss per epoch, with the BO-reported loss of the
+  design as a dashed reference line. Refreshed from a daemon thread after every eval epoch (no test
+  line yet); the final synchronous render adds the TEST score (value ± SEM in the legend)."""
   from matplotlib.figure import Figure
 
   h = np.asarray(history, np.float64)  # (n, 3): epoch, train, val
-  fig = Figure(figsize=(8, 5))
-  ax = fig.subplots(1, 1)
-  ax.plot(h[:, 0], h[:, 1], ".-", color="tab:green", label="train")
-  ax.plot(h[:, 0], h[:, 2], ".-", color="tab:orange", label="validation")
-  ax.axhline(test_loss, ls="--", color="tab:blue", lw=1.5, label=f"test = {test_loss:.4f} ± {test_sem:.4f}")
-  ax.set(title=f"iteration {iteration}", xlabel="epoch", ylabel="loss (normalized)", yscale="log")
-  ax.grid(True, alpha=0.25)
-  ax.legend(fontsize=9)
-  fig.tight_layout()
-  fig.savefig(path, dpi=140)
+  with _PLOT_LOCK:
+    fig = Figure(figsize=(8, 5))
+    ax = fig.subplots(1, 1)
+    ax.plot(h[:, 0], h[:, 1], ".-", color="tab:green", label="train")
+    ax.plot(h[:, 0], h[:, 2], ".-", color="tab:orange", label="validation")
+    ax.axhline(reported, ls="--", color="0.45", lw=1.4, label=f"reported (BO) = {reported:.4f}")
+    if test_loss is not None:
+      ax.axhline(test_loss, ls="--", color="tab:blue", lw=1.5, label=f"test = {test_loss:.4f} ± {test_sem:.4f}")
+    ax.set(title=f"iteration {iteration}", xlabel="epoch", ylabel="loss (normalized)", yscale="log")
+    ax.grid(True, alpha=0.25)
+    ax.legend(fontsize=9)
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
 
 
 def _plot(record, path):
