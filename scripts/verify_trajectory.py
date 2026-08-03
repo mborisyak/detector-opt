@@ -182,7 +182,7 @@ def verify(trajectory, seed: int = 0, output=None, progress=True, **config):
   val_buf = RingBuffer(len(val_index), specs, device=device)
   test_buf = RingBuffer(len(test_index), specs, device=device)
   steps_per_epoch = max(1, len(train_index) // batch)
-  scan_steps = val_every_epochs * steps_per_epoch  # SGD steps folded into one train_chunk call
+  scan_steps = val_every_epochs * steps_per_epoch  # SGD steps folded into one train_epoch call
 
   # Template regressor: the graphdef (architecture) is shared by every point, so the JIT kernels
   # compile once; each point re-initialises fresh params below.
@@ -225,12 +225,12 @@ def verify(trajectory, seed: int = 0, output=None, progress=True, **config):
     return loss, new_state
 
   @jax.jit
-  def train_chunk(params, state, opt_state, key, theta, event_buf, mask_buf, tgt_buf, n):
+  def train_epoch(params, state, opt_state, key, theta, event_buf, mask_buf, tgt_buf, n):
     """One validation interval -- ``val_every_epochs`` epochs of scan-folded SGD over the train buffer at
-    the fixed ``theta``. Returns the mean training loss of the interval (accumulated in the carry)."""
+    the fixed ``theta``. Returns the per-step batch losses (the caller averages them)."""
 
     def step(carry, k):
-      params, state, opt_state, loss_sum = carry
+      params, state, opt_state = carry
       k_idx, k_drop = jax.random.split(k)
       idx = jax.random.randint(k_idx, (draw, ), 0, n)
       event_b = jax.tree.map(lambda a: a[idx], event_buf)
@@ -239,47 +239,34 @@ def verify(trajectory, seed: int = 0, output=None, progress=True, **config):
                                                 has_aux=True)(params, state, k_drop, theta, event_b, mask_buf[idx], target_b)
       updates, opt_state = opt.update(grads, opt_state, params)
       params = optax.apply_updates(params, updates)
-      return (params, state, opt_state, loss_sum + loss), None
+      return (params, state, opt_state), loss
 
-    carry0 = (params, state, opt_state, jnp.float32(0.0))
-    (params, state, opt_state, loss_sum), _ = jax.lax.scan(step, carry0, jax.random.split(key, scan_steps))
-    return params, state, opt_state, loss_sum / scan_steps
+    (params, state, opt_state), losses = jax.lax.scan(step, (params, state, opt_state), jax.random.split(key, scan_steps))
+    return params, state, opt_state, losses
 
   @partial(jax.jit, static_argnames="rows")
   def evaluate(params, state, theta, event_buf, mask_buf, tgt_buf, rows):
-    """One sequential batch-by-batch pass over the WHOLE buffer (all ``rows``; the final partial
-    chunk is masked, nothing is dropped), on the ENSEMBLE-MEAN prediction. Scalar accumulation
-    only: returns the mean per-key metric plus the mean loss and its SEM."""
+    """One sequential batch-by-batch pass over the WHOLE buffer on the ENSEMBLE-MEAN prediction.
+    The scan returns per-sample losses/metrics; the first ``rows`` are averaged, with the standard
+    error of the loss mean."""
     reg = nnx.merge(reg_def, params, state)
-    n_chunks = -(-rows // eval_batch)  # ceil
+    n_batches = -(-rows // eval_batch)  # ceil; the clipped tail past ``rows`` is sliced off below
     pool_rows = jax.tree.leaves(event_buf)[0].shape[0]
 
-    def step(acc, c):
-      idx = c * eval_batch + jnp.arange(eval_batch, dtype=jnp.int32)
-      valid = (idx < rows).astype(jnp.float32)  # mask for the final partial chunk
-      safe = jnp.clip(idx, 0, pool_rows - 1)
-      ev = jax.tree.map(lambda a: a[safe], event_buf)
-      m = mask_buf[safe]
+    def step(_, c):
+      idx = jnp.clip(c * eval_batch + jnp.arange(eval_batch, dtype=jnp.int32), 0, pool_rows - 1)
+      ev = jax.tree.map(lambda a: a[idx], event_buf)
+      m = mask_buf[idx]
       feats = detector.combine_encoded(ev, theta, mask=m)
       emask = detector.element_mask(ev, m)
-      tnorm = detector.normalize_target(jax.tree.map(lambda a: a[safe], tgt_buf))
+      tnorm = detector.normalize_target(jax.tree.map(lambda a: a[idx], tgt_buf))
       pred = _predict_shared(reg, feats, emask, members)
-      per = detector.loss(pred, tnorm)  # per-sample ensemble loss (eval_batch,)
-      md = detector.metric(pred, tnorm)
-      loss_sum, sq_sum, metric_sum = acc
-      return (
-        loss_sum + jnp.sum(per * valid), sq_sum + jnp.sum(jnp.square(per) * valid), {
-          k: metric_sum[k] + jnp.sum(md[k] * valid)
-          for k in labels
-        },
-      ), None
+      return None, (detector.loss(pred, tnorm), detector.metric(pred, tnorm))
 
-    init = (jnp.float32(0.0), jnp.float32(0.0), {name: jnp.float32(0.0) for name in labels})
-    (loss_sum, sq_sum, metric_sum), _ = jax.lax.scan(step, init, jnp.arange(n_chunks))
-    mean = loss_sum / rows
-    sem = jnp.sqrt(jnp.maximum(sq_sum / rows - jnp.square(mean), 0.0) / rows)
-    out = {k: metric_sum[k] / rows for k in labels}
-    out.update(loss=mean, loss_sem=sem)
+    _, (losses, metrics) = jax.lax.scan(step, None, jnp.arange(n_batches))
+    losses = losses.reshape(-1)[:rows]  # per-sample losses over the whole buffer
+    out = {k: jnp.mean(metrics[k].reshape(-1)[:rows]) for k in labels}
+    out.update(loss=jnp.mean(losses), loss_sem=jnp.std(losses) / jnp.sqrt(rows))
     return out
 
   print(f"trajectory: {traj['path']} ({traj['physical'].shape[0]} points) | verifying {len(chosen)} points: {chosen}")
@@ -354,11 +341,11 @@ def verify(trajectory, seed: int = 0, output=None, progress=True, **config):
     train_loss = float("nan")
     epoch = 0
     while epoch < epochs:
-      params, state, opt_state, loss_mean = train_chunk(
+      params, state, opt_state, losses = train_epoch(
         params, state, opt_state, _key(point_seq), theta, *train_buf.buffers(), n_train
       )
       epoch += val_every_epochs
-      train_loss = float(loss_mean)
+      train_loss = float(jnp.mean(losses))
       val_loss = float(evaluate(params, state, theta, *val_buf.buffers(), rows=len(val_buf))["loss"])
       history.append([epoch, train_loss, val_loss])
       if best is None or val_loss < best[0]:

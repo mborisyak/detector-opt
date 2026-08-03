@@ -49,7 +49,6 @@ def comparison_table(out_root, runs):
         f"{'val':>8}{'test':>8}{'sem':>8}{'delta':>9}",
         "-" * 88,
     ]
-    n_rows = 0
     for strategy, results in runs.items():
         vpath = os.path.join(out_root, strategy, "verification.json")
         if not os.path.exists(vpath):
@@ -62,10 +61,6 @@ def comparison_table(out_root, runs):
             f"{p['val_loss']:>8.4f}{p['test_loss']:>8.4f}{p['test_sem']:>8.4f}"
             f"{p['test_loss'] - p['reported_loss']:>+9.4f}"
         )
-        n_rows += 1
-    if n_rows == 0:
-        print("  [skip] no verification.json under any strategy -- comparison.txt not written")
-        return
     text = "\n".join(lines) + "\n"
     path = os.path.join(out_root, "comparison.txt")
     with open(path, "w") as f:
