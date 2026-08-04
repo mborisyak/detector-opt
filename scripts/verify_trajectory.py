@@ -394,7 +394,6 @@ def verify(trajectory, seed: int = 0, output=None, progress=True, force: bool = 
     history = [[0, float("nan"), restored_val]]  # [epoch, train_loss (interval mean), val_loss]
     train_loss = float("nan")
     print(f"  restored from checkpoint: val={restored_val:.4f} (reported={reported:.4f})", flush=True)
-    train_loss = float("nan")
     plot_path = os.path.join(plots_dir, f"verification_{p:03d}.png")
     epoch = 0
     while epoch < epochs:
@@ -490,12 +489,14 @@ _PLOT_LOCK = threading.Lock()
 
 
 def _plot_learning(history, reported, test_loss, test_sem, iteration, path):
-  """Per-point learning curve: validation loss per epoch, starting at epoch 0 -- the RESTORED network,
-  before any training on the fresh data -- with the run's reported loss as a reference line.
-  Refreshed from a daemon thread after every eval epoch (no test line yet); the final synchronous
-  render adds the TEST score (value ± SEM in the legend). The train loss is deliberately not drawn: it is the running per-member loss with
-  dropout ACTIVE, an estimator that sits several SEM off the deterministic ensemble loss val and test
-  are measured with, so putting the two curves on one axis compares nothing."""
+  """Per-point learning curve: validation loss per epoch, starting at epoch 0 -- the RESTORED
+  network, before any training on the fresh data -- with the run's reported loss as a reference
+  line. Refreshed from a daemon thread after every eval epoch (no test line yet); the final
+  synchronous render adds the TEST score (value ± SEM in the legend).
+
+  The train loss is deliberately not drawn: it is the running per-member loss with dropout ACTIVE,
+  an estimator that sits several SEM off the deterministic ensemble loss val and test are measured
+  with, so putting the two curves on one axis compares nothing."""
   from matplotlib.figure import Figure
 
   h = np.asarray(history, np.float64)  # (n, 3): epoch, train (running, unplotted), val
