@@ -22,7 +22,8 @@ the run never saw:
 
 ``verify.budget`` and ``verify.batch`` default to the run's ``training.budget`` / ``training.batch``
 (an explicit ``null`` counts as absent); the architecture and optimizer come from the run config
-(``regressor`` / ``training.optimizer``). A finite data-backed detector caps each
+(``regressor`` / ``training.optimizer``), with the learning rate wrapped in a single-cycle cosine
+decay spanning each point's whole training (peak -> ~0, restarted per point). A finite data-backed detector caps each
 split at its share of unique events (a repeated index replays the IDENTICAL row -- duplicates would
 only burn simulation time), keeping the three sets disjoint. Run with the config of the run that
 produced the trajectory, so the detector matches the trajectory's design encoding::
@@ -53,7 +54,7 @@ from flax import nnx
 
 import detopt
 from detopt.utils import io
-from detopt.utils.config import optimizer as make_optimizer, resolve_device
+from detopt.utils.config import resolve_device, split
 from detopt.utils.pools import RingBuffer
 from detopt.utils.events import split_disjoint
 
@@ -219,7 +220,12 @@ def verify(trajectory, seed: int = 0, output=None, progress=True, force: bool = 
   model = detopt.nn.from_config(detector, config=config["regressor"], rngs=nnx.Rngs(_key(template_seq)))
   reg_def = nnx.split(model, nnx.Param, nnx.Variable)[0]
   members = model.ensemble()
-  opt = make_optimizer(config["training"]["optimizer"])
+  # Single-cycle cosine-decayed learning rate over the whole per-point training (peak -> ~0),
+  # mirroring FullBudgetTrainer; each point's fresh ``opt.init`` restarts the cycle.
+  opt_name, opt_args = split(config["training"]["optimizer"])
+  opt_args = dict(opt_args)
+  schedule = optax.cosine_decay_schedule(init_value=opt_args.pop("learning_rate"), decay_steps=epochs * steps_per_epoch)
+  opt = getattr(optax, opt_name)(learning_rate=schedule, **opt_args)
   draw = (members or 1) * batch
 
   def fill(buf, theta, event_index, desc):
@@ -316,6 +322,7 @@ def verify(trajectory, seed: int = 0, output=None, progress=True, force: bool = 
     "batch": batch,
     "members": members,
     "init": "checkpoint",  # the run's own network for this design, continued on fresh data
+    "lr_schedule": "cosine",
   }
   record = {**settings, "reported": {"calls": traj["calls"].tolist(), "loss": traj["reported"].tolist()}, "points": []}
   json_path = os.path.join(out_dir, "verification.json")
