@@ -73,7 +73,7 @@ bo:
 # the step size shows up as a gap rather than passing silently.
 verify:
   budget: 65536       # explicit: training.budget is the run's whole pool, far more than a re-score needs
-  n_points: 10
+  n_points: 5
   epochs: 40
   val_every_epochs: 2
   batch: 256

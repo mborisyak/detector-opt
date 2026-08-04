@@ -39,7 +39,46 @@ from detopt.utils.viz.bo import plot_iteration, plot_convergence
 VALID_INIT_STRATEGIES = ("from_scratch", "continue", "closest", "meta")
 
 
-def bo(output, seed: int, **config):
+def _finished_run(output, budget):
+    """The finished run already sitting in ``output``, or ``None``.
+
+    A run is finished when its ``results.json`` says so (``completed``). Results written before that
+    flag existed are judged by the budget they consumed: the loop only ever stops because the pool
+    could not fit another design, so a run that spent >= 90% of the budget ran to the end. Anything
+    else is a run that was interrupted -- it is restarted, not resumed (the pools, the GP and the
+    per-design RNG streams are all built from scratch, so there is no mid-run resume to speak of).
+    """
+    path = os.path.join(output, "results.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        data = json.load(f)
+    if data.get("completed") is True:
+        return data
+    if "completed" not in data and int(data.get("detector_calls_used", 0)) >= 0.9 * budget:
+        return data
+    return None
+
+
+def _save_results(output, results, best_loss, best_design, used, completed):
+    with open(os.path.join(output, "results.json"), "w") as f:
+        json.dump(
+            {
+                "results": results,
+                "best_loss": float(best_loss),
+                "best_design": best_design,
+                "n_iterations_completed": len(results),
+                "detector_calls_used": int(used),
+                "method": "JAX-GP+EI",
+                "completed": bool(completed),
+            },
+            f,
+            indent=2,
+            default=float,
+        )
+
+
+def bo(output, seed: int, force: bool = False, **config):
     seed = int(seed)
     nn_init_strategy = config.get("nn_init_strategy", "from_scratch")
     if nn_init_strategy not in VALID_INIT_STRATEGIES:
@@ -76,6 +115,17 @@ def bo(output, seed: int, **config):
     # The trainer owns the budget-sized event pools (train + val); the run ends
     # when they fill. Designs append into them (windowed) across iterations.
     budget = trainer.train_pool.capacity + trainer.val_pool.capacity
+
+    # Idempotent: a finished run in `output` is left alone unless --force is given.
+    finished = None if force else _finished_run(output, budget)
+    if finished is not None:
+        print(
+            f"[skip] {output} already holds a completed run "
+            f"({finished['n_iterations_completed']} iterations, best loss {finished['best_loss']:.5f}) "
+            f"-- pass --force to run it again"
+        )
+        return finished["best_loss"], finished["best_design"], finished["results"]
+
     root_seq = np.random.SeedSequence(int(seed))  # per-design RNG via spawn
 
     proposed_encoded = []  # row-aligned with trained_params (warm-start)
@@ -162,31 +212,37 @@ def bo(output, seed: int, **config):
                 "warm_start_from": warm_from,
             }
         )
-        with open(os.path.join(output, "results.json"), "w") as f:
-            json.dump(
-                {
-                    "results": results,
-                    "best_loss": float(best_loss),
-                    "best_design": best_design,
-                    "n_iterations_completed": i + 1,
-                    "detector_calls_used": int(trainer.train_pool.current + trainer.val_pool.current),
-                    "method": "JAX-GP+EI",
-                },
-                f,
-                indent=2,
-                default=float,
-            )
+        _save_results(
+            output,
+            results,
+            best_loss,
+            best_design,
+            trainer.train_pool.current + trainer.val_pool.current,
+            completed=False,
+        )
 
         # Refresh the convergence plot after every completed iteration.
         plot_convergence(results, output)
         i += 1
 
+    _save_results(
+        output,
+        results,
+        best_loss,
+        best_design,
+        trainer.train_pool.current + trainer.val_pool.current,
+        completed=True,
+    )
     plot_convergence(results, output)
     print(f"\nBest loss: {best_loss:.6f}")
     return best_loss, best_design, results
 
 
 if __name__ == "__main__":
+    import sys
+
     import gearup
 
-    gearup.gearup(bo).with_config("config/bo.yaml")()
+    # gearup's CLI is `key=value`; `--force` is the conventional spelling, translated here.
+    arguments = ["force=yes" if a == "--force" else a for a in sys.argv[1:]]
+    gearup.gearup(bo).with_config("config/bo.yaml")(arguments)

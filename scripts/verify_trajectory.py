@@ -2,19 +2,23 @@
 """Independent verification of a BO design-optimization trajectory.
 
 Reads a finished bo.py run's ``results.json`` (a run directory is searched for it), selects at most
-``verify.n_points`` designs along the trajectory (ALWAYS including the final one), spread
-more-or-less uniformly in cumulative detector calls, and re-scores every selected design
-independently of the run's own training machinery:
+``verify.n_points`` INCUMBENTS -- the iterations where the run's best-so-far loss improved, always
+including the LAST such iteration, which is the run's answer -- and re-scores each of them on data
+the run never saw:
 
   1. sample the verification budget of events at the FIXED design;
   2. split 6:2:2 into train / validation / test buffers (disjoint event sets, drawn once and shared
      by every point, so the scores along the trajectory are paired);
-  3. train a fresh (ensemble) regressor on the train buffer for ``verify.epochs`` epochs;
+  3. restore the network the run REPORTED that design with (its last per-design checkpoint) and
+     continue training it on the fresh train buffer for ``verify.epochs`` epochs. Same network, all
+     new data: what changes between the reported number and this one is only the data it is measured
+     on -- and, past epoch 0, the extra training the fresh budget buys;
   4. every ``verify.val_every_epochs`` epochs, evaluate the WHOLE validation buffer (sequentially,
-     batch-by-batch) and keep the parameters with the best validation loss;
+     batch-by-batch) and keep the parameters with the best validation loss -- epoch 0 (the restored
+     network, untouched) counts, so a design that only degrades keeps its reported network;
   5. at the end only, evaluate the WHOLE test buffer at those parameters and report the TEST loss
      (+- SEM) -- an independent held-out score the optimizer never saw. Each point also gets a
-     learning-curve plot (train/val per epoch, the test score as a dashed line) in ``plots/``.
+     learning-curve plot (validation per epoch, reported + test as horizontal lines) in ``plots/``.
 
 ``verify.budget`` and ``verify.batch`` default to the run's ``training.budget`` / ``training.batch``
 (an explicit ``null`` counts as absent); the architecture and optimizer come from the run config
@@ -27,7 +31,8 @@ produced the trajectory, so the detector matches the trajectory's design encodin
 
 Writes ``verification.json`` + ``verification.png`` next to the trajectory file (or into ``output=``).
 Resumable: points already present in ``verification.json`` under identical settings are reused, not
-recomputed (a settings mismatch recomputes everything -- the old data answers a different question).
+recomputed (a settings mismatch recomputes everything -- the old data answers a different question),
+and ``--force`` recomputes every point regardless.
 """
 
 import json
@@ -46,6 +51,7 @@ import optax
 from flax import nnx
 
 import detopt
+from detopt.utils import io
 from detopt.utils.config import optimizer as make_optimizer, resolve_device
 from detopt.utils.pools import RingBuffer
 from detopt.utils.events import split_disjoint
@@ -98,20 +104,42 @@ def _load_trajectory(path):
   }
 
 
-def _select_points(calls, n_max):
-  """At most ``n_max`` trajectory indices, more-or-less uniformly spread in cumulative detector
-  ``calls`` and ALWAYS including the last point: the nearest trajectory point to each of ``n_max``
-  uniform call levels between the first and last point (duplicates collapse, so fewer than
-  ``n_max`` may come back)."""
-  calls = np.asarray(calls, np.float64)
-  n = calls.shape[0]
-  if n <= n_max:
-    return list(range(n))
+def _restore_design_network(run_dir, iteration):
+  """The ``(parameters, state, design)`` of the network the run trained for ``iteration`` -- the last
+  epoch checkpointed under ``<run_dir>/checkpoints/design_<iteration>``, which is the one whose loss
+  the run reported. Parameters and state come back as pure dicts (load them into a freshly built
+  module's abstract state with ``nnx.replace_by_pure_dict``)."""
+  path = os.path.join(run_dir, "checkpoints", f"design_{iteration:04d}")
+  if not os.path.isdir(path):
+    raise FileNotFoundError(
+      f"no checkpoint at {path} -- verification continues the network the run reported, so the run's "
+      f"per-design checkpoints must be kept"
+    )
+  manager = io.get_checkpointer(path)
+  if manager.latest_step() is None:
+    raise ValueError(f"{path} holds no saved epoch")
+  parameters, state, design, _aux = io.restore_training_checkpoint(manager)
+  manager.close()
+  return parameters, state, design
+
+
+def _select_points(calls, reported, n_max):
+  """At most ``n_max`` trajectory indices, taken from the INCUMBENTS -- the iterations where the
+  best-so-far loss improves (the first point always is one). Those are the only designs the run
+  actually claims anything about: the rest of the trajectory is proposals the optimizer tried and
+  discarded, and re-scoring them says nothing about whether the optimization worked. The last
+  incumbent is the run's answer, so it is always kept; if there are more than ``n_max``, the ones in
+  between are thinned to those nearest to ``n_max`` levels uniform in cumulative detector calls."""
+  reported = np.asarray(reported, np.float64)
+  improves = np.flatnonzero(reported < np.minimum.accumulate(np.concatenate([[np.inf], reported[:-1]])))
+  if improves.shape[0] <= n_max:
+    return [int(i) for i in improves]
   if n_max == 1:
-    return [n - 1]
+    return [int(improves[-1])]
+  calls = np.asarray(calls, np.float64)[improves]
   targets = np.linspace(calls[0], calls[-1], n_max)
-  chosen = {int(np.argmin(np.abs(calls - t))) for t in targets}
-  chosen.add(n - 1)  # the last target lands on the last point already; kept explicit
+  chosen = {int(improves[np.argmin(np.abs(calls - t))]) for t in targets}
+  chosen.add(int(improves[-1]))  # the run's answer -- the last target lands on it anyway
   return sorted(chosen)
 
 
@@ -130,7 +158,7 @@ def _split_indices(size, budget, seed):
   return tuple(u[:n] for u, n in zip(universes, (n_train, n_val, n_test)))
 
 
-def verify(trajectory, seed: int = 0, output=None, progress=True, **config):
+def verify(trajectory, seed: int = 0, output=None, progress=True, force: bool = False, **config):
   device = resolve_device(config.get("device"))
   v = config.get("verify")
   if v is None:
@@ -138,7 +166,7 @@ def verify(trajectory, seed: int = 0, output=None, progress=True, **config):
   training = config.get("training")
   if training is None:
     training = {}
-  n_points = int(v.get("n_points", 10))
+  n_points = int(v.get("n_points", 5))
   budget = v.get("budget")  # None or absent -> the run's training.budget
   if budget is None:
     budget = training.get("budget")
@@ -164,8 +192,9 @@ def verify(trajectory, seed: int = 0, output=None, progress=True, **config):
       f"trajectory design dim {traj['physical'].shape[1]} != detector design dim {design_dim} "
       f"-- run with the config of the run that produced the trajectory"
     )
-  chosen = _select_points(traj["calls"], n_points)
-  out_dir = output if output is not None else os.path.dirname(os.path.abspath(traj["path"]))
+  chosen = _select_points(traj["calls"], traj["reported"], n_points)
+  run_dir = os.path.dirname(os.path.abspath(traj["path"]))  # the run's own directory: results.json + checkpoints/
+  out_dir = output if output is not None else run_dir
   os.makedirs(out_dir, exist_ok=True)
 
   master = np.random.SeedSequence(int(seed))
@@ -298,6 +327,7 @@ def verify(trajectory, seed: int = 0, output=None, progress=True, **config):
     "steps_per_epoch": steps_per_epoch,
     "batch": batch,
     "members": members,
+    "init": "checkpoint",  # the run's own network for this design, continued on fresh data
   }
   record = {**settings, "reported": {"calls": traj["calls"].tolist(), "loss": traj["reported"].tolist()}, "points": []}
   json_path = os.path.join(out_dir, "verification.json")
@@ -306,7 +336,10 @@ def verify(trajectory, seed: int = 0, output=None, progress=True, **config):
 
   # Resume: points already verified under IDENTICAL settings are reused, never recomputed; anything
   # else in the file is superseded (the settings drive the result, so a mismatch means stale data).
-  if os.path.exists(json_path):
+  # --force skips the reuse entirely: every point is recomputed and the file overwritten.
+  if force:
+    print("--force: recomputing every point, ignoring anything already in verification.json", flush=True)
+  elif os.path.exists(json_path):
     with open(json_path) as f:
       stored = json.load(f)
     mismatched = [k for k in settings if stored.get(k) != settings[k]]
@@ -325,7 +358,7 @@ def verify(trajectory, seed: int = 0, output=None, progress=True, **config):
       pt = next(entry for entry in record["points"] if entry["point"] == p)
       plot_path = os.path.join(plots_dir, f"verification_{p:03d}.png")
       if not os.path.exists(plot_path):  # e.g. produced under an older plot naming
-        _plot_learning(pt["history"], pt["test_loss"], pt["test_sem"], p, plot_path)
+        _plot_learning(pt["history"], pt["reported_loss"], pt["test_loss"], pt["test_sem"], p, plot_path)
       print(
         f"[point {rank + 1}/{len(chosen)}] iteration {p} already verified: test={pt['test_loss']:.4f} -- skipped", flush=True
       )
@@ -342,16 +375,30 @@ def verify(trajectory, seed: int = 0, output=None, progress=True, **config):
     fill(val_buf, theta, val_index, "sample val")
     fill(test_buf, theta, test_index, "sample test")
 
-    # Fresh network + optimizer per point (same graphdef -> the kernels stay compiled).
+    # The network the run itself reported this design with -- its LAST checkpointed epoch, i.e. the
+    # weights at the moment the trainer declared convergence. The verification continues THAT
+    # network (the optimiser state is not checkpointed, so only its moments restart), so the two
+    # numbers describe the same network and differ only in the data: all of it is fresh here.
+    # ``from_config`` only supplies the architecture; the weights are replaced by the checkpoint's.
     point_model = detopt.nn.from_config(detector, config=config["regressor"], rngs=nnx.Rngs(_key(point_seq)))
     _, params, state = nnx.split(point_model, nnx.Param, nnx.Variable)
+    pure_params, pure_state, ckpt_design = _restore_design_network(run_dir, p)
+    if not np.allclose(np.asarray(ckpt_design["encoded"], np.float32), np.asarray(traj["encoded"][p], np.float32)):
+      raise ValueError(f"iteration {p}: the checkpoint's design differs from the one in results.json")
+    nnx.replace_by_pure_dict(params, pure_params)
+    nnx.replace_by_pure_dict(state, pure_state)
     params, state = jax.device_put(params, device), jax.device_put(state, device)
     opt_state = opt.init(params)
     n_train = jnp.int32(len(train_buf))
 
-    best = None  # (val_loss, epoch, params, state)
-    history = []  # [epoch, train_loss (interval mean), val_loss]
+    # Epoch 0 IS the restored network: scored on the fresh validation buffer before any training, so
+    # the curve starts at what the reported network is worth on data it never saw -- and if training
+    # on the fresh budget only makes it worse, best-val keeps the restored network.
+    restored_val = float(evaluate(params, state, theta, *val_buf.buffers(), rows=len(val_buf))["loss"])
+    best = (restored_val, 0, params, state)  # (val_loss, epoch, params, state)
+    history = [[0, float("nan"), restored_val]]  # [epoch, train_loss (interval mean), val_loss]
     train_loss = float("nan")
+    print(f"  restored from checkpoint: val={restored_val:.4f} (reported={reported:.4f})", flush=True)
     epoch = 0
     while epoch < epochs:
       params, state, opt_state, loss_mean = train_chunk(
@@ -361,7 +408,7 @@ def verify(trajectory, seed: int = 0, output=None, progress=True, **config):
       train_loss = float(loss_mean)
       val_loss = float(evaluate(params, state, theta, *val_buf.buffers(), rows=len(val_buf))["loss"])
       history.append([epoch, train_loss, val_loss])
-      if best is None or val_loss < best[0]:
+      if val_loss < best[0]:
         best = (val_loss, epoch, params, state)
       if progress:
         print(f"  epoch {epoch}/{epochs}  train={train_loss:.4f}  val={val_loss:.4f}  best={best[0]:.4f}@{best[1]}", flush=True)
@@ -372,7 +419,7 @@ def verify(trajectory, seed: int = 0, output=None, progress=True, **config):
       f"  -> best val={best_val:.4f} (epoch {best_epoch})  TEST={test['loss']:.4f}±{test['loss_sem']:.4f}  "
       f"reported={reported:.4f}  delta(test-reported)={test['loss'] - reported:+.4f}", flush=True,
     )
-    _plot_learning(history, test["loss"], test["loss_sem"], p, os.path.join(plots_dir, f"verification_{p:03d}.png"))
+    _plot_learning(history, reported, test["loss"], test["loss_sem"], p, os.path.join(plots_dir, f"verification_{p:03d}.png"))
 
     record["points"].append({
       "point": int(p),
@@ -407,21 +454,26 @@ def verify(trajectory, seed: int = 0, output=None, progress=True, **config):
   return record
 
 
+def _best_so_far(record):
+  """``(calls, best)`` of the run's COMPUTED convergence curve -- the running minimum of the reported
+  loss. What an optimization run claims is this curve, not the per-iteration losses: those are
+  proposals, most of them deliberately bad, and plotting them buries every other line in the figure."""
+  calls = np.asarray(record["reported"]["calls"], np.float64)
+  return calls, np.minimum.accumulate(np.asarray(record["reported"]["loss"], np.float64))
+
+
 def _plot_comparison(record, path):
-  """The headline figure: the run's own COMPUTED loss trajectory (dashed -- the optimizer's
-  possibly-biased objective) vs the PROPER independent estimates (solid -- held-out test ±SEM at the
-  verified points), both against cumulative detector calls."""
+  """The headline figure: the run's own COMPUTED convergence curve (dashed -- the running minimum of
+  a possibly-biased objective) against the PROPER independent estimates (solid -- held-out test ±SEM
+  of each verified incumbent), both against cumulative detector calls. The verified points are NOT
+  made monotone: where they rise, the incumbent that the run believed in did not hold up."""
   from matplotlib.figure import Figure
 
   points = record["points"]
   calls = np.asarray([pt["detector_calls"] for pt in points], np.float64)
-  reported = record["reported"]
   fig = Figure(figsize=(9, 5.5))
   ax = fig.subplots(1, 1)
-  ax.plot(
-    np.asarray(reported["calls"], np.float64), np.asarray(reported["loss"], np.float64), "--", color="0.45", lw=1.4,
-    label="computed (BO objective)"
-  )
+  ax.step(*_best_so_far(record), where="post", ls="--", color="0.45", lw=1.6, label="computed (BO objective, best so far)")
   ax.errorbar(
     calls, [pt["test_loss"] for pt in points], yerr=[pt["test_sem"] for pt in points], fmt="o-", ms=5, lw=1.8, capsize=3,
     color="tab:blue", label="proper estimate (held-out test)"
@@ -433,16 +485,19 @@ def _plot_comparison(record, path):
   fig.savefig(path, dpi=140)
 
 
-def _plot_learning(history, test_loss, test_sem, iteration, path):
-  """Per-point learning curves: train + validation loss per epoch, with the final TEST score as a
-  horizontal dashed line (value ± SEM in the legend)."""
+def _plot_learning(history, reported, test_loss, test_sem, iteration, path):
+  """Per-point learning curve: validation loss per epoch, starting at epoch 0 -- the RESTORED network,
+  before any training on the fresh data -- with the run's reported loss and the final TEST score as
+  horizontal lines. The train loss is deliberately not drawn: it is the running per-member loss with
+  dropout ACTIVE, an estimator that sits several SEM off the deterministic ensemble loss val and test
+  are measured with, so putting the two curves on one axis compares nothing."""
   from matplotlib.figure import Figure
 
-  h = np.asarray(history, np.float64)  # (n, 3): epoch, train, val
+  h = np.asarray(history, np.float64)  # (n, 3): epoch, train (running, unplotted), val
   fig = Figure(figsize=(8, 5))
   ax = fig.subplots(1, 1)
-  ax.plot(h[:, 0], h[:, 1], ".-", color="tab:green", label="train")
-  ax.plot(h[:, 0], h[:, 2], ".-", color="tab:orange", label="validation")
+  ax.axhline(reported, ls=":", color="0.45", lw=1.5, label=f"reported by BO = {reported:.4f}")
+  ax.plot(h[:, 0], h[:, 2], ".-", color="tab:orange", label="validation (epoch 0 = restored network)")
   ax.axhline(test_loss, ls="--", color="tab:blue", lw=1.5, label=f"test = {test_loss:.4f} ± {test_sem:.4f}")
   ax.set(title=f"iteration {iteration}", xlabel="epoch", ylabel="loss (normalized)", yscale="log")
   ax.grid(True, alpha=0.25)
@@ -452,40 +507,48 @@ def _plot_learning(history, test_loss, test_sem, iteration, path):
 
 
 def _plot(record, path):
-  """Two panels: the run's reported loss curve with the verified train/val/test scores on top, and
-  the per-component test metric of the best-val network -- both against detector calls."""
+  """The run's computed convergence curve (running minimum) with the verified scores of each
+  incumbent on top, and next to it the paired difference verified - reported with its SEM: the
+  systematic part of that difference is the objective's bias, the scatter is the run's own estimator
+  noise. A third panel breaks the test metric into its components when there is more than one."""
   from matplotlib.figure import Figure
 
   points = record["points"]
   calls = np.asarray([pt["detector_calls"] for pt in points], np.float64)
-  fig = Figure(figsize=(13, 5.5))
-  ax_loss, ax_comp = fig.subplots(1, 2)
-
-  reported = record["reported"]
-  rc, rl = np.asarray(reported["calls"], np.float64), np.asarray(reported["loss"], np.float64)
-  ax_loss.plot(rc, rl, "-", color="0.65", lw=1.2, label="reported (BO objective)")
-  ax_loss.plot(calls, [pt["train_loss"] for pt in points], "s--", ms=4, color="tab:green", alpha=0.7, label="verified train")
-  ax_loss.plot(calls, [pt["val_loss"] for pt in points], "o--", ms=5, color="tab:orange", alpha=0.8, label="verified val")
-  ax_loss.errorbar(
-    calls, [pt["test_loss"] for pt in points], yerr=[pt["test_sem"] for pt in points], fmt="D-", ms=6, capsize=3,
-    color="tab:blue", label="verified TEST"
-  )
-  ax_loss.set(title="independent verification", xlabel="detector calls", ylabel="loss (normalized)", yscale="log")
-  ax_loss.grid(True, alpha=0.25)
-  ax_loss.legend(fontsize=8)
-
+  test = np.asarray([pt["test_loss"] for pt in points], np.float64)
+  sem = np.asarray([pt["test_sem"] for pt in points], np.float64)
+  delta = test - np.asarray([pt["reported_loss"] for pt in points], np.float64)
   names = [k for k in points[0]["test_metric"] if k != "loss"]
-  for name in names:
-    ax_comp.plot(calls, [pt["test_metric"][name] for pt in points], ".-", label=name)
-  ax_comp.set(title="test metric per component (best-val network)", xlabel="detector calls", yscale="log")
-  ax_comp.grid(True, alpha=0.25)
-  if len(names) > 0:
-    ax_comp.legend(fontsize=8, ncol=2)
+  n_panels = 3 if len(names) > 1 else 2
+  fig = Figure(figsize=(6.5 * n_panels, 5.5))
+  axes = fig.subplots(1, n_panels)
+
+  axes[0].step(*_best_so_far(record), where="post", ls="--", color="0.45", lw=1.6, label="reported (best so far)")
+  axes[0].plot(calls, [pt["val_loss"] for pt in points], "o--", ms=5, color="tab:orange", alpha=0.8, label="verified val")
+  axes[0].errorbar(calls, test, yerr=sem, fmt="D-", ms=6, capsize=3, color="tab:blue", label="verified TEST")
+  axes[0].set(title="independent verification", xlabel="detector calls", ylabel="loss (normalized)", yscale="log")
+  axes[0].legend(fontsize=8)
+
+  axes[1].axhline(0.0, color="0.45", lw=1.2)
+  axes[1].errorbar(calls, delta, yerr=sem, fmt="o", ms=6, capsize=3, color="tab:red")
+  axes[1].set(title=f"verified - reported (mean {delta.mean():+.4f})", xlabel="detector calls", ylabel="difference in loss")
+
+  if n_panels == 3:
+    for name in names:
+      axes[2].plot(calls, [pt["test_metric"][name] for pt in points], ".-", label=name)
+    axes[2].set(title="test metric per component", xlabel="detector calls", yscale="log")
+    axes[2].legend(fontsize=8, ncol=2)
+  for ax in axes:
+    ax.grid(True, alpha=0.25)
   fig.tight_layout()
   fig.savefig(path, dpi=140)
 
 
 if __name__ == "__main__":
+  import sys
+
   import gearup
 
-  gearup.gearup(verify).with_config("config/bo.yaml")()
+  # gearup's CLI is ``key=value``; ``--force`` is the conventional spelling, translated here.
+  arguments = ["force=yes" if a == "--force" else a for a in sys.argv[1:]]
+  gearup.gearup(verify).with_config("config/bo.yaml")(arguments)
