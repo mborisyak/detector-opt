@@ -176,6 +176,111 @@ def plot_convergence_comparison(runs, out_path, title="BO convergence by strateg
     return out_path
 
 
+# Categorical slots of the validated default palette, assigned to strategies in FIXED order (never
+# cycled) with a distinct marker each -- the marker is the secondary encoding, so the series stay
+# separable without relying on colour.
+_STRATEGY_STYLE = (
+    ("#2a78d6", "o"),  # blue
+    ("#eb6834", "s"),  # orange
+    ("#1baf7a", "^"),  # aqua
+    ("#eda100", "D"),  # yellow
+    ("#e87ba4", "v"),  # magenta
+    ("#4a3aa7", "P"),  # violet
+)
+
+
+def plot_strategy_verification(runs, out_path, *, json_path=None, title="BO convergence: self-evaluated vs verified"):
+    """Overlay each strategy's self-evaluated and independently verified loss on one axis.
+
+    ``runs`` maps a strategy label to ``{"results": [...], "verification": {...} | None}`` -- the BO
+    run's ``results.json`` entries and the ``verification.json`` written by
+    ``scripts/verify_trajectory.py``.
+
+    Per strategy, one colour (colour follows the strategy, never its rank) carrying:
+
+    * a **dashed** step -- the run's own best-so-far loss. That number is *self-evaluated*: the
+      convergence procedure stopped on the very train/val losses it reports, and the warm-started and
+      continual strategies carry a network that has already seen other designs' data;
+    * **open markers** on that dashed line -- the raw reported loss of exactly the designs that were
+      verified, so the pairing is visible rather than inferred;
+    * a **solid** line with error bars -- those same designs re-scored on a held-out test split that
+      nothing in the procedure ever looked at.
+
+    The vertical gap between a strategy's open and filled markers is its optimism, and it is not the
+    same for all four -- which is why the raw dashed comparison alone would mislead. Everything drawn
+    is written to ``json_path`` so the figure regenerates without re-running anything.
+    """
+    import json
+
+    from matplotlib.figure import Figure
+    from matplotlib.lines import Line2D
+
+    fig = Figure(figsize=(10, 6))
+    ax = fig.subplots()
+    dumped = {}
+
+    for index, (label, run) in enumerate(runs.items()):
+        results = run.get("results") or []
+        if len(results) == 0:
+            continue
+        colour, marker = _STRATEGY_STYLE[index % len(_STRATEGY_STYLE)]
+        calls = np.cumsum([r["spent"] for r in results], dtype=np.float64)
+        reported = np.array([r["loss"] for r in results], dtype=np.float64)
+        best = np.minimum.accumulate(reported)
+        ax.step(calls, best, where="post", lw=1.8, ls="--", color=colour, alpha=0.9,
+                label=f"{label} (self-evaluated)")
+        entry = {"calls": calls.tolist(), "reported_loss": reported.tolist(),
+                 "self_evaluated_best_so_far": best.tolist()}
+
+        verification = run.get("verification")
+        points = (verification or {}).get("points") or []
+        if len(points) > 0:
+            vx = np.array([p["detector_calls"] for p in points], dtype=np.float64)
+            vy = np.array([p["test_loss"] for p in points], dtype=np.float64)
+            verr = np.array([p["test_sem"] for p in points], dtype=np.float64)
+            vreported = np.array([p["reported_loss"] for p in points], dtype=np.float64)
+            # the self-evaluated value of exactly these designs (open markers, on the dashed style)
+            ax.plot(vx, vreported, ls="none", marker=marker, ms=7, mfc="none", mec=colour, mew=1.6)
+            ax.errorbar(vx, vy, yerr=verr, color=colour, lw=2.2, marker=marker, ms=7, capsize=3,
+                        markeredgecolor="white", markeredgewidth=1.0,
+                        label=f"{label} (verified, held-out)")
+            entry["verification"] = {
+                "calls": vx.tolist(), "test_loss": vy.tolist(), "test_sem": verr.tolist(),
+                "reported_loss": vreported.tolist(),
+                "point": [p["point"] for p in points],
+                "val_loss": [p["val_loss"] for p in points],
+                "design_physical": [p["design_physical"] for p in points],
+            }
+        dumped[label] = entry
+
+    ax.set_xlabel("cumulative detector calls (simulated events)")
+    ax.set_ylabel("loss (normalised MSE)")
+    ax.set_yscale("log")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.25, lw=0.6)
+    handles, labels = ax.get_legend_handles_labels()
+    # A second, style-only legend: what dashed / open / solid mean.
+    style = [
+        Line2D([], [], color="#52514e", ls="--", lw=2, label="self-evaluated, best-so-far"),
+        Line2D([], [], color="#52514e", ls="none", marker="o", ms=7, mfc="none", mew=1.6,
+               label="self-evaluated, verified designs"),
+        Line2D([], [], color="#52514e", ls="-", lw=2, marker="o", ms=7, markeredgecolor="white",
+               label="verified (held-out test split)"),
+    ]
+    first = ax.legend(handles, labels, loc="upper right", fontsize=9, ncols=2)
+    ax.add_artist(first)
+    ax.legend(handles=style, loc="lower left", fontsize=9, frameon=False)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    print(f"  [plot] strategy comparison -> {out_path}")
+
+    if json_path is not None:
+        with open(json_path, "w") as f:
+            json.dump({"runs": dumped}, f, indent=2, default=float)
+        print(f"  [plot] plotted values -> {json_path}")
+    return out_path
+
+
 def plot_confirmation(history, *, bo_loss, out_path, bo_std=0.0, confirmed_loss=None, epochs=None, title=None):
     """Train/val loss vs epoch for a full-budget confirmation retrain.
 

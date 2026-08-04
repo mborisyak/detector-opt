@@ -129,11 +129,13 @@ release/
 *.webm
 *.html
 
-/data/
-/output/
+/data
+/output
 
 *.md
 !README.md
 !CHANGELOG.md
 
 /FairShip
+/DFG-co-design
+/meta-detector-optimization

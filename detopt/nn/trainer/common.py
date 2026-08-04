@@ -72,6 +72,19 @@ def window_sample_indices(trainer, key, start, count):
     return start + jax.random.randint(key, (trainer.draw_batch,), 0, jnp.maximum(count, 1))
 
 
+def cosine_optimizer(optimizer_config, total_steps):
+    """The run's optimiser with its learning rate wrapped in a single-cycle cosine decay (peak ->
+    ~0) over ``total_steps``. Shared by the fixed-epoch trainers (full-budget confirmation and
+    verification), which train for a known number of steps and so can anneal."""
+    from ...utils.config import split
+
+    name, arguments = split(optimizer_config)
+    arguments = dict(arguments)
+    peak = arguments.pop("learning_rate")
+    schedule = optax.cosine_decay_schedule(init_value=peak, decay_steps=int(total_steps))
+    return getattr(optax, name)(learning_rate=schedule, **arguments)
+
+
 def fresh_design_network(trainer, init_seq, init_params):
     """A FRESH network per design (optionally warm-started), optimiser reset -- ``(params, state,
     opt_state)`` on the trainer's device. Warm-start carries PARAMS only; the non-param buffer

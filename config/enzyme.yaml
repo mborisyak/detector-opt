@@ -1,0 +1,84 @@
+# BO run over the enzymatic single-batch design of experiments -- the bioprocess counterpart of
+# config/bo.yaml. Select it with the gearup root token, e.g.
+#
+#   python scripts/bo.py =enzyme output=output/enzyme/meta seed=42 nn_init_strategy=meta
+#
+# or run all four network strategies at once with ./make.sh output/enzyme 42 enzyme.
+#
+# The design is the batch of 4 initial experiments (volume fraction of the enzyme stock x
+# temperature, so 8 dimensions); the regressor infers the enzyme's optimal temperature from the
+# batch's readout, and the converged loss of that inference is what BO minimises.
+detector: enzyme
+
+regressor:
+  # The meta-regressor: a deep set over the batch of experiments -> optimal temperature. One set
+  # ELEMENT per experiment, its features being that experiment's 8 measurements followed by its own
+  # two design values (combine_encoded), so the network is design-conditioned and reads each readout
+  # together with the condition that produced it. Aggregating over the element axis makes the
+  # inference permutation-invariant in the experiments, which is exactly the symmetry of the problem:
+  # T* is a property of the enzyme and the batch is an unordered set of (condition, readout) pairs.
+  # Each block is [hidden..., out]; the next block sees 2 * out (own value + aggregated batch).
+  # `mlp-regressor: {features: [128, 128], ...}` is the order-dependent flat-MLP ablation.
+  set-regressor:
+    features: [[24, 16], [16, 24]]
+    n_models: 4      # ensemble: independent members, averaged at evaluation (null = a single net)
+    p_dropout: 0.1   # halves the train-val gap at 8k events, no cost in val loss
+
+device: cuda
+
+training:
+  n0: 2048
+  n_increment: 1024
+  batch: 256
+  # Gradient-free evaluation batch for the sequential train+val loss passes.
+  eval_batch: 2048
+  # Mandatory unconditional epochs after every data addition.
+  warmup_epochs: 32
+  # Shared detector-call budget for the run; pools are preallocated at this many rows (180 B/event).
+  budget: 1048576
+  # Per-design cap AND the epoch length (iteration_limit / batch SGD steps). Set to the full budget:
+  # the convergence criterion alone decides when a design is done.
+  iteration_limit: 131072
+
+  val_fraction: 0.25
+  # Convergence: |val - train| + SEM < loss_precision, over a target scaled by the T_melting prior
+  # half-range (6.5 C), so the no-information level is 1/3 and a good design reaches ~0.10.
+  flatness_tol: 1.0
+  loss_precision: 2.0e-2
+  patience: 16
+  optimizer:
+    adamw:
+      learning_rate: 2.5e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-6
+
+bo:
+  # No fixed iteration count -- the run continues until the shared `budget` is exhausted.
+  # Initial random proposals = gp.n_folds.
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds: [-6.0, 1.5]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+  ei:
+    n_restarts: 32
+    n_steps: 100
+
+# Independent re-scoring of each finished trajectory (scripts/verify_trajectory.py): a fresh
+# regressor per selected design, 6:2:2 split, best-validation epoch, ONE held-out test score. make.sh
+# runs this chain at HALF the integration step of the runs themselves, so a result that depended on
+# the step size shows up as a gap rather than passing silently.
+verify:
+  budget: 65536       # explicit: training.budget is the run's whole pool, far more than a re-score needs
+  n_points: 10
+  epochs: 40
+  val_every_epochs: 2
+  batch: 256
+  eval_batch: 2048
+  sample_batch: 1024
+
+# Overridden per run by make.sh; see scripts/bo.py VALID_INIT_STRATEGIES.
+nn_init_strategy: from_scratch

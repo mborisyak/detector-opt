@@ -11,7 +11,7 @@ import numpy as np
 import optax
 
 from ...utils.training import masked_mean_sem
-from .common import Trainer, TrainResult, fresh_design_network, window_sample_indices
+from .common import Trainer, TrainResult, cosine_optimizer, fresh_design_network, window_sample_indices
 
 __all__ = ["FullBudgetTrainer"]
 
@@ -70,8 +70,6 @@ class FullBudgetTrainer(Trainer):
         device=None,
         seed: int = 0,
     ):
-        from ...utils.config import split
-
         self.max_epochs = int(max_epochs)
 
         # The single design fills the whole budget; one epoch is a full pass over the
@@ -81,11 +79,7 @@ class FullBudgetTrainer(Trainer):
         val_budget = round(budget * val_fraction)
         train_budget = budget - val_budget
         steps_per_epoch = max(1, train_budget // int(batch))
-        name, opt_args = split(optimizer_config)
-        opt_args = dict(opt_args)
-        peak_lr = opt_args.pop("learning_rate")
-        schedule = optax.cosine_decay_schedule(init_value=peak_lr, decay_steps=self.max_epochs * steps_per_epoch)
-        optimizer = getattr(optax, name)(learning_rate=schedule, **opt_args)
+        optimizer = cosine_optimizer(optimizer_config, self.max_epochs * steps_per_epoch)
         super().__init__(
             detector,
             regressor_config=regressor_config,

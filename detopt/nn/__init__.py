@@ -9,6 +9,7 @@ from .common import Model
 # detopt/nn/generator.py (CVAE/DeepSetVAE/MLPVAE) are BROKEN/quarantined (unported to the padded
 # (B, M, F) contract) -- deliberately NOT imported or registered here.
 from .discriminator import *
+from .mlp import MLPRegressor
 from .set_regressor import SetRegressor
 from .pair_set_regressor import PairSetRegressor
 from .induced import InducedSetRegressor
@@ -19,6 +20,7 @@ from .masked_set import MaskedSetRegressor
 from .hierarchical import DoubleSetRegressor, StructuredSetRegressor
 
 __models__: dict[str, type[Model]] = {
+    "mlp-regressor": MLPRegressor,  # flat (order-dependent) MLP over a fixed-length element set; enzyme ablation
     "set-regressor": SetRegressor,  # ensemble via n_models (None = single net)
     "pair-set-regressor": PairSetRegressor,  # deep set over all hit PAIRS (single net)
     "set-discriminator": SetDiscriminator,

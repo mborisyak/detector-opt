@@ -1,0 +1,104 @@
+# Full default config for the `enzyme` detector (EnzymeDetector): EVERY __init__ parameter, written
+# at its default value. Single-batch design of experiments on A + B -> C + D via an enzyme E.
+# Concentrations are mM, times hours, temperatures degrees Celsius.
+enzyme:
+  n_experiments: 4    # the designed batch: BO searches 2 * n_experiments dimensions
+  n_measurements: 8   # [A] read-outs per experiment, evenly spaced, the last at `duration`
+
+  # Stock solutions mixed at t = 0. The design gives the volume fraction taken by the enzyme stock;
+  # the A and B stocks split the rest equally, so A0 = B0 = concentration_A * (1 - fraction) / 2.
+  concentration_A: 1.0
+  concentration_B: 1.0
+  # The E stock is set so the CALIBRATED turnover lands in the hexokinase band: at 3e-5 mM the
+  # mixture holds ~15 nM of enzyme and k_cat(T*) comes out with a median ~60/s (literature 30-300/s).
+  # At 1e-2 mM the calibration had to cripple k_cat to ~0.2/s to still take an hour -- physically
+  # wrong by 1000x, though kinetically identical (only the product k_cat*E0 enters the rate).
+  concentration_E: 3.0e-5
+
+  duration: 1.0            # one experiment lasts an hour
+  measurement_noise: 0.05  # std of the [A] read-out
+
+  # Design bounds -- what can actually be pipetted, nothing narrower: a volume fraction runs the whole
+  # 0 (no enzyme) to 1 (no substrate), and both extremes are useless experiments rather than invalid
+  # ones, so let the optimiser discover that instead of forbidding it here. The temperature range is
+  # the liquid-water range, which is also where the objective peak is sought.
+  enzyme_fraction_bounds: [0.0, 1.0]
+  temperature_bounds: [0.0, 100.0]
+
+  # The objective: conversion of the 1/3 E : 1/3 A : 1/3 B mixture after `duration`. Its maximising
+  # temperature is the target. (The mixing rule makes fraction = 1/3 exactly that mixture.)
+  objective_fraction: 0.3333333333333333
+
+  # Turnover calibration. `log_k0_cat` is the one kinetic parameter NOT drawn from the prior: instead,
+  # every drawn enzyme is rescaled so that the mixture at `calibration_fraction`, at its own fastest
+  # temperature, reaches half conversion at a time drawn log-uniformly from `half_time_bounds` (hours).
+  # Turnover enters the rate as a single multiplicative factor, so this is an exact rescaling of every
+  # timescale and it does not move which temperature is fastest. Without it a uniform prior over
+  # log_k0_cat would put most enzymes either finished or untouched within the hour, carrying no
+  # information either way; with it the whole prior is measurable in one `duration`.
+  calibration_fraction: 0.5
+  half_time_bounds: [0.25, 2.0]
+
+  # Prior over an UNKNOWN HEXOKINASE VARIANT -- the reaction this model describes is literally
+  # hexokinase's: glucose (A) + ATP (B) -> glucose-6-phosphate (C) + ADP (D), bi-substrate with both
+  # products inhibitory. Ranges are the approximate literature spread across isoforms and species
+  # (HK I/II/III, yeast), NOT one isoform. Every parameter is drawn uniformly within its range, so a
+  # `log_*` range is log-uniform on the quantity itself. `log_k0_cat` is absent by construction --
+  # the turnover scale is calibrated, not drawn (see HALF_TIME_BOUNDS in detopt/detector/enzyme.py).
+  #
+  # Two deliberate exclusions. Glucokinase (HK IV) is left out: its K_M(glucose) ~ 5-10 mM together
+  # with the tight G6P inhibition of HK I/II would be a combination no real isoform has (glucokinase
+  # is not product-inhibited at all), and that impossible corner is also by far the stiffest thing
+  # the solver would ever see. And this model makes product inhibition COMPETITIVE on the substrate,
+  # whereas HK I's G6P inhibition acts at a separate site -- the constants are real, the functional
+  # form is a simplification.
+  parameters:
+    log_K0_A: [-3.91, -1.61]  # K_M glucose: 0.02 .. 0.2 mM (HK I/II, ~0.03-0.05 mM)
+    Q10_A: [0.7, 2.0]         # its per-10C factor -- K_M drifts only mildly with temperature
+    log_K0_B: [-2.30, 0.0]    # K_M ATP: 0.1 .. 1 mM
+    Q10_B: [0.7, 2.0]
+    log_K0i_C: [-3.91, -1.61] # Ki, G6P: 0.02 .. 0.2 mM -- tight product inhibition (~0.06 mM)
+    Q10_C: [0.7, 2.0]
+    log_K0i_D: [-1.20, 1.10]  # Ki, ADP: 0.3 .. 3 mM -- weak (~1 mM)
+    Q10_D: [0.7, 2.0]
+    Q10_cat: [1.8, 2.6]       # Arrhenius slope of the turnover: Ea 40 .. 60 kJ/mol
+    delta_H: [4.5e4, 1.0e5]   # unfolding enthalpy over R (K): 370 .. 830 kJ/mol (~50 kDa monomer)
+    delta_C: [2.5e3, 4.5e3]   # heat-capacity change over R (K): 21 .. 37 kJ/mol/K
+    T_melting: [45.0, 58.0]   # hexokinase inactivates above ~45 C; must lie within temperature_bounds
+
+  # ---------------------------------------------------------------------------------------------
+  # Numerics: the resolution of each numerical procedure. None of these change the physics -- they
+  # decide how accurately it is computed -- and each is justified by a script that re-derives it
+  # (scripts/check_stability.py for the step, scripts/verify_lsoda.py for the scheme itself).
+  # ---------------------------------------------------------------------------------------------
+
+  # Golden-section contractions locating a temperature extremum: T* (the target) and the calibration
+  # optimum. Each contraction is ONE integration and shrinks the bracket by 0.618, so 20 take the
+  # 100 C range to 100*0.618^20 = 0.0066 C. That is finer than the 384-point scan this replaced
+  # (0.009 C median) for 22 integrations instead of 384.
+  n_temperature_steps: 20
+  # Trapezoid nodes for the calibration's tau(T) = int_0^x_half dx/rate. The calibration is a
+  # quadrature over the EXTENT, not a time integration, so this is its only resolution knob.
+  n_quadrature: 33
+  # RKC2 steps per objective integration -- one `duration` in one interval, so dt = 1/640 h = 5.6 s.
+  n_objective_steps: 640
+  # RKC2 steps per read-out interval. With n_measurements = 8 that is 8 * 80 = 640 steps per
+  # experiment, i.e. deliberately the SAME dt as the objective integration.
+  n_steps_per_measurement: 80
+  # RKC2 stages per step. The scheme spends s rate evaluations to push a damped Chebyshev polynomial
+  # along the negative real axis, so its stability boundary grows like s^2 instead of Euler's fixed 2:
+  # measured z = 16.60 at s = 5 (3.32 per evaluation vs Euler's 2.0). The stiffest corner of the prior
+  # has |df/dx| = 4765/h, giving dt_max = 3.5e-3 h; the counts above run at 1.56e-3 h, z = 7.3, a
+  # 2.3x margin. Past the boundary this is not inaccuracy -- the extent leaves its physical range and
+  # never comes back. float32 gives out at s = 10, where roundoff in the recursion leaves no stable
+  # interval at all.
+  n_stages: 5
+  # Verwer's damping epsilon = 2/13. It lifts |R(z)| off 1 between the polynomial's extrema, turning
+  # the bare Chebyshev scheme's tangency into a strip of genuine stability -- without it the boundary
+  # is theoretically longer but touches |R| = 1, so roundoff alone can destabilise a step.
+  damping: 0.153846
+  # Guard threshold, in mM, on the error the solve estimates for ITSELF: every integration runs a dt
+  # and a dt/2 chain and reports max|fine - coarse|, and __call__ raises if that exceeds this. Set to
+  # 10% of measurement_noise -- the integration must not disturb what the read-out itself resolves.
+  # The true error runs ~1000x inside it (LSODA-checked).
+  integration_tolerance: 5.0e-3
