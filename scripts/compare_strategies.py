@@ -4,7 +4,9 @@
 Reads, per strategy, ``<output>/<strategy>/results.json`` (the BO run) and, when present,
 ``<output>/<strategy>/verification.json`` (``scripts/verify_trajectory.py``), and writes
 ``<output>/convergence_all.png`` plus ``<output>/convergence_all.json`` -- the latter holding every
-plotted number, so the figure regenerates from JSON alone.
+plotted number, so the figure regenerates from JSON alone -- and ``<output>/comparison.txt``, the
+same comparison as a table: BO steps, detector calls per step (avg+-std), and the last verified
+design's reported loss against its held-out test estimate.
 
 Each strategy gets one colour. Its **dashed** step is the run's own best-so-far loss, which is
 self-evaluated: BO's convergence procedure stopped on the very losses it reports. **Open markers**
@@ -20,6 +22,7 @@ rank them wrongly.
 import argparse
 import json
 import os
+from statistics import mean, pstdev
 
 import matplotlib
 
@@ -68,8 +71,38 @@ def main(out_root, strategies):
             line += (f"   {last['test_loss']:>8.5f}±{last['test_sem']:<8.5f}"
                      f" {last['test_loss'] - last['reported_loss']:>+10.5f}")
         print(line)
-    print("\n'verified' is the FINAL trajectory point's held-out test loss; optimism is "
+    print("\n'verified' is the LAST verified design's held-out test loss; optimism is "
           "verified - self-evaluated for that same design.")
+    comparison_table(out_root, runs)
+
+
+def comparison_table(out_root, runs):
+    """``comparison.txt``: per strategy the BO step statistics (total steps, detector calls per
+    step avg+-std over the per-iteration ``spent``) and the FINAL design's reported loss vs the
+    verified held-out test estimate. Strategies without a ``verification.json`` are left out; the
+    file is only written once at least one strategy is verified."""
+    lines = [
+        f"{'strategy':<14}{'steps':>6}{'calls/step':>16}{'calls':>9}{'reported':>10}"
+        f"{'val':>8}{'test':>8}{'sem':>8}{'delta':>9}",
+        "-" * 88,
+    ]
+    for strategy, run in runs.items():
+        if run["verification"] is None:
+            continue
+        p = run["verification"]["points"][-1]  # sorted by iteration; the last verified design
+        spent = [int(r["spent"]) for r in run["results"]]
+        cps = f"{mean(spent):.0f}+-{pstdev(spent):.0f}"
+        lines.append(
+            f"{strategy:<14}{len(spent):>6}{cps:>16}{int(p['detector_calls']):>9}{p['reported_loss']:>10.4f}"
+            f"{p['val_loss']:>8.4f}{p['test_loss']:>8.4f}{p['test_sem']:>8.4f}"
+            f"{p['test_loss'] - p['reported_loss']:>+9.4f}"
+        )
+    text = "\n".join(lines) + "\n"
+    path = os.path.join(out_root, "comparison.txt")
+    with open(path, "w") as f:
+        f.write(text)
+    print(text, end="")
+    print(f"comparison -> {path}")
 
 
 if __name__ == "__main__":

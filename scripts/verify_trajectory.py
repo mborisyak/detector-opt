@@ -37,6 +37,7 @@ and ``--force`` recomputes every point regardless.
 
 import json
 import os
+import threading
 from functools import partial
 
 import matplotlib
@@ -211,7 +212,7 @@ def verify(trajectory, seed: int = 0, output=None, progress=True, force: bool = 
   val_buf = RingBuffer(len(val_index), specs, device=device)
   test_buf = RingBuffer(len(test_index), specs, device=device)
   steps_per_epoch = max(1, len(train_index) // batch)
-  scan_steps = val_every_epochs * steps_per_epoch  # SGD steps folded into one train_chunk call
+  scan_steps = val_every_epochs * steps_per_epoch  # SGD steps folded into one train_epoch call
 
   # Template regressor: the graphdef (architecture) is shared by every point, so the JIT kernels
   # compile once; each point re-initialises fresh params below.
@@ -254,12 +255,12 @@ def verify(trajectory, seed: int = 0, output=None, progress=True, force: bool = 
     return loss, new_state
 
   @jax.jit
-  def train_chunk(params, state, opt_state, key, theta, event_buf, mask_buf, tgt_buf, n):
+  def train_epoch(params, state, opt_state, key, theta, event_buf, mask_buf, tgt_buf, n):
     """One validation interval -- ``val_every_epochs`` epochs of scan-folded SGD over the train buffer at
-    the fixed ``theta``. Returns the mean training loss of the interval (accumulated in the carry)."""
+    the fixed ``theta``. Returns the per-step batch losses (the caller averages them)."""
 
     def step(carry, k):
-      params, state, opt_state, loss_sum = carry
+      params, state, opt_state = carry
       k_idx, k_drop = jax.random.split(k)
       idx = jax.random.randint(k_idx, (draw, ), 0, n)
       event_b = jax.tree.map(lambda a: a[idx], event_buf)
@@ -268,47 +269,34 @@ def verify(trajectory, seed: int = 0, output=None, progress=True, force: bool = 
                                                 has_aux=True)(params, state, k_drop, theta, event_b, mask_buf[idx], target_b)
       updates, opt_state = opt.update(grads, opt_state, params)
       params = optax.apply_updates(params, updates)
-      return (params, state, opt_state, loss_sum + loss), None
+      return (params, state, opt_state), loss
 
-    carry0 = (params, state, opt_state, jnp.float32(0.0))
-    (params, state, opt_state, loss_sum), _ = jax.lax.scan(step, carry0, jax.random.split(key, scan_steps))
-    return params, state, opt_state, loss_sum / scan_steps
+    (params, state, opt_state), losses = jax.lax.scan(step, (params, state, opt_state), jax.random.split(key, scan_steps))
+    return params, state, opt_state, losses
 
   @partial(jax.jit, static_argnames="rows")
   def evaluate(params, state, theta, event_buf, mask_buf, tgt_buf, rows):
-    """One sequential batch-by-batch pass over the WHOLE buffer (all ``rows``; the final partial
-    chunk is masked, nothing is dropped), on the ENSEMBLE-MEAN prediction. Scalar accumulation
-    only: returns the mean per-key metric plus the mean loss and its SEM."""
+    """One sequential batch-by-batch pass over the WHOLE buffer on the ENSEMBLE-MEAN prediction.
+    The scan returns per-sample losses/metrics; the first ``rows`` are averaged, with the standard
+    error of the loss mean."""
     reg = nnx.merge(reg_def, params, state)
-    n_chunks = -(-rows // eval_batch)  # ceil
+    n_batches = -(-rows // eval_batch)  # ceil; the clipped tail past ``rows`` is sliced off below
     pool_rows = jax.tree.leaves(event_buf)[0].shape[0]
 
-    def step(acc, c):
-      idx = c * eval_batch + jnp.arange(eval_batch, dtype=jnp.int32)
-      valid = (idx < rows).astype(jnp.float32)  # mask for the final partial chunk
-      safe = jnp.clip(idx, 0, pool_rows - 1)
-      ev = jax.tree.map(lambda a: a[safe], event_buf)
-      m = mask_buf[safe]
+    def step(_, c):
+      idx = jnp.clip(c * eval_batch + jnp.arange(eval_batch, dtype=jnp.int32), 0, pool_rows - 1)
+      ev = jax.tree.map(lambda a: a[idx], event_buf)
+      m = mask_buf[idx]
       feats = detector.combine_encoded(ev, theta, mask=m)
       emask = detector.element_mask(ev, m)
-      tnorm = detector.normalize_target(jax.tree.map(lambda a: a[safe], tgt_buf))
+      tnorm = detector.normalize_target(jax.tree.map(lambda a: a[idx], tgt_buf))
       pred = _predict_shared(reg, feats, emask, members)
-      per = detector.loss(pred, tnorm)  # per-sample ensemble loss (eval_batch,)
-      md = detector.metric(pred, tnorm)
-      loss_sum, sq_sum, metric_sum = acc
-      return (
-        loss_sum + jnp.sum(per * valid), sq_sum + jnp.sum(jnp.square(per) * valid), {
-          k: metric_sum[k] + jnp.sum(md[k] * valid)
-          for k in labels
-        },
-      ), None
+      return None, (detector.loss(pred, tnorm), detector.metric(pred, tnorm))
 
-    init = (jnp.float32(0.0), jnp.float32(0.0), {name: jnp.float32(0.0) for name in labels})
-    (loss_sum, sq_sum, metric_sum), _ = jax.lax.scan(step, init, jnp.arange(n_chunks))
-    mean = loss_sum / rows
-    sem = jnp.sqrt(jnp.maximum(sq_sum / rows - jnp.square(mean), 0.0) / rows)
-    out = {k: metric_sum[k] / rows for k in labels}
-    out.update(loss=mean, loss_sem=sem)
+    _, (losses, metrics) = jax.lax.scan(step, None, jnp.arange(n_batches))
+    losses = losses.reshape(-1)[:rows]  # per-sample losses over the whole buffer
+    out = {k: jnp.mean(metrics[k].reshape(-1)[:rows]) for k in labels}
+    out.update(loss=jnp.mean(losses), loss_sem=jnp.std(losses) / jnp.sqrt(rows))
     return out
 
   print(f"trajectory: {traj['path']} ({traj['physical'].shape[0]} points) | verifying {len(chosen)} points: {chosen}")
@@ -399,17 +387,21 @@ def verify(trajectory, seed: int = 0, output=None, progress=True, force: bool = 
     history = [[0, float("nan"), restored_val]]  # [epoch, train_loss (interval mean), val_loss]
     train_loss = float("nan")
     print(f"  restored from checkpoint: val={restored_val:.4f} (reported={reported:.4f})", flush=True)
+    train_loss = float("nan")
+    plot_path = os.path.join(plots_dir, f"verification_{p:03d}.png")
     epoch = 0
     while epoch < epochs:
-      params, state, opt_state, loss_mean = train_chunk(
+      params, state, opt_state, losses = train_epoch(
         params, state, opt_state, _key(point_seq), theta, *train_buf.buffers(), n_train
       )
       epoch += val_every_epochs
-      train_loss = float(loss_mean)
+      train_loss = float(jnp.mean(losses))
       val_loss = float(evaluate(params, state, theta, *val_buf.buffers(), rows=len(val_buf))["loss"])
       history.append([epoch, train_loss, val_loss])
       if val_loss < best[0]:
         best = (val_loss, epoch, params, state)
+      # Live learning curves, refreshed after every eval epoch (fire-and-forget daemon render).
+      threading.Thread(target=_plot_learning, args=(list(history), reported, None, None, p, plot_path), daemon=True).start()
       if progress:
         print(f"  epoch {epoch}/{epochs}  train={train_loss:.4f}  val={val_loss:.4f}  best={best[0]:.4f}@{best[1]}", flush=True)
 
@@ -419,7 +411,7 @@ def verify(trajectory, seed: int = 0, output=None, progress=True, force: bool = 
       f"  -> best val={best_val:.4f} (epoch {best_epoch})  TEST={test['loss']:.4f}±{test['loss_sem']:.4f}  "
       f"reported={reported:.4f}  delta(test-reported)={test['loss'] - reported:+.4f}", flush=True,
     )
-    _plot_learning(history, reported, test["loss"], test["loss_sem"], p, os.path.join(plots_dir, f"verification_{p:03d}.png"))
+    _plot_learning(history, reported, test["loss"], test["loss_sem"], p, plot_path)
 
     record["points"].append({
       "point": int(p),
@@ -485,25 +477,33 @@ def _plot_comparison(record, path):
   fig.savefig(path, dpi=140)
 
 
+# Serialise plotting: matplotlib is not thread-safe, so the per-epoch daemon renders and the final
+# synchronous one must not run concurrently (mirrors scripts/subgradient.py).
+_PLOT_LOCK = threading.Lock()
+
+
 def _plot_learning(history, reported, test_loss, test_sem, iteration, path):
   """Per-point learning curve: validation loss per epoch, starting at epoch 0 -- the RESTORED network,
-  before any training on the fresh data -- with the run's reported loss and the final TEST score as
-  horizontal lines. The train loss is deliberately not drawn: it is the running per-member loss with
+  before any training on the fresh data -- with the run's reported loss as a reference line.
+  Refreshed from a daemon thread after every eval epoch (no test line yet); the final synchronous
+  render adds the TEST score (value ± SEM in the legend). The train loss is deliberately not drawn: it is the running per-member loss with
   dropout ACTIVE, an estimator that sits several SEM off the deterministic ensemble loss val and test
   are measured with, so putting the two curves on one axis compares nothing."""
   from matplotlib.figure import Figure
 
   h = np.asarray(history, np.float64)  # (n, 3): epoch, train (running, unplotted), val
-  fig = Figure(figsize=(8, 5))
-  ax = fig.subplots(1, 1)
-  ax.axhline(reported, ls=":", color="0.45", lw=1.5, label=f"reported by BO = {reported:.4f}")
-  ax.plot(h[:, 0], h[:, 2], ".-", color="tab:orange", label="validation (epoch 0 = restored network)")
-  ax.axhline(test_loss, ls="--", color="tab:blue", lw=1.5, label=f"test = {test_loss:.4f} ± {test_sem:.4f}")
-  ax.set(title=f"iteration {iteration}", xlabel="epoch", ylabel="loss (normalized)", yscale="log")
-  ax.grid(True, alpha=0.25)
-  ax.legend(fontsize=9)
-  fig.tight_layout()
-  fig.savefig(path, dpi=140)
+  with _PLOT_LOCK:
+    fig = Figure(figsize=(8, 5))
+    ax = fig.subplots(1, 1)
+    ax.axhline(reported, ls=":", color="0.45", lw=1.5, label=f"reported by BO = {reported:.4f}")
+    ax.plot(h[:, 0], h[:, 2], ".-", color="tab:orange", label="validation (epoch 0 = restored network)")
+    if test_loss is not None:  # the per-epoch daemon render has no test score yet
+      ax.axhline(test_loss, ls="--", color="tab:blue", lw=1.5, label=f"test = {test_loss:.4f} ± {test_sem:.4f}")
+    ax.set(title=f"iteration {iteration}", xlabel="epoch", ylabel="loss (normalized)", yscale="log")
+    ax.grid(True, alpha=0.25)
+    ax.legend(fontsize=9)
+    fig.tight_layout()
+    fig.savefig(path, dpi=140)
 
 
 def _plot(record, path):
