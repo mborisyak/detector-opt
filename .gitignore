@@ -139,3 +139,5 @@ release/
 /FairShip
 /DFG-co-design
 /meta-detector-optimization
+
+.snakemake

@@ -22,14 +22,23 @@ dependencies = [
     'jax>=0.4.0',
     'flax>=0.8.5',
     'optax>=0.2.4',
+    'scipy>=1.10.0',           # detopt.utils.encoding
+    'matplotlib>=3.7.0',       # detopt.utils.viz
+    'pyyaml>=6.0',             # detopt.utils.config
+    'tqdm>=4.60.0',            # progress bars (detopt.utils.progress, data loaders)
+    'orbax-checkpoint>=0.5.0', # detopt.utils.io checkpoints
+    'gearup>=1.0.0',           # every script's key=value CLI
 ]
 requires-python = '>=3.9'
 
+# Lazily imported and deliberately NOT declared: uproot (ROOT event files), pyvista (3D straw viz),
+# absl (log silencing), and the torch/botorch stack (legacy scripts only).
 [project.optional-dependencies]
 dev = [
     'pytest>=5.3.2',
     'yapf>=0.40.0',
     'ruff>=0.6.0',
+    'snakemake>=9.0',  # Snakefile: parallel scheduling of the BO comparison
 ]
 
 [project.urls]

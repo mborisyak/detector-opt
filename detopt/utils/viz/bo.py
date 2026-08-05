@@ -281,6 +281,87 @@ def plot_strategy_verification(runs, out_path, *, json_path=None, title="BO conv
     return out_path
 
 
+def _median_step(curves):
+    """Pointwise median of ``where="post"`` step functions, given as ``(x, y)`` pairs with x sorted.
+
+    Evaluated on the union of the curves' x grids, starting at the first point every curve has
+    reached (before that the median is over fewer runs and would jump when one joins); beyond its
+    last point a curve continues flat -- a best-so-far value persists once found.
+    """
+    start = max(float(x[0]) for x, _ in curves)
+    grid = np.unique(np.concatenate([x for x, _ in curves]))
+    grid = grid[grid >= start]
+    stack = np.stack([y[np.searchsorted(x, grid, side="right") - 1] for x, y in curves])
+    return grid, np.median(stack, axis=0)
+
+
+def plot_median_convergence(runs, out_path, *, json_path=None, title="BO convergence: median best-so-far across seeds"):
+    """Two panels of per-strategy MEDIAN best-so-far (cummin) curves across seeds.
+
+    ``runs`` maps a strategy label to ``{seed_label: {"results": [...], "verification": {...} | None}}``
+    -- each seed's ``results.json`` entries and its ``verification.json`` (``scripts/
+    verify_trajectory.py``). Left panel: the runs' own self-evaluated reported loss (dashed, the
+    same visual language as :func:`plot_strategy_verification`). Right panel: the independently
+    verified held-out test loss of the verified designs (solid). Per seed the best-so-far curve is
+    a step function in cumulative detector calls; the median over seeds is taken pointwise via
+    :func:`_median_step`. Everything drawn is written to ``json_path`` so the figure regenerates
+    without re-running anything.
+    """
+    from matplotlib.figure import Figure
+
+    fig = Figure(figsize=(12, 5.5))
+    axes = fig.subplots(1, 2, sharex=True)
+    dumped = {}
+
+    for index, (label, seeds) in enumerate(runs.items()):
+        colour, _ = _STRATEGY_STYLE[index % len(_STRATEGY_STYLE)]
+        reported, verified = [], []
+        for run in seeds.values():
+            results = run.get("results") or []
+            if len(results) > 0:
+                calls = np.cumsum([r["spent"] for r in results], dtype=np.float64)
+                loss = np.array([r["loss"] for r in results], dtype=np.float64)
+                reported.append((calls, np.minimum.accumulate(loss)))
+            points = sorted((run.get("verification") or {}).get("points") or [],
+                            key=lambda p: p["detector_calls"])
+            if len(points) > 0:
+                vx = np.array([p["detector_calls"] for p in points], dtype=np.float64)
+                vy = np.array([p["test_loss"] for p in points], dtype=np.float64)
+                verified.append((vx, np.minimum.accumulate(vy)))
+        entry = {"seeds": list(seeds)}
+        panels = ((axes[0], reported, "--", "self_evaluated"), (axes[1], verified, "-", "verified"))
+        for ax, curves, linestyle, key in panels:
+            if len(curves) == 0:
+                continue
+            grid, median = _median_step(curves)
+            suffix = "" if len(curves) == len(seeds) else f" (n={len(curves)})"
+            ax.step(grid, median, where="post", lw=2.0, ls=linestyle, color=colour, alpha=0.9,
+                    label=f"{label}{suffix}")
+            entry[key] = {"calls": grid.tolist(), "median_best_so_far": median.tolist(),
+                          "n_seeds": len(curves)}
+        dumped[label] = entry
+
+    subtitles = ("self-evaluated (reported loss)", "verified (held-out test loss)")
+    for ax, subtitle in zip(axes, subtitles):
+        ax.set_xlabel("cumulative detector calls (simulated events)")
+        ax.set_yscale("log")
+        ax.set_title(subtitle)
+        ax.grid(True, alpha=0.25, lw=0.6)
+        if len(ax.get_lines()) > 0:
+            ax.legend(loc="upper right", fontsize=9)
+    axes[0].set_ylabel("median best-so-far loss (normalised MSE)")
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    print(f"  [plot] median convergence -> {out_path}")
+
+    if json_path is not None:
+        with open(json_path, "w") as f:
+            json.dump({"runs": dumped}, f, indent=2, default=float)
+        print(f"  [plot] plotted values -> {json_path}")
+    return out_path
+
+
 def plot_confirmation(history, *, bo_loss, out_path, bo_std=0.0, confirmed_loss=None, epochs=None, title=None):
     """Train/val loss vs epoch for a full-budget confirmation retrain.
 
