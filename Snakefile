@@ -12,9 +12,10 @@
 #   snakemake -c1                     -> strictly serial (a small card that fits one job)
 #   snakemake -cN -n                  -> dry run: show what would be (re)computed
 #
-# Sharing one GPU between concurrent jobs relies on XLA preallocation being off
-# (XLA_PYTHON_CLIENT_PREALLOCATE=false in the global env) -- with preallocation on, the first job
-# grabs the whole card.
+# Sharing one GPU between concurrent jobs requires XLA preallocation to be off -- with it on, the
+# first job grabs the whole card and every other one OOMs. Every command below is prefixed with
+# ENV (XLA_PYTHON_CLIENT_PREALLOCATE=false), so a job is correct regardless of the environment
+# snakemake happened to inherit.
 #
 # Edit the CONFIG/SEEDS constants below; every path derives from them (a fresh comparison over new
 # settings = new SEEDS or a new PREFIX).
@@ -43,10 +44,7 @@
 # the first real invocation over an existing output tree, either record metadata once with
 # `snakemake -c1 --touch` or run with `--rerun-triggers mtime`; a `-n` dry run shows what would
 # happen.
-import os
 import random
-
-os.environ["PYTHONUNBUFFERED"] = "1"  # progress is watched through logs; keep it line-buffered
 
 CONFIG = "enzyme"  # run config: config/<CONFIG>.yaml
 SUPER_SEED = 123456
@@ -55,6 +53,12 @@ SEEDS = [rng.randint(0, 2 ** 31 - 1) for _ in range(5)]
 
 PREFIX = f"output/{CONFIG}"  # per-seed run tree = <PREFIX>/<seed>/<strategy>/, cross-seed median = <PREFIX>/median.png
 STRATEGIES = ["from_scratch", "continue", "closest", "meta"]
+
+# Prepended to every command below, so a job carries its environment explicitly rather than
+# inheriting one: preallocation off (concurrent jobs must take only the GPU memory they actually
+# use) and unbuffered stdout (progress is usually watched through a redirect or a pipe, where
+# Python would block-buffer it and a healthy run would look silent for many minutes).
+ENV = "XLA_PYTHON_CLIENT_PREALLOCATE=false PYTHONUNBUFFERED=1"
 
 wildcard_constraints:
   seed="|".join(str(seed) for seed in SEEDS),
@@ -74,7 +78,7 @@ rule bo:
   resources:
     gpu=1,
   shell:
-    f'python scripts/bo.py "={CONFIG}" output={PREFIX}/{{wildcards.seed}}/{{wildcards.strategy}} '
+    f'{ENV} python scripts/bo.py "={CONFIG}" output={PREFIX}/{{wildcards.seed}}/{{wildcards.strategy}} '
     f"seed={{wildcards.seed}} nn_init_strategy={{wildcards.strategy}}"
 
 
@@ -89,7 +93,7 @@ rule verify:
   resources:
     gpu=1,
   shell:
-    f'python scripts/verify_trajectory.py "={CONFIG}" trajectory={PREFIX}/{{wildcards.seed}}/{{wildcards.strategy}} '
+    f'{ENV} python scripts/verify_trajectory.py "={CONFIG}" trajectory={PREFIX}/{{wildcards.seed}}/{{wildcards.strategy}} '
     f"seed={{wildcards.seed}}"
 
 
@@ -103,7 +107,7 @@ rule compare:
     f"{PREFIX}/{{seed}}/convergence_all.png",
     f"{PREFIX}/{{seed}}/convergence_all.json",
   shell:
-    f"python scripts/compare_strategies.py --output {PREFIX}/{{wildcards.seed}}"
+    f"{ENV} python scripts/compare_strategies.py --output {PREFIX}/{{wildcards.seed}}"
 
 
 # Across seeds: per strategy the pointwise MEDIAN of the best-so-far (cummin) curves -- two panels,
@@ -118,7 +122,7 @@ rule median:
   params:
     runs=" ".join(f"{PREFIX}/{seed}" for seed in SEEDS),
   shell:
-    f"python scripts/median_convergence.py --runs {{params.runs}} --output {PREFIX}/median.png"
+    f"{ENV} python scripts/median_convergence.py --runs {{params.runs}} --output {PREFIX}/median.png"
 
 
 # Stage targets mirroring make.sh's `bo` / `verify` stages (without their implied --force).
