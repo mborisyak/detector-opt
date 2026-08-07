@@ -160,7 +160,16 @@ def _split_indices(size, budget, seed):
   return tuple(u[:n] for u, n in zip(universes, (n_train, n_val, n_test)))
 
 
-def verify(trajectory, seed: int = 0, output=None, progress=True, force: bool = False, **config):
+# How the sampling fills report themselves. ``bar`` is tqdm, fine on a terminal; ``plain`` drops the
+# bar and leaves only the per-validation-epoch lines, which is what a log file or a snakemake pipe
+# wants (tqdm redraws with carriage returns, so a redirected bar is thousands of unreadable lines);
+# ``none`` is silent apart from the per-point summaries.
+PROGRESS_MODES = ("bar", "plain", "none")
+
+
+def verify(trajectory, seed: int = 0, output=None, progress: str = "bar", force: bool = False, **config):
+  if progress not in PROGRESS_MODES:
+    raise ValueError(f"progress must be one of {PROGRESS_MODES}, got {progress!r}")
   device = resolve_device(config.get("device"))
   v = config.get("verify")
   if v is None:
@@ -237,7 +246,7 @@ def verify(trajectory, seed: int = 0, output=None, progress=True, force: bool = 
     n = event_index.shape[0]
     # One decoded physical design serves every full-size chunk (theta is fixed within a fill).
     phys_full = detector.decode_design(jnp.broadcast_to(theta[None, :], (sample_batch, design_dim)))
-    bar = tqdm(total=n, desc=desc, disable=not progress)
+    bar = tqdm(total=n, desc=desc, disable=progress != "bar")
     for o in range(0, n, sample_batch):
       idx = event_index[o:o + sample_batch]
       k = idx.shape[0]
@@ -408,7 +417,7 @@ def verify(trajectory, seed: int = 0, output=None, progress=True, force: bool = 
         best = (val_loss, epoch, params, state)
       # Live learning curves, refreshed after every eval epoch (fire-and-forget daemon render).
       threading.Thread(target=_plot_learning, args=(list(history), reported, None, None, p, plot_path), daemon=True).start()
-      if progress:
+      if progress != "none":
         print(f"  epoch {epoch}/{epochs}  train={train_loss:.4f}  val={val_loss:.4f}  best={best[0]:.4f}@{best[1]}", flush=True)
 
     best_val, best_epoch, best_params, best_state = best

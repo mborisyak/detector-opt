@@ -80,7 +80,7 @@ if [ "${RUN_VERIFY}" -eq 1 ]; then
   for strategy in "${STRATEGIES[@]}"; do
     echo "==================== verify: ${strategy} ===================="
     python scripts/verify_trajectory.py "=${CONFIG}" trajectory="${OUT}/${strategy}" seed="${SEED}" \
-      ${FORCE[@]+"${FORCE[@]}"}
+      progress=plain ${FORCE[@]+"${FORCE[@]}"}
   done
 fi
 

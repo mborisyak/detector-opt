@@ -94,7 +94,7 @@ rule verify:
     gpu=1,
   shell:
     f'{ENV} python scripts/verify_trajectory.py "={CONFIG}" trajectory={PREFIX}/{{wildcards.seed}}/{{wildcards.strategy}} '
-    f"seed={{wildcards.seed}}"
+    f"seed={{wildcards.seed}} progress=plain"
 
 
 # Per-seed overlay of self-evaluated (dashed) vs verified (solid) + the comparison.txt table.
