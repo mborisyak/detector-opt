@@ -74,10 +74,12 @@ def save_design(detector, design_path, design):
 
 
 def save_training_checkpoint(manager, step, *, config, parameters, state, design, aux=None):
-    """Save one epoch's network + design into a (per-design) ``manager`` at ``step``.
+    """Save a design's converged network + design into a (per-design) ``manager`` at ``step``.
 
-    ``manager`` is a per-design :func:`get_checkpointer` (one per design iteration),
-    so saving every epoch prunes to the manager's ``max_to_keep`` most recent epochs.
+    ``manager`` is a per-design :func:`get_checkpointer` (one per design iteration), written
+    ONCE at convergence with ``step`` = the design's epoch count -- so the checkpoint holds
+    exactly the state whose loss the run reported, which is what every reader asks for via
+    ``latest_step()``. (``max_to_keep`` therefore never prunes: there is only one step.)
     The trained network (``parameters`` / ``state``, flattened to pure dicts) and
     the ``design`` are saved as *separate* orbax items, so :func:`restore_design`
     reads the small design tree alone -- quick access without the network. The model

@@ -200,15 +200,6 @@ class _DesignBase(Trainer):
                 pool_size_history.append(train_count)
                 epoch_in_round += 1
 
-                self._save_checkpoint(
-                    manager,
-                    len(train_loss_history),
-                    params,
-                    state,
-                    design_tree,
-                    train_mean,
-                    val_mean,
-                )
                 if on_epoch is not None:
                     plot_pool.submit(
                         on_epoch,
@@ -279,6 +270,21 @@ class _DesignBase(Trainer):
                 print(f"  [grow] window -> {tp.current - w0_train}, pool {tp.current}/{tp.capacity}")
                 continue
 
+            # ONE checkpoint per design, written at convergence. Saving every epoch wrote 27 files
+            # an epoch to retain only the last three (96% of them deleted again), and orbax's
+            # async save blocks the NEXT one until its background write lands -- free only while
+            # the epoch outlasts the write (~200 ms locally, more on network storage). Nothing
+            # read the earlier epochs anyway: both consumers take ``latest_step()``, i.e. exactly
+            # this final state (verify_trajectory._restore_design_network, continue_reported).
+            self._save_checkpoint(
+                manager,
+                len(train_loss_history),
+                params,
+                state,
+                design_tree,
+                train_mean,
+                val_mean,
+            )
             if manager is not None:
                 manager.wait_until_finished()
             self._persist_network(params, state, opt_state)  # continual: keep it

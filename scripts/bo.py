@@ -11,7 +11,8 @@ Thin driver around two reusable wrappers:
 * :class:`detopt.nn.trainer.DesignTrainer` -- per-design network training. It
   builds JIT train/eval kernels once, preallocates fixed-size GPU event pools,
   runs the data-growing convergence procedure (see its docstring), and
-  checkpoints each epoch. The detector-call budget is shared across all designs.
+  checkpoints once per design, at convergence. The detector-call budget is
+  shared across all designs.
 
 The objective is the converged loss ``(mean_train + mean_val) / 2`` (BO minimises
 it directly); each observation's GP noise is the loss estimate's own SEM.
