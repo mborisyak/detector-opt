@@ -61,7 +61,10 @@ bo:
     n_folds: 5
     n_restarts: 5
     n_steps: 40
-    log_lengthscale_prior_bounds: [-6.0, 1.5]
+    # See config/bo.yaml: l is read against the unit cube, so the ceiling must sit
+    # well above 1 for ARD to be able to declare a design dimension irrelevant.
+    # Measured on the finished meta runs, 1.5 pinned 3-5 of these 8 dimensions.
+    log_lengthscale_prior_bounds: [-6.0, 4.0]
     log_amplitude_prior_bounds: [-6.0, 1.5]
   ei:
     n_restarts: 32

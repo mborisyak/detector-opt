@@ -20,11 +20,11 @@ The surrogate
 -------------
 The GP is scikit-learn's :class:`~sklearn.gaussian_process.GaussianProcessRegressor`
 with an ARD-RBF kernel (``ConstantKernel * RBF``, one lengthscale per dimension),
-which is the same kernel family as :mod:`detopt.bo.gp`. Two things differ from that
+which is the same kernel family as :mod:`detopt.bo.jax_gp`. Two things differ from that
 JAX implementation, deliberately:
 
 * **Objective.** sklearn tunes the hyperparameters by maximising the log MARGINAL
-  likelihood; :mod:`detopt.bo.gp` minimises a predictive k-fold CV NLL. Different
+  likelihood; :mod:`detopt.bo.jax_gp` minimises a predictive k-fold CV NLL. Different
   criteria pick different hyperparameters, so the two are not interchangeable
   fits -- BO trajectories will differ.
 * **No JIT.** Nothing here is traced or compiled, which is the point: the jitted
@@ -32,11 +32,12 @@ JAX implementation, deliberately:
   run leaked tens of MB per BO iteration. Plain NumPy has no such failure mode and
   ``n`` may vary freely, so no padding, capacity or masking is needed.
 
-:mod:`detopt.bo.gp` and :mod:`detopt.bo.acquisition` are untouched and still used by
-``scripts/benchmark_gp.py`` and the GP tests; this driver simply no longer calls them.
+:mod:`detopt.bo.jax_gp` is retained as a reference implementation, used only by
+``scripts/benchmark_gp.py`` and the GP tests; this driver never calls it.
 """
 
 import numpy as np
+from scipy.linalg import cho_solve
 from scipy.optimize import minimize
 from scipy.stats import norm
 from sklearn.gaussian_process import GaussianProcessRegressor
@@ -69,13 +70,18 @@ class BayesianOptimizer:
         self._rng = np.random.default_rng(int(seed))
         self._seed = int(seed)
 
-        # The config states the prior box in LOG space (that is how detopt.bo.gp
+        # The config states the prior box in LOG space (that is how detopt.bo.jax_gp
         # parameterises it); sklearn wants the natural-scale bounds. The kernel is
         # amplitude^2 * exp(-|dx/l|^2 / 2), so ConstantKernel carries amplitude^2 --
         # hence exp(2 * log_amplitude) -- and RBF carries l = exp(log_lengthscale).
         # `n_folds` and `n_steps` from the config do not apply to this backend (there
         # is no CV split and L-BFGS-B runs to its own convergence); `n_folds` is still
         # read above as the historical default for `n_init`.
+        #
+        # The lengthscale bounds are read against the UNIT cube, so a lengthscale of 1
+        # already spans the whole domain and anything much larger switches a dimension
+        # off. The ceiling therefore has to sit well above 1 for ARD to be able to
+        # declare a design dimension irrelevant -- see config/bo.yaml.
         ls_low, ls_high = self.gp_cfg["log_lengthscale_prior_bounds"]
         amp_low, amp_high = self.gp_cfg["log_amplitude_prior_bounds"]
         self._length_scale_bounds = (float(np.exp(ls_low)), float(np.exp(ls_high)))
@@ -151,14 +157,56 @@ class BayesianOptimizer:
         z = (y_best - mean) / std
         return (y_best - mean) * norm.cdf(z) + std * norm.pdf(z)
 
+    @staticmethod
+    def _ei_and_grad(model, x, y_best):
+        """EI and its EXACT gradient at a single point ``x`` ``(d,)``.
+
+        With ``u = y_best - mu`` and ``z = u / sigma`` the outer derivatives of
+        ``EI = u*Phi(z) + sigma*phi(z)`` collapse to ``dEI/du = Phi(z)`` and
+        ``dEI/dsigma = phi(z)`` (the ``phi'(z) = -z phi(z)`` terms cancel), so
+
+            grad EI = -Phi(z) * grad mu + phi(z) * grad sigma.
+
+        For the ARD-RBF kernel ``k_i = c exp(-|x - X_i|^2_l / 2)`` the Jacobian is
+        ``J_ij = dk_i/dx_j = k_i (X_ij - x_j) / l_j^2``, giving ``grad mu = J^T alpha``
+        and, from ``sigma^2 = c - k^T K^-1 k``, ``grad sigma = -J^T v / sigma`` with
+        ``v = K^-1 k``. Everything comes off the fitted model, so no finite differences
+        are needed -- which matters because EI underflows to ~1e-15 on a flat surrogate,
+        where differencing is pure cancellation noise.
+        """
+        x = np.asarray(x, dtype=np.float64).ravel()
+        X_train = model.X_train_
+        length_scale = np.atleast_1d(model.kernel_.k2.length_scale).astype(np.float64)
+        amplitude2 = float(model.kernel_.k1.constant_value)
+
+        diff = X_train - x  # (n, d), = X_i - x
+        scaled = diff / length_scale
+        k = amplitude2 * np.exp(-0.5 * np.einsum("ij,ij->i", scaled, scaled))  # (n,)
+        v = cho_solve((model.L_, True), k)  # K^-1 k
+
+        alpha = np.ravel(model.alpha_)
+        mean = float(k @ alpha)
+        var = max(amplitude2 - float(k @ v), 1e-12)
+        sigma = np.sqrt(var)
+
+        u = y_best - mean
+        z = u / sigma
+        cdf, pdf = norm.cdf(z), norm.pdf(z)
+        ei = u * cdf + sigma * pdf
+
+        jac = (k[:, None] * diff) / (length_scale**2)  # (n, d) = dk_i/dx_j
+        grad_mean = jac.T @ alpha
+        grad_sigma = -(jac.T @ v) / sigma
+        return float(ei), -cdf * grad_mean + pdf * grad_sigma
+
     def _optimise_ei(self, model, y_best):
         """Maximise EI over the unit cube: coarse random sweep, then local polish.
 
-        sklearn's ``predict`` exposes no gradient with respect to X (the JAX path
-        differentiated straight through the GP), so the search is derivative-free at the
-        top level: one BATCHED evaluation over many candidates finds the basins cheaply,
-        and L-BFGS-B -- with its own finite differences -- refines the best few. The
-        sweep is the important half; the polish only sharpens an already-chosen basin.
+        One BATCHED evaluation over many candidates finds the basins cheaply, then
+        L-BFGS-B refines the ``n_restarts`` best of them using the EXACT gradient from
+        :meth:`_ei_and_grad` -- so every restart in the config is honoured, and the
+        polish stays trustworthy where EI is small (finite differences there are
+        cancellation noise).
         """
         n_restarts = int(self.ei_cfg.get("n_restarts", 32))
         n_steps = int(self.ei_cfg.get("n_steps", 100))
@@ -169,12 +217,15 @@ class BayesianOptimizer:
         order = np.argsort(-ei)
         best_x, best_ei = candidates[order[0]], float(ei[order[0]])
 
-        # Polishing every candidate would cost n_restarts x n_steps single-point
-        # predicts; the sweep has already ranked them, so refine only the leaders.
-        for start in candidates[order[:max(1, min(n_restarts, 8))]]:
+        def negative_ei(x):
+            value, grad = self._ei_and_grad(model, x, y_best)
+            return -value, -grad
+
+        for start in candidates[order[:max(1, n_restarts)]]:
             result = minimize(
-                lambda x: -float(self._expected_improvement(model, x[None, :], y_best)[0]),
+                negative_ei,
                 start,
+                jac=True,
                 method="L-BFGS-B",
                 bounds=[(0.0, 1.0)] * self.d,
                 options={"maxiter": n_steps},

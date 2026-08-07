@@ -43,7 +43,7 @@ _GP_CFG = dict(
     n_folds=5,
     n_restarts=5,
     n_steps=40,
-    log_lengthscale_prior_bounds=(-6.0, 1.5),
+    log_lengthscale_prior_bounds=(-6.0, 4.0),
     log_amplitude_prior_bounds=(-6.0, 1.5),
 )
 _EI_CFG = dict(n_restarts=32, n_steps=100)

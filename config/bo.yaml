@@ -80,7 +80,13 @@ bo:
     n_folds: 5
     n_restarts: 5
     n_steps: 40
-    log_lengthscale_prior_bounds: [-6.0, 1.5]
+    # Lengthscales are read against the UNIT cube, so l = 1 already spans the whole
+    # domain. The old ceiling of 1.5 (l = 4.5) pinned 3-5 of the 8 enzyme dimensions
+    # at the bound: ARD wants to switch uninformative design dimensions OFF, which
+    # needs l >> 1, and clamping instead leaves them weakly coupled. 4.0 gives
+    # l = 54.6 -- effectively inert -- while the floor still forbids a degenerate
+    # white-noise fit.
+    log_lengthscale_prior_bounds: [-6.0, 4.0]
     log_amplitude_prior_bounds: [-6.0, 1.5]
   ei:
     n_restarts: 32

@@ -5,7 +5,7 @@ The CV-NLL objective for GP hyperparameters is full-batch, exact-gradient,
 deterministic, smooth and low-dimensional -- the regime where a line-search
 quasi-Newton method (L-BFGS) should dominate a fixed-LR stochastic optimiser
 (Adam). This benchmark builds the same k-fold CV-NLL objective that
-``detopt.bo.gp.fit_gp`` minimises and compares, on identical data:
+``detopt.bo.jax_gp.fit_gp`` minimises and compares, on identical data:
 
   * **fit**   -- multi-restart (cold) optimisation, best over restarts;
   * **refit** -- single warm-started run from a previous state's hyperparameters;
@@ -28,7 +28,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from detopt.bo.gp import GPHParams, _make_cv_nll
+from detopt.bo.jax_gp import GPHParams, _make_cv_nll
 
 # --------------------------------------------------------------------------- #
 # Problem + objective (mirrors fit_gp's standardised CV-NLL)
