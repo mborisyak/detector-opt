@@ -35,10 +35,10 @@ training:
   # Mandatory unconditional epochs after every data addition.
   warmup_epochs: 32
   # Shared detector-call budget for the run; pools are preallocated at this many rows (180 B/event).
-  budget: 131072
+  budget: 1048576
   # Per-design cap AND the epoch length (iteration_limit / batch SGD steps). Set to the full budget:
   # the convergence criterion alone decides when a design is done.
-  iteration_limit: 131072
+  iteration_limit: 262144
 
   val_fraction: 0.25
   # Convergence: |val - train| + SEM < loss_precision, over a target scaled by the T_melting prior
@@ -75,7 +75,7 @@ bo:
 # runs this chain at HALF the integration step of the runs themselves, so a result that depended on
 # the step size shows up as a gap rather than passing silently.
 verify:
-  budget: 131072
+  budget: 262144
   n_points: 5
   epochs: 80
   val_every_epochs: 2

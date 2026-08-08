@@ -12,6 +12,13 @@
 #   snakemake -c1                     -> strictly serial (a small card that fits one job)
 #   snakemake -cN -n                  -> dry run: show what would be (re)computed
 #
+# SEED SCHEDULING: no ordering -- every seed x strategy BO job is independent, so snakemake runs as
+# many at once as you allow. Cap concurrency with --resources gpu=K (each heavy rule declares gpu=1):
+#
+#   snakemake -c16 --resources gpu=8  -> up to 8 GPU jobs at once. The H100 has ample room (one job
+#                                        ~15% of its 132 SMs, ~1.2 GB); pick K from the 4-vs-8
+#                                        saturation probe. preallocation-off is baked into ENV below.
+#
 # Sharing one GPU between concurrent jobs requires XLA preallocation to be off -- with it on, the
 # first job grabs the whole card and every other one OOMs. Every command below is prefixed with
 # ENV (XLA_PYTHON_CLIENT_PREALLOCATE=false), so a job is correct regardless of the environment
@@ -49,16 +56,21 @@ import random
 CONFIG = "enzyme"  # run config: config/<CONFIG>.yaml
 SUPER_SEED = 123456
 rng = random.Random(SUPER_SEED)
-SEEDS = [rng.randint(0, 2 ** 31 - 1) for _ in range(5)]
+SEEDS = [rng.randint(0, 2 ** 31 - 1) for _ in range(10)]
 
 PREFIX = f"output/{CONFIG}"  # per-seed run tree = <PREFIX>/<seed>/<strategy>/, cross-seed median = <PREFIX>/median.png
 STRATEGIES = ["from_scratch", "continue", "closest", "meta"]
 
 # Prepended to every command below, so a job carries its environment explicitly rather than
 # inheriting one: preallocation off (concurrent jobs must take only the GPU memory they actually
-# use) and unbuffered stdout (progress is usually watched through a redirect or a pipe, where
-# Python would block-buffer it and a healthy run would look silent for many minutes).
-ENV = "XLA_PYTHON_CLIENT_PREALLOCATE=false PYTHONUNBUFFERED=1"
+# use), unbuffered stdout (progress is usually watched through a redirect or a pipe, where Python
+# would block-buffer it and a healthy run would look silent for many minutes), and the CUDA MPS pipe
+# dir so every job routes through the user-mode MPS server. WITHOUT MPS, N processes TIME-SLICE the
+# H100 (measured ~0.20 SMACT total regardless of N -> ~no speedup); WITH it they co-run (measured
+# ~0.69 SMACT / 365 W at 8 jobs -> ~5x aggregate throughput). The daemon must be started once per
+# boot (user-mode, no root):
+#   CUDA_MPS_PIPE_DIRECTORY=$HOME/.mps nvidia-cuda-mps-control -d     (stop: echo quit | nvidia-cuda-mps-control)
+ENV = "XLA_PYTHON_CLIENT_PREALLOCATE=false PYTHONUNBUFFERED=1 CUDA_MPS_PIPE_DIRECTORY=$HOME/.mps"
 
 wildcard_constraints:
   seed="|".join(str(seed) for seed in SEEDS),
@@ -71,7 +83,8 @@ rule all:
     f"{PREFIX}/median.png",
 
 
-# One BO run: one config, one seed, one strategy, its own output tree.
+# One BO run: one config, one seed, one strategy, its own output tree. No inputs -- every seed x
+# strategy job is independent, scheduled freely up to --resources gpu=K.
 rule bo:
   output:
     f"{PREFIX}/{{seed}}/{{strategy}}/results.json",

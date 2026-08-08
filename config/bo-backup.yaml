@@ -20,7 +20,7 @@ detector:
     max_dt: 1.0
     max_time: 300.0
     material: kapton
-    data_dir: "data/mc/numpy_newFS"  # 36k events across the 50 files; boundary crossings are upstream of the magnet (magnet-independent)
+    data_dir: "data/mc-100K"  # 36k events across the 50 files; boundary crossings are upstream of the magnet (magnet-independent)
 
 # Nominal (initial/baseline) design -- NOT detector state. A named physical-design dict the
 # detector encodes via encode_design (BO itself seeds from random proposals).
@@ -31,30 +31,29 @@ nominal_design:
 regressor:
   set-regressor:
     features: [[24, 32], [32, 24]]
-    n_models: null
+    n_models: null   # ensemble of 8 (omit n_models for a single net)
     p_dropout: 0.1
 
 device: cuda
 
-### target 10+ steps
 training:
   n0: 2048
   n_increment: 1024
-  batch: 256
+  batch: 128
   # Gradient-free evaluation batch for the sequential train+val loss passes
   # (no backprop, so it can exceed the training batch).
   eval_batch: 2048
   # Mandatory unconditional epochs after every data addition.
   warmup_epochs: 32
   # Extended shared detector-call budget for the whole BO run.
-  budget: 1048576
+  budget: 424288 #524288
   # Per-design upper limit on data (also sets epoch = iteration_limit / batch).
-  iteration_limit: 262144
+  iteration_limit: 65536
 
   val_fraction: 0.25
   # Convergence: per-epoch-slope flatness tol, target loss precision, plateau window.
   flatness_tol: 1.0
-  loss_precision: 2.0e-2
+  loss_precision: 2.5e-2
   patience: 32
   optimizer:
     adamw:
@@ -62,16 +61,16 @@ training:
       b1: 0.9
       b2: 0.999
       eps: 1.0e-8
-      weight_decay: 1.0e-4
+      weight_decay: 1.0e-3
 
 # Independent trajectory verification (scripts/verify_trajectory.py): re-score <= n_points designs
 # of a finished run's results.json (uniform in cumulative detector calls, always the last) on a
 # 6:2:2 train/val/test split; best-val network scored once on the held-out test buffer.
 verify:
-  n_points: 5
-  epochs: 64
-  val_every_epochs: 1
-  eval_batch: 1024
+  n_points: 10
+  epochs: 8         # one epoch = one pass over the train buffer
+  val_every_epochs: 1     # validate (whole val buffer) every this many epochs
+  eval_batch: 512   # eval chunk; 512 keeps the 8-member ensemble's eval activations inside 8GB VRAM
   sample_batch: 1024
 
 bo:
@@ -81,7 +80,13 @@ bo:
     n_folds: 5
     n_restarts: 5
     n_steps: 40
-    log_lengthscale_prior_bounds: [-6.0, 1.5]
+    # Lengthscales are read against the UNIT cube, so l = 1 already spans the whole
+    # domain. The old ceiling of 1.5 (l = 4.5) pinned 3-5 of the 8 enzyme dimensions
+    # at the bound: ARD wants to switch uninformative design dimensions OFF, which
+    # needs l >> 1, and clamping instead leaves them weakly coupled. 4.0 gives
+    # l = 54.6 -- effectively inert -- while the floor still forbids a degenerate
+    # white-noise fit.
+    log_lengthscale_prior_bounds: [-6.0, 4.0]
     log_amplitude_prior_bounds: [-6.0, 1.5]
   ei:
     n_restarts: 32
