@@ -1,5 +1,5 @@
 # DEPRECATED: not maintained against the typed-records detector API (Event/Target/Design
-# namedtuples, combine/combine_encoded, raw buffers). Left untouched on purpose -- do not use
+# namedtuples, combine/combine_scaled, raw buffers). Left untouched on purpose -- do not use
 # or refactor.
 import os
 
@@ -43,7 +43,7 @@ def generate(seed, output, progress=True, restore=True, **config):
 
     design = restored["design"]["design"]
     print(f"using {design} as initial design")
-    print(f"using {detector.decode_design(design)} as initial design")
+    print(f"using {detector.to_nominal(design)} as initial design")
     design_optimizer, design_optimizer_state = (
         restored["design"]["optimizer"],
         restored["design"]["optimizer_state"],

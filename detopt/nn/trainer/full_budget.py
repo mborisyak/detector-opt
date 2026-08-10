@@ -100,16 +100,16 @@ class FullBudgetTrainer(Trainer):
     def _init_design_network(self, init_seq, init_params):
         return fresh_design_network(self, init_seq, init_params)  # fresh, single design
 
-    def train(self, design_enc, seed_seq, *, on_epoch=None) -> TrainResult:
+    def train(self, design_scaled, seed_seq, *, on_epoch=None) -> TrainResult:
         """Train a fresh regressor on the full budget for ``max_epochs`` epochs.
 
-        Samples the entire budget under ``design_enc`` (one design) up front, then
+        Samples the entire budget under ``design_scaled`` (one design) up front, then
         runs exactly ``max_epochs`` epochs with the cosine-decayed LR. Returns the
         final ``(train + val) / 2`` loss and its combined SEM.
         """
         detector = self.detector
-        design_enc = np.asarray(design_enc, dtype=np.float32)
-        design = detector.decode_design(design_enc)  # physical Design namedtuple (what the pools store)
+        design_scaled = np.asarray(design_scaled, dtype=np.float32)
+        design = detector.to_nominal(design_scaled)  # physical Design namedtuple (what the pools store)
         init_seq, training_seq = seed_seq.spawn(2)
 
         # Fresh, randomly initialised regressor + optimiser (cosine-scheduled LR).

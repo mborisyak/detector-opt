@@ -1,6 +1,14 @@
-"""Tests for detopt.bo.BayesianOptimizer (owns X-normalisation; y is raw)."""
+"""Tests for detopt.bo.BayesianOptimizer (owns X-normalisation; y is raw).
+
+The class works in ONE space, the scaled cube ``[0, 1]^d``: :meth:`append` takes scaled designs and
+:meth:`propose` returns one, with no transform inside. These tests pin that contract, and in
+particular that the cube is searched UNIFORMLY -- the defect this replaced handed the optimiser a
+quantile-encoded box, so a uniform draw piled against the design bounds and a third of the
+evaluations landed where nothing could be learned.
+"""
 
 import numpy as np
+import pytest
 
 from detopt.bo import BayesianOptimizer
 
@@ -14,48 +22,68 @@ _GP_CFG = dict(
 _EI_CFG = dict(n_restarts=4, n_steps=20)
 
 
-def _make_bo(d=3, bound=3.0, n_init=5, seed=0):
-    bounds = np.stack([np.full(d, -bound), np.full(d, bound)], axis=1)
-    return BayesianOptimizer(bounds, gp=_GP_CFG, ei=_EI_CFG, n_init=n_init, seed=seed)
-
-
-def test_x_normalisation_round_trip():
-    bo = _make_bo(bound=3.0)
-    X = np.array([[-3.0, 0.0, 3.0], [1.0, -2.0, 2.5]], dtype="float32")
-    np.testing.assert_allclose(bo.to_nominal(bo.to_unit(X)), X, atol=1e-5)
-    # Edges of the box map to the unit-cube corners.
-    np.testing.assert_allclose(bo.to_unit(np.full(3, -3.0)), np.zeros(3), atol=1e-6)
-    np.testing.assert_allclose(bo.to_unit(np.full(3, 3.0)), np.ones(3), atol=1e-6)
+def _make_bo(d=3, n_init=5, seed=0):
+    return BayesianOptimizer(d, gp=_GP_CFG, ei=_EI_CFG, n_init=n_init, seed=seed)
 
 
 def test_append_requires_noise():
     """noise is mandatory (the GP is heteroscedastic)."""
     bo = _make_bo()
-    import pytest
-
     with pytest.raises(TypeError):
         bo.append(np.zeros((2, 3), "float32"), np.zeros(2, "float32"))
 
 
 def test_propose_random_during_init():
     """Before ``n_init`` observations, proposals are random and carry no GP info."""
-    bo = _make_bo(d=3, bound=3.0, n_init=5)
+    bo = _make_bo(d=3, n_init=5)
     x = bo.propose()
     assert x.shape == (3,)
-    assert np.all(x >= -3.0 - 1e-5) and np.all(x <= 3.0 + 1e-5)
+    assert np.all(x >= 0.0) and np.all(x <= 1.0)
     assert bo.last_info is None
 
 
 def test_propose_uses_gp_after_init():
-    """Once enough points exist, propose() fits the GP and returns a bounded design."""
+    """Once enough points exist, propose() fits the GP and returns a scaled design in the cube."""
     rng = np.random.default_rng(1)
-    bo = _make_bo(d=2, bound=3.0, n_init=5)
+    bo = _make_bo(d=2, n_init=5)
     for _ in range(12):
-        x = rng.uniform(-3.0, 3.0, size=2).astype("float32")
-        # Minimise ||x||^2 (a simple convex objective).
-        bo.append(x, float(np.sum(x**2)), noise=1e-2)
+        x = rng.uniform(0.0, 1.0, size=2).astype("float32")
+        # Minimise ||x - 0.5||^2 (a simple convex objective with an INTERIOR optimum).
+        bo.append(x, float(np.sum((x - 0.5) ** 2)), noise=1e-2)
     x_next = bo.propose()
     assert x_next.shape == (2,)
-    assert np.all(x_next >= -3.0 - 1e-5) and np.all(x_next <= 3.0 + 1e-5)
+    assert np.all(x_next >= 0.0) and np.all(x_next <= 1.0)
     assert bo.last_info is not None
     assert np.isfinite(bo.last_info["ei"])
+
+
+def test_gp_proposals_stay_in_the_cube():
+    """Every EI-driven proposal is inside ``[0, 1]^d``, including against an objective whose optimum
+    sits ON a corner -- the EI polish must clip rather than run out of the box."""
+    rng = np.random.default_rng(2)
+    bo = _make_bo(d=3, n_init=5, seed=3)
+    for _ in range(20):
+        x = np.asarray(bo.propose(), dtype=np.float32)
+        assert np.all(x >= 0.0) and np.all(x <= 1.0), x
+        bo.append(x, float(np.sum(x)), noise=1e-2)  # minimised at the all-zero CORNER
+
+
+def test_initial_proposals_are_uniform_in_the_cube():
+    """The initial random proposals are UNIFORM in the cube -- so they are a uniform NOMINAL design.
+
+    This is the regression test for the parameterisation defect: under the old quantile encoding a
+    uniform draw in the searched box put ~57% of proposals in the outer 20% of every coordinate and
+    only ~6% in the middle 14%. Affine scaling must reproduce the uniform 20% / 14%.
+    """
+    xs = []
+    for seed in range(200):
+        bo = _make_bo(d=4, n_init=8, seed=seed)
+        xs.extend(np.asarray(bo.propose(), dtype=np.float64) for _ in range(8))
+    x = np.asarray(xs)  # (1600, 4)
+
+    outer = float(np.mean((x < 0.1) | (x > 0.9)))  # outer 20% of the range
+    middle = float(np.mean((x > 0.43) & (x < 0.57)))  # middle 14%
+    assert 0.16 < outer < 0.24, f"outer-20% occupancy {outer:.3f}, expected ~0.20"
+    assert 0.11 < middle < 0.17, f"middle-14% occupancy {middle:.3f}, expected ~0.14"
+    # and no coordinate is systematically off-centre
+    assert np.all(np.abs(x.mean(axis=0) - 0.5) < 0.05), x.mean(axis=0)

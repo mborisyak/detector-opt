@@ -11,10 +11,6 @@ try:
 except ImportError:
     uproot = None
 
-from ..utils.encoding import (
-    normal_to_uniform_jax,
-    uniform_to_normal_jax,
-)
 from ..utils import tensor
 from ..data import load_ship2numpy_events
 from . import straw_detector
@@ -654,7 +650,7 @@ class StrawDetector(Detector):
         """Normalize ``design`` (a Design namedtuple / config Mapping / flat physical array) to the Design
         NAMEDTUPLE with every field broadcast to a leading ``(n, ...)`` event axis. The flat<->namedtuple
         conversion happens ONCE here; downstream (:meth:`_design_to_geometry`) carries the namedtuple, so
-        no raw flat unencoded design is ever stored or threaded through the simulation."""
+        no raw flat nominal design is ever stored or threaded through the simulation."""
         nt = self.unflatten_design(self.flatten_design(design))  # -> Design namedtuple (fields 1-D or (b, ...))
 
         def batch(x):
@@ -929,12 +925,12 @@ class StrawDetector(Detector):
         out = self._simulate(design, event_index)
         return out["ground_truth"], out["X"], out["mask"], out["target"]
 
-    # Design encoding: the base Detector wraps the subclass `_encode_flat`/`_decode_flat`
-    # (flat physical <-> encoded) with the dict<->flat conversion; the design subclass owns
-    # the bounds, `design_spec`, `design_bounds`, and the flat encode/decode to N(0,1).
+    # Design scaling: the base Detector wraps the subclass `_to_scaled_flat`/`_to_nominal_flat`
+    # (flat nominal <-> scaled) with the dict<->flat conversion; the design subclass owns
+    # the bounds, `design_spec`, `design_bounds`, and the flat affine map onto `[0, 1]`.
 
     # ------------------------------------------------------------------ #
-    # Combine: ABSTRACT here (Detector declares combine_encoded/combined_event_shape/element_mask). Each
+    # Combine: ABSTRACT here (Detector declares combine_scaled/combined_event_shape/element_mask). Each
     # combine LEAF builds its own per-hit/-layer features; the shared 4-feature logic is the module
     # function `four_feature_combine` below. The TDC standardisation constants live here (event
     # normalisation is straw-wide, used by that function).
@@ -942,17 +938,29 @@ class StrawDetector(Detector):
     _TDC_MEAN = 440.0
     _TDC_STD = 80.0
 
-    def _decode_to_layer_geometry(self, d_enc):
-        """Encoded design ``(B, design_dim)`` -> per-layer ``(positions(B,n),
+    def _scaled_to_layer_geometry(self, design_scaled):
+        """Scaled design ``(B, design_dim)`` -> per-layer ``(positions(B,n),
         angles(B,n), B_field(B))``, used by :func:`four_feature_combine`. Defined by the
         design subclass (it owns how the design expands into per-layer geometry)."""
-        raise NotImplementedError("_decode_to_layer_geometry is defined by the design subclass")
+        raise NotImplementedError("_scaled_to_layer_geometry is defined by the design subclass")
 
 
-def four_feature_combine(det, event, encoded_design, mask=None):
-    """The shared 4-feature combine: raw ``StrawEvent`` + ENCODED design -> per-hit features (normalised)
+def scale(values, bounds):
+    """NOMINAL ``[low, high]`` -> SCALED ``[0, 1]``, the design's only parameterisation change."""
+    low, high = bounds
+    return (values - low) / (high - low)
+
+
+def unscale(values, bounds):
+    """SCALED ``[0, 1]`` -> NOMINAL ``[low, high]`` (inverse of :func:`scale`)."""
+    low, high = bounds
+    return values * (high - low) + low
+
+
+def four_feature_combine(det, event, design_scaled, mask=None):
+    """The shared 4-feature combine: raw ``StrawEvent`` + SCALED design -> per-hit features (normalised)
     ``[TDC, norm(layer z), wire_y_left, wire_y_right]``. Geometry-AGNOSTIC: it gathers each hit's own layer
-    geometry through ``det._decode_to_layer_geometry`` (the design subclass owns that decode), so every
+    geometry through ``det._scaled_to_layer_geometry`` (the design subclass owns that map), so every
     4-feature combine leaf (``FreeStrawDetector``, ``Stereo4Feature``, incl. its ``engine='relay'`` mode) calls this.
     ``mask`` is accepted for the uniform signature but ignored (the element axis IS the hit axis; padded
     hits are zeroed downstream by the regressor mask).
@@ -960,7 +968,7 @@ def four_feature_combine(det, event, encoded_design, mask=None):
     The sense wire is encoded as its two y-endpoints at the FIXED x-ends of the parallelogram (the sheared
     geometry ``Y = y - x*tan(angle)`` is constant along the wire) -- the natural input for stereo
     triangulation -> track fit -> curvature -> momentum, differentiable w.r.t. the design through the
-    decode+gather."""
+    unscale+gather."""
     import jax.numpy as jnp
 
     station = jnp.asarray(event.station, jnp.int32)
@@ -973,11 +981,11 @@ def four_feature_combine(det, event, encoded_design, mask=None):
     per_station = det.n_views_per_station * det.n_layers_per_view
     layer = station * per_station + view * det.n_layers_per_view + layer_in_view  # (B, M) global layer idx
 
-    # Decode design and gather each hit's own layer geometry.
-    d_enc = jnp.asarray(encoded_design, dtype=jnp.float32)
-    if d_enc.ndim == 1:
-        d_enc = jnp.broadcast_to(d_enc[None, :], (B, d_enc.shape[0]))
-    positions, angles, _B = det._decode_to_layer_geometry(d_enc)  # (B,n),(B,n),(B,); field unused (fixed)
+    # Un-scale the design and gather each hit's own layer geometry.
+    d_scaled = jnp.asarray(design_scaled, dtype=jnp.float32)
+    if d_scaled.ndim == 1:
+        d_scaled = jnp.broadcast_to(d_scaled[None, :], (B, d_scaled.shape[0]))
+    positions, angles, _B = det._scaled_to_layer_geometry(d_scaled)  # (B,n),(B,n),(B,); field unused (fixed)
 
     z_hit = jnp.take_along_axis(positions, layer, axis=1)  # (B, M)
     angle_hit = jnp.take_along_axis(angles, layer, axis=1)  # (B, M)

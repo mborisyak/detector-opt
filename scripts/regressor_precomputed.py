@@ -1,5 +1,5 @@
 # DEPRECATED: not maintained against the typed-records detector API (Event/Target/Design
-# namedtuples, combine/combine_encoded, raw buffers). Left untouched on purpose -- do not use
+# namedtuples, combine/combine_scaled, raw buffers). Left untouched on purpose -- do not use
 # or refactor; see scripts/regression.py for the current regressor-training entry point.
 import math
 import os
@@ -142,9 +142,9 @@ def regress(
 
     # Initialize detector (needed for design and normalization parameters)
     detector = detopt.detector.from_config(config["detector"])
-    enc = detector.encode_design(config["design"])  # design ALWAYS from config (detector holds none)
+    enc = detector.to_scaled(config["design"])  # design ALWAYS from config (detector holds none)
     enc = enc.reshape(1, -1)
-    print(f"Encoded design: {enc}")
+    print(f"Scaled design: {enc}")
     print(f"Design parameters: {detector.get_design(enc)}")
     print(f"Spawn probability: {detector.p_spawn_single}")
 

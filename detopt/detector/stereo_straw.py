@@ -6,10 +6,10 @@ Each station carries a fixed [0, +a, -a, 0] view layout (horizontal, +stereo,
     [ station_z (n_stations) , stereo_angle a ]
 
 so dimension ``n_stations + 1`` instead of the base ``2*n_layers + 1``. The
-magnetic field and the intra-station gaps are fixed. The station-z encoding is
+magnetic field and the intra-station gaps are fixed. The station-z scaling is
 **coupled and ordered**: each station has a z width (``station_width``) and the
-decode is sequential, so decoded stations are always ordered, never overlap each
-other, and never intrude into the spectrometer magnet (centred at ``z0``,
+map back to nominal is sequential, so stations are always ordered, never overlap
+each other, and never intrude into the spectrometer magnet (centred at ``z0``,
 half-width ``magnet_half_cm``). Upstream stations sit below ``z0 - magnet_half``,
 downstream ones above ``z0 + magnet_half`` (see ``_station_lo_hi``).
 """
@@ -19,8 +19,7 @@ from typing import NamedTuple
 import jax
 import numpy as np
 
-from .straw import Pool, StrawDetector
-from ..utils.encoding import normal_to_uniform_jax, uniform_to_normal_jax
+from .straw import Pool, StrawDetector, scale, unscale
 
 __all__ = ["StereoStrawDetector", "StereoDesign"]
 
@@ -225,51 +224,68 @@ class StereoStrawDetector(StrawDetector):
         return positions.astype(np.float32), angles.astype(np.float32), Bs
 
     # ------------------------------------------------------------------ #
-    # Encode/decode: compact physical <-> N(0,1)  (B fixed, not a design dof)
+    # Nominal <-> scaled: compact physical <-> [0, 1]  (B fixed, not a design dof)
+    #
+    # The stations are ORDERED and magnet-excluding, so station k's admissible window is coupled to
+    # station k-1 and the "each coordinate on its own range" rule does not hold literally here: u_k is
+    # the fraction of the REMAINING admissible window ``_station_lo_hi(k, prev_z)``, not of the single
+    # global pair in ``design_bounds()['stations']``. The loop is identical in both directions and to
+    # the quantile version it replaces; only the per-window transform is now affine.
     # ------------------------------------------------------------------ #
-    def _encode_flat(self, design):
+    def _station_window(self, k, prev_z, jnp):
+        """Station ``k``'s admissible ``(lo, hi)``, with a collapsed-or-inverted window widened to a
+        positive ``1e-3``. The guard is needed in BOTH directions: forward it stops a /0, and backward
+        a negative ``(hi - lo)`` would make z DECREASE in u and leave the box entirely -- silently
+        breaking the ordering the sequential window exists to enforce (the quantile map it replaces
+        still produced a finite, if meaningless, z)."""
+        lo, hi = self._station_lo_hi(k, prev_z)
+        return lo, lo + jnp.maximum(hi - lo, 1e-3)
+
+    def _to_scaled_flat(self, design):
         import jax.numpy as jnp
 
         d = jnp.asarray(design, jnp.float32)
         ns = self.n_stations
-        # Station z's: invert the sequential coupled bounds. We have the physical z's,
-        # so each station's (lo, hi) follows from the previous station's z directly.
-        es, prev = [], None
+        # Station z's: invert the sequential coupled windows. We have the physical z's, so each
+        # station's (lo, hi) follows from the previous station's z directly.
+        us, prev = [], None
         for k in range(ns):
             if k == self.n_stations_upstream:
                 prev = None  # new side downstream of the magnet
             z_k = d[..., k]
-            lo, hi = self._station_lo_hi(k, prev)
-            hi = lo + jnp.maximum(hi - lo, 1e-3)  # guard a collapsed interval (max-packed extreme) from a /0 in the inverse
-            es.append(uniform_to_normal_jax(z_k, lo, hi))
+            lo, hi = self._station_window(k, prev, jnp)
+            us.append((z_k - lo) / (hi - lo))
             prev = z_k
-        z_e = jnp.stack(es, axis=-1)
-        a_e = uniform_to_normal_jax(d[..., ns : ns + 1], self.stereo_bound[0], self.stereo_bound[1])
-        return jnp.concatenate([z_e, a_e], axis=-1)
+        z_u = jnp.stack(us, axis=-1)
+        a_u = scale(d[..., ns : ns + 1], self.stereo_bound)
+        return jnp.concatenate([z_u, a_u], axis=-1)
 
-    def _decode_flat(self, encoded_design):
+    def _to_nominal_flat(self, design_scaled):
         import jax.numpy as jnp
 
-        e = jnp.asarray(encoded_design, jnp.float32)
+        u = jnp.asarray(design_scaled, jnp.float32)
         ns = self.n_stations
-        # Station z's: decode sequentially so the bound for each station depends on the
-        # previous decoded z -> ordered, non-overlapping, magnet-excluding by construction.
+        # Station z's: un-scale sequentially so the window for each station depends on the previous
+        # station's z -> ordered, non-overlapping, magnet-excluding by construction. ``u_k = 0`` is a
+        # reachable hard corner (station k packed one pitch behind k-1); it is admissible, where the
+        # quantile map only approached it as theta -> -inf.
         zs, prev = [], None
         for k in range(ns):
             if k == self.n_stations_upstream:
                 prev = None  # new side downstream of the magnet
-            lo, hi = self._station_lo_hi(k, prev)
-            z_k = normal_to_uniform_jax(e[..., k], lo, hi)
+            lo, hi = self._station_window(k, prev, jnp)
+            z_k = lo + u[..., k] * (hi - lo)
             zs.append(z_k)
             prev = z_k
         z_d = jnp.stack(zs, axis=-1)
-        a_d = normal_to_uniform_jax(e[..., ns : ns + 1], self.stereo_bound[0], self.stereo_bound[1])
+        a_d = unscale(u[..., ns : ns + 1], self.stereo_bound)
         return jnp.concatenate([z_d, a_d], axis=-1)
 
-    def _decode_to_layer_geometry(self, d_enc):
+
+    def _scaled_to_layer_geometry(self, design_scaled):
         import jax.numpy as jnp
 
-        phys = self._decode_flat(d_enc)  # (B, ns+1) flat physical
+        phys = self._to_nominal_flat(design_scaled)  # (B, ns+1) flat physical
         positions, angles = self._expand(phys, jnp)  # (B, n_layers) each
         # Field is fixed at max_B (not a design dof).
         B_field = jnp.full((phys.shape[0],), self.max_B, dtype=jnp.float32)

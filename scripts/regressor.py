@@ -92,7 +92,7 @@ def regress(seed, output, progress=False, restore=True, trace=None, report=None,
     np_rng = np.random.default_rng(seed=(seed, 0))
 
     detector = detopt.detector.from_config(config["detector"])
-    enc = detector.encode_design(config["design"])  # design ALWAYS from config (detector holds none)
+    enc = detector.to_scaled(config["design"])  # design ALWAYS from config (detector holds none)
     enc = enc.reshape(1, -1)
     print(enc)
     # input("Waiting ")

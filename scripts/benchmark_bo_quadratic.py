@@ -92,13 +92,22 @@ def objective(A, b, x):
 
 
 def run_bo(A, b, bounds, *, iters, seed):
-    """Sequential BO; returns the best-so-far regret curve and the best x."""
-    bo = BayesianOptimizer(bounds, gp=_GP_CFG, ei=_EI_CFG, seed=seed)
+    """Sequential BO; returns the best-so-far regret curve and the best x.
+
+    BayesianOptimizer speaks the SCALED design cube ``[0, 1]^d``, so the box lives here, at the
+    boundary, exactly as it does in ``scripts/bo.py``: proposals are un-scaled onto ``bounds``
+    affinely before the objective sees them, and the scaled coordinate is what gets appended.
+    Because the map is affine, BO's uniform initial points are uniform IN THE BOX -- the same
+    measure ``run_random`` samples, which is what makes the comparison fair.
+    """
+    low, high = bounds[:, 0], bounds[:, 1]
+    bo = BayesianOptimizer(bounds.shape[0], gp=_GP_CFG, ei=_EI_CFG, seed=seed)
     best_f, best_x, curve = np.inf, None, []
     for _ in range(iters):
-        x = bo.propose()
+        scaled = bo.propose()
+        x = low + np.asarray(scaled, dtype=np.float64) * (high - low)
         f = objective(A, b, x)
-        bo.append(x, f, noise=_NOISE)
+        bo.append(scaled, f, noise=_NOISE)
         if f < best_f:
             best_f, best_x = f, np.asarray(x, dtype=np.float64)
         curve.append(best_f)

@@ -195,7 +195,7 @@ def run_pipeline(
     quality + candidate cuts (MEAS_CUT, CHI2_CUT, DOCA_CUT); weak defaults keep all reconstructable
     events. Shared by `fit` (weak) and `scripts/fairship_select.py` (FairShip clean)."""
     sigma_hit = detector.straw_pitch / np.sqrt(12.0)
-    phys = np.asarray(detector.flatten_design(detector.decode_design(detector.encode_design(_resolve_design(config)))), np.float32)
+    phys = np.asarray(detector.flatten_design(detector.to_nominal(detector.to_scaled(_resolve_design(config)))), np.float32)
     positions, angles, _ = detector._design_to_geometry(phys[None, :])
     layer_z = np.asarray(positions[0], np.float64)
     layer_tan = np.tan(np.asarray(angles[0], np.float64))
@@ -559,7 +559,7 @@ def run_retina_pipeline(
     (network-identical RMSE + DoCA). Mirrors :func:`run_pipeline` but uses no MC truth at any step."""
     sigma_hit = detector.straw_pitch / np.sqrt(12.0)
     s_lo = float(s_lo) if s_lo is not None else sigma_hit
-    phys = np.asarray(detector.flatten_design(detector.decode_design(detector.encode_design(_resolve_design(config)))), np.float32)
+    phys = np.asarray(detector.flatten_design(detector.to_nominal(detector.to_scaled(_resolve_design(config)))), np.float32)
     positions, angles, _ = detector._design_to_geometry(phys[None, :])
     layer_z = np.asarray(positions[0], np.float64)
     layer_tan = np.tan(np.asarray(angles[0], np.float64))

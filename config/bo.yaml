@@ -23,7 +23,7 @@ detector:
     data_dir: "data/mc/numpy_newFS"  # 36k events across the 50 files; boundary crossings are upstream of the magnet (magnet-independent)
 
 # Nominal (initial/baseline) design -- NOT detector state. A named physical-design dict the
-# detector encodes via encode_design (BO itself seeds from random proposals).
+# detector scales via to_scaled (BO itself seeds from random proposals).
 nominal_design:
   stations: [8407.0, 8607.0, 9307.0, 9507.0]
   view_angle: 0.0798
@@ -81,8 +81,21 @@ bo:
     n_folds: 5
     n_restarts: 5
     n_steps: 40
-    log_lengthscale_prior_bounds: [-6.0, 1.5]
+    # Lengthscales are read against the UNIT cube, so l = 1 already spans the whole
+    # domain. The old ceiling of 1.5 (l = 4.5) was calibrated when the searched box
+    # was the encoded [-3, 3]^d; on the scaled cube it pins uninformative dimensions
+    # at the bound instead of letting ARD switch them OFF (which needs l >> 1).
+    # 4.0 gives l = 54.6 -- effectively inert -- while the floor still forbids a
+    # degenerate white-noise fit. Matches config/enzyme.yaml.
+    log_lengthscale_prior_bounds: [-6.0, 4.0]
     log_amplitude_prior_bounds: [-6.0, 1.5]
+    # Ordinary per-coordinate ARD: this design has NO exchangeable element. A layer's wire stagger
+    # is keyed to its index parity, so permuting layers is a different detector; and the stereo
+    # stations are already ordered by their coupled sequential window, so the relabelling symmetry
+    # is removed by the parameterisation rather than left for the kernel.
+    kernel:
+      ard-rbf: {}
+
   ei:
     n_restarts: 32
     n_steps: 100

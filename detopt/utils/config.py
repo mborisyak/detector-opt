@@ -1,6 +1,6 @@
 from typing import Any, TypeVar
 
-__all__ = ["split", "extract", "optimizer", "resolve_device", "load_config"]
+__all__ = ["split", "extract", "optimizer", "resolve_device", "load_config", "override"]
 
 
 def split(config: dict[str, dict[str, Any]]) -> tuple[str, dict[str, Any]]:
@@ -72,3 +72,27 @@ def load_config(path):
 
             return yaml.safe_load(f)
         return json.load(f)
+
+
+def override(config, assignments):
+    """Apply ``dotted.key=value`` assignments to a loaded config, in place, and return it.
+
+    The value is parsed as YAML, so scalars, lists and mappings all work
+    (``enzyme.parameters.T_melting='[25.0, 75.0]'``). An assignment to a key the config does not
+    already define is an ERROR rather than a new entry: these come from a command line, where a
+    typo would otherwise be silently ignored and the sweep would report the unchanged config.
+    """
+    import yaml
+
+    for assignment in assignments:
+        key, separator, value = assignment.partition("=")
+        if separator != "=":
+            raise ValueError(f"expected dotted.key=value, got {assignment!r}")
+        node = config
+        *path, leaf = key.split(".")
+        for step in path:
+            node = node[step]
+        if leaf not in node:
+            raise KeyError(f"{key!r} is not a config key ({leaf!r} not in {sorted(node)})")
+        node[leaf] = yaml.safe_load(value)
+    return config

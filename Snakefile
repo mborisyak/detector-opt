@@ -70,7 +70,7 @@ STRATEGIES = ["from_scratch", "continue", "closest", "meta"]
 # ~0.69 SMACT / 365 W at 8 jobs -> ~5x aggregate throughput). The daemon must be started once per
 # boot (user-mode, no root):
 #   CUDA_MPS_PIPE_DIRECTORY=$HOME/.mps nvidia-cuda-mps-control -d     (stop: echo quit | nvidia-cuda-mps-control)
-ENV = "XLA_PYTHON_CLIENT_PREALLOCATE=false PYTHONUNBUFFERED=1 CUDA_MPS_PIPE_DIRECTORY=$HOME/.mps"
+ENV = "XLA_PYTHON_CLIENT_PREALLOCATE=false PYTHONUNBUFFERED=1"  # MPS removed: local RTX 3070 finish-up runs no-MPS (MPS was neutral-to-negative for enzyme on this GPU)
 
 wildcard_constraints:
   seed="|".join(str(seed) for seed in SEEDS),

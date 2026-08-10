@@ -25,6 +25,11 @@ the per-event design perturbation, the RingBuffer of network-ready examples, the
 scan-folded regressor training, the deterministic SeedSequence seeding, the orbax
 checkpointing, validation and plotting -- mirrors ``subgradient.py``.
 
+``theta`` lives in the **scaled** cube ``[0, 1]^d``, bounded, so every design step and every
+perturbation is projected back into it before the geometry is built. The same two calibration
+items flagged in ``subgradient.py`` (the design L2 now descends toward the lower CORNER rather
+than the centre, and ``design_eps`` means a fixed fraction of each range) are unrevisited here too.
+
 Config: ``config/lfi.yaml`` (mirrors ``subgradient.yaml``; the ``lfi:`` block
 replaces ``subgradient:`` and a ``discriminator:`` net + optimizer are added).
 """
@@ -60,11 +65,11 @@ from detopt.utils.events import disjoint_index_streams
 
 
 def _initial_theta(detector, config):
-    """Initial encoded design: ``encode_design`` of the resolved ``design`` config -- a named
+    """Initial scaled design: ``to_scaled`` of the resolved ``design`` config -- a named
     physical-design dict (e.g. ``config/design/initial_stereo.yaml``, gearup-resolved from
     ``design: initial_stereo``). The initial design is config-supplied, always: the detector
     has no default/current design to fall back to."""
-    return jnp.asarray(detector.encode_design(config["design"]), jnp.float32)
+    return jnp.asarray(detector.to_scaled(config["design"]), jnp.float32)
 
 
 # --------------------------------------------------------------------------- #
@@ -142,7 +147,7 @@ def _save_design_yaml(output, epoch, detector, theta):
     """Write the current physical design to ``<output>/designs/detector-lfi-<epoch>.yaml`` in the
     same bare-dict format as the ``config/design/*.yaml`` files (e.g. ``initial_stereo.yaml``), so a
     snapshot can be dropped straight back in as a ``design:`` config. Size-1 arrays unwrap to scalars."""
-    design = detector.decode_design(jnp.asarray(theta, jnp.float32))  # Design namedtuple
+    design = detector.to_nominal(jnp.asarray(theta, jnp.float32))  # Design namedtuple
     physical = {}
     for name, val in zip(design._fields, design):
         flat = np.asarray(val).reshape(-1)
@@ -235,16 +240,16 @@ def optimize(seed, output, progress=True, restore=True, init_from=None, **config
     # reg_ring: network-ready (combined features, mask, normalized target) -- filled from the
     # LOCAL design neighbourhood (theta0 +/- design_eps), since the regressor is the surrogate
     # near the current design.
-    # disc_ring: raw normalized X + mask + the per-event [encoded theta | normalized
-    # conditioning] packed in the third slot -- filled over the WHOLE encoded space
+    # disc_ring: raw normalized X + mask + the per-event [scaled theta | normalized
+    # conditioning] packed in the third slot -- filled over the WHOLE scaled cube
     # (theta ~ N(0,1)), so the discriminator learns the global X-on-theta ratio (its
     # theta-gradient then supplies the score at the current design). The joint/product
     # samples are drawn from this ring (real = matched (X, theta, gt); pseudo = a SEPARATE X'
     # with an INDEPENDENT theta', each X carrying its own conditioning gt).
     # Rings store RAW records and combine per batch (combined features are wide). reg_ring +
     # val_ring rows are (event, mask, target, per-event PHYSICAL design); disc_ring rows are
-    # (event, mask, [encoded theta | normalized ground truth]) -- the disc differentiates the
-    # logit w.r.t. its per-event encoded theta, so it stores theta, not a physical design.
+    # (event, mask, [scaled theta | normalized ground truth]) -- the disc differentiates the
+    # logit w.r.t. its per-event scaled theta, so it stores theta, not a nominal design.
     M = int(jax.tree.leaves(detector.event_spec())[0].shape[0])  # per-hit count
     gt_dim = int(detector.ground_truth_dim())
     mask_spec = jax.ShapeDtypeStruct((M,), jnp.int32)
@@ -256,20 +261,28 @@ def optimize(seed, output, progress=True, restore=True, init_from=None, **config
 
     # --- jitted kernels -------------------------------------------------------
     def _sample_reg_raw(theta_pert, event_index):
-        """Raw regressor row at the (per-event perturbed) encoded design + ``event_index``: ``(event, mask,
-        target, design)`` -- the per-event physical ``Design`` record completes the row so each event
-        re-combines at the design it was generated under."""
-        phys = detector.decode_design(theta_pert)
+        """Raw regressor row at the (per-event perturbed) SCALED design + ``event_index``: ``(event, mask,
+        target, design)`` -- the per-event nominal ``Design`` record completes the row so each event
+        re-combines at the design it was generated under.
+
+        Clipped into the cube first: ``to_nominal`` of an out-of-cube theta extrapolates past the
+        design bounds and hands the non-differentiable C solver geometry outside the detector."""
+        theta_pert = jnp.clip(theta_pert, 0.0, 1.0)
+        phys = detector.to_nominal(theta_pert)
         _gt, event, mask, target = detector(phys, event_index)
         return event, mask, target, phys
 
     def _disc_batch(seq, event_index):
-        """A discriminator-ring chunk sampled over the WHOLE encoded design space (theta ~ N(0,1)) at the
+        """A discriminator-ring chunk sampled over the WHOLE scaled design space (theta ~ U[0, 1]) at the
         given ``event_index``: returns ``(event, mask, [theta | gt_norm])`` ready to push into
-        ``disc_ring`` (combine runs at train time via combine_encoded)."""
+        ``disc_ring`` (combine runs at train time via combine_scaled).
+
+        UNIFORM, not normal: the scaled cube IS the whole design space, so a uniform draw covers it
+        exactly once. A standard normal would put most of its mass outside the cube (invalid
+        geometry) and, once clipped, pile it on the corners."""
         n = int(np.asarray(event_index).shape[0])
-        theta_g = jax.random.normal(_key(seq), (n, design_dim))  # whole space
-        gt, event, mask, _target = detector(detector.decode_design(theta_g), event_index)
+        theta_g = jax.random.uniform(_key(seq), (n, design_dim))  # whole space
+        gt, event, mask, _target = detector(detector.to_nominal(theta_g), event_index)
         gt_norm = detector.normalize_ground_truth(gt)
         return event, mask, jnp.concatenate([theta_g, gt_norm], axis=-1)
 
@@ -332,8 +345,8 @@ def optimize(seed, output, progress=True, restore=True, init_from=None, **config
         k_r, k_p = jax.random.split(key)
         Xr, mr, thr, cr = real
         Xp, mp, thp, cp = pseudo
-        logit_real = disc_m(detector.combine_encoded(Xr, thr, mask=mr), mr, cr, deterministic=False, rngs=nnx.Rngs(k_r))
-        logit_pseudo = disc_m(detector.combine_encoded(Xp, thp, mask=mp), mp, cp, deterministic=False, rngs=nnx.Rngs(k_p))
+        logit_real = disc_m(detector.combine_scaled(Xr, thr, mask=mr), mr, cr, deterministic=False, rngs=nnx.Rngs(k_r))
+        logit_pseudo = disc_m(detector.combine_scaled(Xp, thp, mask=mp), mp, cp, deterministic=False, rngs=nnx.Rngs(k_p))
         # Mean BCE over both classes; the 0.5 averages the two per-example terms so a random
         # discriminator reads ~log(2), not ~2 log(2).
         loss = 0.5 * jnp.mean(jax.nn.softplus(-logit_real) + jax.nn.softplus(logit_pseudo))
@@ -344,7 +357,7 @@ def optimize(seed, output, progress=True, restore=True, init_from=None, **config
     def train_discriminator(params, state, opt_state, key, fresh, ring, n_ring):
         """``substeps`` scan-folded steps; each draw is ``batch`` rows from the current ``fresh``
         buffer + ``batch`` from the historical ``ring`` (-> 2*batch real and 2*batch pseudo).
-        ``fresh``/``ring`` are each ``(event, mask, pack)`` with pack row = [encoded theta | gt]."""
+        ``fresh``/``ring`` are each ``(event, mask, pack)`` with pack row = [scaled theta | gt]."""
         f_X, f_mask, f_pack = fresh
         r_X, r_mask, r_pack = ring
         n_fresh = jax.tree.leaves(f_X)[0].shape[0]
@@ -381,13 +394,13 @@ def optimize(seed, output, progress=True, restore=True, init_from=None, **config
     def design_step(theta, design_opt_state, event_f, mask_f, target_f, gt_f, r_params, r_state, d_params, d_state):
         """One LFI design update on a FRESH batch at the current theta (events held fixed).
         The surrogate's theta-gradient is the pathwise + score-function estimator; both the
-        regressor loss and the discriminator logit depend on theta through ``combine_encoded``.
+        regressor loss and the discriminator logit depend on theta through ``combine_scaled``.
         Returns updated ``(theta, design_opt_state)`` plus ``(loss, grad)`` for logging."""
 
         def design_loss(theta):
             reg = nnx.merge(reg_def, r_params, r_state)
             disc_m = nnx.merge(disc_def, d_params, d_state)
-            feats = detector.combine_encoded(event_f, theta, mask=mask_f)  # (design_batch, M, F) theta-path
+            feats = detector.combine_scaled(event_f, theta, mask=mask_f)  # (design_batch, M, F) theta-path
             emask = detector.element_mask(event_f, mask_f)  # regressor element mask (== mask_f for hit detectors)
             tnorm = detector.normalize_target(target_f)  # (design_batch, T)
             cnorm = detector.normalize_ground_truth(gt_f)  # (design_batch, gt_dim)
@@ -405,7 +418,8 @@ def optimize(seed, output, progress=True, restore=True, init_from=None, **config
 
         loss, dgrad = jax.value_and_grad(design_loss)(theta)
         updates, design_opt_state = design_opt.update(dgrad, design_opt_state, theta)
-        theta = optax.apply_updates(theta, updates)
+        # The searched space is the BOUNDED scaled cube, so the step is projected back into it.
+        theta = jnp.clip(optax.apply_updates(theta, updates), 0.0, 1.0)
         return theta, design_opt_state, loss, dgrad
 
     @jax.jit
@@ -479,6 +493,7 @@ def optimize(seed, output, progress=True, restore=True, init_from=None, **config
         reg_params, reg_state, reg_opt_state = restored["regressor"]
         disc_params, disc_state, disc_opt_state = restored["discriminator"]
         theta, design_opt_state = restored["design"]
+        detopt.utils.io.check_scaled_design(theta, f"{manager.directory} step {last}")
         aux = restored["aux"]
         # The replay rings are not restored -- they start empty and refill as training resumes.
         starting_epoch = int(last) + 1
@@ -567,7 +582,7 @@ def optimize(seed, output, progress=True, restore=True, init_from=None, **config
             # regressor data: LOCAL perturbation around the current design.
             theta_pert = theta[None, :] + design_eps * jax.random.normal(_key(epoch_seq), (samples, design_dim))
             fresh_reg = _sample_reg_raw(theta_pert, train_stream.next_block(samples))  # (event, mask, target, design)
-            # discriminator data: the WHOLE encoded space (theta ~ N(0,1)), independent of the design.
+            # discriminator data: the WHOLE scaled cube (theta ~ U[0, 1]), independent of the design.
             fresh_disc = _disc_batch(epoch_seq, train_stream.next_block(samples))
             reg_ring.push(*fresh_reg)
             disc_ring.push(*fresh_disc)
@@ -593,7 +608,7 @@ def optimize(seed, output, progress=True, restore=True, init_from=None, **config
 
             # (5) LFI design gradient + step on a FRESH batch at the EXACT current theta (jitted),
             # drawn from the separate 'design' pool (held out from regressor/discriminator training).
-            phys_cur = detector.decode_design(jnp.broadcast_to(theta[None, :], (design_batch, design_dim)))
+            phys_cur = detector.to_nominal(jnp.broadcast_to(theta[None, :], (design_batch, design_dim)))
             gt_d, event_d, mask_d, target_d = detector(phys_cur, design_stream.next_block(design_batch))
             theta, design_opt_state, _dloss, dgrad = design_step(
                 theta,
@@ -617,7 +632,7 @@ def optimize(seed, output, progress=True, restore=True, init_from=None, **config
 
         train_losses[epoch] = step_losses.mean()
         disc_losses[epoch] = step_disc.mean()
-        designs[epoch] = np.asarray(detector.flatten_design(detector.decode_design(theta)))
+        designs[epoch] = np.asarray(detector.flatten_design(detector.to_nominal(theta)))
         for name in labels:
             val_metrics[name][epoch] = float(val[name])
         aux = snapshot(epoch + 1)

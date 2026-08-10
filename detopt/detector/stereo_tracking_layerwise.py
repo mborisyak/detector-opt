@@ -47,7 +47,7 @@ class StereoLayerGrid(StereoStrawDetector):
         masked scatter-MAX is order-independent: a real hit always beats the floor / a padded write.
         Returns ``(grid, B)``."""
         if mask is None:
-            raise ValueError(f"{type(self).__name__}.combine_encoded requires the per-hit mask")
+            raise ValueError(f"{type(self).__name__}.combine_scaled requires the per-hit mask")
         station = jnp.asarray(event.station, jnp.int32)  # (B, M)
         view = jnp.asarray(event.view, jnp.int32)
         layer = jnp.asarray(event.layer, jnp.int32)
@@ -65,7 +65,7 @@ class StereoLayerGrid(StereoStrawDetector):
         grid = grid.at[bidx, g, s_col].max(write_val, mode="drop")  # (B, n_layers, n_straws)
         return grid, B
 
-    def _layer_positions(self, encoded_design, B):
+    def _layer_positions(self, design_scaled, B):
         """Per-layer ``(station_z_norm, view_norm, layer_norm, angle_norm, y_offset_norm)``, each
         ``(B, n_layers)`` in ~``[-1, 1]``.
 
@@ -80,10 +80,10 @@ class StereoLayerGrid(StereoStrawDetector):
         layer_view = within // self.n_layers_per_view  # (n_layers,) view-in-station
         layer_lpv = within % self.n_layers_per_view  # (n_layers,) layer-in-view
 
-        d_enc = jnp.asarray(encoded_design, jnp.float32)
-        if d_enc.ndim == 1:
-            d_enc = jnp.broadcast_to(d_enc[None, :], (B, d_enc.shape[0]))
-        phys = self._decode_flat(d_enc)  # (B, n_stations + 1) physical [station_z..., stereo_angle]
+        d_scaled = jnp.asarray(design_scaled, jnp.float32)
+        if d_scaled.ndim == 1:
+            d_scaled = jnp.broadcast_to(d_scaled[None, :], (B, d_scaled.shape[0]))
+        phys = self._to_nominal_flat(d_scaled)  # (B, n_stations + 1) physical [station_z..., stereo_angle]
         z_layer = phys[..., : self.n_stations][:, layer_station]  # (B, n_layers) each layer's station z
         z_mid = 0.5 * (self.layer_bounds[0] + self.layer_bounds[1])
         z_half = max(0.5 * (self.layer_bounds[1] - self.layer_bounds[0]), 1e-6)
@@ -117,11 +117,11 @@ class StereoLayerWise(StereoLayerGrid):
         # element axis = global layers; per-layer feature = [station_z, view, layer, angle, y_offset] ++ TDC grid
         return (self.n_layers, 5 + self.n_straws)
 
-    def combine_encoded(self, event, encoded_design, mask=None):
-        """Raw ``StrawEvent`` + ENCODED design -> per-LAYER features ``(B, n_layers, 5 + n_straws)``:
+    def combine_scaled(self, event, design_scaled, mask=None):
+        """Raw ``StrawEvent`` + SCALED design -> per-LAYER features ``(B, n_layers, 5 + n_straws)``:
         ``[station_z_norm, view_norm, layer_norm, angle_norm, y_offset_norm]`` ++ the per-layer TDC grid.
         REQUIRES ``mask``."""
         grid, B = self._tdc_grid(event, mask)
-        station_z_norm, view_norm, layer_norm, angle_norm, y_offset_norm = self._layer_positions(encoded_design, B)
+        station_z_norm, view_norm, layer_norm, angle_norm, y_offset_norm = self._layer_positions(design_scaled, B)
         positions = jnp.stack([station_z_norm, view_norm, layer_norm, angle_norm, y_offset_norm], axis=-1)  # (B,n_layers,5)
         return jnp.concatenate([positions, grid], axis=-1)  # (B, n_layers, 5 + n_straws)

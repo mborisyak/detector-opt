@@ -80,7 +80,8 @@ def continued(run, iterations="", seed: int = 0, output=None, epochs=None, progr
 
   detector = detopt.detector.from_config(config["detector"])
   design_dim = int(detector.design_dim())
-  results = json.load(open(os.path.join(run, "results.json")))["results"]
+  results_path = os.path.join(run, "results.json")
+  results = io.check_bo_results(json.load(open(results_path))["results"], results_path)
   chosen = [int(i) for i in str(iterations).split(",") if len(i) > 0] or [len(results) - 1]
   windows = bo_windows(results, int(training["n0"]), int(training["n_increment"]), float(training["val_fraction"]))
   out_dir = output if output is not None else os.path.join(run, "continued")
@@ -120,12 +121,12 @@ def continued(run, iterations="", seed: int = 0, output=None, epochs=None, progr
 
   def fill(buf, theta, event_index, desc):
     event_index = np.asarray(event_index, np.int64)
-    phys_full = detector.decode_design(jnp.broadcast_to(theta[None, :], (sample_batch, design_dim)))
+    phys_full = detector.to_nominal(jnp.broadcast_to(theta[None, :], (sample_batch, design_dim)))
     bar = tqdm(total=event_index.shape[0], desc=desc, disable=not progress)
     for o in range(0, event_index.shape[0], sample_batch):
       idx = event_index[o:o + sample_batch]
       k = idx.shape[0]
-      phys = phys_full if k == sample_batch else detector.decode_design(jnp.broadcast_to(theta[None, :], (k, design_dim)))
+      phys = phys_full if k == sample_batch else detector.to_nominal(jnp.broadcast_to(theta[None, :], (k, design_dim)))
       _gt, event, mask, target = detector(phys, idx)
       buf.push(event, mask, target)
       bar.update(k)
@@ -134,7 +135,7 @@ def continued(run, iterations="", seed: int = 0, output=None, epochs=None, progr
   def _net_loss(params, state, drop_key, theta, event_b, mask_b, target_b):
     """The TRAIN path: dropout on, each ensemble member on its own slice of the drawn minibatch."""
     reg = nnx.merge(reg_def, params, state)
-    feats = detector.combine_encoded(event_b, theta, mask=mask_b)
+    feats = detector.combine_scaled(event_b, theta, mask=mask_b)
     emask = detector.element_mask(event_b, mask_b)
     target = detector.normalize_target(target_b)
     if members is None:
@@ -175,7 +176,7 @@ def continued(run, iterations="", seed: int = 0, output=None, epochs=None, progr
       idx = jnp.clip(c * eval_batch + jnp.arange(eval_batch, dtype=jnp.int32), 0, pool_rows - 1)
       ev = jax.tree.map(lambda a: a[idx], event_buf)
       m = mask_buf[idx]
-      feats = detector.combine_encoded(ev, theta, mask=m)
+      feats = detector.combine_scaled(ev, theta, mask=m)
       emask = detector.element_mask(ev, m)
       tnorm = detector.normalize_target(jax.tree.map(lambda a: a[idx], tgt_buf))
       if members is None:
@@ -207,7 +208,7 @@ def continued(run, iterations="", seed: int = 0, output=None, epochs=None, progr
   }
   for p in chosen:
     r = results[p]
-    theta = jnp.asarray(r["x_encoded"], jnp.float32)
+    theta = jnp.asarray(r["x_scaled"], jnp.float32)
     reported = float(r["loss"])
     train_at, n_train_bo, val_at, n_val_bo = windows[p]
 
@@ -216,7 +217,7 @@ def continued(run, iterations="", seed: int = 0, output=None, epochs=None, progr
     step_saved = manager.latest_step()
     pure_params, pure_state, ckpt_design, aux = io.restore_training_checkpoint(manager)
     manager.close()
-    if not np.allclose(np.asarray(ckpt_design["encoded"], np.float32), np.asarray(r["x_encoded"], np.float32)):
+    if not np.allclose(np.asarray(ckpt_design["scaled"], np.float32), np.asarray(r["x_scaled"], np.float32)):
       raise ValueError(f"iteration {p}: checkpoint design != results.json design")
     point_model = detopt.nn.from_config(detector, config=config["regressor"], rngs=nnx.Rngs(0))
     _, params, state = nnx.split(point_model, nnx.Param, nnx.Variable)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Quick comparison of learning-rate schedules under our real stopping criterion.
 
-Trains ONE design (the debug detector, nominal encoded design) with the actual
+Trains ONE design (the debug detector, nominal design at the scaled midpoint) with the actual
 :class:`detopt.nn.trainer.DesignTrainer` -- same convergence procedure, same
 config numbers -- under three schedules, and reports how much data / how many
 epochs each needs to estimate the loss to precision:
@@ -63,7 +63,7 @@ def run(seed=0, n_max_cap=16384):
     )
     steps_per_epoch = n_max_cap // common["batch"]
     schedules = make_schedules(steps_per_epoch)
-    design = np.zeros(det.design_dim(), dtype=np.float32)  # nominal design
+    design = np.full(det.design_dim(), 0.5, dtype=np.float32)  # nominal design = the scaled midpoint
 
     rows = []
     for name, sched in schedules.items():

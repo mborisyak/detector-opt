@@ -28,7 +28,7 @@ import matplotlib
 
 matplotlib.use("AGG")
 
-from detopt.utils.viz.bo import plot_strategy_verification
+from detopt.utils.viz.bo import plot_convergence_two_panel
 
 STRATEGIES = ["from_scratch", "continue", "closest", "meta"]
 
@@ -55,24 +55,14 @@ def main(out_root, strategies):
     if len(runs) == 0:
         raise SystemExit(f"no results.json found under {out_root}/<strategy>/")
 
-    plot_strategy_verification(
+    # One figure, two stacked step-panels: top = self-evaluated best-so-far, bottom = verified
+    # (held-out) best-so-far. When no strategy has a verification.json, a single self-evaluated panel
+    # is drawn instead. Both panels share the same step style.
+    plot_convergence_two_panel(
         runs,
         os.path.join(out_root, "convergence_all.png"),
         json_path=os.path.join(out_root, "convergence_all.json"),
     )
-
-    print(f"\n{'strategy':<14} {'self-evaluated':>15} {'verified (test)':>22} {'optimism':>10}")
-    for label, run in runs.items():
-        best = min(r["loss"] for r in run["results"])
-        line = f"{label:<14} {best:>15.5f}"
-        points = (run["verification"] or {}).get("points") or []
-        if len(points) > 0:
-            last = points[-1]
-            line += (f"   {last['test_loss']:>8.5f}±{last['test_sem']:<8.5f}"
-                     f" {last['test_loss'] - last['reported_loss']:>+10.5f}")
-        print(line)
-    print("\n'verified' is the LAST verified design's held-out test loss; optimism is "
-          "verified - self-evaluated for that same design.")
     comparison_table(out_root, runs)
 
 

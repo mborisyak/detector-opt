@@ -1,0 +1,15 @@
+# Can BO's ADVANTAGE and the iteration payoff hold at the same time?
+#
+# Measured so far, both at m=4 and T in [35, 68]: at the 5% read-out BO beats random 1.31x
+# (p < 0.001) but doubling 60 -> 120 iterations buys only 0.07 C; at the 2% read-out the doubling
+# buys 0.11 C on a smaller base (12% against 5%) but BO no longer beats random (0.91x, p = 0.66).
+#
+# The hypothesis this tests: BO earns its advantage on DEAD VOLUME -- regions a surrogate learns to
+# stop proposing in and a uniform draw keeps wasting draws on. The current box was narrowed until
+# almost none is left (plateau fraction 0.00), which is exactly when uniform sampling is hard to
+# beat. A wider box restores that volume; the question is whether it does so without the roughness
+# that made the [0, 100] box unlearnable.
+#
+# Two arms, both modes each, so every BO arm is compared against a null drawn on its OWN function.
+w2 |both|--kernel permutation-invariant-rbf --set enzyme.temperature_bounds=[25.0,80.0] --set enzyme.measurement_noise=0.02
+w5 |both|--kernel permutation-invariant-rbf --set enzyme.temperature_bounds=[25.0,80.0]

@@ -87,7 +87,7 @@ def verify(seed, output=None, progress=True, **config):
 
     detector = detopt.detector.from_config(config["detector"])
     design = config.get("design") or config["nominal_design"]
-    theta = jnp.asarray(detector.encode_design(design), jnp.float32)  # the FIXED design (encoded), shared by every event
+    theta = jnp.asarray(detector.to_scaled(design), jnp.float32)  # the FIXED design (scaled), shared by every event
     design_dim = int(detector.design_dim())
     labels = tuple(detector.metric_labels())
 
@@ -111,7 +111,7 @@ def verify(seed, output=None, progress=True, **config):
 
     def fill(event_index):
         """Simulate the events at ``event_index`` at the FIXED design into a buffer (raw event, mask, raw
-        target). ``combine_encoded`` + ``normalize_target`` run per batch in the kernels."""
+        target). ``combine_scaled`` + ``normalize_target`` run per batch in the kernels."""
         event_index = np.asarray(event_index, np.int64)
         n = event_index.shape[0]
         buf = RingBuffer(n, specs, device=device)
@@ -120,7 +120,7 @@ def verify(seed, output=None, progress=True, **config):
         while filled < n:
             chunk = min(sample_chunk, n - filled)
             idx = event_index[filled:filled + chunk]
-            phys = detector.decode_design(jnp.broadcast_to(theta[None, :], (chunk, design_dim)))
+            phys = detector.to_nominal(jnp.broadcast_to(theta[None, :], (chunk, design_dim)))
             _gt, event, mask, target = detector(phys, idx)
             buf.push(event, mask, target)
             filled += chunk
@@ -130,7 +130,7 @@ def verify(seed, output=None, progress=True, **config):
 
     def _net_loss(params, state, drop_key, event_b, mask_b, target_b, count):
         reg = nnx.merge(reg_def, params, state)
-        feats = detector.combine_encoded(event_b, theta, mask=mask_b)  # fixed design (encoded), per hit
+        feats = detector.combine_scaled(event_b, theta, mask=mask_b)  # fixed design (scaled), per hit
         emask = detector.element_mask(event_b, mask_b)  # per-element mask (== hit mask, unless layer-wise)
         loss = jnp.mean(_forward_loss(reg, detector.loss, feats, emask, detector.normalize_target(target_b),
                                       members, count, deterministic=False, rngs=nnx.Rngs(drop_key)))
@@ -170,7 +170,7 @@ def verify(seed, output=None, progress=True, **config):
 
         def step(acc, chunk):
             ev_chunk, m, t = chunk
-            feats = detector.combine_encoded(ev_chunk, theta, mask=m)
+            feats = detector.combine_scaled(ev_chunk, theta, mask=m)
             emask = detector.element_mask(ev_chunk, m)
             pred = _forward_shared(reg, feats, emask, members, deterministic=True)
             md = detector.metric(pred, _target_for(detector.normalize_target(t), members))
@@ -186,7 +186,7 @@ def verify(seed, output=None, progress=True, **config):
     val_buf = fill(val_index)
     n_train = jnp.int32(len(train_buf))
 
-    print(f"design (encoded->physical): {detector.decode_design(theta)}")
+    print(f"design (scaled->nominal): {detector.to_nominal(theta)}")
     print(f"train={train_samples} val={val_samples}  steps={steps} batch={batch}  members={members or 1}")
 
     history = []

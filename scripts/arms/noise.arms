@@ -1,0 +1,12 @@
+# CONFIRMATION of the screen's winner: does a 2% read-out actually convert extra iterations into a
+# better design, and by more than the 5% read-out does?
+#
+# The screen (output/screen) says the 2% assay is smoother (correlation length 0.74 of the cube
+# against 0.52), has more room over a 20-draw shotgun (1.93x against 1.62x) and keeps paying for
+# iterations longer (1.18x from 60 to 120 draws against 1.13x). Those are LANDSCAPE statistics --
+# they say an optimiser COULD win more here, not that one does. This runs the optimiser.
+#
+# One arm, both modes: the null must be drawn on the SAME function as the BO arm, and at 2% noise
+# that is not the function output/iters120 was measured on. Read the BO-vs-null ratio within this
+# directory against the same ratio in output/iters120 -- the ratios compare, the losses do not.
+lo |both|--kernel permutation-invariant-rbf --set enzyme.measurement_noise=0.02

@@ -2,7 +2,7 @@
 
 Event generation (``__call__``) needs a data source and is not exercised here;
 these cover the differentiable / network-facing surface: record specs, design
-encode/decode, combine/combine_encoded, and the loss/metric dicts.
+nominal<->scaled, combine/combine_scaled, and the loss/metric dicts.
 """
 
 import inspect
@@ -54,10 +54,10 @@ def test_contract_surface():
     assert not hasattr(d, "update_from_yaml_design")
     for name in (
         "__call__",
-        "encode_design",
-        "decode_design",
+        "to_scaled",
+        "to_nominal",
         "combine",
-        "combine_encoded",
+        "combine_scaled",
         "event_spec",
         "target_spec",
         "ground_truth_spec",
@@ -68,7 +68,7 @@ def test_contract_surface():
         "normalize_ground_truth",
     ):
         assert hasattr(d, name), f"missing {name!r}"
-    # Event normalization is folded into combine_encoded -- no standalone event normalize/denormalize.
+    # Event normalization is folded into combine_scaled -- no standalone event normalize/denormalize.
     assert not hasattr(d, "normalize")
     assert not hasattr(d, "denormalize")
 
@@ -92,13 +92,39 @@ def test_shape_invariants():
     assert d.combined_feature_dim == 4
 
 
-def test_encode_decode_roundtrip():
+def test_scaled_nominal_roundtrip():
     d = _make_detector()
     phys = _nominal_design(d)
-    enc = d.encode_design(phys)
-    # decode_design returns a Design namedtuple now; flatten it back to compare with the flat physical.
-    back = np.asarray(d.flatten_design(d.decode_design(enc)))
-    np.testing.assert_allclose(back, phys, rtol=1e-3, atol=1e-2)
+    enc = d.to_scaled(phys)
+    assert np.all(np.asarray(enc) >= 0.0) and np.all(np.asarray(enc) <= 1.0)  # scaled IS the unit cube
+    # to_nominal returns a Design namedtuple; flatten it back to compare with the flat nominal.
+    back = np.asarray(d.flatten_design(d.to_nominal(enc)))
+    # The map is affine per coordinate, so the round trip is exact to float32.
+    np.testing.assert_allclose(back, phys, rtol=1e-6, atol=1e-3)
+
+
+def test_scaled_cube_covers_exactly_the_design_bounds():
+    """The unit cube's corners ARE the design bounds -- no saturation, nothing outside.
+
+    Under the quantile encoding the box's interior mapped to a design piled against the bounds and
+    the corners were only reached as theta -> +-inf. Affine scaling makes ``u = 0`` / ``u = 1`` the
+    bounds exactly, and every interior point admissible."""
+    d = _make_detector()
+    spec, bounds = d.design_spec(), d.design_bounds()
+    lo = np.asarray(d._to_nominal_flat(jnp.zeros(d.design_dim(), jnp.float32)))
+    hi = np.asarray(d._to_nominal_flat(jnp.ones(d.design_dim(), jnp.float32)))
+    offset = 0
+    for field, leaf in zip(spec._fields, spec):
+        n = int(np.prod(leaf.shape))
+        expected_lo, expected_hi = bounds[field]
+        np.testing.assert_allclose(lo[offset:offset + n], expected_lo, rtol=1e-6)
+        np.testing.assert_allclose(hi[offset:offset + n], expected_hi, rtol=1e-6)
+        offset += n
+    # A uniform draw in the cube is a uniform NOMINAL design: it stays inside the bounds.
+    u = np.random.default_rng(0).uniform(0.0, 1.0, (256, d.design_dim())).astype("float32")
+    p = np.asarray(jax.vmap(d._to_nominal_flat)(jnp.asarray(u)))
+    assert np.all(np.isfinite(p))
+    assert np.all(p >= np.minimum(lo, hi) - 1e-3) and np.all(p <= np.maximum(lo, hi) + 1e-3)
 
 
 def test_design_record_contract():
@@ -109,41 +135,41 @@ def test_design_record_contract():
     # flatten/unflatten round-trip on the flat physical vector (via the tensor codec)
     a = np.arange(d.design_dim(), dtype=np.float32)
     np.testing.assert_allclose(np.asarray(d.flatten_design(d.unflatten_design(a))), a)
-    # decode -> Design namedtuple whose fields are the spec fields
-    enc = jnp.asarray(np.random.default_rng(0).standard_normal(d.design_dim()).astype("float32"))
-    assert d.decode_design(enc)._fields == spec._fields
+    # to_nominal -> Design namedtuple whose fields are the spec fields
+    enc = jnp.asarray(np.random.default_rng(0).uniform(0.0, 1.0, d.design_dim()).astype("float32"))
+    assert d.to_nominal(enc)._fields == spec._fields
 
 
-def test_encode_decode_jittable():
+def test_scaling_jittable():
     d = _make_detector()
     phys = jnp.asarray(_nominal_design(d))
-    enc = jax.jit(d.encode_design)(phys)
+    enc = jax.jit(d.to_scaled)(phys)
     assert enc.shape == (d.design_dim(),)
     assert bool(jnp.all(jnp.isfinite(enc)))
 
 
-def test_combine_encoded_shape_and_broadcast():
+def test_combine_scaled_shape_and_broadcast():
     d = _make_detector()
     B = 3
     rng = np.random.default_rng(1)
     event = _fab_event(d, B, rng)
-    d_enc = jnp.asarray(rng.standard_normal(d.design_dim()).astype("float32"))
+    d_enc = jnp.asarray(rng.uniform(0.0, 1.0, d.design_dim()).astype("float32"))
 
-    feats_1d = d.combine_encoded(event, d_enc)
-    feats_2d = d.combine_encoded(event, jnp.broadcast_to(d_enc[None, :], (B, d.design_dim())))
+    feats_1d = d.combine_scaled(event, d_enc)
+    feats_2d = d.combine_scaled(event, jnp.broadcast_to(d_enc[None, :], (B, d.design_dim())))
     assert feats_1d.shape == (B, d.max_hits_per_event, d.combined_feature_dim)  # compact fixed width
     # A 1-D design broadcasts to the per-row design.
     np.testing.assert_allclose(np.asarray(feats_1d), np.asarray(feats_2d), rtol=1e-5)
 
 
-def test_combine_matches_combine_encoded():
-    """``combine(event, design)`` defaults to ``combine_encoded(event, encode_design(design))``."""
+def test_combine_matches_combine_scaled():
+    """``combine(event, design)`` defaults to ``combine_scaled(event, to_scaled(design))``."""
     d = _make_detector()
     rng = np.random.default_rng(5)
     event = _fab_event(d, 3, rng)
-    enc = d.encode_design(jnp.asarray(_nominal_design(d)))
-    a = d.combine(event, d.decode_design(enc))  # physical Design -> encode -> combine_encoded
-    b = d.combine_encoded(event, enc)
+    enc = d.to_scaled(jnp.asarray(_nominal_design(d)))
+    a = d.combine(event, d.to_nominal(enc))  # nominal Design -> scale -> combine_scaled
+    b = d.combine_scaled(event, enc)
     np.testing.assert_allclose(np.asarray(a), np.asarray(b), rtol=1e-4, atol=1e-4)
 
 
@@ -151,9 +177,9 @@ def test_combine_differentiable_wrt_design():
     d = _make_detector()
     rng = np.random.default_rng(2)
     event = _fab_event(d, 2, rng)
-    d_enc = jnp.asarray(rng.standard_normal(d.design_dim()).astype("float32"))
+    d_enc = jnp.asarray(rng.uniform(0.0, 1.0, d.design_dim()).astype("float32"))
 
-    grad = jax.grad(lambda e: jnp.sum(d.combine_encoded(event, e)))(d_enc)
+    grad = jax.grad(lambda e: jnp.sum(d.combine_scaled(event, e)))(d_enc)
     assert bool(jnp.all(jnp.isfinite(grad)))
     assert float(jnp.sum(jnp.abs(grad))) > 0.0
 

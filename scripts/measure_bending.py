@@ -34,9 +34,9 @@ from detopt.utils.events import shuffled_event_index  # noqa: E402
 def measure(seed=0, n_events=4096, out="bending.png", **config):
     detector = detopt.detector.from_config(config["detector"])
 
-    # Physical (un-encoded) design from the config `design:` ref -> per-layer z planes.
-    theta = detector.encode_design(config["design"])
-    phys = np.asarray(detector.flatten_design(detector.decode_design(theta)), np.float32)
+    # Nominal (un-scaled) design from the config `design:` ref -> per-layer z planes.
+    theta = detector.to_scaled(config["design"])
+    phys = np.asarray(detector.flatten_design(detector.to_nominal(theta)), np.float32)
     layer_z = np.asarray(detector._design_to_geometry(phys[None, :])[0][0], np.float32)  # (n_planes,)
     design = np.broadcast_to(phys[None, :], (int(n_events), phys.shape[0]))  # one row per event
 

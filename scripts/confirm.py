@@ -29,6 +29,7 @@ import numpy as np
 
 import detopt
 from detopt.nn.trainer import FullBudgetTrainer
+from detopt.utils import io
 from detopt.utils.events import shuffled_event_index
 from detopt.utils.viz.bo import plot_confirmation
 
@@ -39,16 +40,16 @@ def confirm(results, max_epochs: int = 100, seed: int = 0, **config):
         run = json.load(f)
 
     # Best design = the iteration with the lowest reported loss. We retrain on its
-    # *encoded* design (the trainer decodes it to physical for the detector).
-    rs = run["results"]
+    # *scaled* design (the trainer un-scales it to nominal for the detector).
+    rs = io.check_bo_results(run["results"], results)
     best = min(rs, key=lambda r: r["loss"])
-    design_enc = np.asarray(best["x_encoded"], dtype=np.float32)
+    design_scaled = np.asarray(best["x_scaled"], dtype=np.float32)
     bo_loss, bo_std = float(best["loss"]), float(best.get("loss_std", float("nan")))
     print(f"Best design: iteration {best['iteration']} of {len(rs)} " f"| BO loss = {bo_loss:.4f} ± {bo_std:.4f}")
 
     detector = detopt.detector.from_config(config["detector"])
-    phys = np.asarray(detector.flatten_design(detector.decode_design(design_enc)), dtype=np.float32)
-    print(f"  encoded  = {design_enc.tolist()}")
+    phys = np.asarray(detector.flatten_design(detector.to_nominal(design_scaled)), dtype=np.float32)
+    print(f"  scaled   = {design_scaled.tolist()}")
     print(f"  physical = {phys.tolist()}")
 
     trainer = FullBudgetTrainer.from_config(detector, config, max_epochs=max_epochs, seed=seed)
@@ -67,7 +68,7 @@ def confirm(results, max_epochs: int = 100, seed: int = 0, **config):
         f"Sampling the full budget ({budget} detector calls) under this design and "
         f"training a fresh regressor for {max_epochs} epochs (cosine LR, seed={seed})..."
     )
-    result = trainer.train(design_enc, np.random.SeedSequence(seed), on_epoch=_progress)
+    result = trainer.train(design_scaled, np.random.SeedSequence(seed), on_epoch=_progress)
 
     print(
         f"\nConfirmed loss = {result.objective_loss:.4f} ± {result.objective_std:.4f} "
@@ -81,7 +82,7 @@ def confirm(results, max_epochs: int = 100, seed: int = 0, **config):
     snap = last.get("snap")
     record = {
         "best_iteration": best["iteration"],
-        "design_encoded": design_enc.tolist(),
+        "design_scaled": design_scaled.tolist(),
         "design_physical": phys.tolist(),
         "bo_loss": bo_loss,
         "bo_loss_std": bo_std,
@@ -116,7 +117,7 @@ def evaluate(checkpoint, seed: int = 0, step=None, **config):
 
     Restores the regressor from a training ``checkpoint`` (and the design it was
     trained for), then scores it on the whole detector-call budget of freshly
-    sampled events at that design (design-conditioned, the design's true encoded
+    sampled events at that design (design-conditioned, the design's true scaled
     geometry). Answers: does this network's reported per-design loss hold up on
     fresh held-out data?
     """
@@ -140,10 +141,10 @@ def evaluate(checkpoint, seed: int = 0, step=None, **config):
     stored = io.restore_config(manager, used_step)
     regressor_config = stored["regressor"] if stored is not None else config["regressor"]
 
-    design_enc = np.asarray(design["encoded"], dtype=np.float32)
-    phys = np.asarray(detector.flatten_design(detector.decode_design(design_enc)), dtype=np.float32)
+    design_scaled = np.asarray(design["scaled"], dtype=np.float32)
+    phys = np.asarray(detector.flatten_design(detector.to_nominal(design_scaled)), dtype=np.float32)
     print(f"Loaded checkpoint {checkpoint} (step {used_step})")
-    print(f"  design encoded  = {design_enc.tolist()}")
+    print(f"  design scaled   = {design_scaled.tolist()}")
     if aux:
         rec_t = float(aux.get("train_loss", float("nan")))
         rec_v = float(aux.get("val_loss", float("nan")))
@@ -159,8 +160,8 @@ def evaluate(checkpoint, seed: int = 0, step=None, **config):
     @jax.jit
     def eval_batch(params, state, event, mask, target):
         net = nnx.merge(graphdef, params, state)
-        # The design's true ENCODED design (1-D -> combine_encoded broadcasts per event).
-        feats = detector.combine_encoded(event, design_enc, mask=mask)
+        # The design's true SCALED design (1-D -> combine_scaled broadcasts per event).
+        feats = detector.combine_scaled(event, design_scaled, mask=mask)
         emask = detector.element_mask(event, mask)
         return net.loss(detector.loss, feats, emask, detector.normalize_target(target),
                         deterministic=True)  # per-event (B,)
@@ -190,7 +191,7 @@ def evaluate(checkpoint, seed: int = 0, step=None, **config):
                 "checkpoint": os.path.abspath(checkpoint),
                 "step": int(used_step),
                 "design_blind": bool(design_blind),
-                "design_encoded": design_enc.tolist(),
+                "design_scaled": design_scaled.tolist(),
                 "design_physical": phys.tolist(),
                 "checkpoint_train_loss": (float(aux.get("train_loss")) if aux and "train_loss" in aux else None),
                 "checkpoint_val_loss": (float(aux.get("val_loss")) if aux and "val_loss" in aux else None),

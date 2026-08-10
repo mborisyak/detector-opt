@@ -18,7 +18,7 @@ detectors decide *how*.
     them generically with ``jax.tree``.
 
   * ``__call__(seed, design) -> (ground_truth, event, mask, target)`` generates
-    events. ``design`` is **un-encoded** (physical ``Design`` / config Mapping /
+    events. ``design`` is **NOMINAL** (physical ``Design`` / config Mapping /
     flat array), leading axis ``B``::
 
         ground_truth : GroundTruth -- generator truth (== conditioning)
@@ -28,17 +28,20 @@ detectors decide *how*.
 
     Event generation is host-side (numpy) and non-differentiable.
 
-  * ``encode_design(d) -> d_enc`` is a bijection from the interior of the
-    constrained space onto unconstrained R^n; it accepts a ``Design`` namedtuple,
-    a config ``Mapping``, or an already-flat physical array. ``decode_design`` is
-    its inverse and returns a ``Design``. Both are differentiable / jittable.
+  * A design lives in exactly TWO spaces. ``to_scaled(d) -> d_scaled`` is a
+    bijection from the constrained NOMINAL (physical) space onto the SCALED cube
+    ``[0, 1]^n``, each coordinate affinely on its own design range; it accepts a
+    ``Design`` namedtuple, a config ``Mapping``, or an already-flat nominal array.
+    ``to_nominal`` is its inverse and returns a ``Design``. Both are
+    differentiable / jittable. There is no third (unconstrained) space: optimisers
+    search the scaled cube directly, so a uniform draw there IS a uniform design.
 
-  * ``combine_encoded(event, d_enc) -> features`` merges a *raw* event and an
-    *encoded* design into a single design-informed event -- it normalises/packs
+  * ``combine_scaled(event, d_scaled) -> features`` merges a *raw* event and a
+    *scaled* design into a single design-informed event -- it normalises/packs
     the event itself (there is no separate ``normalize``), differentiable w.r.t.
-    the encoded design; the hit ``mask`` is threaded separately by the caller.
+    the scaled design; the hit ``mask`` is threaded separately by the caller.
     ``combine(event, design)`` is the convenience wrapper
-    ``combine_encoded(event, encode_design(design))`` used when training from
+    ``combine_scaled(event, to_scaled(design))`` used when training from
     buffers that store the raw physical design.
 
   * ``normalize_target(Target) -> Array`` maps targets into the network's flat
@@ -50,9 +53,10 @@ detectors decide *how*.
     array against the flat normalised label and return per-sample ``(B,)`` arrays.
 
   * The ``*_spec`` records are the source of truth; the ``*_dim`` accessors
-    (``design_dim``, ``encoded_design_dim``, ``target_dim``, ``ground_truth_dim``,
-    ``combined_feature_dim``) are derived for the convenience of the networks.
-    ``encoded_design_shape`` and ``combined_event_shape`` stay flat-array shapes.
+    (``design_dim``, ``target_dim``, ``ground_truth_dim``, ``combined_feature_dim``)
+    are derived for the convenience of the networks. ``design_shape`` and
+    ``combined_event_shape`` stay flat-array shapes; ``design_shape`` covers both
+    design spaces, which share a width.
 """
 
 import math
@@ -119,12 +123,9 @@ class Detector(object):
         raise NotImplementedError()
 
     def design_shape(self) -> Shape:
-        """Flat physical design shape (defined per detector)."""
+        """Flat design shape, shared by BOTH spaces: the scaled vector is the nominal design one
+        coordinate at a time on ``[0, 1]``, so it has the same width (defined per detector)."""
         raise NotImplementedError()
-
-    def encoded_design_shape(self) -> Shape:
-        """Encoded (unconstrained) design shape; may differ from ``design_shape``."""
-        return self.design_shape()
 
     def combined_event_shape(self):
         """Per-hit feature shape ``(M, F)`` produced by :meth:`combine` (a flat float array)."""
@@ -135,9 +136,6 @@ class Detector(object):
     # ------------------------------------------------------------------ #
     def design_dim(self):
         return _prod(self.design_shape())
-
-    def encoded_design_dim(self):
-        return _prod(self.encoded_design_shape())
 
     def target_dim(self):
         return _spec_dim(self.target_spec())
@@ -163,10 +161,13 @@ class Detector(object):
         raise NotImplementedError()
 
     # ------------------------------------------------------------------ #
-    # Physical design as a typed ``Design`` namedtuple (e.g. stereo: ``(stations, angle)``); the
-    # ENCODED design stays a single flat vector. A detector defines ``design_spec`` (the ``Design``
-    # namedtuple filled with ``jax.ShapeDtypeStruct`` -- same shape as ``event_spec``/``target_spec``),
-    # ``design_bounds``, and the flat physical<->encoded bijection (``_encode_flat`` / ``_decode_flat``).
+    # A design lives in exactly TWO spaces. NOMINAL is the physical design, a typed ``Design``
+    # namedtuple (e.g. stereo: ``(stations, angle)``), used for reading a starting design from the
+    # config and for writing results; SCALED is a single flat vector in ``[0, 1]^d``, each coordinate
+    # on its own design range, and is what every optimiser searches and every network is conditioned
+    # on. A detector defines ``design_spec`` (the ``Design`` namedtuple filled with
+    # ``jax.ShapeDtypeStruct`` -- same shape as ``event_spec``/``target_spec``), ``design_bounds``,
+    # and the flat nominal<->scaled bijection (``_to_scaled_flat`` / ``_to_nominal_flat``).
     # The record<->flat conversion (``flatten_design`` / ``unflatten_design``) is GENERIC here, via the
     # ``tensor`` codec over the design pytree -- exactly how Event/Target records are packed.
     # ------------------------------------------------------------------ #
@@ -205,28 +206,32 @@ class Detector(object):
 
         return tensor.unflatten(tensor.structure(self.design_spec()), jnp.asarray(flat, jnp.float32))
 
-    def encode_design(self, design):
-        """Physical design (``Design`` namedtuple, config Mapping, or flat array) -> encoded vector."""
-        return self._encode_flat(self.flatten_design(design))
+    def to_scaled(self, design):
+        """NOMINAL design (``Design`` namedtuple, config Mapping, or flat array) -> SCALED vector."""
+        return self._to_scaled_flat(self.flatten_design(design))
 
-    def decode_design(self, encoded_design):
-        """Encoded flat vector -> physical ``Design`` namedtuple."""
-        return self.unflatten_design(self._decode_flat(encoded_design))
+    def to_nominal(self, design_scaled):
+        """SCALED flat vector -> NOMINAL ``Design`` namedtuple."""
+        return self.unflatten_design(self._to_nominal_flat(design_scaled))
 
-    def _encode_flat(self, design):
-        """Flat physical design array -> encoded vector (the bijection; defined per detector)."""
+    def _to_scaled_flat(self, design):
+        """Flat NOMINAL design -> SCALED ``[0, 1]`` vector (the bijection; defined per detector).
+
+        For most detectors this is the per-coordinate affine map of ``design_bounds``; where a
+        coordinate's range depends on another (the stereo stations are ordered, so station k's range
+        starts at station k-1), the detector implements that coupling here."""
         raise NotImplementedError()
 
-    def _decode_flat(self, encoded_design):
-        """Encoded vector -> flat physical design array (inverse of :meth:`_encode_flat`)."""
+    def _to_nominal_flat(self, design_scaled):
+        """SCALED vector -> flat NOMINAL design (inverse of :meth:`_to_scaled_flat`)."""
         raise NotImplementedError()
 
     # ------------------------------------------------------------------ #
     # Combine: raw event (+ design) -> flat per-hit network features.
     # ------------------------------------------------------------------ #
-    def combine_encoded(self, event, encoded_design, mask=None):
-        """Merge a raw ``Event`` and an ENCODED design into ``features (..., M, F)`` (defined per
-        detector). Normalises/packs the event internally; differentiable w.r.t. the encoded design.
+    def combine_scaled(self, event, design_scaled, mask=None):
+        """Merge a raw ``Event`` and a SCALED design into ``features (..., M, F)`` (defined per
+        detector). Normalises/packs the event internally; differentiable w.r.t. the scaled design.
 
         ``mask`` (the per-hit validity mask) is OPTIONAL: hit-wise combines ignore it (padded hits
         carry index 0 and are zeroed downstream by the regressor mask). Combines whose element axis
@@ -235,14 +240,14 @@ class Detector(object):
         raise NotImplementedError()
 
     def combine(self, event, design, mask=None):
-        """Merge a raw ``Event`` and a PHYSICAL design: encode it, then :meth:`combine_encoded`. NEVER
-        overridden -- the feature layout varies through ``combine_encoded``. (The FairShip replay is NOT
-        design-blind: the caller passes the geometry the data was recorded at -- it already has it.)"""
-        return self.combine_encoded(event, self.encode_design(design), mask=mask)
+        """Merge a raw ``Event`` and a NOMINAL design: scale it, then :meth:`combine_scaled`. NEVER
+        overridden -- the feature layout varies through :meth:`combine_scaled`. (The FairShip replay is
+        NOT design-blind: the caller passes the geometry the data was recorded at -- it already has it.)"""
+        return self.combine_scaled(event, self.to_scaled(design), mask=mask)
 
     def element_mask(self, event, mask):
         """Per-ELEMENT validity mask ``(..., n_elements)`` for the regressor aggregation -- the element
-        axis matches :meth:`combine_encoded`, so each combine leaf IMPLEMENTS it: a hit-wise combine
+        axis matches :meth:`combine_scaled`, so each combine leaf IMPLEMENTS it: a hit-wise combine
         returns the hit ``mask`` unchanged (element == hit); a layer-wise combine returns the all-valid
         per-layer mask. Abstract here (it varies with the combine)."""
         raise NotImplementedError()

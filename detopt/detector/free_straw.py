@@ -15,8 +15,7 @@ from typing import NamedTuple
 import jax
 import numpy as np
 
-from .straw import StrawDetector, four_feature_combine, four_feature_shape
-from ..utils.encoding import normal_to_uniform_jax, uniform_to_normal_jax
+from .straw import StrawDetector, four_feature_combine, four_feature_shape, scale, unscale
 
 __all__ = ["FreeStrawDetector", "FreeDesign", "free_design_array"]
 
@@ -92,40 +91,43 @@ class FreeStrawDetector(StrawDetector):
                 np.ascontiguousarray(np.asarray(d.B)[:, 0], np.float32))
 
     # ------------------------------------------------------------------ #
-    # Encode/decode (constrained <-> N(0,1)), differentiable
+    # Nominal <-> scaled: each block affinely on its own bound, differentiable
     # ------------------------------------------------------------------ #
-    def _encode_flat(self, design):
+    def _to_scaled_flat(self, design):
         import jax.numpy as jnp
 
-        design = jnp.asarray(design, dtype=jnp.float32)
+        d = jnp.asarray(design, dtype=jnp.float32)
         n = self.n_layers
-        pos_e = uniform_to_normal_jax(design[..., :n], *self.layer_bounds)
-        ang_e = uniform_to_normal_jax(design[..., n : 2 * n], *self.angle_bounds)
-        B_e = uniform_to_normal_jax(design[..., 2 * n : 2 * n + 1], *self.b_bounds())
-        return jnp.concatenate([pos_e, ang_e, B_e], axis=-1)
+        return jnp.concatenate([
+            scale(d[..., :n], self.layer_bounds),
+            scale(d[..., n : 2 * n], self.angle_bounds),
+            scale(d[..., 2 * n : 2 * n + 1], self.b_bounds()),
+        ], axis=-1)
 
-    def _decode_flat(self, encoded_design):
+    def _to_nominal_flat(self, design_scaled):
         import jax.numpy as jnp
 
-        enc = jnp.asarray(encoded_design, dtype=jnp.float32)
+        u = jnp.asarray(design_scaled, dtype=jnp.float32)
         n = self.n_layers
-        pos_d = normal_to_uniform_jax(enc[..., :n], *self.layer_bounds)
-        ang_d = normal_to_uniform_jax(enc[..., n : 2 * n], *self.angle_bounds)
-        B_d = normal_to_uniform_jax(enc[..., 2 * n : 2 * n + 1], *self.b_bounds())
-        return jnp.concatenate([pos_d, ang_d, B_d], axis=-1)
+        return jnp.concatenate([
+            unscale(u[..., :n], self.layer_bounds),
+            unscale(u[..., n : 2 * n], self.angle_bounds),
+            unscale(u[..., 2 * n : 2 * n + 1], self.b_bounds()),
+        ], axis=-1)
 
-    def _decode_to_layer_geometry(self, d_enc):
-        """Encoded design -> per-layer ``(positions(B,n), angles(B,n), B(B))``.
-        The free design *is* per-layer, so decode + split."""
-        phys = self._decode_flat(d_enc)
+
+    def _scaled_to_layer_geometry(self, design_scaled):
+        """Scaled design -> per-layer ``(positions(B,n), angles(B,n), B(B))``.
+        The free design *is* per-layer, so un-scale + split."""
+        phys = self._to_nominal_flat(design_scaled)
         n = self.n_layers
         return phys[:, :n], phys[:, n : 2 * n], phys[:, 2 * n]
 
     # ------------------------------------------------------------------ #
     # Combine: the shared 4-feature per-hit combine (element == hit).
     # ------------------------------------------------------------------ #
-    def combine_encoded(self, event, encoded_design, mask=None):
-        return four_feature_combine(self, event, encoded_design, mask=mask)
+    def combine_scaled(self, event, design_scaled, mask=None):
+        return four_feature_combine(self, event, design_scaled, mask=mask)
 
     def combined_event_shape(self):
         return four_feature_shape(self)

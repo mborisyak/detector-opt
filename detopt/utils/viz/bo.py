@@ -11,7 +11,8 @@ import os
 
 import numpy as np
 
-__all__ = ["plot_iteration", "plot_convergence", "plot_convergence_comparison", "plot_confirmation"]
+__all__ = ["plot_iteration", "plot_convergence", "plot_convergence_comparison",
+           "plot_convergence_two_panel", "plot_confirmation"]
 
 
 def plot_iteration(history, iteration, design, val_loss, plots_dir):
@@ -279,6 +280,67 @@ def plot_strategy_verification(runs, out_path, *, json_path=None, title="BO conv
             json.dump({"runs": dumped}, f, indent=2, default=float)
         print(f"  [plot] plotted values -> {json_path}")
     return out_path
+
+
+def plot_convergence_two_panel(runs, out_path, *, json_path=None, title="BO convergence by strategy"):
+  """Two stacked step-panels sharing an x-axis: TOP = each strategy's self-evaluated best-so-far
+  loss, BOTTOM = the same for the independently verified (held-out test) designs. When no strategy
+  has a verification, only the single self-evaluated panel is drawn. Both panels use the SAME step
+  style (matching :func:`plot_convergence_comparison`); colour+marker follow the strategy, never its
+  rank. Everything drawn is written to ``json_path`` so either panel regenerates without re-running.
+
+  ``runs`` maps a strategy label -> ``{"results": [...], "verification": {...} | None}``.
+  """
+  import json
+
+  from matplotlib.figure import Figure
+
+  has_verif = any((run.get("verification") or {}).get("points") for run in runs.values())
+  fig = Figure(figsize=(9, 8) if has_verif else (9, 5))
+  if has_verif:
+    ax_self, ax_ver = fig.subplots(2, 1, sharex=True)
+  else:
+    ax_self, ax_ver = fig.subplots(), None
+
+  dumped = {}
+  for index, (label, run) in enumerate(runs.items()):
+    results = run.get("results") or []
+    if len(results) == 0:
+      continue
+    colour, marker = _STRATEGY_STYLE[index % len(_STRATEGY_STYLE)]
+    calls = np.cumsum([r["spent"] for r in results], dtype=np.float64)
+    best = np.minimum.accumulate([r["loss"] for r in results])
+    ax_self.step(calls, best, where="post", lw=2, marker=marker, ms=3, color=colour, label=label)
+    entry = {"self_evaluated": {"calls": calls.tolist(), "best_so_far": best.tolist()}}
+
+    points = sorted(((run.get("verification") or {}).get("points") or []), key=lambda p: p["detector_calls"])
+    if ax_ver is not None and len(points) > 0:
+      vx = np.array([p["detector_calls"] for p in points], dtype=np.float64)
+      vbest = np.minimum.accumulate([p["test_loss"] for p in points])
+      ax_ver.step(vx, vbest, where="post", lw=2, marker=marker, ms=3, color=colour, label=label)
+      entry["verified"] = {"calls": vx.tolist(), "best_so_far": vbest.tolist(),
+                           "test_loss": [float(p["test_loss"]) for p in points],
+                           "test_sem": [float(p["test_sem"]) for p in points]}
+    dumped[label] = entry
+
+  for ax in (a for a in (ax_self, ax_ver) if a is not None):
+    ax.set_yscale("log")
+    ax.grid(True, alpha=0.3)
+    ax.set_ylabel("best-so-far loss (norm. MSE)")
+    ax.legend(loc="upper right", fontsize=9)
+  ax_self.set_title(f"{title} — self-evaluated")
+  if ax_ver is not None:
+    ax_ver.set_title("verified (held-out test)")
+  (ax_ver or ax_self).set_xlabel("cumulative detector calls (simulated events)")
+  fig.tight_layout()
+  fig.savefig(out_path, dpi=120)
+  print(f"  [plot] strategy comparison (two-panel) -> {out_path}")
+
+  if json_path is not None:
+    with open(json_path, "w") as f:
+      json.dump({"runs": dumped}, f, indent=2, default=float)
+    print(f"  [plot] plotted values -> {json_path}")
+  return out_path
 
 
 def _median_step(curves):

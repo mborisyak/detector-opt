@@ -23,7 +23,7 @@ class ContinualTrainer(_DesignBase):
     * **Replay sampling** -- each minibatch is half from the current design's
       window ``[w0, w0 + count)`` and half drawn uniformly from all past
       iterations' data ``[0, w0)``. The first design (``w0 == 0``, no history)
-      draws both halves from its own window. Past events carry their own encoded
+      draws both halves from its own window. Past events carry their own scaled
       design in the pool, so ``combine`` handles the mixed-design batch.
     """
 

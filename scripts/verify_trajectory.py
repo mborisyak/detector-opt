@@ -88,7 +88,7 @@ def _key(seq):
 
 def _load_trajectory(path):
   """Load a bo.py run's ``results.json`` (given directly, or found in a run directory). Returns a
-  dict with the flat PHYSICAL designs ``(n, d)``, the ENCODED designs (exactly what the optimizer
+  dict with the flat NOMINAL designs ``(n, d)``, the SCALED designs (exactly what the optimizer
   evaluated), the cumulative detector ``calls`` per iteration (cumsum of the recorded per-design
   ``spent``) and the run's reported objective loss per iteration."""
   if os.path.isdir(path):
@@ -97,10 +97,11 @@ def _load_trajectory(path):
     rs = json.load(f)["results"]
   if len(rs) == 0:
     raise ValueError(f"{path}: empty BO results")
+  io.check_bo_results(rs, path)
   return {
     "path": path,
     "physical": np.asarray([r["design"] for r in rs], np.float32),
-    "encoded": np.asarray([r["x_encoded"] for r in rs], np.float32),
+    "scaled": np.asarray([r["x_scaled"] for r in rs], np.float32),
     "calls": np.cumsum([int(r["spent"]) for r in rs]).astype(np.float64),
     "reported": np.asarray([r["loss"] for r in rs], np.float64),
   }
@@ -215,7 +216,7 @@ def verify(trajectory, seed: int = 0, output=None, progress: str = "bar", force:
 
   # Three disjoint fixed-design buffers of raw (event, mask, target) rows, allocated once and fully
   # overwritten per trajectory point (the design is fixed per point -> no per-event design column;
-  # ``combine_encoded`` runs per batch with the point's theta).
+  # ``combine_scaled`` runs per batch with the point's theta).
   M = int(jax.tree.leaves(detector.event_spec())[0].shape[0])  # per-hit count
   specs = (detector.event_spec(), jax.ShapeDtypeStruct((M, ), jnp.int32), detector.target_spec())
   train_buf = RingBuffer(len(train_index), specs, device=device)
@@ -238,19 +239,19 @@ def verify(trajectory, seed: int = 0, output=None, progress: str = "bar", force:
   draw = (members or 1) * batch
 
   def fill(buf, theta, event_index, desc):
-    """(Re)fill ``buf`` with the events at ``event_index`` simulated at the FIXED encoded design
+    """(Re)fill ``buf`` with the events at ``event_index`` simulated at the FIXED scaled design
     ``theta``; pushing exactly ``capacity`` rows overwrites the whole ring. STRICTLY SERIAL: the
     propagation engine fills detector-owned buffers in place, so concurrent calls on one detector
     instance corrupt each other (verified: threaded fills produce NaN losses)."""
     event_index = np.asarray(event_index, np.int64)
     n = event_index.shape[0]
     # One decoded physical design serves every full-size chunk (theta is fixed within a fill).
-    phys_full = detector.decode_design(jnp.broadcast_to(theta[None, :], (sample_batch, design_dim)))
+    phys_full = detector.to_nominal(jnp.broadcast_to(theta[None, :], (sample_batch, design_dim)))
     bar = tqdm(total=n, desc=desc, disable=progress != "bar")
     for o in range(0, n, sample_batch):
       idx = event_index[o:o + sample_batch]
       k = idx.shape[0]
-      phys = phys_full if k == sample_batch else detector.decode_design(jnp.broadcast_to(theta[None, :], (k, design_dim)))
+      phys = phys_full if k == sample_batch else detector.to_nominal(jnp.broadcast_to(theta[None, :], (k, design_dim)))
       _gt, event, mask, target = detector(phys, idx)
       buf.push(event, mask, target)
       bar.update(k)
@@ -258,7 +259,7 @@ def verify(trajectory, seed: int = 0, output=None, progress: str = "bar", force:
 
   def _net_loss(params, state, drop_key, theta, event_b, mask_b, target_b):
     reg = nnx.merge(reg_def, params, state)
-    feats = detector.combine_encoded(event_b, theta, mask=mask_b)  # fixed design (encoded), per hit
+    feats = detector.combine_scaled(event_b, theta, mask=mask_b)  # fixed design (scaled), per hit
     emask = detector.element_mask(event_b, mask_b)  # per-element mask (== hit mask, unless layer-wise)
     loss = jnp.mean(
       _forward_loss(
@@ -302,7 +303,7 @@ def verify(trajectory, seed: int = 0, output=None, progress: str = "bar", force:
       idx = jnp.clip(c * eval_batch + jnp.arange(eval_batch, dtype=jnp.int32), 0, pool_rows - 1)
       ev = jax.tree.map(lambda a: a[idx], event_buf)
       m = mask_buf[idx]
-      feats = detector.combine_encoded(ev, theta, mask=m)
+      feats = detector.combine_scaled(ev, theta, mask=m)
       emask = detector.element_mask(ev, m)
       tnorm = detector.normalize_target(jax.tree.map(lambda a: a[idx], tgt_buf))
       pred = _predict_shared(reg, feats, emask, members)
@@ -367,8 +368,8 @@ def verify(trajectory, seed: int = 0, output=None, progress: str = "bar", force:
         f"[point {rank + 1}/{len(chosen)}] iteration {p} already verified: test={pt['test_loss']:.4f} -- skipped", flush=True
       )
       continue
-    theta = jnp.asarray(traj["encoded"][p], jnp.float32)  # exactly what the optimizer evaluated
-    phys_flat = np.asarray(detector.flatten_design(detector.decode_design(theta)), np.float32)
+    theta = jnp.asarray(traj["scaled"][p], jnp.float32)  # exactly what the optimizer evaluated
+    phys_flat = np.asarray(detector.flatten_design(detector.to_nominal(theta)), np.float32)
     reported = float(traj["reported"][p])
     print(
       f"\n[point {rank + 1}/{len(chosen)}] iteration {p} @ {traj['calls'][p]:.0f} detector calls | "
@@ -387,7 +388,7 @@ def verify(trajectory, seed: int = 0, output=None, progress: str = "bar", force:
     point_model = detopt.nn.from_config(detector, config=config["regressor"], rngs=nnx.Rngs(_key(point_seq)))
     _, params, state = nnx.split(point_model, nnx.Param, nnx.Variable)
     pure_params, pure_state, ckpt_design = _restore_design_network(run_dir, p)
-    if not np.allclose(np.asarray(ckpt_design["encoded"], np.float32), np.asarray(traj["encoded"][p], np.float32)):
+    if not np.allclose(np.asarray(ckpt_design["scaled"], np.float32), np.asarray(traj["scaled"][p], np.float32)):
       raise ValueError(f"iteration {p}: the checkpoint's design differs from the one in results.json")
     nnx.replace_by_pure_dict(params, pure_params)
     nnx.replace_by_pure_dict(state, pure_state)
@@ -433,7 +434,7 @@ def verify(trajectory, seed: int = 0, output=None, progress: str = "bar", force:
       "detector_calls": float(traj["calls"][p]),
       "reported_loss": reported,
       "design_physical": phys_flat.tolist(),
-      "design_encoded": np.asarray(theta).tolist(),
+      "design_scaled": np.asarray(theta).tolist(),
       "best_epoch": int(best_epoch),
       "train_loss": train_loss,
       "val_loss": float(best_val),

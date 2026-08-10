@@ -22,7 +22,7 @@ single compiled kernel serves any window position/fill without recompiling.
 
 Every event carries its own **raw physical design** in the pool, and ``combine`` is
 always **design-conditioned**: each event is merged with its own design
-(``combine`` encodes it, then ``combine_encoded`` decodes + gathers per-hit), so the
+(``combine`` scales it, then ``combine_scaled`` un-scales + gathers per-hit), so the
 network sees the true detector geometry -- and a mixed-design batch (e.g. replay) is
 handled per event. Pools store RAW records (events/targets/design); ``combine`` +
 ``normalize_target`` run per batch inside the kernels, not at fill time.
@@ -205,7 +205,7 @@ class Trainer:
 
     # ------------------------------------------------------------------ #
     # JIT kernels. Buffers are (event, mask, target, design); ``design`` holds each
-    # event's RAW PHYSICAL design (``combine`` encodes it, then ``combine_encoded``
+    # event's RAW PHYSICAL design (``combine`` scales it, then ``combine_scaled``
     # decodes + gathers). The window is addressed by a runtime ``start`` offset +
     # ``count`` (one compiled kernel serves any window). ``combine`` + ``normalize_target``
     # run here, per batch, on the raw records (not at pool-fill time).

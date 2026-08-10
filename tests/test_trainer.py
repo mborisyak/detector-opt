@@ -138,14 +138,23 @@ def _small_continual(loss_precision, *, n0, n_increment, iteration_limit, budget
 
 
 def test_continual_trainer_persists_and_replays(seed):
-    """The continual trainer keeps one network and accumulates a replay history."""
+    """The continual trainer keeps ONE network across designs and accumulates a replay history.
+
+    The persistent net is built EAGERLY in ``__init__`` -- never lazily on the first ``train()`` --
+    so no jax array is ever cached behind a ``None``. What "persists" therefore means here is that
+    the same network is CONTINUED rather than rebuilt: the weights that come out of one design are
+    the weights that go into the next."""
     det, trainer = _small_continual(0.5, n0=256, n_increment=128, iteration_limit=512, budget=20_000, seed=seed)
     design = np.zeros(det.design_dim(), dtype=np.float32)
-    assert trainer._running is None
+    assert trainer._running is not None  # eager: the network exists before any training
+    before = jax.tree.map(np.asarray, trainer._running[0])
+
     assert trainer.train(design, np.random.SeedSequence(seed)) is not None
-    assert trainer._running is not None  # network persisted across the call
     after_first = trainer.train_pool.current
-    # The next design continues the SAME network (init returns the persisted tuple).
+    trained = jax.tree.map(np.asarray, trainer._running[0])
+    # Training WROTE BACK to the persistent tuple: at least one leaf moved.
+    assert any(not np.allclose(a, b) for a, b in zip(jax.tree.leaves(before), jax.tree.leaves(trained)))
+    # The next design continues that same net -- init hands back the persisted tuple unchanged.
     assert trainer._init_design_network(np.random.SeedSequence(0), None) is trainer._running
     # ... and appends to the pool, so history is available for replay.
     assert trainer.train(design, np.random.SeedSequence(seed + 1)) is not None

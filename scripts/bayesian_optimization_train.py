@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # DEPRECATED: not maintained against the typed-records detector API (Event/Target/Design
-# namedtuples, combine/combine_encoded, raw buffers). Left untouched on purpose -- do not use
+# namedtuples, combine/combine_scaled, raw buffers). Left untouched on purpose -- do not use
 # or refactor; see scripts/subgradient.py / scripts/lfi.py for the current design-optimization loops.
 
 import argparse
@@ -311,7 +311,7 @@ def train_and_evaluate(
       * at the end, computes the BO objective as the exact MSE over **every
         event** in the pool's final val partition (sequential, no random).
     """
-    design = detector.encode_design(design_params)  # design ALWAYS supplied (detector holds none)
+    design = detector.to_scaled(design_params)  # design ALWAYS supplied (detector holds none)
 
     if init_state is None:
         regressor_def, r_params, r_state, opt_state, optimizer = _init_regressor_state(detector, config, seed)
