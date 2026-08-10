@@ -75,22 +75,32 @@ def test_specs():
   assert detector.size() is None  # analytic source
 
 
-def test_design_encoding_is_a_bijection_onto_the_bounds():
+def test_design_scaling_is_a_bijection_onto_the_bounds():
+  """Nominal <-> scaled is affine per coordinate, so the unit cube IS the design box.
+
+  The scaled space is BOUNDED (it was unconstrained R^n under the old quantile encoding), so the
+  invariant is no longer "any point of R^n lands in the bounds" -- that is false by construction
+  here, and an out-of-cube u is simply not a design. What must hold: the round trip is exact, the
+  cube's corners are the bounds exactly, and every point of the cube is admissible."""
   detector = _detector()
   design = _design(detector)
   physical = np.asarray(detector.flatten_design(design))
-  encoded = detector.encode_design(design)
-  assert np.allclose(np.asarray(detector.flatten_design(detector.decode_design(encoded))), physical, atol=1e-4)
+  scaled = detector.to_scaled(design)
+  assert np.all(np.asarray(scaled) >= 0.0) and np.all(np.asarray(scaled) <= 1.0)
+  assert np.allclose(np.asarray(detector.flatten_design(detector.to_nominal(scaled))), physical, atol=1e-4)
 
-  # Any point of R^n decodes inside the bounds (up to float32 rounding at the saturated ends),
-  # and only there.
   rng = np.random.default_rng(0)
-  decoded = detector.decode_design(jnp.asarray(8.0 * rng.standard_normal((64, detector.design_dim())), jnp.float32))
-  for values, (low, high) in ((decoded.enzyme_fraction, detector.enzyme_fraction_bounds),
-                              (decoded.temperature, detector.temperature_bounds)):
+  cube = jnp.asarray(rng.uniform(0.0, 1.0, (64, detector.design_dim())), jnp.float32)
+  # The corners included: u = 0 / u = 1 must BE the bounds, not merely approach them.
+  cube = jnp.concatenate([cube, jnp.zeros((1, detector.design_dim()), jnp.float32),
+                          jnp.ones((1, detector.design_dim()), jnp.float32)], axis=0)
+  nominal = detector.to_nominal(cube)
+  for values, (low, high) in ((nominal.enzyme_fraction, detector.enzyme_fraction_bounds),
+                              (nominal.temperature, detector.temperature_bounds)):
     values = np.asarray(values)
     span = 1e-6 * (high - low)
     assert np.all((low - span <= values) & (values <= high + span))
+    assert np.isclose(values.min(), low, atol=span) and np.isclose(values.max(), high, atol=span)
 
 
 def test_event_is_deterministic_and_the_target_ignores_the_design():
@@ -142,7 +152,7 @@ def test_a_single_design_or_one_design_per_event():
   broadcast = detector(design, index)[1].measurements
   batched = detector(
     jax.tree.map(lambda a: jnp.broadcast_to(jnp.asarray(a), (16,) + jnp.asarray(a).shape),
-                 detector.decode_design(detector.encode_design(design))),
+                 detector.to_nominal(detector.to_scaled(design))),
     index
   )[1].measurements
   assert np.allclose(np.asarray(broadcast), np.asarray(batched), atol=1e-3)
@@ -152,15 +162,15 @@ def test_combine_is_design_informed_and_differentiable():
   detector = _detector()
   index = np.arange(8)
   _, event, mask, _ = detector(_design(detector), index)
-  encoded = jnp.broadcast_to(detector.encode_design(_design(detector))[None], (8, detector.design_dim()))
+  encoded = jnp.broadcast_to(detector.to_scaled(_design(detector))[None], (8, detector.design_dim()))
 
-  features = detector.combine_encoded(event, encoded, mask=mask)
+  features = detector.combine_scaled(event, encoded, mask=mask)
   assert features.shape == (8,) + detector.combined_event_shape()
   # The trailing two features are the experiment's own design values, in ~[-1, 1].
   assert np.all(np.abs(np.asarray(features[..., -2:])) <= 1.0 + 1e-5)
   assert np.array_equal(np.asarray(detector.element_mask(event, mask)), np.asarray(mask))
 
-  gradient = jax.grad(lambda d: jnp.sum(detector.combine_encoded(event, d, mask=mask)))(encoded)
+  gradient = jax.grad(lambda d: jnp.sum(detector.combine_scaled(event, d, mask=mask)))(encoded)
   assert np.all(np.isfinite(np.asarray(gradient)))
   assert np.any(np.abs(np.asarray(gradient)) > 0)  # the design really reaches the features
 
@@ -355,7 +365,7 @@ def test_set_regressor_shapes(seed):
   assert regressor.n_features_in == detector.n_measurements + 2  # one element per experiment
 
   _, event, mask, target = detector(_design(detector), np.arange(8))
-  features = detector.combine(event, detector.decode_design(detector.encode_design(_design(detector))), mask=mask)
+  features = detector.combine(event, detector.to_nominal(detector.to_scaled(_design(detector))), mask=mask)
   predicted = regressor(features, detector.element_mask(event, mask), deterministic=True)
   assert predicted.shape == (8, detector.target_dim())
   per_sample = regressor.loss(detector.loss, features, mask, detector.normalize_target(target), deterministic=True)
@@ -371,7 +381,7 @@ def test_set_regressor_is_permutation_invariant_over_experiments(seed):
   mlp = from_config(detector, config={'mlp-regressor': {'features': [16, 16]}}, rngs=nnx.Rngs(seed))
 
   _, event, mask, _ = detector(_design(detector), np.arange(8))
-  features = detector.combine(event, detector.decode_design(detector.encode_design(_design(detector))), mask=mask)
+  features = detector.combine(event, detector.to_nominal(detector.to_scaled(_design(detector))), mask=mask)
   elements = detector.element_mask(event, mask)
   order = np.roll(np.arange(detector.n_experiments), 1)
 
@@ -391,7 +401,7 @@ def test_mlp_regressor_shapes(seed):
   assert regressor.n_inputs == detector.n_experiments * (detector.n_measurements + 2)
 
   _, event, mask, target = detector(_design(detector), np.arange(8))
-  features = detector.combine(event, detector.decode_design(detector.encode_design(_design(detector))), mask=mask)
+  features = detector.combine(event, detector.to_nominal(detector.to_scaled(_design(detector))), mask=mask)
   predicted = regressor(features, detector.element_mask(event, mask), deterministic=True)
   assert predicted.shape == (8, detector.target_dim())
   per_sample = regressor.loss(detector.loss, features, mask, detector.normalize_target(target), deterministic=True)

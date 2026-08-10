@@ -7,6 +7,7 @@ chains in ``BayesianOptimizer`` and the trainers against silent seed reuse.
 """
 
 import numpy as np
+import jax
 import optax
 
 from detopt.bo import BayesianOptimizer
@@ -24,8 +25,7 @@ _EI = dict(n_restarts=4, n_steps=20)
 
 
 def _bo(seed, d=3, n_init=4):
-    bounds = np.stack([np.full(d, -3.0), np.full(d, 3.0)], axis=1)
-    return BayesianOptimizer(bounds, gp=_GP, ei=_EI, n_init=n_init, seed=seed)
+    return BayesianOptimizer(d, gp=_GP, ei=_EI, n_init=n_init, seed=seed)
 
 
 def _proposal_seq(seed, n=4):
@@ -128,7 +128,20 @@ def test_continual_trainer_seed_stored_and_propagated():
     """The persistent network's init seed is the stored run seed (not kwargs.get):
     same constructor seed -> identical result, different -> different net -> different."""
     ca, cb, cc = _continual(0), _continual(0), _continual(5)
-    assert ca._init_seed == 0 and cc._init_seed == 5  # seed propagated, not defaulted
+    assert ca.seed == 0 and cc.seed == 5  # stored, not defaulted
+    # The property that matters is that the seed reaches the PERSISTENT NETWORK's initialisation.
+    # Asserting only that two runs differ does NOT test it: `Trainer.__init__` also seeds
+    # `shuffled_event_index`, so the train/val split alone moves the loss by ~0.05 even when the two
+    # networks are byte-identical -- verified by hardcoding the net's seed, under which every other
+    # assertion in this test still passes. Compare the initial weights directly.
+    assert any(
+        not np.allclose(x, y)
+        for x, y in zip(jax.tree.leaves(ca._running[0]), jax.tree.leaves(cc._running[0]))
+    )
+    assert all(
+        np.allclose(x, y)
+        for x, y in zip(jax.tree.leaves(ca._running[0]), jax.tree.leaves(cb._running[0]))
+    )
     a = _loss(ca, train_seed=0)
     b = _loss(cb, train_seed=0)
     c = _loss(cc, train_seed=0)

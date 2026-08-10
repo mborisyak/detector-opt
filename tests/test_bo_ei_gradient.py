@@ -49,23 +49,28 @@ def _fitted(d, n, seed):
     """A fitted sklearn GP on a smooth objective + the centered incumbent."""
     rng = np.random.default_rng(seed)
     w = rng.normal(size=d)
-    bounds = np.stack([np.zeros(d), np.ones(d)], axis=1)
-    bo = BayesianOptimizer(bounds, gp=_GP_CFG, ei=_EI_CFG, n_init=5, seed=seed)
+    bo = BayesianOptimizer(d, gp=_GP_CFG, ei=_EI_CFG, n_init=5, seed=seed)
     X = rng.random((n, d))
     y = np.sin(2.0 * X @ w) + 0.5 * ((X - 0.5) ** 2).sum(1)
     for i in range(n):
         bo.append(X[i], float(y[i]), noise=0.02)
     y_centered = bo.y - bo.y.mean()
-    return bo._fit(y_centered), float(np.min(y_centered))
+    return bo._fit(bo.X, y_centered, bo.noise), float(np.min(y_centered))
 
 
 def _jax_ei(model, x, y_best):
-    """EI rebuilt in JAX from the fitted sklearn parameters (the autodiff target)."""
+    """EI rebuilt in JAX from the fitted sklearn parameters (the autodiff target).
+
+    The closed form below is the ARD-RBF one, which is valid because these fixtures build the
+    optimiser with no exchangeable block -- there the kernel reduces exactly to ``sigma^2 * RBF``
+    (pinned by ``test_without_blocks_it_is_exactly_an_ard_rbf``). Asserted rather than assumed, so
+    this reference cannot silently drift out of agreement with the kernel it is checking."""
+    assert len(model.kernel_.blocks) == 0, "the ARD closed form below does not hold with a symmetry"
     X_train = jnp.asarray(model.X_train_)
     L = jnp.asarray(model.L_)
     alpha = jnp.asarray(np.ravel(model.alpha_))
-    length_scale = jnp.asarray(np.atleast_1d(model.kernel_.k2.length_scale))
-    amplitude2 = jnp.asarray(float(model.kernel_.k1.constant_value))
+    length_scale = jnp.asarray(model.kernel_.coordinate_length_scales())
+    amplitude2 = jnp.asarray(float(model.kernel_.constant_value))
 
     scaled = (X_train - x) / length_scale
     k = amplitude2 * jnp.exp(-0.5 * jnp.sum(scaled * scaled, axis=1))

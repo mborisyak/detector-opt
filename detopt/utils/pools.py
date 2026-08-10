@@ -8,7 +8,7 @@ may carry mixed dtypes (int32 hit indices beside a float32 TDC) without special-
 
 **They store RAW records** -- raw events, raw targets, the raw physical design, raw ground
 truth -- NOT design-``combine``d features. ``combine`` + ``normalize_target`` run per training
-batch right before the network (encoded/normalised/combined forms are larger; re-deriving them
+batch right before the network (scaled/normalised/combined forms are larger; re-deriving them
 per batch is the intended trade). ``push``/``append`` and ``buffers`` are positional so callers
 keep the ``ring.push(a, b, c)`` / ``*ring.buffers()`` idiom; each item is just a pytree now.
 """

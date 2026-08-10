@@ -37,14 +37,14 @@ def main(buffer=32768, val_buffer=8192, eps=0.1, train_steps=6000, batch=512, co
     F = det.combined_feature_dim
     labels = [f"y{i}" for i in range(int(det.target_dim()))]  # per-axis target components (net outputs)
     nd = cfg["nominal_design"]
-    theta0 = jnp.asarray(det.encode_design(nd), jnp.float32)
+    theta0 = jnp.asarray(det.to_scaled(nd), jnp.float32)
     train_stream, val_stream = disjoint_index_streams(det.size(), [0.8], 0)  # disjoint train/val event sets
     rng = np.random.default_rng(0)
     counts = np.array([det.n_stations, det.n_views_per_station, det.n_layers_per_view, det.n_straws], np.float32)
     print(f"M={M} F={F} input_dim={M * F}  design_dim={dd}  eps={eps}")
 
     def featurize(event, mask, theta, key):
-        # Real combine_encoded() features, but with padded slots given RANDOM geometry + TDC=-1
+        # Real combine_scaled() features, but with padded slots given RANDOM geometry + TDC=-1
         # (a plain MLP processes every slot, unlike the DeepSet's masked aggregation).
         # Returns UNpermuted (B, M, F); permutation is applied per-step (augmentation).
         m = jnp.asarray(mask).astype(bool)  # (B, M)
@@ -56,7 +56,7 @@ def main(buffer=32768, val_buffer=8192, eps=0.1, train_steps=6000, batch=512, co
             layer=jnp.where(m, jnp.asarray(event.layer), ri[..., 2]),
             straw=jnp.where(m, jnp.asarray(event.straw), ri[..., 3]),
         )
-        feats = det.combine_encoded(ev, theta)  # (B,M,F): [TDC, z, yL, yR, field]
+        feats = det.combine_scaled(ev, theta)  # (B,M,F): [TDC, z, yL, yR, field]
         feats = feats.at[..., 0].set(jnp.where(m, feats[..., 0], -1.0))  # TDC=-1 for padded
         return feats  # (B, M, F)
 
@@ -71,7 +71,7 @@ def main(buffer=32768, val_buffer=8192, eps=0.1, train_steps=6000, batch=512, co
         while got < n:
             c = min(2048, n - got)
             theta = theta0[None, :] + eps * jax.random.normal(jax.random.PRNGKey(int(rng.integers(1 << 30))), (c, dd))
-            _gt, event, mask, target = det(det.decode_design(theta), stream.next_block(c))
+            _gt, event, mask, target = det(det.to_nominal(theta), stream.next_block(c))
             key, kf = jax.random.split(key)
             Fs.append(featurize(event, mask, theta, kf))
             Ts.append(jnp.asarray(det.normalize_target(target)))

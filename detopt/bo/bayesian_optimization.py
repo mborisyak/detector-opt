@@ -1,18 +1,22 @@
 """Bayesian optimisation driver (scikit-learn GP) that owns X-normalisation + y-centering.
 
-The public API works entirely in the *nominal* (physical) design space:
-:meth:`append` takes nominal designs + objective values and :meth:`propose`
-returns one nominal design. Internally:
+A design lives in one of TWO spaces:
 
-* **X** is mapped to the unit cube ``[0, 1]^d`` (per-dimension min/max from
-  ``bounds``); the GP and the Expected-Improvement search run there.
-* **y** is **centered** (``y - mean(y)``) before fitting -- the GP has a zero
-  prior mean, so an un-centered constant offset would force a long lengthscale /
-  large amplitude. y is *not scaled* (the detector returns losses in a reasonable
-  range); only the mean is removed. Centering is a constant shift, so EI's
-  argmax -- and hence the proposed design -- is unchanged; it only makes the
-  fitted lengthscale/amplitude meaningful.
+* **nominal** -- the physical design (mM, degrees C, metres, tesla). Read from the
+  config as a starting design and written to ``results.json``; never searched.
+* **scaled** -- ``[0, 1]^d``, each coordinate affinely on its own design range. This
+  is what every optimiser searches and what every network is conditioned on, and it
+  is the ONLY space this class ever sees: :meth:`append` takes scaled designs and
+  :meth:`propose` returns one. There is no transform here at all -- the detector owns
+  nominal <-> scaled (``to_scaled`` / ``to_nominal``), so the GP is fitted, and EI
+  maximised, directly on what the caller passes.
 
+Internally:
+
+* **X** is stored exactly as given, in ``[0, 1]^d``. Because the map onto that box is
+  affine per coordinate, uniform in it is a UNIFORM NOMINAL DESIGN -- which is what
+  the initial points and the EI candidate sweep must sample -- and mixed units (a
+  volume fraction against a temperature in C) are already commensurate.
 Objectives are **minimised** -- append the value to minimise (e.g. the loss
 directly); EI targets the largest expected reduction below the best so far.
 
@@ -39,29 +43,33 @@ JAX implementation, deliberately:
 import numpy as np
 from scipy.linalg import cho_solve
 from scipy.optimize import minimize
-from scipy.stats import norm
+from scipy.stats import norm, qmc
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel
 
+from .kernels import PermutationInvariantRBF
+
 __all__ = ["BayesianOptimizer"]
+
 
 
 class BayesianOptimizer:
     @classmethod
     def from_config(cls, config):
         config = dict(config)
-        bounds = config.pop("bounds")
-        return cls(bounds, **config)
+        return cls(config.pop("d"), **config)
 
-    def __init__(self, bounds, *, gp, ei, n_init=None, seed=0):
-        bounds = np.asarray(bounds, dtype=np.float32)  # (d, 2): [low, high]
-        if bounds.ndim != 2 or bounds.shape[1] != 2:
-            raise ValueError("bounds must have shape (d, 2): per-dimension [low, high]")
-        self.low = bounds[:, 0]
-        self.high = bounds[:, 1]
-        if np.any(self.high <= self.low):
-            raise ValueError("each bound must satisfy high > low")
-        self.d = int(bounds.shape[0])
+    def __init__(self, d, *, gp, ei, kernel=None, n_init=None, seed=0):
+        """``d`` is the design dimension. There are no bounds to pass: the caller works in the scaled
+        box ``[0, 1]^d`` already, so the box IS the search space.
+
+        ``kernel`` is the GP prior, built by :func:`detopt.bo.kernel_from_config` from the config's
+        ``gp.kernel`` entry -- the caller owns it because choosing it needs the DETECTOR (the design
+        dimension, and which of its coordinates are exchangeable), which this class never sees.
+        ``None`` falls back to the plain ARD-RBF built from the ``gp`` prior bounds below."""
+        self.d = int(d)
+        if self.d < 1:
+            raise ValueError(f"d must be a positive design dimension, got {d!r}")
 
         self.gp_cfg = dict(gp)
         self.ei_cfg = dict(ei)
@@ -69,6 +77,11 @@ class BayesianOptimizer:
         self.n_init = int(n_init) if n_init is not None else int(self.gp_cfg["n_folds"])
         self._rng = np.random.default_rng(int(seed))
         self._seed = int(seed)
+        # Initial design: a SCRAMBLED SOBOL sequence, not independent uniform draws. On a landscape
+        # whose informative region is a small fraction of the box, i.i.d. points clump and leave
+        # holes. Scrambling keeps it randomised per seed (so seeds remain independent replicates)
+        # while guaranteeing the coverage.
+        self._sobol = qmc.Sobol(self.d, scramble=True, seed=int(seed))
 
         # The config states the prior box in LOG space (that is how detopt.bo.jax_gp
         # parameterises it); sklearn wants the natural-scale bounds. The kernel is
@@ -78,10 +91,10 @@ class BayesianOptimizer:
         # is no CV split and L-BFGS-B runs to its own convergence); `n_folds` is still
         # read above as the historical default for `n_init`.
         #
-        # The lengthscale bounds are read against the UNIT cube, so a lengthscale of 1
-        # already spans the whole domain and anything much larger switches a dimension
-        # off. The ceiling therefore has to sit well above 1 for ARD to be able to
-        # declare a design dimension irrelevant -- see config/bo.yaml.
+        # The lengthscale bounds are read against the SCALED box [0, 1], so a lengthscale of 1
+        # already spans the whole domain and anything much larger switches a dimension off. The
+        # ceiling therefore has to sit well above 1 for ARD to be able to declare a design
+        # dimension irrelevant -- see config/bo.yaml.
         ls_low, ls_high = self.gp_cfg["log_lengthscale_prior_bounds"]
         amp_low, amp_high = self.gp_cfg["log_amplitude_prior_bounds"]
         self._length_scale_bounds = (float(np.exp(ls_low)), float(np.exp(ls_high)))
@@ -90,7 +103,33 @@ class BayesianOptimizer:
         self._amplitude_init = float(np.exp(amp_low + amp_high))  # exp(2 * midpoint)
         self.n_gp_restarts = int(self.gp_cfg.get("n_restarts", 5))
 
-        # X stored in the normalised unit cube [0, 1]; y / noise in nominal units.
+        # The GP prior. Supplied by the caller when the design has structure worth modelling (see
+        # detopt.bo.kernels); otherwise the historical ARD-RBF, one lengthscale per coordinate.
+        self.kernel = kernel if kernel is not None else PermutationInvariantRBF(
+            d=self.d,
+            blocks=(),  # no symmetry -> an ordinary per-coordinate ARD-RBF
+            constant_value=self._amplitude_init,
+            constant_value_bounds=self._amplitude_bounds,
+            length_scale=np.full(self.d, self._length_scale_init),
+            length_scale_bounds=self._length_scale_bounds,
+        )
+
+        # X in the SCALED box [0, 1]; y / noise in the objective's own units.
+        # A kernel built for a different dimension fails only on the FIRST surrogate fit -- after
+        # n_init designs have already been scored -- with an opaque IndexError from inside the
+        # kernel. `kernel_from_config` sizes itself from the detector's full design, so any reduced
+        # search (a fixed or shared coordinate) must build its own; say so here rather than there.
+        # `k_and_grad_x` and `grad_diag` are hard requirements of the EI gradient, and `d` is what
+        # makes the kernel's coordinate layout checkable -- so demand all three rather than letting
+        # an object without them through to fail later, deeper, and less legibly.
+        if kernel is not None:
+            missing = [n for n in ("d", "k_and_grad_x", "grad_diag") if not hasattr(kernel, n)]
+            if len(missing) > 0:
+                raise ValueError(f"kernel {type(kernel).__name__} is missing {missing}; the analytic EI "
+                                 f"gradient needs all of them")
+            if int(kernel.d) != self.d:
+                raise ValueError(f"kernel is {int(kernel.d)}-dimensional but the search is {self.d}-"
+                                 f"dimensional; build the kernel at the SEARCHED dimension")
         self.X = np.empty((0, self.d), dtype=np.float32)
         self.y = np.empty((0,), dtype=np.float32)
         self.noise = np.empty((0,), dtype=np.float32)
@@ -98,23 +137,10 @@ class BayesianOptimizer:
         self.last_info = None
 
     # ------------------------------------------------------------------ #
-    # Nominal <-> normalised unit cube [0, 1] conversion (per dimension)
-    # ------------------------------------------------------------------ #
-    def to_unit(self, X):
-        """Nominal design(s) -> normalised unit cube ``[0, 1]``."""
-        X = np.asarray(X, dtype=np.float32)
-        return (X - self.low) / (self.high - self.low)
-
-    def to_nominal(self, U):
-        """Normalised unit cube ``[0, 1]`` -> nominal design(s)."""
-        U = np.asarray(U, dtype=np.float32)
-        return self.low + U * (self.high - self.low)
-
-    # ------------------------------------------------------------------ #
     def append(self, X, y, noise):
-        """Record observation(s) in nominal space.
+        """Record observation(s) in the SCALED box ``[0, 1]``.
 
-        ``X`` is ``(d,)`` or ``(n, d)`` nominal designs; ``y`` the matching
+        ``X`` is ``(d,)`` or ``(n, d)`` scaled designs; ``y`` the matching
         objective value(s) to minimise; ``noise`` the per-observation standard
         deviation -- **mandatory** (the GP is heteroscedastic; every observation
         carries its own measured uncertainty).
@@ -122,32 +148,29 @@ class BayesianOptimizer:
         X = np.atleast_2d(np.asarray(X, dtype=np.float32))
         y = np.atleast_1d(np.asarray(y, dtype=np.float32))
         noise = np.broadcast_to(np.asarray(noise, dtype=np.float32), y.shape).copy()
-        self.X = np.vstack([self.X, self.to_unit(X)])
+        self.X = np.vstack([self.X, X])
         self.y = np.concatenate([self.y, y])
         self.noise = np.concatenate([self.noise, noise])
 
     # ------------------------------------------------------------------ #
     # Surrogate + acquisition
     # ------------------------------------------------------------------ #
-    def _fit(self, y_centered):
-        """Fit the ARD-RBF GP on the observations so far.
+    def _fit(self, X, y_centered, noise):
+        """Fit the ARD-RBF GP on the given observations.
 
         ``alpha`` is the per-observation noise VARIANCE placed on the kernel diagonal,
         so the caller's standard deviations are squared here -- that is what carries the
         heteroscedastic per-design SEM into the fit. ``normalize_y`` stays off because
         this class already centers y.
         """
-        kernel = ConstantKernel(self._amplitude_init, self._amplitude_bounds) * RBF(
-            np.full(self.d, self._length_scale_init), self._length_scale_bounds
-        )
         model = GaussianProcessRegressor(
-            kernel=kernel,
-            alpha=np.maximum(self.noise.astype(np.float64) ** 2, 1e-12),
+            kernel=self.kernel,
+            alpha=np.maximum(noise.astype(np.float64) ** 2, 1e-12),
             n_restarts_optimizer=self.n_gp_restarts,
             normalize_y=False,
             random_state=self._seed,
         )
-        return model.fit(self.X.astype(np.float64), y_centered.astype(np.float64))
+        return model.fit(X.astype(np.float64), y_centered.astype(np.float64))
 
     @staticmethod
     def _expected_improvement(model, X, y_best):
@@ -175,18 +198,15 @@ class BayesianOptimizer:
         where differencing is pure cancellation noise.
         """
         x = np.asarray(x, dtype=np.float64).ravel()
-        X_train = model.X_train_
-        length_scale = np.atleast_1d(model.kernel_.k2.length_scale).astype(np.float64)
-        amplitude2 = float(model.kernel_.k1.constant_value)
-
-        diff = X_train - x  # (n, d), = X_i - x
-        scaled = diff / length_scale
-        k = amplitude2 * np.exp(-0.5 * np.einsum("ij,ij->i", scaled, scaled))  # (n,)
+        k, jac = model.kernel_.k_and_grad_x(model.X_train_, x)  # (n,), (n, d) = dk_i/dx_j
+        # k(x, x), NOT the amplitude: a group-averaged kernel's diagonal is not constant (it
+        # measures how far x is from its own permutations), so the prior variance depends on x.
+        prior_variance = float(model.kernel_.diag(x[None, :])[0])
         v = cho_solve((model.L_, True), k)  # K^-1 k
 
         alpha = np.ravel(model.alpha_)
         mean = float(k @ alpha)
-        var = max(amplitude2 - float(k @ v), 1e-12)
+        var = max(prior_variance - float(k @ v), 1e-12)
         sigma = np.sqrt(var)
 
         u = y_best - mean
@@ -194,13 +214,18 @@ class BayesianOptimizer:
         cdf, pdf = norm.cdf(z), norm.pdf(z)
         ei = u * cdf + sigma * pdf
 
-        jac = (k[:, None] * diff) / (length_scale**2)  # (n, d) = dk_i/dx_j
         grad_mean = jac.T @ alpha
-        grad_sigma = -(jac.T @ v) / sigma
+        # sigma^2 = diag(x) - k^T K^-1 k, so BOTH terms move with x. The second alone is the
+        # stationary-kernel case; for a group-averaged kernel diag(x) depends on how far x sits from
+        # its own permutations, and dropping its derivative can flip the gradient's direction.
+        grad_prior = (model.kernel_.grad_diag(x) if hasattr(model.kernel_, "grad_diag")
+                      else np.zeros_like(grad_mean))
+        grad_sigma = (grad_prior - 2.0 * (jac.T @ v)) / (2.0 * sigma)
         return float(ei), -cdf * grad_mean + pdf * grad_sigma
 
-    def _optimise_ei(self, model, y_best):
-        """Maximise EI over the unit cube: coarse random sweep, then local polish.
+    def _optimise_ei(self, model, y_best, low, high):
+        """Maximise EI over the box ``[low, high]`` (the scaled cube):
+        coarse random sweep, then local polish.
 
         One BATCHED evaluation over many candidates finds the basins cheaply, then
         L-BFGS-B refines the ``n_restarts`` best of them using the EXACT gradient from
@@ -212,7 +237,8 @@ class BayesianOptimizer:
         n_steps = int(self.ei_cfg.get("n_steps", 100))
         n_candidates = max(4096, 512 * self.d)
 
-        candidates = self._rng.random((n_candidates, self.d))
+        # Uniform in the box, which IS the cube, so this is a uniform DESIGN.
+        candidates = low + self._rng.random((n_candidates, self.d)) * (high - low)
         ei = self._expected_improvement(model, candidates, y_best)
         order = np.argsort(-ei)
         best_x, best_ei = candidates[order[0]], float(ei[order[0]])
@@ -227,32 +253,36 @@ class BayesianOptimizer:
                 start,
                 jac=True,
                 method="L-BFGS-B",
-                bounds=[(0.0, 1.0)] * self.d,
+                bounds=list(zip(low, high)),
                 options={"maxiter": n_steps},
             )
             if -float(result.fun) > best_ei:
-                best_ei, best_x = -float(result.fun), np.clip(result.x, 0.0, 1.0)
+                best_ei, best_x = -float(result.fun), np.clip(result.x, low, high)
         return best_x, best_ei
 
     # ------------------------------------------------------------------ #
     def propose(self):
-        """Return the next design to evaluate, in nominal space."""
+        """Return the next design to evaluate, in the SCALED box ``[0, 1]``."""
+        # Space-filling initial design, before there is anything worth fitting.
         if self.X.shape[0] < self.n_init:
             self.last_info = None
-            return self.to_nominal(self._rng.random(self.d))
+            return np.clip(self._sobol.random(1)[0], 0.0, 1.0).astype(np.float32)
 
-        # Center y (the GP has a zero prior mean); not scaled. The incumbent for EI is
-        # the best CENTERED observation, so it is consistent with what the GP was fit on.
+        # Center y (the GP has a zero prior mean); never scaled. A constant shift leaves EI's argmax
+        # -- and hence the proposal -- unchanged; it only makes the fitted lengthscale/amplitude
+        # meaningful. The incumbent for EI is the best CENTERED observation, so EI and the surrogate
+        # agree about what "improvement" means.
         y_mean = float(np.mean(self.y))
         y_centered = self.y - y_mean
-        model = self._fit(y_centered)
-        x_best, ei = self._optimise_ei(model, float(np.min(y_centered)))
+        model = self._fit(self.X, y_centered, self.noise)
+        x_best, ei = self._optimise_ei(model, float(np.min(y_centered)),
+                                       np.zeros(self.d), np.ones(self.d))
 
-        amplitude2, length_scale = model.kernel_.k1.constant_value, model.kernel_.k2.length_scale
+        amplitude2, length_scale = model.kernel_.constant_value, model.kernel_.length_scale
         self.last_info = {
             "ei": float(ei),
             "log_lengthscale_mean": float(np.mean(np.log(np.atleast_1d(length_scale)))),
             "log_amplitude": float(0.5 * np.log(amplitude2)),
             "y_mean": y_mean,
         }
-        return self.to_nominal(x_best)
+        return np.asarray(x_best, dtype=np.float32)

@@ -52,9 +52,9 @@ NN_REF = "nll-tdc"  # the tracker whose OUR-cut accepted subset the (fit-less) n
 def _load_nn(checkpoint, config, seed):
     """Build the regressor from ``config`` (matching the checkpoint) + restore it. Returns
     ``(detector, theta, predict_norm, step)`` -- ``predict_norm(feats, mask)`` is a jitted deterministic
-    (ensemble-averaged) forward to the NORMALIZED target; ``theta`` is the encoded config design."""
+    (ensemble-averaged) forward to the NORMALIZED target; ``theta`` is the scaled config design."""
     detector = detopt.detector.from_config(config["detector"])
-    theta = jnp.asarray(detector.encode_design(config["design"]), jnp.float32)
+    theta = jnp.asarray(detector.to_scaled(config["design"]), jnp.float32)
     rngs = nnx.Rngs(jax.random.PRNGKey(int(seed)))
 
     manager = detopt.utils.io.get_checkpointer(checkpoint)
@@ -82,13 +82,13 @@ def _load_nn(checkpoint, config, seed):
 
 def _nn_pred9(detector, theta, predict_norm, event, mask, chunk):
     """Network predictions over a StrawEvent ``(B, M)`` -> physical ``(B, 9)`` = [vertex(3) cm, p1(3),
-    p2(3) GeV], the same layout the trackers + ``true9`` use. ``combine_encoded`` standardises per chunk."""
+    p2(3) GeV], the same layout the trackers + ``true9`` use. ``combine_scaled`` standardises per chunk."""
     B = mask.shape[0]
     preds = []
     for i in range(0, B, chunk):
         ev = TR._slice_event(event, i, i + chunk)
         m = jnp.asarray(mask[i:i + chunk])
-        feats = detector.combine_encoded(ev, theta, mask=m)
+        feats = detector.combine_scaled(ev, theta, mask=m)
         preds.append(np.asarray(predict_norm(feats, detector.element_mask(ev, m))))
     pred = detector.denormalize_predictions(np.concatenate(preds, 0))  # DaughterTarget (vertex, p1, p2)
     return np.concatenate([np.asarray(pred.vertex), np.asarray(pred.p1), np.asarray(pred.p2)], axis=-1)

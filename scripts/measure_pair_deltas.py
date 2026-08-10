@@ -33,8 +33,8 @@ def measure(seed=0, n_events=2048, **config):
     F = detector.combined_feature_dim
     M = detector.max_hits_per_event
 
-    theta = jnp.asarray(detector.encode_design(config["design"]), jnp.float32)  # the design we train at
-    phys = np.asarray(detector.flatten_design(detector.decode_design(theta)), np.float32)
+    theta = jnp.asarray(detector.to_scaled(config["design"]), jnp.float32)  # the design we train at
+    phys = np.asarray(detector.flatten_design(detector.to_nominal(theta)), np.float32)
     design = np.broadcast_to(phys[None, :], (n_events, phys.shape[0]))  # one row per event
 
     event_index = shuffled_event_index(detector.size(), int(n_events), int(seed))
@@ -45,9 +45,9 @@ def measure(seed=0, n_events=2048, **config):
                                             detector._seeds(event_index), process_ids=process_ids)
     mask = (tdc >= 0).astype(np.int32)
 
-    theta_b = jnp.broadcast_to(theta[None, :], (n_events, detector.encoded_design_dim()))
+    theta_b = jnp.broadcast_to(theta[None, :], (n_events, detector.design_dim()))
     event = detector._pack_event(hits_idx, tdc)  # -> StrawEvent
-    feats = np.asarray(detector.combine_encoded(event, theta_b))  # (n, M, F)
+    feats = np.asarray(detector.combine_scaled(event, theta_b))  # (n, M, F)
 
     pairwise = [[] for _ in range(F)]  # all same-event daughter-pair |Δ| per feature
     daughters_per_event = []
@@ -64,7 +64,7 @@ def measure(seed=0, n_events=2048, **config):
 
     pairwise = [np.concatenate(v) if v else np.array([np.nan]) for v in pairwise]
 
-    print(f"design: {detector.decode_design(theta)}")
+    print(f"design: {detector.to_nominal(theta)}")
     print(
         f"events={n_events}  daughter hits/event: mean={np.mean(daughters_per_event):.1f} "
         f"median={int(np.median(daughters_per_event))}\n"

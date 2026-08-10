@@ -1,0 +1,40 @@
+# Does normalising the group average to a CONSTANT DIAGONAL help?
+#
+# Four arms on the FULL 8-dimensional design, config as it stands (T in [25, 80], m = 4, 5%
+# read-out), differing ONLY in the surrogate:
+#
+#   pi      k(x,y)                                  -- the group average, diagonal NOT constant
+#   pinorm  c * k(x,y) / sqrt(k(x,x) k(y,y))        -- the same average, rescaled to k(x,x) = c
+#   sort    k_ard(sort x, sort y)                   -- invariance by folding instead of averaging
+#   null    random search
+#
+# THE QUESTION. The group average's prior variance is up to |G| = 24 times larger on the fully tied
+# stratum than at a generic design (6.3x at the initial lengthscale, over 2000 designs), so EI's exploration
+# term peaks exactly on the all-identical batch -- the least informative design of experiments there
+# is. Normalising removes that peak while keeping BOTH properties sorting gives up: exact invariance
+# AND smoothness across the tie locus. If the varying diagonal is what costs the group average, this
+# arm is strictly better than both; if it is what EARNS it (the varying diagonal IS the method-of-
+# images Neumann prior on the fundamental domain), normalising should cost.
+#
+# THE AMPLITUDE IS OUTSIDE THE NORMALISATION and that is load-bearing. The bare
+# k / sqrt(k(x,x) k(y,y)) cancels the amplitude identically -- numerator and denominator each carry
+# one factor -- leaving k(x,x) = 1 for every c and dk/dlog(c) == 0 EXACTLY (measured). The marginal
+# likelihood is then flat in the amplitude, so the GP cannot scale its prior to the data; with these
+# losses (variance ~1e-3 .. 1e-2 after centring) a prior variance pinned at 1 inflates the posterior
+# everywhere and EI over-explores. `scripts/benchmark_symmetry.py` implements it that way, and that
+# is the most likely reason its normalised arm came LAST (0.86x, behind the null) on the
+# shared-fraction design. This arm does not reproduce that defect, so it is NOT a re-run of that
+# measurement and the two numbers are not comparable.
+#
+# 12 seeds per arm. Stated plainly because it bounds what this campaign can conclude: the earlier
+# 8-seed comparison could not separate sorting from the group average (4/8 seeds at 120 iterations,
+# one-sided p = 0.19 unpaired / 0.32 paired; two-sided 0.38 / 0.64), and the PAIRED effect size
+# measured there on log-AUC (d_z = 0.255, NOT Cohen's d -- the two-sample value is 0.41) needs ~96
+# seeds for 80% power. 12 seeds gives ~22% power against an effect that size, and the 8 that
+# measured it gave 18%. So a null result here means UNRESOLVED, not "no difference" --
+# only an effect several times larger than the sorting-vs-average one can show up at this size, and
+# that is exactly the case worth screening for first.
+pi     |bo    |--kernel permutation-invariant-rbf
+pinorm |bo    |--kernel normalised-invariant-rbf
+sort   |bo    |--kernel sorting-rbf
+null   |random|

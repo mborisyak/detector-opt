@@ -49,8 +49,8 @@ def _train_curve(seed, n0, max_epochs):
         eval_batch=2048,
         seed=seed,
     )
-    design_enc = np.zeros(det.design_dim(), dtype=np.float32)
-    design_phys = np.asarray(det.flatten_design(det.decode_design(design_enc)), dtype=np.float32)
+    design_scaled = np.full(det.design_dim(), 0.5, dtype=np.float32)  # the scaled midpoint of every bound
+    design_phys = np.asarray(det.flatten_design(det.to_nominal(design_scaled)), dtype=np.float32)
 
     init_seq, run_seq = np.random.SeedSequence(seed).spawn(2)
     tp, vp = trainer.train_pool, trainer.val_pool

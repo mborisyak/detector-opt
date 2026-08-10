@@ -13,7 +13,7 @@ detector: enzyme
 regressor:
   # The meta-regressor: a deep set over the batch of experiments -> optimal temperature. One set
   # ELEMENT per experiment, its features being that experiment's 8 measurements followed by its own
-  # two design values (combine_encoded), so the network is design-conditioned and reads each readout
+  # two design values (combine_scaled), so the network is design-conditioned and reads each readout
   # together with the condition that produced it. Aggregating over the element axis makes the
   # inference permutation-invariant in the experiments, which is exactly the symmetry of the problem:
   # T* is a property of the enzyme and the batch is an unordered set of (condition, readout) pairs.
@@ -66,9 +66,146 @@ bo:
     # Measured on the finished meta runs, 1.5 pinned 3-5 of these 8 dimensions.
     log_lengthscale_prior_bounds: [-6.0, 4.0]
     log_amplitude_prior_bounds: [-6.0, 1.5]
+    # The design is a BATCH of interchangeable experiments: the regressor aggregates over them
+    # permutation-invariantly, so all n_experiments! orderings are ONE design with ONE loss, and the
+    # surrogate should be invariant too rather than modelling 24 copies of every optimum.
+    # `exchangeable` is how many elements interchange; the blocks (enzyme_fraction, temperature) are
+    # read off design_spec and permuted TOGETHER, because experiment k is the pair.
+    #
+    # There are two ways to obtain that invariance and they are NOT equivalent. Averaging over the
+    # group (`permutation-invariant-rbf`) keeps smoothness and reproduces exactly the posterior MEAN
+    # of a plain GP fed every relabelling with the same target -- but it must tie one lengthscale per
+    # block, and its prior variance is |G| times larger on tied designs. Sorting instead folds the
+    # domain: invariant, constant diagonal, ARD per ORDER STATISTIC, O(m log m) rather than O(2^m m),
+    # at the cost of a crease on the measure-zero tie locus.
+    # MEASURED CHOICE (2026-08-10, scripts/benchmark_symmetry.py: 5 BO seeds x 30 iterations on the
+    # shared-fraction design, one shared null). Sorting is the only surrogate that beat the null:
+    #
+    #   kernel                    best@30   null/it   p(it < null)   near-tied proposals
+    #   sorting-rbf                0.0424     1.29x        0.016              62%
+    #   ard-rbf (no symmetry)      0.0555     0.99x        0.42               22%
+    #   stick-breaking reparam.    0.0559     0.98x        0.79               44%
+    #   permutation-invariant-rbf  0.0624     0.88x        0.73               81%
+    #   the same, normalised       0.0638     0.86x        0.95               73%   <-- RETRACTED
+    #
+    # RETRACTION (2026-08-10). The normalised row measured a BROKEN kernel and says nothing about
+    # normalisation. `scripts/benchmark_symmetry.py` implements it as the bare
+    # k(x,y)/sqrt(k(x,x)k(y,y)), in which the amplitude cancels identically -- numerator and
+    # denominator each carry one factor of it -- so k(x,x) = 1 for every amplitude and
+    # dk/dlog(amplitude) == 0 EXACTLY (measured at c = 0.01, 1, 100: all zero). The marginal
+    # likelihood is flat in that hyperparameter, the GP cannot scale its prior to the data, and with
+    # these losses (variance ~1e-3 .. 1e-2 after centring) a prior variance pinned at 1 inflates the
+    # posterior everywhere, so EI over-explores and the surrogate degenerates toward random search --
+    # which is what 0.86x is. `detopt.bo.NormalisedInvariantRBF` keeps the amplitude OUTSIDE the
+    # normalisation (c * k/sqrt(kk), so k(x,x) = c and the hyperparameter is identifiable again) and
+    # is being measured on the full design in output/kernel-norm.
+    #
+    # The group average's MEDIAN is behind random search here -- at p = 0.73, which is no evidence of a
+    # difference in either direction; read it as "did not separate", not as "lost". What separates
+    # sorting is not the constant diagonal -- `ard-rbf` has one and only matches the null -- but that
+    # after sorting, coordinate k IS the k-th order statistic, so ARD can say "the coldest probe
+    # matters differently from the hottest" (Spearman -0.22 .. +0.32 against the loss, measured on the
+    # OLD [35, 68] box -- at the configured [25, 80] it is -0.21 .. +0.27, same story, different
+    # numbers), which a
+    # symmetric function CAN say about a set and a slot-indexed kernel cannot.
+    #
+    # SCOPE -- AND THE TABLE ABOVE DOES NOT TRANSFER TO THIS CONFIG'S OWN DESIGN. That measurement is
+    # on the SHARED-FRACTION design, where the exchangeable element is a scalar temperature, and
+    # there sorting is exactly the quotient metric (||sort a - sort b|| = min_pi ||a - pi b||, the
+    # rearrangement inequality). On the FULL design -- which is what this file configures -- the
+    # element is the pair (fraction, temperature), and sorting by temperature is a KEYED invariant
+    # that matches the distance-minimising assignment only ~25% of the time (24.4% over 20000 uniform
+    # pairs, 20% on the campaign's own proposals; an earlier 27% came from a ~1000-pair sample).
+    #
+    # ⛔️ THE TABLE JUST BELOW IS CONFOUNDED -- superseded by output/kernel-norm, see after it.
+    # RE-RUN THERE (2026-08-10, output/kernel8 against output/wide/w5-*): 8 BO seeds vs 10 random,
+    # 120 iterations, T in [25, 80], m = 4, 5% read-out. The two campaigns' random searches are two
+    # PHYSICALLY SEPARATE runs 14.8 h apart that reproduced design, x_scaled, loss, sem and
+    # verified_loss to exactly 0.0 in all 1200 records (only `time_s` differs, so the FILES are not
+    # byte-identical -- an earlier revision said they were). One null therefore serves both kernels and
+    # they differ in nothing but the kernel:
+    #
+    #   kernel                      best@120       null/BO   p(1-sided)  BO 60->120  payoff ratio
+    #   permutation-invariant-rbf    0.0382 (1.27C)  1.376x     0.010       1.226x       1.163x
+    #   sorting-rbf                  0.0427 (1.34C)  1.231x     0.034       1.125x       1.067x
+    #
+    # READ THE p COLUMN WITH THE CORRECTIONS. It is ONE-SIDED: two-sided, 0.021 and 0.068. Three kernels
+    # (these two plus ard-rbf) share ONE ten-run null, and Holm over that family gives pi 0.041 and
+    # sorting 0.101 -- so the group average survives correction here and SORTING DOES NOT. The payoff
+    # column is a ratio of medians whose bootstrap CI contains 1 for both kernels.
+    #
+    # Sorting does not reproduce the edge it had on the shared-fraction design: head to head against
+    # the group average it is a WASH -- 4 seeds each way, two-sided 0.64 paired / 0.38 unpaired -- so
+    # the median gap above is not resolved at n = 8 and neither kernel is established as better on
+    # the full design. The keyed-invariant caveat is the reason to expect exactly this: the property
+    # that made sorting the quotient metric is absent once the element is a pair.
+    #
+    # ⛔️ SUPERSEDED (2026-08-10 20:5x). The comparison above put an output/kernel8 arm (run 18:47)
+    # against an output/wide arm (run 04:10), and detopt/bo/bayesian_optimization.py was rewritten at
+    # 13:46 BETWEEN them -- the fix that added the missing `d diag(x)/dx` term to the EI gradient. So
+    # those two arms differ in the optimiser as well as the kernel, and the 1.376x is not a property
+    # of the group average. Verified: same seed, same box, same kernel, the first 5 iterations are
+    # bit-identical and the trajectories diverge at iteration 6, the first GP-driven proposal.
+    #
+    # CLEAN COMPARISON, all three kernels re-run under the CURRENT optimiser, 12 seeds x 120
+    # iterations, one shared 12-seed null (output/kernel-norm):
+    #
+    #   kernel                       best@120        null/BO   p(2-sided)   payoff ratio
+    #   sorting-rbf                   0.0444 (1.37C)  1.150x      0.089        1.090x
+    #   normalised-invariant-rbf      0.0485 (1.43C)  1.053x      0.194        0.951x
+    #   permutation-invariant-rbf     0.0512 (1.47C)  0.997x      0.624        1.001x
+    #
+    # The group average lands EXACTLY on the null once the gradient is fixed. Nothing survives Holm
+    # over the three (0.27 / 0.39 / 0.62), but paired by seed sorting beats the group average on
+    # 10/12 seeds at p = 0.034, and normalising the group average beats not normalising it on 10/12
+    # at p = 0.11 -- directionally what the dead-amplitude argument predicts, not significant.
+    #
+    # This is now the reason for the default, and it agrees with the shared-fraction six-arm table at
+    # the top of this comment (which also ran post-fix, 17:54). Two independent designs, one
+    # optimiser, same winner.
+    #
+    # Kept as the default on structural grounds too: exactly invariant, PSD (a
+    # composition, not a minimisation), constant diagonal, and O(m log m) against O(2^m m), which is
+    # what will matter if the batch grows. On the evidence alone the group average is the better
+    # supported choice on THIS design -- it is the one that survives multiplicity correction. This
+    # default is a deliberate deviation from that, recorded as such.
+    # THE DEFAULT, set on ROBUSTNESS rather than on a win (2026-08-10). The group average rescaled to
+    # a constant diagonal is the only one of the three that has BOTH properties the other two trade
+    # against each other: exact invariance and smoothness across the tie locus (which sorting gives
+    # up for a crease), and a constant prior variance (which the bare group average gives up for a
+    # |G|-fold ridge on the all-identical batch). Predicted before it was measured, in
+    # scripts/arms/norm.arms.
+    #
+    # Measured, analytic benchmark (scripts/benchmark_invariant.py, m = 4, 4 permutation-invariant
+    # objectives, 3 seeds each -- output/invariant). Mean RANK ties all three invariant kernels at
+    # exactly 2.00 (ard-rbf is 4.00 on every objective), so none of them wins. What separates them is
+    # the WORST case -- each kernel's worst run against the best kernel's worst run on that objective:
+    #
+    #   kernel                      assignment  saturating  sphere  sum-tanh   worst overall
+    #   normalised-invariant-rbf        8.9x        2.2x     1.1x     1.4x        8.9x
+    #   sorting-rbf                     1.0x       10.5x    14.9x     1.3x       14.9x
+    #   permutation-invariant-rbf      20.5x        1.0x     1.0x     1.0x       20.5x
+    #   ard-rbf                        21.3x        9.4x     8.5x    11.2x       21.3x
+    #
+    # Sorting and the group average each have one objective where they are an order of magnitude off;
+    # the normalised kernel has none. That is what this default buys -- not the best result on any
+    # problem, the smallest worst result across problems.
+    #
+    # ⚠️ WHAT THIS IS NOT. Three seeds cannot rank kernels: a worst-case over three draws is the max
+    # of three samples. And on the ENZYME design at 12 seeds (output/kernel-norm) this kernel came
+    # SECOND, 1.053x over the null against sorting's 1.150x, with nothing surviving Holm. The two
+    # measurements disagree, and the analytic one is the weaker of the two on sample size while being
+    # the stronger on control (exact objective, no evaluation noise, elements are scalars so sorting
+    # gets its best case rather than the keyed approximation the (fraction, temperature) pairs force).
+    # Re-running both properly -- 20 analytic seeds, and the enzyme campaign at more than 12 -- is
+    # owed before this default is called established.
+    kernel:
+      normalised-invariant-rbf:
+        exchangeable: 4   # = n_experiments; the (enzyme_fraction, temperature) blocks permute TOGETHER
   ei:
     n_restarts: 32
     n_steps: 100
+
 
 # Independent re-scoring of each finished trajectory (scripts/verify_trajectory.py): a fresh
 # regressor per selected design, 6:2:2 split, best-validation epoch, ONE held-out test score. make.sh

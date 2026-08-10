@@ -25,8 +25,8 @@ class StereoImage(StereoLayerGrid):
         # channels-last image: (n_layers, n_straws, 6) = [station_z, view, angle, y_offset, straw, TDC]
         return (self.n_layers, self.n_straws, 6)
 
-    def combine_encoded(self, event, encoded_design, mask=None):
-        """Raw ``StrawEvent`` + ENCODED design -> image ``(B, n_layers, n_straws, 6)``. REQUIRES ``mask``.
+    def combine_scaled(self, event, design_scaled, mask=None):
+        """Raw ``StrawEvent`` + SCALED design -> image ``(B, n_layers, n_straws, 6)``. REQUIRES ``mask``.
 
         Per pixel ``(layer l, straw s)``: ``[station_z_norm[l], view_norm[l], angle_norm[l],
         y_offset_norm[l], straw_norm[s], TDC[l, s]]``. ``station_z_norm`` and ``angle_norm`` (the layer's
@@ -34,7 +34,7 @@ class StereoImage(StereoLayerGrid):
         channels are not. (The layer-within-view index is NOT a channel -- it is captured by the
         layer-level conv.)"""
         grid, B = self._tdc_grid(event, mask)  # (B, n_layers, n_straws)
-        station_z_norm, view_norm, _layer_norm, angle_norm, y_offset_norm = self._layer_positions(encoded_design, B)
+        station_z_norm, view_norm, _layer_norm, angle_norm, y_offset_norm = self._layer_positions(design_scaled, B)
         straw_norm = jnp.linspace(-1.0, 1.0, self.n_straws, dtype=jnp.float32)  # (n_straws,) fixed straw position
 
         shape = (B, self.n_layers, self.n_straws)

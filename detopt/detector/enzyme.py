@@ -69,7 +69,6 @@ import jax.numpy as jnp
 
 from .common import Detector
 from ..utils import tensor
-from ..utils.encoding import uniform_to_normal_jax, normal_to_uniform_jax
 
 ### A + B -> C + D via E
 
@@ -187,6 +186,18 @@ def rkc2_coefficients(n_stages, damping):
     mu_tilde = 2.0 * b[j] * omega_1 / b[j - 1]
     rows.append((2.0 * b[j] * omega_0 / b[j - 1], -b[j] / b[j - 2], mu_tilde, -a[j - 1] * mu_tilde))
   return float(b[1] * omega_1), jnp.asarray(rows, jnp.float32)
+
+
+def _scale(values, bounds):
+  """NOMINAL ``[low, high]`` -> SCALED ``[0, 1]``, the design's only parameterisation change."""
+  low, high = bounds
+  return (values - low) / (high - low)
+
+
+def _unscale(values, bounds):
+  """SCALED ``[0, 1]`` -> NOMINAL ``[low, high]`` (inverse of :func:`_scale`)."""
+  low, high = bounds
+  return values * (high - low) + low
 
 
 class EnzymeDesign(NamedTuple):
@@ -359,42 +370,41 @@ class EnzymeDetector(Detector):
     return None  # an analytic source: every index is a fresh enzyme
 
   # ------------------------------------------------------------------ #
-  # Design encoding: independent per-field bounds <-> N(0, 1)
+  # Design scaling: each field affinely onto [0, 1] from its own bounds
   # ------------------------------------------------------------------ #
-  def _encode_flat(self, design):
+  def _to_scaled_flat(self, design):
     d = jnp.asarray(design, jnp.float32)
     n = self.n_experiments
     return jnp.concatenate([
-      uniform_to_normal_jax(d[..., :n], *self.enzyme_fraction_bounds),
-      uniform_to_normal_jax(d[..., n:2 * n], *self.temperature_bounds)
+      _scale(d[..., :n], self.enzyme_fraction_bounds),
+      _scale(d[..., n:2 * n], self.temperature_bounds)
     ], axis=-1)
 
-  def _decode_flat(self, encoded_design):
-    e = jnp.asarray(encoded_design, jnp.float32)
+  def _to_nominal_flat(self, design_scaled):
+    e = jnp.asarray(design_scaled, jnp.float32)
     n = self.n_experiments
     return jnp.concatenate([
-      normal_to_uniform_jax(e[..., :n], *self.enzyme_fraction_bounds),
-      normal_to_uniform_jax(e[..., n:2 * n], *self.temperature_bounds)
+      _unscale(e[..., :n], self.enzyme_fraction_bounds),
+      _unscale(e[..., n:2 * n], self.temperature_bounds)
     ], axis=-1)
 
   # ------------------------------------------------------------------ #
   # Combine + normalisation
   # ------------------------------------------------------------------ #
-  def combine_encoded(self, event, encoded_design, mask=None):
+  def combine_scaled(self, event, design_scaled, mask=None):
     """``features (..., n_experiments, n_measurements + 2)``: each experiment's [A] samples followed
-    by its own two design values. The design is decoded back to the physical space and mapped
-    LINEARLY onto ~[-1, 1] -- the encoding's own erf scale saturates near the bounds, which would
-    squash exactly the extreme designs BO wants to tell apart. ``mask`` is unused: every experiment
-    of the batch is real (the element axis is the design's, not a hit count)."""
-    encoded_design = jnp.asarray(encoded_design, jnp.float32)
-    if encoded_design.ndim == 1:  # one design for the whole event batch
-      encoded_design = jnp.broadcast_to(encoded_design[None, :], event.measurements.shape[:-2] + encoded_design.shape)
-    physical = self._decode_flat(encoded_design)
+    by its own two design values, taken STRAIGHT from the scaled design -- it is already each
+    coordinate affinely on its own range in [0, 1], which is what the network wants. ``mask`` is
+    unused: every experiment of the batch is real (the element axis is the design's, not a hit
+    count)."""
+    design_scaled = jnp.asarray(design_scaled, jnp.float32)
+    if design_scaled.ndim == 1:  # one design for the whole event batch
+      design_scaled = jnp.broadcast_to(design_scaled[None, :], event.measurements.shape[:-2] + design_scaled.shape)
     n = self.n_experiments
-    # E0 = concentration_E * enzyme_fraction, so the normalised fraction IS the normalised initial
-    # enzyme concentration.
-    enzyme = self._to_unit(physical[..., :n], self.enzyme_fraction_bounds)
-    heat = self._to_unit(physical[..., n:2 * n], self.temperature_bounds)
+    # E0 = concentration_E * enzyme_fraction, so the scaled fraction IS the scaled initial enzyme
+    # concentration.
+    enzyme = design_scaled[..., :n]
+    heat = design_scaled[..., n:2 * n]
     # [A] never exceeds half the A stock (the other half of the non-enzyme volume is B).
     measurements = self._to_unit(event.measurements, (0.0, 0.5 * self.concentration_A))
     return jnp.concatenate([measurements, enzyme[..., None], heat[..., None]], axis=-1)

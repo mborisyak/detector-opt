@@ -23,7 +23,7 @@ detector:
     data_dir: "data/mc-100K"  # 36k events across the 50 files; boundary crossings are upstream of the magnet (magnet-independent)
 
 # Nominal (initial/baseline) design -- NOT detector state. A named physical-design dict the
-# detector encodes via encode_design (BO itself seeds from random proposals).
+# detector scales via to_scaled (BO itself seeds from random proposals).
 nominal_design:
   stations: [8407.0, 8607.0, 9307.0, 9507.0]
   view_angle: 0.0798

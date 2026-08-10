@@ -15,6 +15,8 @@ __all__ = [
     "restore_model",
     "restore_aux",
     "load_design",
+    "check_bo_results",
+    "check_scaled_design",
     "save_design",
     "restore_state",
     "save_state",
@@ -49,28 +51,87 @@ def restore_aux(manager: ocp.CheckpointManager):
 
 
 def load_design(detector, design_path):
+    """Read a design file written by :func:`save_design` and return it SCALED to ``[0, 1]``, the
+    space every optimiser searches.
+
+    The file must be the TAGGED form ``{"space": "nominal", "design": [...]}``. A bare JSON list is
+    the pre-migration format and is refused rather than converted, because a bounds check cannot
+    tell the two apart: those files hold ENCODED N(0,1) vectors (~0 = the centre of every range),
+    and wherever a detector's bounds start at zero -- ``enzyme_fraction`` ``[0, 1]``, ``temperature``
+    ``[0, 100]`` -- scaling ~0 lands at ~0, comfortably inside ``[0, 1]``. It would read as the lower
+    CORNER of every range with nothing whatsoever out of place. Hence the tag."""
     import json
     import numpy as np
 
     with open(design_path, "r") as f:
         data = json.load(f)
-    # Accept either a {positions, angles, magnetic_strength} dict or a flat
-    # physical design array, then encode into unconstrained space.
-    if isinstance(data, dict):
-        data = detector.layer_design_to_array(data)
-    arr = np.asarray(data, dtype=np.float32)
-    return np.asarray(detector.encode_design(arr), dtype=np.float32)
+    if not isinstance(data, dict) or data.get("space") != "nominal":
+        raise ValueError(
+            f"{design_path}: not a tagged NOMINAL design file. A bare list is the pre-migration "
+            f"format, holding an ENCODED N(0,1) vector that is not a design in the current "
+            f"parameterisation and cannot be converted -- re-run to regenerate it, or write "
+            f'{{"space": "nominal", "design": [...]}} in physical units.'
+        )
+    arr = np.asarray(data["design"], dtype=np.float32)
+    scaled = np.asarray(detector.to_scaled(arr), dtype=np.float32)
+    if np.any(scaled < -0.01) or np.any(scaled > 1.01):
+        raise ValueError(
+            f"{design_path}: the design is outside this detector's bounds -- scaling it gives "
+            f"[{scaled.min():.3g}, {scaled.max():.3g}], not [0, 1]."
+        )
+    return scaled
 
 
-def save_design(detector, design_path, design):
+def check_scaled_design(design_scaled, where):
+    """Reject a restored design that is not a SCALED vector in ``[0, 1]``.
+
+    A checkpoint written before the encoded->scaled migration stores an ENCODED theta (N(0,1), so
+    ~0 is the CENTRE of every range) together with design-optimiser moments accumulated at encoded
+    gradient magnitudes. Restored onto the scaled cube the theta reads as the lower CORNER and the
+    moments mis-scale the first steps -- neither raises on its own. A finite tolerance is allowed
+    because an un-clipped design step can leave the cube slightly before being used."""
+    import numpy as np
+
+    theta = np.asarray(design_scaled, dtype=np.float64)
+    if np.any(theta < -0.5) or np.any(theta > 1.5):
+        raise ValueError(
+            f"{where}: restored design is not SCALED -- it lies in [{theta.min():.3g}, {theta.max():.3g}], "
+            f"not [0, 1]. A pre-migration checkpoint (encoded theta + optimiser moments at encoded "
+            f"magnitudes) looks exactly like this and cannot be resumed; start a fresh run."
+        )
+    return design_scaled
+
+
+def check_bo_results(results, path):
+    """Reject a ``results.json`` written before the encoded->scaled migration.
+
+    Pre-migration runs stored the searched design as ``"x_encoded"`` in N(0,1) units. Those numbers
+    are not scaled designs: pushing them through ``to_nominal`` extrapolates linearly outside the
+    design box, so the file must not simply be re-keyed. The ``"design"`` column is physical and is
+    the only safe re-entry point. Returns ``results`` unchanged when the file is current."""
+    if len(results) > 0 and "x_scaled" not in results[0]:
+        found = "x_encoded" if "x_encoded" in results[0] else "neither x_scaled nor x_encoded"
+        raise ValueError(
+            f"{path}: pre-migration BO results ({found}). The searched space is now the SCALED cube "
+            f"[0, 1]^d, and the stored N(0,1) vectors do not convert -- re-run, or re-enter through "
+            f"the physical 'design' column."
+        )
+    return results
+
+
+def save_design(detector, design_path, design_scaled):
+    """Write the SCALED design ``design_scaled`` out in NOMINAL (physical) units, TAGGED with the
+    space it is in. Physical units are the only parameterisation-independent form, so a later
+    re-parameterisation cannot invalidate the file; the tag is what lets :func:`load_design` refuse
+    a pre-migration file instead of silently misreading it."""
     import json
     import numpy as np
 
     os.makedirs(os.path.dirname(design_path), exist_ok=True)
 
-    decoded = np.asarray(detector.flatten_design(detector.decode_design(design)), dtype=np.float32)
+    nominal = np.asarray(detector.flatten_design(detector.to_nominal(design_scaled)), dtype=np.float32)
     with open(design_path, "w") as f:
-        json.dump(decoded.tolist(), f, indent=2)
+        json.dump({"space": "nominal", "design": nominal.tolist()}, f, indent=2)
 
 
 def save_training_checkpoint(manager, step, *, config, parameters, state, design, aux=None):
@@ -115,7 +176,7 @@ def restore_training_checkpoint(manager, step=None):
 
     ``parameters`` / ``state`` come back as pure dicts -- load them into an abstract
     nnx state (``nnx.split`` of a freshly built module) with ``nnx.replace_by_pure_dict``.
-    ``design`` is the ``{"encoded", "physical"}`` tree; ``aux`` the saved metrics.
+    ``design`` is the ``{"scaled", "physical"}`` tree; ``aux`` the saved metrics.
     """
     if step is None:
         step = manager.latest_step()

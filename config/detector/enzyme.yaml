@@ -18,12 +18,117 @@ enzyme:
   duration: 1.0            # one experiment lasts an hour
   measurement_noise: 0.05  # std of the [A] read-out
 
-  # Design bounds -- what can actually be pipetted, nothing narrower: a volume fraction runs the whole
-  # 0 (no enzyme) to 1 (no substrate), and both extremes are useless experiments rather than invalid
-  # ones, so let the optimiser discover that instead of forbidding it here. The temperature range is
-  # the liquid-water range, which is also where the objective peak is sought.
+  # Design bounds -- the volume fraction runs the whole 0 (no enzyme) to 1 (no substrate), because
+  # both extremes are useless experiments rather than invalid ones and it is the optimiser's job to
+  # discover that.
   enzyme_fraction_bounds: [0.0, 1.0]
-  temperature_bounds: [0.0, 100.0]
+
+  # The temperature range the assay is run over. This is the benchmark's one legitimate difficulty
+  # knob -- narrowing the ADMISSIBLE SET is the only change that leaves the objective untouched (same
+  # target, same prior, same enzyme population, same normaliser, same noise floor), so before and
+  # after stay the same function and remain comparable in Celsius. (Widening the T_melting prior
+  # would NOT be: see the note on it below.)
+  #
+  # Why it is a knob at all. The readout is a THRESHOLD -- activity collapses across the unfolding
+  # transition, so an experiment says something about T_melting only while it sits near the edge, and
+  # the target IS that edge. The informative window is therefore intrinsically about
+  # (prior width 13 C) + (transition width ~7 C) ~ 20 C, and no kinetic parameter moves it:
+  # softening the transition destroys the target's identifiability instead of widening the window
+  # (measured over delta_H /10 .. x2 in docs/enzyme-gbdt-log.md; the current values are also the
+  # physically right ones). Against the full 0-100 C range that window is only 10%, so ~66% of random
+  # designs score the target's own variance EXACTLY -- a plateau with a needle in it. Landscape
+  # statistics over the candidate boxes, 192 uniformly random PHYSICAL designs each (so these numbers
+  # are independent of how the optimiser parameterises its search):
+  #
+  #   bounds      misses window   plateau   best     median   median/best
+  #   [0, 100]        65.6%         3.6%    0.0719   0.2946      4.10
+  #   [35, 70]        28.5%         0.0%    0.0402   0.1650      4.10
+  #   [40, 65]        14.3%         0.0%    0.0406   0.1272      3.13
+  #   [44, 62]         4.5%         0.0%    0.0420   0.0967      2.30
+  #
+  # The achievable optimum is FLAT at ~0.040 across every narrowed box -- the best design is interior
+  # to all of them, so narrowing removes dead region rather than handing the optimiser its answer.
+  #
+  # ⚠️ PROVENANCE (audited 2026-08-10): only the [0, 100] row is reproducible from data still on disk
+  # (output/gbdt/landscape/random_base.json: plateau 3.6%, best 0.0719, median 0.2946, ratio 4.10 --
+  # all exact). The three narrowed rows have NO stored landscape JSON anywhere in the tree; the
+  # landscape files that exist vary the T_melting PRIOR (melt20_80/melt25_75/melt30_70), not this
+  # box. The "misses window" column is also not reproducible from the stored designs at the stated
+  # [48, 62] window (which gives 55.7%, not 65.6%; 65.6% needs a 10 C window). Treat the three
+  # narrowed rows as UNVERIFIED until re-measured -- and note the box decision below does not rest
+  # on them, it rests on the BO-vs-null table further down.
+  #
+  # SET TO [25, 80] (2026-08-10), WIDENED from [35, 68] on the measurement below. This reverses the
+  # direction of the earlier narrowing, and the reason it does is that narrowing optimised the wrong
+  # quantity: it maximised how good a design a SHOTGUN finds, when what the benchmark exists to show
+  # is that an OPTIMISER's extra iterations are worth more than a shotgun's.
+  #
+  # Measured with the working (invariant-kernel) optimiser, 8 BO seeds against 10 random
+  # instances, 120 iterations, each row's null drawn on its own function (output/wide, output/iters120, output/noise_lo):
+  #
+  #   box        noise   BO@120    null/BO   p       BO 60->120   null 60->120   ratio
+  #   [35, 68]   0.05    0.0357    1.31x     2e-5      1.115x        1.117x       1.00x
+  #   [25, 80]   0.05    0.0382    1.38x     0.010     1.226x        1.054x       1.16x
+  #   [35, 68]   0.02    0.0158    0.97x     0.62      1.289x        1.230x       1.05x
+  #   [25, 80]   0.02    0.0188    1.03x     0.45      1.458x        1.120x       1.30x
+  #
+  # (An earlier revision of this comment read 1.39x / 1.048x / 1.17x on the second row. Those were
+  # computed while one of the ten random-search runs was still finishing; the values above are the
+  # complete 8-vs-10 figures. The conclusion is unchanged.)
+  #
+  # ⛔️ THIS TABLE WAS MEASURED WITH A DEFECTIVE EI GRADIENT (found 2026-08-10 20:5x). All four rows
+  # come from output/iters120, output/wide and output/noise_lo, which ran 01:51-03:41. The missing
+  # `d diag(x)/dx` term in the EI gradient was not fixed in detopt/bo/bayesian_optimization.py until
+  # 13:46 the same day. So every BO arm in this table was proposed by an optimiser whose acquisition
+  # gradient was wrong; only the random nulls are unaffected, because random search never calls the
+  # GP -- which is precisely why the nulls reproduce bit-identically across the fix and gave false
+  # comfort that nothing had changed.
+  #
+  # HOW MUCH THIS MATTERS, measured: re-running `permutation-invariant-rbf` at [25, 80] under the
+  # FIXED optimiser (output/kernel-norm, 12 seeds) gives null/BO = 0.997x -- exactly the null --
+  # against the 1.376x in the row below. Same seeds, same box, same kernel: the first five
+  # iterations are bit-identical (the random initial design) and the trajectories diverge at
+  # iteration 6, the first GP-driven proposal. The measured value of the invariant kernel therefore
+  # does NOT survive the fix, and neither should this table be trusted until re-run.
+  #
+  # THE BOX DECISION RESTS ON IT and has not been re-confirmed. Left at [25, 80] because reverting on
+  # equally untrustworthy evidence would be no better; re-running the four rows under the current
+  # optimiser is the outstanding work.
+  #
+  # ⚠️ EVEN IF IT IS RE-RUN, how much weight it carries -- audited 2026-08-10 -- is LESS than it looks.
+  # The arithmetic is exact; the inference is weak on three counts, all recorded in
+  # docs/enzyme-gbdt-log.md:
+  #
+  #   * The p column is ONE-SIDED. Two-sided it is 4.6e-5 / 0.021 / 1.0 / 0.90. Each row has its OWN
+  #     null (verified: the four null sets differ by up to 0.16 in best-so-far), so these are four
+  #     independent tests and Holm across them changes little: 9.0e-5, 0.031, 0.90, 0.90. Both 5%
+  #     rows survive; the 2% rows were never significant.
+  #   * The last column's bootstrap 95% CI CONTAINS 1 on every row (e.g. [0.901, 1.294] for the row
+  #     this box was chosen on). Recomputed per-seed instead of as a ratio of medians, p = 0.14. The
+  #     ratio ORDERS the boxes; it does not establish that any of them differs from 1.
+  #   * It is checkpoint-sensitive: read at 30 iterations instead of 60 the four rows give
+  #     1.058 / 0.940 / 1.134 / 1.109, so the [25, 80] 5% row -- the one this box rests on -- inverts.
+  #
+  # And the selection is CIRCULAR: the 1.16x that justifies this box is measured on the same runs
+  # that are then reported as the result for it. Choosing the box this way is defensible as a design
+  # decision; quoting the same number afterwards as evidence FOR the box is not. A clean confirmation
+  # would need fresh seeds at [25, 80], which have not been run.
+  #
+  # The last column is the point. At [35, 68] doubling the iteration budget helps BO and random
+  # EXACTLY equally (1.00x), so a strategy that fits twice the iterations into the same wall clock
+  # wins nothing an optimiser-blind baseline would not also win. At [25, 80] BO's extra iterations
+  # are worth 1.16x the null's, and BO still beats it outright (1.38x, p = 0.01) -- both halves of
+  # the brief at once. The 2% read-out rows show the trade the other way: the largest differential
+  # payoff in the table, but BO only TIES the null, which is no showcase for an optimiser.
+  #
+  # The cost is 0.04 C of absolute resolution (1.23 -> 1.27 C at 120 iterations), which is the dead
+  # volume BO has to spend its early iterations learning to avoid. That is the mechanism, not a side
+  # effect: a surrogate earns its advantage where there is somewhere it can learn NOT to propose.
+  #
+  # NOT trustworthy for this knob: the `screen` landscape statistics (correlation length, headroom)
+  # rank [25, 80] mid-table. They describe how much a benchmark rewards more evaluations BY ANYONE,
+  # which is a different question, and they got this one wrong. See docs/enzyme-gbdt-log.md.
+  temperature_bounds: [25.0, 80.0]
 
   # The objective: conversion of the 1/3 E : 1/3 A : 1/3 B mixture after `duration`. Its maximising
   # temperature is the target. (The mixing rule makes fraction = 1/3 exactly that mixture.)
@@ -64,6 +169,19 @@ enzyme:
     Q10_cat: [1.8, 2.6]       # Arrhenius slope of the turnover: Ea 40 .. 60 kJ/mol
     delta_H: [4.5e4, 1.0e5]   # unfolding enthalpy over R (K): 370 .. 830 kJ/mol (~50 kDa monomer)
     delta_C: [2.5e3, 4.5e3]   # heat-capacity change over R (K): 21 .. 37 kJ/mol/K
+    # The TARGET the regressor infers. Deliberately UNCHANGED, and not a tuning knob at all.
+    #
+    # Widening this range does not make the benchmark easier to optimise, it makes it a DIFFERENT
+    # objective. The loss is an expectation of predictive MSE over the drawn enzymes, so a wider
+    # prior averages over a wider population and moves the objective's own minimum and its
+    # irreducible (noise-set) floor. On top of that `normalize_target` scales by this very range, so
+    # the reported number shrinks for free. Measured, widening to [25, 75]: normalised loss
+    # 0.089 -> 0.060 while the physical resolution got WORSE, 1.94 C -> 6.11 C RMSE. Nothing before
+    # and after such a change is comparable.
+    #
+    # The benchmark's difficulty belongs in the DESIGN SPACE -- which designs the optimiser may
+    # choose -- because narrowing that leaves the target, the enzyme population and the floor
+    # identical. See `temperature_bounds` above.
     T_melting: [45.0, 58.0]   # hexokinase inactivates above ~45 C; must lie within temperature_bounds
 
   # ---------------------------------------------------------------------------------------------

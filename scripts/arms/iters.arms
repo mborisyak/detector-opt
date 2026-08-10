@@ -1,0 +1,8 @@
+# Does the benchmark still pay for iterations at the count the META strategy actually reaches?
+#
+# The four-strategy campaign's claim is an ITERATION ADVANTAGE: meta fitted ~124 designs into the
+# wall clock the others spent on ~60. That only converts into a better final design if best-so-far
+# is still falling between 60 and 120 -- which a 60-iteration campaign cannot answer, however good
+# its numbers look. The kernel is the one measured to work (output/kernel): ard-rbf ties the null.
+pi   |bo    |--kernel permutation-invariant-rbf
+null |random|

@@ -29,8 +29,8 @@ class StereoHits(StereoStrawDetector):
     def element_mask(self, event, mask):
         return mask  # element == hit (the continuous-conv regressor treats each hit as a graph node)
 
-    def combine_encoded(self, event, encoded_design, mask=None):
-        """Raw ``StrawEvent`` + ENCODED design -> per-HIT features ``(B, M, 7)`` (``mask`` accepted but
+    def combine_scaled(self, event, design_scaled, mask=None):
+        """Raw ``StrawEvent`` + SCALED design -> per-HIT features ``(B, M, 7)`` (``mask`` accepted but
         not needed -- padded hits are gated by the regressor's hit mask)."""
         station = jnp.asarray(event.station, jnp.int32)  # (B, M)
         view = jnp.asarray(event.view, jnp.int32)
@@ -41,10 +41,10 @@ class StereoHits(StereoStrawDetector):
         per_station = self.n_views_per_station * self.n_layers_per_view
         g = jnp.clip(station * per_station + view * self.n_layers_per_view + layer, 0, self.n_layers - 1)  # (B,M)
 
-        d_enc = jnp.asarray(encoded_design, jnp.float32)
-        if d_enc.ndim == 1:
-            d_enc = jnp.broadcast_to(d_enc[None, :], (B, d_enc.shape[0]))
-        phys = self._decode_flat(d_enc)  # (B, n_stations + 1) physical [station_z..., stereo_angle]
+        d_scaled = jnp.asarray(design_scaled, jnp.float32)
+        if d_scaled.ndim == 1:
+            d_scaled = jnp.broadcast_to(d_scaled[None, :], (B, d_scaled.shape[0]))
+        phys = self._to_nominal_flat(d_scaled)  # (B, n_stations + 1) physical [station_z..., stereo_angle]
         z_hit = jnp.take_along_axis(phys[..., : self.n_stations], jnp.clip(station, 0, self.n_stations - 1), axis=1)
         z_mid = 0.5 * (self.layer_bounds[0] + self.layer_bounds[1])
         z_half = max(0.5 * (self.layer_bounds[1] - self.layer_bounds[0]), 1e-6)

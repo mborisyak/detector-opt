@@ -105,7 +105,7 @@ def _key(seq):
 
 def _sample_buffer(detector, theta, event_index, *, sampling_batch, device, progress):
     """Simulate the events at ``event_index`` at the FIXED design ``theta`` into a buffer (raw event,
-    mask, raw target). ``combine_encoded`` + ``normalize_target`` run per batch in the train/eval kernels
+    mask, raw target). ``combine_scaled`` + ``normalize_target`` run per batch in the train/eval kernels
     -- the buffer never holds the (wide) combined features."""
     design_dim = detector.design_dim()
     M = int(jax.tree.leaves(detector.event_spec())[0].shape[0])  # per-hit count
@@ -119,7 +119,7 @@ def _sample_buffer(detector, theta, event_index, *, sampling_batch, device, prog
     while filled < n:
         chunk = min(sampling_batch, n - filled)
         idx = event_index[filled:filled + chunk]
-        phys = detector.decode_design(jnp.broadcast_to(theta[None, :], (chunk, design_dim)))
+        phys = detector.to_nominal(jnp.broadcast_to(theta[None, :], (chunk, design_dim)))
         _gt, event, mask, target = detector(phys, idx)
         buf.push(event, mask, target)
         filled += chunk
@@ -139,7 +139,7 @@ def regress(seed, checkpoint=None, restore=True, init_from=None, progress=True, 
     steps_per_epoch = max(1, train_samples // batch)
 
     detector = detopt.detector.from_config(config["detector"])
-    theta = jnp.asarray(detector.encode_design(config["design"]), jnp.float32)  # FIXED design, always from config
+    theta = jnp.asarray(detector.to_scaled(config["design"]), jnp.float32)  # FIXED design, always from config
     design_source = "initial design (config)"
     design_dim = detector.design_dim()
     labels = tuple(detector.metric_labels())
@@ -199,7 +199,7 @@ def regress(seed, checkpoint=None, restore=True, init_from=None, progress=True, 
 
     def _net_loss(params, state, drop_key, event_b, mask_b, target_b, count):
         reg = nnx.merge(reg_def, params, state)
-        feats = detector.combine_encoded(event_b, theta, mask=mask_b)  # fixed design (encoded), per hit
+        feats = detector.combine_scaled(event_b, theta, mask=mask_b)  # fixed design (scaled), per hit
         emask = detector.element_mask(event_b, mask_b)  # per-element mask (== hit mask, unless layer-wise)
         loss = jnp.mean(_forward_loss(reg, detector.loss, feats, emask, detector.normalize_target(target_b),
                                       members, count, deterministic=False, rngs=nnx.Rngs(drop_key)))
@@ -244,7 +244,7 @@ def regress(seed, checkpoint=None, restore=True, init_from=None, progress=True, 
         def step(acc, chunk):
             s, ss = acc
             ev_chunk, m, t = chunk
-            feats = detector.combine_encoded(ev_chunk, theta, mask=m)
+            feats = detector.combine_scaled(ev_chunk, theta, mask=m)
             emask = detector.element_mask(ev_chunk, m)
             pred = _forward_shared(reg, feats, emask, members, deterministic=True)
             md = detector.metric(pred, _target_for(detector.normalize_target(t), members))
@@ -265,8 +265,8 @@ def regress(seed, checkpoint=None, restore=True, init_from=None, progress=True, 
     val_buf = fill(val_index)
     n_train = jnp.int32(len(train_buf))
 
-    physical = detector.flatten_design(detector.decode_design(theta))
-    print(f"decoded design: {detector.decode_design(theta)}")
+    physical = detector.flatten_design(detector.to_nominal(theta))
+    print(f"decoded design: {detector.to_nominal(theta)}")
     print(
         f"train={train_samples} val={val_samples}  epochs={epochs} batch={batch} "
         f"steps/epoch={steps_per_epoch}  members={members}"
@@ -283,7 +283,7 @@ def regress(seed, checkpoint=None, restore=True, init_from=None, progress=True, 
             "seed": int(seed),
             "design_source": design_source,
             "design_physical": np.asarray(physical).tolist(),
-            "design_encoded": np.asarray(theta).tolist(),
+            "design_scaled": np.asarray(theta).tolist(),
             "labels": list(labels),
             "final_validation": final,  # normalized per-component mean MSE
             "final_validation_sem": final_sem,  # standard error of each mean MSE (normalized)
@@ -324,14 +324,14 @@ def regress(seed, checkpoint=None, restore=True, init_from=None, progress=True, 
 
 
 def _resolve_design(detector, design):
-    """Encoded ``theta`` from a design given on the command line. ``design`` is either an
+    """Scaled ``theta`` from a design given on the command line. ``design`` is either an
     already-resolved design dict (gearup expands the top-level ``design`` key through
     ``config/design/``) or a bare name / path, which we load from ``config/design/<name>.yaml``
     (a second comparison design is NOT a config key, so it arrives as a string we resolve here)."""
     if isinstance(design, str):
         path = design if os.path.exists(design) else os.path.join("config", "design", f"{design}.yaml")
         design = detopt.utils.config.load_config(path)
-    return jnp.asarray(detector.encode_design(design), jnp.float32)
+    return jnp.asarray(detector.to_scaled(design), jnp.float32)
 
 
 def validate(seed, checkpoint, compare=None, design_b=None, progress=True, **config):
@@ -392,7 +392,7 @@ def validate(seed, checkpoint, compare=None, design_b=None, progress=True, **con
         def chunk_pred(i):
             sl = slice(i * eval_batch, (i + 1) * eval_batch)
             ev = jax.tree.map(lambda a: a[sl], event_buf)
-            feats = detector.combine_encoded(ev, theta, mask=mask_buf[sl])
+            feats = detector.combine_scaled(ev, theta, mask=mask_buf[sl])
             emask = detector.element_mask(ev, mask_buf[sl])
             return np.asarray(predict(params, state, feats, emask))
 
@@ -400,7 +400,7 @@ def validate(seed, checkpoint, compare=None, design_b=None, progress=True, **con
         cut = n_chunks * eval_batch
         tgt_norm = detector.normalize_target(jax.tree.map(lambda a: a[:cut], tgt_buf))
         errors = detector.prediction_errors(np.concatenate(preds), np.asarray(tgt_norm))
-        print(f"\n{ckpt}  (step {last}, design {detector.decode_design(theta)}):")
+        print(f"\n{ckpt}  (step {last}, design {detector.to_nominal(theta)}):")
         for name, (err, unit) in errors.items():
             print(f"  {name:>10s}  bias={err.mean():+.4g}  std={err.std():.4g}  {unit}")
         return errors

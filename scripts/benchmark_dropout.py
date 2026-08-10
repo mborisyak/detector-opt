@@ -28,8 +28,9 @@ DROPOUTS = [0.0, 0.1, 0.3]
 
 def run(seed=0, n_models=4, budget=400_000, iteration_limit=16384, loss_precision=2.0e-2):
     det = Stereo4Feature(engine="simplified")
-    # Nominal design: zeros in ENCODED space decode to the midpoint of every bound.
-    design = np.zeros(det.design_dim(), dtype=np.float32)
+    # Nominal design: 0.5 is the midpoint of every bound in the SCALED cube (zeros, which meant
+    # the midpoint under the old encoding, are now its LOWER CORNER).
+    design = np.full(det.design_dim(), 0.5, dtype=np.float32)
     rows = []
     for p in DROPOUTS:
         trainer = DesignTrainer(

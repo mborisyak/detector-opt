@@ -4,7 +4,7 @@
 * :class:`ContinualTrainer` -- one persistent network across designs, with replay;
 * :class:`FullBudgetTrainer` -- one design, full budget up front, fixed epochs.
 
-All are **design-conditioned**: ``combine`` always sees each event's true encoded
+All are **design-conditioned**: ``combine`` always sees each event's true scaled
 design (no design scramble).
 """
 

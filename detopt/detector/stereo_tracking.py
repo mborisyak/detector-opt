@@ -19,8 +19,8 @@ __all__ = ["Stereo4Feature", "DaughterTarget", "StereoTrackerTruth"]
 class Stereo4Feature(StereoStrawDetector):
     """Stereo geometry + the 4-feature per-hit combine (the default stereo detector)."""
 
-    def combine_encoded(self, event, encoded_design, mask=None):
-        return four_feature_combine(self, event, encoded_design, mask=mask)
+    def combine_scaled(self, event, design_scaled, mask=None):
+        return four_feature_combine(self, event, design_scaled, mask=mask)
 
     def combined_event_shape(self):
         return four_feature_shape(self)
@@ -53,7 +53,7 @@ class StereoTrackerTruth(Stereo4Feature):
         """Build a tracking ``StrawEvent`` from the solver's per-track trajectory
         (``traj (B, n_tracks, m, 3)``, ``n_cross (B, n_tracks)``). Each recorded crossing becomes one
         hit: its ``(station, view, layer-in-view)`` address + nearest ``straw`` are quantised from the
-        ``(x, y, z)`` crossing (same geometry as :meth:`combine_encoded`), and -- under the flags --
+        ``(x, y, z)`` crossing (same geometry as :meth:`combine_scaled`), and -- under the flags --
         ``x, y`` (the exact crossing, ``hits_xy``); ``drift_r`` (perpendicular crossing->wire distance,
         re-derived host-side from ``(x, y)`` then SMEARED by ``N(0, sigma_spatial)`` to be FairShip-
         realistic, ``drift_r``); and ``tdc`` (the real digitised TDC, looked up from the ``digi`` packed

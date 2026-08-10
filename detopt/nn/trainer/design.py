@@ -116,14 +116,14 @@ class _DesignBase(Trainer):
 
     def train(
         self,
-        design_enc,
+        design_scaled,
         seed_seq,
         *,
         init_params=None,
         on_epoch=None,
         step=0,
     ) -> TrainResult | None:
-        """Train a regressor for one *encoded* design.
+        """Train a regressor for one *scaled* design.
 
         Appends this design's events into the shared budget pools (a fresh window)
         and trains within that window. ``seed_seq`` is a
@@ -134,8 +134,8 @@ class _DesignBase(Trainer):
         exhausted (the design did not complete).
         """
         detector = self.detector
-        design_enc = np.asarray(design_enc, dtype=np.float32)
-        design = detector.decode_design(design_enc)  # physical Design namedtuple (what the pools store)
+        design_scaled = np.asarray(design_scaled, dtype=np.float32)
+        design = detector.to_nominal(design_scaled)  # physical Design namedtuple (what the pools store)
         design_phys = np.asarray(detector.flatten_design(design), dtype=np.float32)  # flat, for the checkpoint tree
 
         init_seq, training_seq = seed_seq.spawn(2)
@@ -151,7 +151,7 @@ class _DesignBase(Trainer):
         w0_train_j, w0_val_j = jnp.int32(w0_train), jnp.int32(w0_val)
 
         manager = self._checkpoint_manager(step)
-        design_tree = {"encoded": design_enc, "physical": design_phys}
+        design_tree = {"scaled": design_scaled, "physical": design_phys}
 
         train_loss_history, val_loss_history, pool_size_history = [], [], []
         train_sem_history, val_sem_history = [], []
