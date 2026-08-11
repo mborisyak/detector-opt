@@ -11,6 +11,7 @@ from .common import Model
 from .discriminator import *
 from .mlp import MLPRegressor
 from .set_regressor import SetRegressor
+from .alpha_set_regressor import AlphaSetRegressor
 from .pair_set_regressor import PairSetRegressor
 from .induced import InducedSetRegressor
 from .predictive import PredictiveSetRegressor, PredictiveProbRegressor, PredictiveMixtureRegressor
@@ -22,6 +23,10 @@ from .hierarchical import DoubleSetRegressor, StructuredSetRegressor
 __models__: dict[str, type[Model]] = {
     "mlp-regressor": MLPRegressor,  # flat (order-dependent) MLP over a fixed-length element set; enzyme ablation
     "set-regressor": SetRegressor,  # ensemble via n_models (None = single net)
+    # Same deep set, but each per-element block is a residual stack with zero-initialised
+    # per-unit alpha: identity at init, so depth is cheap to add where the plain stack at
+    # widths 16-24 degrades. Capacity is width/depth here, not a list of hidden sizes.
+    "alpha-set-regressor": AlphaSetRegressor,
     "pair-set-regressor": PairSetRegressor,  # deep set over all hit PAIRS (single net)
     "set-discriminator": SetDiscriminator,
     "induced-set-regressor": InducedSetRegressor,

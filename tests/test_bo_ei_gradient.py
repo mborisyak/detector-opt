@@ -16,7 +16,7 @@ import jax.numpy as jnp  # noqa: E402
 from jax.scipy.linalg import cho_solve as jax_cho_solve  # noqa: E402
 from jax.scipy.stats import norm as jax_norm  # noqa: E402
 
-from detopt.bo import BayesianOptimizer  # noqa: E402
+from detopt.bo import ARDRBF, BayesianOptimizer  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -61,11 +61,12 @@ def _fitted(d, n, seed):
 def _jax_ei(model, x, y_best):
     """EI rebuilt in JAX from the fitted sklearn parameters (the autodiff target).
 
-    The closed form below is the ARD-RBF one, which is valid because these fixtures build the
-    optimiser with no exchangeable block -- there the kernel reduces exactly to ``sigma^2 * RBF``
-    (pinned by ``test_without_blocks_it_is_exactly_an_ard_rbf``). Asserted rather than assumed, so
-    this reference cannot silently drift out of agreement with the kernel it is checking."""
-    assert len(model.kernel_.blocks) == 0, "the ARD closed form below does not hold with a symmetry"
+    The closed form below is the ARD-RBF one, which is valid because these fixtures take the
+    driver's default kernel, ``sigma^2 * RBF`` with no symmetry of any kind. Asserted rather than
+    assumed, and by EXACT type: :class:`SortingRBF` is an ``ARDRBF`` too, and this form does not
+    hold for it (its arguments are sorted first), so an ``isinstance`` check would let the reference
+    drift out of agreement with the kernel it is checking."""
+    assert type(model.kernel_) is ARDRBF, "the ARD closed form below does not hold for this kernel"
     X_train = jnp.asarray(model.X_train_)
     L = jnp.asarray(model.L_)
     alpha = jnp.asarray(np.ravel(model.alpha_))

@@ -93,6 +93,22 @@ bo:
     # is keyed to its index parity, so permuting layers is a different detector; and the stereo
     # stations are already ordered by their coupled sequential window, so the relabelling symmetry
     # is removed by the parameterisation rather than left for the kernel.
+    #
+    # AN INVARIANT KERNEL IS NOT AN OPTION HERE, and the reason is worth writing down because
+    # `config/enzyme.yaml` selects one and the two designs look superficially alike. Both invariant
+    # families (sorting, group average) would have to act on the SCALED coordinates the GP sees, and
+    # `_to_nominal_flat` (stereo_straw.py:263) makes those conditional: u_k is the fraction of the
+    # window REMAINING after station k-1, with the window reset at the magnet, so u_1 and u_2 are not
+    # commensurable quantities and slots 0-1 live upstream of the magnet while 2-3 live downstream.
+    # Measured on 2000 uniform draws at this config: the nominal stations come out strictly
+    # increasing in EVERY draw (slot ranges [8250, 8667], [8374, 8767], [9147, 9600], [9259, 9700]),
+    # and sorting the u's moves the physical design by a median 175 cm, max 437 cm, leaving it
+    # unchanged in 64/2000. So sorting is the IDENTITY in the space where it would mean something
+    # (the nominal z's, already ordered) and asserts a false equality in the space it would act on.
+    # A genuine set symmetry here needs the map to change first -- independent per-station z on a
+    # global range, ordering left to the solver, as `free_straw` does with its 32 `layer_z` (the C
+    # solver sorts layers by z before propagating, straw_detector.c:589, so a 32! redundancy IS
+    # unmodelled there and an invariant kernel would have something real to quotient).
     kernel:
       ard-rbf: {}
 

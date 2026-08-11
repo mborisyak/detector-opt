@@ -23,12 +23,19 @@ def masked_mean(values, n_valid):
 
 
 def masked_mean_sem(values, n_valid):
-    """Masked mean and its standard error over the first ``n_valid`` entries."""
+    """Masked mean and its standard error over the first ``n_valid`` entries.
+
+    The error of the mean is ``std / sqrt(n - 1)``: ``var`` below is the POPULATION variance
+    (divided by ``n``), so the unbiased error of the mean divides by ``n - 1`` rather than ``n``.
+    At the evaluation sizes used here the two differ by well under a permille, but the estimate
+    feeds the GP's observation noise and the convergence test, so it is the defined quantity
+    rather than the convenient one.
+    """
     valid = jnp.arange(values.shape[0]) < n_valid
     count = jnp.maximum(jnp.sum(valid), 1.0)
     mean = jnp.sum(jnp.where(valid, values, 0.0)) / count
     var = jnp.maximum(jnp.sum(jnp.where(valid, values**2, 0.0)) / count - mean**2, 0.0)
-    return mean, jnp.sqrt(var / count)
+    return mean, jnp.sqrt(var / jnp.maximum(count - 1.0, 1.0))
 
 
 def is_plateaued(loss_history, patience, flatness_tol, loss_precision):

@@ -1,6 +1,34 @@
-# Full default config for the `enzyme` detector (EnzymeDetector): EVERY __init__ parameter, written
-# at its default value. Single-batch design of experiments on A + B -> C + D via an enzyme E.
-# Concentrations are mM, times hours, temperatures degrees Celsius.
+# ADENYLATE KINASE variant (2026-08-11, user). Same reaction as the baseline -- A + B -> C (+ D)
+# via the enzyme E, with product inhibition -- run on a SMALL enzyme instead of a ~50 kDa one, so
+# that the melt is wide enough for the objective to vary smoothly with the design.
+#
+# THE ENZYME. Adenylate kinase, EC 2.7.4.3: ATP + AMP <-> 2 ADP, inhibited by its product. 214
+# residues / 23.6 kDa for the E. coli enzyme, a single chain that unfolds two-state -- against the
+# ~450-residue cooperative unit the baseline assumes. Note C and D are the SAME species here (both
+# ADP), so the two inhibition constants are equal; the baseline's asymmetric pair (tight G6P, weak
+# ADP) is a hexokinase property and is not transferable. Shikimate kinase (EC 2.7.1.71, 173 aa)
+# would keep distinct products at the price of much thinner calorimetry.
+#
+# THE POPULATION IS REAL, NOT INVENTED. AdK is the textbook mesophile-to-thermophile series, and the
+# prior below is simply its measured spread across organisms: B. subtilis ~47-50 C, E. coli ~55 C,
+# G. stearothermophilus ~74 C, T. thermophilus / Aquifex ~78-90 C. So `T_melting: [45, 78]` is one
+# enzyme family across its natural hosts rather than a knob turned to make BO work.
+#
+# WHY THIS FIXES THE LANDSCAPE. Measured on this repo's own `gibbs_fraction` at the literature
+# thermodynamics below, the hot-side 10-90% width is 9.8-14.9 K (typical 12.2) with peak folded
+# fraction >= 0.985 -- against 4.6-10.2 K for the baseline. The quantity that governs whether a
+# batch degenerates is
+#
+#     useful experiments ~ (prior span) / (transition width) = 33 K / 12.2 K ~ 2.7
+#
+# measured directly on the baseline as 1.8, where the best m=3 design tiles three probes one width
+# apart and the best m=4 design is two useful probes plus junk. At ~2.7, batches of 2-3 remain
+# genuinely non-redundant while a probe now informs over +-6 K instead of +-3 K, so moving it 2 K
+# changes the loss continuously instead of switching a bump on or off.
+#
+# NOT COMPARABLE WITH THE BASELINE, by construction: the loss is an expectation over the drawn
+# population and `normalize_target` scales by the prior half-range, so both the objective's floor and
+# its units move. Compare runs of this config only with each other.
 enzyme:
   # 2 (user, 2026-08-11 19:20), down from 4. Pure combinatorics, and it is the batch size -- a
   # DESIGN-SPACE choice -- not an enzyme parameter, so the system itself is untouched.
@@ -212,7 +240,7 @@ enzyme:
   # against 0.12 at [25, 80] -- so the initial random designs carry signal more often, which is the
   # stated requirement for BO to have anything to model early. It also cuts the dead volume that
   # made uninformative designs the EXPENSIVE ones (a ceiling design measured at 68266 calls).
-  temperature_bounds: [35.0, 68.0]
+  temperature_bounds: [35.0, 88.0]
 
   # The objective: conversion of the 1/3 E : 1/3 A : 1/3 B mixture after `duration`. Its maximising
   # temperature is the target. (The mixing rule makes fraction = 1/3 exactly that mixture.)
@@ -242,17 +270,17 @@ enzyme:
   # whereas HK I's G6P inhibition acts at a separate site -- the constants are real, the functional
   # form is a simplification.
   parameters:
-    log_K0_A: [-3.91, -1.61]  # K_M glucose: 0.02 .. 0.2 mM (HK I/II, ~0.03-0.05 mM)
+    log_K0_A: [-3.00, -1.20]  # K_M AMP: 0.05 .. 0.3 mM (AdK, ~0.1 mM)
     Q10_A: [0.7, 2.0]         # its per-10C factor -- K_M drifts only mildly with temperature
-    log_K0_B: [-2.30, 0.0]    # K_M ATP: 0.1 .. 1 mM
+    log_K0_B: [-2.99, -1.20]  # K_M ATP: 0.05 .. 0.3 mM (AdK, ~0.1 mM)
     Q10_B: [0.7, 2.0]
-    log_K0i_C: [-3.91, -1.61] # Ki, G6P: 0.02 .. 0.2 mM -- tight product inhibition (~0.06 mM)
+    log_K0i_C: [-2.30, -0.69] # Ki, ADP: 0.1 .. 0.5 mM -- C and D are the SAME product here,
     Q10_C: [0.7, 2.0]
-    log_K0i_D: [-1.20, 1.10]  # Ki, ADP: 0.3 .. 3 mM -- weak (~1 mM)
+    log_K0i_D: [-2.30, -0.69] # so the two constants match: AdK makes 2 ADP
     Q10_D: [0.7, 2.0]
     Q10_cat: [1.8, 2.6]       # Arrhenius slope of the turnover: Ea 40 .. 60 kJ/mol
-    delta_H: [4.5e4, 1.0e5]   # unfolding enthalpy over R (K): 370 .. 830 kJ/mol (~50 kDa monomer)
-    delta_C: [2.5e3, 4.5e3]   # heat-capacity change over R (K): 21 .. 37 kJ/mol/K
+    delta_H: [3.61e4, 4.57e4] # 300 .. 380 kJ/mol, AdK calorimetry (214 residues, two-state)
+    delta_C: [1.32e3, 1.56e3] # 11 .. 13 kJ/mol/K, i.e. ~55 J/mol/K per residue
     # The TARGET the regressor infers. Deliberately UNCHANGED, and not a tuning knob at all.
     #
     # Widening this range does not make the benchmark easier to optimise, it makes it a DIFFERENT
@@ -266,7 +294,7 @@ enzyme:
     # The benchmark's difficulty belongs in the DESIGN SPACE -- which designs the optimiser may
     # choose -- because narrowing that leaves the target, the enzyme population and the floor
     # identical. See `temperature_bounds` above.
-    T_melting: [45.0, 58.0]   # hexokinase inactivates above ~45 C; must lie within temperature_bounds
+    T_melting: [45.0, 78.0]   # the AdK homologue series, mesophile to thermophile
 
   # ---------------------------------------------------------------------------------------------
   # Numerics: the resolution of each numerical procedure. None of these change the physics -- they

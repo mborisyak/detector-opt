@@ -45,9 +45,8 @@ from scipy.linalg import cho_solve
 from scipy.optimize import minimize
 from scipy.stats import norm, qmc
 from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import RBF, ConstantKernel
 
-from .kernels import PermutationInvariantRBF
+from .kernels import ARDRBF
 
 __all__ = ["BayesianOptimizer"]
 
@@ -105,9 +104,8 @@ class BayesianOptimizer:
 
         # The GP prior. Supplied by the caller when the design has structure worth modelling (see
         # detopt.bo.kernels); otherwise the historical ARD-RBF, one lengthscale per coordinate.
-        self.kernel = kernel if kernel is not None else PermutationInvariantRBF(
+        self.kernel = kernel if kernel is not None else ARDRBF(
             d=self.d,
-            blocks=(),  # no symmetry -> an ordinary per-coordinate ARD-RBF
             constant_value=self._amplitude_init,
             constant_value_bounds=self._amplitude_bounds,
             length_scale=np.full(self.d, self._length_scale_init),

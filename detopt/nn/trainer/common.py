@@ -47,7 +47,7 @@ __all__ = ["Trainer", "TrainResult"]
 
 class TrainResult(NamedTuple):
     objective_loss: float  # (mean_train + mean_val) / 2 at convergence
-    objective_std: float  # 0.5 * sqrt(train_sem^2 + val_sem^2) -- est_sem
+    objective_std: float  # |val - train| + hypot(train_sem, val_sem) -- spread + error of the means
     spent: int  # detector calls this design added to the pools (train + val)
     params: object  # trained regressor params (for warm-starting later designs)
 

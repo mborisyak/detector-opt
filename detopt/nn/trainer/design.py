@@ -237,7 +237,14 @@ class _DesignBase(Trainer):
                     if not (train_flat and val_flat):
                         continue  # (2) train further
                     if diff + err < self.loss_precision:
-                        objective = (0.5 * (train_mean + val_mean), 0.5 * err)  # (4)
+                        # The objective is (train + val) / 2 and its uncertainty is `diff + err`:
+                        # the SPREAD of the two numbers averaged, plus the error of their means. It
+                        # is the very quantity the line above just bounded below `loss_precision`,
+                        # so what the GP is told about an observation is exactly what made the
+                        # design stop -- and never smaller than the tolerance that allowed it.
+                        # Passing `err` alone (the old value) claims a precision the estimate does
+                        # not have: it ignores the generalisation gap, which is the larger term.
+                        objective = (0.5 * (train_mean + val_mean), diff + err)  # (4)
                         print(
                             f"  [converged] train={train_mean:.4f} val={val_mean:.4f} "
                             f"diff={diff:.4f} err={err:.4f} diff+err={diff + err:.4f} "

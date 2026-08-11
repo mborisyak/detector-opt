@@ -37,7 +37,13 @@ DETECTOR_CONFIG = "config/detector/enzyme.yaml"
 # to int32 by the detector, so this stays well inside that range.
 VERIFY_OFFSET = 1 << 24
 
-# The GP/EI settings of config/enzyme.yaml, which this driver does not otherwise read.
+# The GP/EI settings of config/enzyme.yaml, which this driver does not otherwise read. The
+# lengthscale prior is overridable from the command line (`--log-lengthscale-bounds LO HI`) because
+# it is the subject of a study: on the recorded designs of finished runs, narrowing it from [-6, 4]
+# to [-1.5, 0.5] raises the spread of the GP's predicted means from 0.105 to 0.251 of the data's own
+# spread, i.e. it stops the surrogate predicting nearly the same value everywhere. The width is a
+# modelling CHOICE about how quickly the objective may vary, so it belongs in the arms file next to
+# the kernel rather than baked in here.
 GP = {
   "n_folds": 5,
   "n_restarts": 5,
@@ -49,7 +55,14 @@ EI = {"n_restarts": 32, "n_steps": 100}
 
 
 def run(mode, seed, n_iterations, n_events, overrides, output, verify, fixed_fraction=None,
-        n_init=None, kernel_name=None, shared_fraction=False):
+        n_init=None, kernel_name=None, shared_fraction=False, log_lengthscale_bounds=None,
+        log_amplitude_bounds=None):
+  # A per-run copy, so a swept prior never leaks into the module-level default.
+  gp_settings = dict(GP)
+  if log_lengthscale_bounds is not None:
+    gp_settings["log_lengthscale_prior_bounds"] = [float(v) for v in log_lengthscale_bounds]
+  if log_amplitude_bounds is not None:
+    gp_settings["log_amplitude_prior_bounds"] = [float(v) for v in log_amplitude_bounds]
   config = detopt.utils.config.override(detopt.utils.config.load_config(DETECTOR_CONFIG), overrides)
   detector = detopt.detector.from_config(config)
   n = detector.n_experiments
@@ -120,8 +133,8 @@ def run(mode, seed, n_iterations, n_events, overrides, output, verify, fixed_fra
     # coordinates laid out as [fraction, T_1 .. T_n]. Two lengthscales: one tied across the
     # temperatures (a symmetric function cannot tell experiment 1 from experiment 3), one for the
     # fraction, which is now a single genuinely distinguishable coordinate.
-    ls_low, ls_high = GP["log_lengthscale_prior_bounds"]
-    amp_low, amp_high = GP["log_amplitude_prior_bounds"]
+    ls_low, ls_high = gp_settings["log_lengthscale_prior_bounds"]
+    amp_low, amp_high = gp_settings["log_amplitude_prior_bounds"]
     # `kernel_from_config` sizes the kernel from `design_spec()` -- the FULL 2n design -- so it
     # cannot be used for any reduced search. Both reduced parameterisations build it here at the
     # dimension actually searched: `--shared-fraction` declares the temperature block exchangeable
@@ -133,7 +146,10 @@ def run(mode, seed, n_iterations, n_events, overrides, output, verify, fixed_fra
     # PermutationInvariantRBF silently DOWNGRADES every kernel added later (the normalised variant
     # would have run as the plain group average here, under its own name in the results).
     clazz = detopt.bo.__kernels__[kernel_name]
-    layout = {"sort_blocks": blocks} if kernel_name == "sorting-rbf" else {"blocks": blocks}
+    # `ard-rbf` is the plain sklearn product and takes no group argument at all; the others differ
+    # only in whether their index tuples are averaged over or sorted by.
+    layout = {} if kernel_name == "ard-rbf" else (
+        {"sort_blocks": blocks} if kernel_name == "sorting-rbf" else {"blocks": blocks})
     kernel = clazz(
       d=searched, **layout,
       constant_value=float(np.exp(amp_low + amp_high)),
@@ -146,10 +162,10 @@ def run(mode, seed, n_iterations, n_events, overrides, output, verify, fixed_fra
     # itself from the full design), which `searched_dimensions` and `shared_fraction` record instead.
     kernel_config = {kernel_name: ({"exchangeable": n} if len(blocks) > 0 else {})}
   else:
-    kernel = detopt.bo.kernel_from_config(kernel_config, detector, GP)
+    kernel = detopt.bo.kernel_from_config(kernel_config, detector, gp_settings)
   optimiser = BayesianOptimizer(
-    searched, gp=GP, ei=EI, kernel=kernel,
-    n_init=int(n_init) if n_init is not None else GP["n_folds"], seed=seed
+    searched, gp=gp_settings, ei=EI, kernel=kernel,
+    n_init=int(n_init) if n_init is not None else gp_settings["n_folds"], seed=seed
   )
   rng = np.random.default_rng(seed)
   # Normalised MSE -> C: the target is scaled to [-1, 1] over the T_melting prior, so one unit of
@@ -170,13 +186,26 @@ def run(mode, seed, n_iterations, n_events, overrides, output, verify, fixed_fra
     design = np.asarray(to_design(x), dtype=np.float32)
 
     score = score_design(detector, design, n_events=n_events, event_offset=0, seed=0)
-    # The GP's observation noise. Under common random numbers the objective is EXACTLY reproducible
-    # (measured sd 0.00000 over repeats), so the honest value is ~0 and only a jitter is needed for
-    # conditioning. `score.sem` is the SAMPLING error of the loss estimate -- how far this event
-    # block's answer sits from the infinite-sample one -- which is a real uncertainty about the
-    # design's true quality but NOT scatter the GP would see if it re-evaluated the same point.
-    # Feeding it as observation noise makes the GP over-smooth and over-explore.
-    optimiser.append(x, score.loss, noise=max(score.sem, 1e-6))
+    # The GP's observation noise, taken from the regressor's own generalisation gap.
+    #
+    # The reported objective is (train + val) / 2, so the natural uncertainty on it is the SPREAD of
+    # the two numbers it averages: how far this design's estimate could be from its converged value.
+    # For the GBDT proxy that is |val - train| (the /2 is dropped here deliberately -- the neural
+    # driver, whose val is not selected by a stage-wise minimum, uses |val - train| / 2).
+    #
+    # What this replaces, and why it matters. `score.sem` is the SAMPLING error of the estimate --
+    # measured median 0.0026 -- and handing it to the GP as alpha = sem^2 = 6.5e-06 against a fitted
+    # prior variance of ~0.008 forces the surrogate to interpolate every point (a ratio of 1:1200).
+    # A step-like objective then has to be explained by shortening the lengthscale, which is what
+    # collapses it to ~0.24 and makes it swing 2.4x across the early iterations that set the whole
+    # trajectory. The generalisation gap is both larger and better founded: measured median
+    # |val - train| = 0.050, i.e. alpha = 0.0025, about 31% of the prior variance.
+    #
+    # Cross-check on the same runs: single-evaluation reproducibility, from scoring every design on
+    # a disjoint block too, is sd(loss - verified_loss)/sqrt(2) = 0.00329 -- an order of magnitude
+    # above `sem` and an order below this gap. The gap is therefore a generous nugget rather than a
+    # noise estimate, which is the intent: it stops the GP interpolating.
+    optimiser.append(x, score.loss, noise=max(abs(score.val - score.train), 1e-6))
 
     entry = {
       "iteration": iteration,
@@ -184,6 +213,7 @@ def run(mode, seed, n_iterations, n_events, overrides, output, verify, fixed_fra
       "x_scaled": x.tolist(),
       "loss": score.loss,
       "loss_sem": score.sem,
+      "gp_noise": float(max(abs(score.val - score.train), 1e-6)),
       # The same loss in DEGREES CELSIUS of target resolution. `loss` is a mean squared error on a
       # target scaled by the T_melting prior half-range, so it is only comparable between runs that
       # share that prior; the physical RMSE is comparable across every variant of the benchmark,
@@ -238,7 +268,9 @@ def run(mode, seed, n_iterations, n_events, overrides, output, verify, fixed_fra
       "concentration_E": float(detector.concentration_E),
       "objective_fraction": float(detector.objective_fraction),
       "half_time_bounds": [float(v) for v in detector.half_time_bounds],
-      "celsius_per_unit": float(celsius_per_unit)
+      "celsius_per_unit": float(celsius_per_unit),
+      "log_lengthscale_prior_bounds": [float(v) for v in gp_settings["log_lengthscale_prior_bounds"]],
+      "log_amplitude_prior_bounds": [float(v) for v in gp_settings["log_amplitude_prior_bounds"]]
     },
     "results": results,
     "best_loss": float(best_loss),
@@ -280,12 +312,28 @@ def main():
     help="GP kernel (default: sorting-rbf -- the batch's symmetry by sorting, which measured best; "
     "permutation-invariant-rbf averages over the group instead; ard-rbf models no symmetry)"
   )
+  parser.add_argument(
+    "--log-lengthscale-bounds", nargs=2, type=float, default=None, metavar=("LO", "HI"),
+    help="prior bounds on log lengthscale (default -6 4). Narrowing this is how the surrogate is "
+         "stopped from going flat: it forbids the marginal likelihood from explaining a nearly "
+         "constant objective with an effectively infinite lengthscale."
+  )
+  parser.add_argument(
+    "--log-amplitude-bounds", nargs=2, type=float, default=None, metavar=("LO", "HI"),
+    help="prior bounds on log amplitude, i.e. constant_value in (exp(2 LO), exp(2 HI)) (default "
+         "-6 1.5, six orders of magnitude). The objective is a normalised MSE with known support -- "
+         "measured min 0.032, p95 0.325, no-information level 1/3 -- so its variance is bracketed a "
+         "priori and the prior variance need not be free over six decades. Measured: the fit lands "
+         "at 1.08-1.19x the data variance and never touches these bounds, so this is hygiene "
+         "rather than a live defect."
+  )
   parser.add_argument("--set", dest="overrides", action="append", default=[], metavar="KEY=VALUE")
   parser.add_argument("--output", default=None)
   arguments = parser.parse_args()
   run(
     arguments.mode, arguments.seed, arguments.n_iterations, arguments.n_events, arguments.overrides, arguments.output,
-    arguments.verify, arguments.fix_fraction, arguments.n_init, arguments.kernel, arguments.shared_fraction
+    arguments.verify, arguments.fix_fraction, arguments.n_init, arguments.kernel, arguments.shared_fraction,
+    arguments.log_lengthscale_bounds, arguments.log_amplitude_bounds
   )
 
 

@@ -169,6 +169,8 @@ class FullBudgetTrainer(Trainer):
                     )
 
         objective_loss = 0.5 * (train_mean + val_mean)
-        objective_std = 0.5 * float(np.hypot(train_sem, val_sem))
+        # Same definition as DesignTrainer: the spread of the two averaged losses plus the error
+        # of their means, so `objective_std` means one thing across trainers.
+        objective_std = float(abs(val_mean - train_mean) + np.hypot(train_sem, val_sem))
         spent = tp.current + vp.current
         return TrainResult(objective_loss, objective_std, spent, params)

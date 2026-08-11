@@ -21,9 +21,10 @@ by averaging an equivariant base over the group. Two consequences worth being ex
   a direct answer to the measured pathology of ARD lengthscales pinning at the prior ceiling.
 
 * **With no exchangeable block it degrades exactly to ARD-RBF** (``|G| = 1``, one lengthscale per
-  coordinate). The straw/stereo geometries are NOT symmetric -- a layer's wire stagger is keyed to
-  its index parity, and the stereo stations are already ordered by their coupled window -- so they
-  take that path and nothing about their fit changes.
+  coordinate) -- a property, verified by a test, and NOT how a design without a symmetry should be
+  served. The straw/stereo geometries are not symmetric (a layer's wire stagger is keyed to its
+  index parity, and the stereo stations are already ordered by their coupled window), so they take
+  :class:`ARDRBF`, which is sklearn's plain ``ConstantKernel * RBF`` and says what it models.
 
 Not stationary (``k(x, x')`` is not a function of ``x - x'`` once the group is averaged over) and
 ``diag`` is not constant, so neither of sklearn's stationary mixins applies.
@@ -33,9 +34,104 @@ import itertools
 import math
 
 import numpy as np
-from sklearn.gaussian_process.kernels import Hyperparameter, Kernel
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel, Hyperparameter, Kernel
 
-__all__ = ["PermutationInvariantRBF", "NormalisedInvariantRBF", "SortingRBF"]
+__all__ = ["ARDRBF", "PermutationInvariantRBF", "NormalisedInvariantRBF", "SortingRBF"]
+
+
+class ARDRBF(Kernel):
+  """``amplitude^2 * RBF(l)``: sklearn's OWN ``ConstantKernel * RBF``, with the three things the EI
+  optimiser needs bolted on -- the design dimension ``d``, ``k_and_grad_x`` (the gradient in the
+  INPUT, which sklearn does not expose) and ``grad_diag``.
+
+  This is the no-symmetry surrogate, and it is its own class deliberately. The same numbers come out
+  of :class:`PermutationInvariantRBF` with ``blocks=()``, but by a route that averages over a group
+  of one and takes the permanent of a 1x1 matrix -- a modelling statement ("this design is a set")
+  written in the code for designs that are not, and a Ryser pass to say nothing. Naming the plain
+  kernel keeps "no symmetry" a CHOICE in the registry rather than a degenerate case of the other.
+
+  The maths is delegated: :meth:`__call__` and :meth:`diag` are sklearn's product, so the ARD path
+  cannot drift away from the library's own implementation of it.
+  """
+
+  def __init__(self, d, constant_value=1.0, constant_value_bounds=(1e-5, 1e5),
+               length_scale=1.0, length_scale_bounds=(1e-5, 1e5)):
+    self.d = d
+    self.constant_value = constant_value
+    self.constant_value_bounds = constant_value_bounds
+    # Broadcast a scalar to one entry per COORDINATE here: sklearn reads `n_elements` off
+    # `hyperparameter_length_scale` but builds `theta` from the ATTRIBUTE, so a scalar leaves theta
+    # and bounds different lengths and `fit` dies with "The number of bounds is not compatible with
+    # the length of x0".
+    self.length_scale = length_scale
+    self.length_scale_bounds = length_scale_bounds
+    if np.atleast_1d(np.asarray(length_scale, dtype=float)).size == 1 and d > 1:
+      self.length_scale = np.full(d, float(np.ravel(length_scale)[0]))
+
+  @property
+  def n_length_scales(self):
+    return self.d
+
+  # sklearn hyperparameter plumbing (names must match the __init__ args). `hyperparameters` is
+  # collected by `dir()`, i.e. alphabetically, so theta is [log amplitude^2, log l] -- the same
+  # order sklearn's own Product produces, which is what lets `__call__` forward its gradient
+  # columns unchanged.
+  @property
+  def hyperparameter_constant_value(self):
+    return Hyperparameter("constant_value", "numeric", self.constant_value_bounds)
+
+  @property
+  def hyperparameter_length_scale(self):
+    return Hyperparameter("length_scale", "numeric", self.length_scale_bounds, self.d)
+
+  @property
+  def _kernel(self):
+    """sklearn's ``ConstantKernel * RBF`` at the CURRENT hyperparameters.
+
+    Built per call, not stored: sklearn tunes a kernel by ``clone_with_theta``, which assigns the
+    attributes directly and never re-runs ``__init__``, so anything cached from the constructor
+    would silently answer with the hyperparameters the fit started from."""
+    return (ConstantKernel(float(self.constant_value), self.constant_value_bounds)
+            * RBF(self.coordinate_length_scales(), self.length_scale_bounds))
+
+  def coordinate_length_scales(self):
+    """The lengthscale of each DESIGN COORDINATE, ``(d,)``. Same name and meaning as the invariant
+    kernels', where it repeats a block's shared value -- here every coordinate has its own."""
+    length_scale = np.atleast_1d(np.asarray(self.length_scale, dtype=float))
+    if length_scale.size == 1:
+      length_scale = np.full(self.d, length_scale[0])
+    if length_scale.size != self.d:
+      raise ValueError(f"length_scale has {length_scale.size} entries, expected {self.d}")
+    return length_scale
+
+  def __call__(self, X, Y=None, eval_gradient=False):
+    return self._kernel(np.atleast_2d(X), None if Y is None else np.atleast_2d(Y), eval_gradient)
+
+  def diag(self, X):
+    return self._kernel.diag(np.atleast_2d(X))
+
+  def grad_diag(self, x):
+    """Exactly zero: ``k(x, x) = amplitude^2`` for every ``x``, so the posterior variance's prior
+    term does not move with the proposal."""
+    return np.zeros(self.d)
+
+  def k_and_grad_x(self, X_train, x):
+    """``k(x, X_train)`` and ``dk/dx``: ``(n,)`` and ``(n, d)``. The acquisition needs the gradient
+    in the INPUT, which no sklearn kernel exposes, so this one expression is ours."""
+    x = np.asarray(x, dtype=float).ravel()
+    X_train = np.atleast_2d(np.asarray(X_train, dtype=float))
+    length_scale = self.coordinate_length_scales()
+    difference = X_train - x[None, :]                                   # (n, d)
+    exponent = (difference * difference / (length_scale**2)[None, :]).sum(axis=1)
+    k = float(self.constant_value) * np.exp(-0.5 * exponent)            # (n,)
+    return k, k[:, None] * difference / (length_scale**2)[None, :]
+
+  def is_stationary(self):
+    return True
+
+  def __repr__(self):
+    return (f"{type(self).__name__}(d={self.d}, amplitude^2={float(self.constant_value):.3g}, "
+            f"l={np.round(self.coordinate_length_scales(), 3)})")
 
 
 class PermutationInvariantRBF(Kernel):
@@ -372,7 +468,7 @@ class PermutationInvariantRBF(Kernel):
             f"l={np.round(self._length_scales(), 3)})")
 
 
-class SortingRBF(PermutationInvariantRBF):
+class SortingRBF(ARDRBF):
   """An ARD-RBF that SORTS the exchangeable elements before comparing them.
 
   ``k(x, y) = k_ard(sigma x, sigma y)``, where ``sigma`` orders the elements by one designated block
@@ -409,12 +505,12 @@ class SortingRBF(PermutationInvariantRBF):
 
   def __init__(self, d, sort_blocks=(), key=-1, constant_value=1.0, constant_value_bounds=(1e-5, 1e5),
                length_scale=1.0, length_scale_bounds=(1e-5, 1e5)):
-    # The parent is constructed with NO exchangeable block: this kernel is a plain per-coordinate
-    # ARD in the sorted frame, so every coordinate keeps its own lengthscale. `sort_blocks` describes
-    # only which coordinates travel together under the sort.
-    super().__init__(d=d, blocks=(), constant_value=constant_value,
-                     constant_value_bounds=constant_value_bounds, length_scale=length_scale,
-                     length_scale_bounds=length_scale_bounds)
+    # The parent is the PLAIN ARD-RBF: this kernel is a per-coordinate ARD in the sorted frame, so
+    # every coordinate keeps its own lengthscale, and the invariance comes from the folding below
+    # rather than from any group the parent averages over. `sort_blocks` describes only which
+    # coordinates travel together under the sort.
+    super().__init__(d=d, constant_value=constant_value, constant_value_bounds=constant_value_bounds,
+                     length_scale=length_scale, length_scale_bounds=length_scale_bounds)
     self.sort_blocks = sort_blocks
     self.key = key
     # Every name in the signature must survive `get_params` -> `clone`, which sklearn calls on each
@@ -442,10 +538,9 @@ class SortingRBF(PermutationInvariantRBF):
   def diag(self, X):
     return super().diag(self._sorted(X))
 
-  def grad_diag(self, x):
-    """Exactly zero: ``k(x, x)`` is the amplitude for every ``x``, so the posterior variance's first
-    term does not move and EI has no gradient pulling it toward self-similar designs."""
-    return np.zeros(self.d)
+  # `grad_diag` is the parent's: sorting leaves k(x, x) at the amplitude, so the zero it returns is
+  # already the right answer here -- and the reason this kernel exists is that the group average's
+  # is NOT zero, which is what pulls EI toward self-similar designs.
 
   def k_and_grad_x(self, X_train, x):
     """Chain rule through the sort. Its Jacobian is a permutation matrix almost everywhere, so the

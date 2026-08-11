@@ -33,19 +33,38 @@ training:
   # Gradient-free evaluation batch for the sequential train+val loss passes.
   eval_batch: 2048
   # Mandatory unconditional epochs after every data addition.
-  warmup_epochs: 32
+  warmup_epochs: 16
   # Shared detector-call budget for the run; pools are preallocated at this many rows (180 B/event).
-  budget: 1048576
+  # 512 * 1024, doubled from 262144 on 2026-08-11 to pay for `loss_precision: 1.0e-2` below: at
+  # ~27000 calls a design (measured, output/calib/from_scratch) this leaves `from_scratch` ~19
+  # designs, back above the 10-design floor, where 262144 would have left ~8.
+  budget: 524288
   # Per-design cap AND the epoch length (iteration_limit / batch SGD steps). Set to the full budget:
-  # the convergence criterion alone decides when a design is done.
-  iteration_limit: 262144
+  # the convergence criterion alone decides when a design is done. Keeping the two equal also keeps
+  # the "did not reach precision within iteration_limit" RuntimeError unreachable -- the cap can
+  # never bind before the pool is exhausted, so an expensive design degrades instead of crashing.
+  iteration_limit: 524288
 
   val_fraction: 0.25
   # Convergence: |val - train| + SEM < loss_precision, over a target scaled by the T_melting prior
   # half-range (6.5 C), so the no-information level is 1/3 and a good design reaches ~0.10.
   flatness_tol: 1.0
-  loss_precision: 2.0e-2
-  patience: 16
+  # 1.0e-2 is needed to RESOLVE THE OPTIMUM, and the budget pays for it (2026-08-11).
+  #
+  # The criterion is `|val - train| + err < loss_precision`, so this is the slack the objective is
+  # allowed to carry. At 2.0e-2 that slack (0.02) is larger than the gap between a good design and
+  # the best one at the tuned settings -- measured over 384 random designs at [38, 65] x fraction
+  # [0.2, 0.7], the best scores 0.0329 and the 5th percentile ~0.045, a 0.012 spread. An optimiser
+  # cannot rank designs whose true difference sits inside its own evaluation slack, however many
+  # iterations it gets, which is the whole quantity this benchmark exists to show.
+  #
+  # The price, measured on `from_scratch` (output/calib/from_scratch, seed 1244111331, box [25, 80]):
+  # 32761 / 36856 / 20476 / 19111 calls per design against a median 10921 at 2.0e-2 -- ~2.5-3x, since
+  # `err ~ 1/sqrt(window)` and only more data clears a tighter bar. At budget 262144 that left ~8
+  # designs a run, under the 10-design floor; `budget` is therefore doubled below rather than this
+  # being relaxed.
+  loss_precision: 1.0e-2
+  patience: 8
   optimizer:
     adamw:
       learning_rate: 2.5e-4
@@ -56,7 +75,11 @@ training:
 
 bo:
   # No fixed iteration count -- the run continues until the shared `budget` is exhausted.
-  # Initial random proposals = gp.n_folds.
+  # Random proposals before the GP takes over. Written explicitly (user, 2026-08-11) rather than
+  # left to default to gp.n_folds: at the run lengths this campaign targets -- 10-15 designs for the
+  # per-design strategies -- the initial block is a THIRD of a run, so it is a setting in its own
+  # right and not an implementation detail of the cross-validation.
+  n_init: 5
   gp:
     n_folds: 5
     n_restarts: 5
@@ -64,7 +87,25 @@ bo:
     # See config/bo.yaml: l is read against the unit cube, so the ceiling must sit
     # well above 1 for ARD to be able to declare a design dimension irrelevant.
     # Measured on the finished meta runs, 1.5 pinned 3-5 of these 8 dimensions.
-    log_lengthscale_prior_bounds: [-6.0, 4.0]
+    # NARROWED 2026-08-11 from [-6, 4]. The old range permits l = 0.0025 on a unit cube (every point
+    # independent, K diagonal) and l = 54.6 (the objective is constant) -- both degenerate, and both
+    # reachable by the marginal likelihood when the initial designs carry little signal, which is the
+    # "flat GP -> EI degenerates to random search" failure this benchmark kept hitting.
+    #
+    # Two independent measurements on recorded runs at [25, 80], neither involving the optimiser's
+    # own trajectory:
+    #   * replaying the GP fit at iteration 10, the spread of its predicted means (in units of the
+    #     data's spread) rises 0.105 -> 0.182 -> 0.217 -> 0.251 as the prior narrows through
+    #     [-6,4], [-3,2], [-2,1], [-1.5,0.5]: a narrower prior stops the surrogate predicting nearly
+    #     the same value everywhere;
+    #   * held-out prediction of the NEXT design from the first k (8 seeds, k in 10..40): MAE
+    #     0.0661 -> 0.0542 and mean negative log predictive density 0.37 -> 0.09 going from [-6,4]
+    #     to [-2,1], i.e. both the point prediction and the honesty of its uncertainty improve.
+    #
+    # [-2, 1] (l in 0.14 .. 2.7) is taken over the tighter [-1.5, 0.5]: it scored marginally better
+    # on MAE, it still brackets the settled fitted value (0.24-0.29) with room either side, and it
+    # does not pin 94% of fits against a bound the way the tighter one does.
+    log_lengthscale_prior_bounds: [-2.0, 1.0]
     log_amplitude_prior_bounds: [-6.0, 1.5]
     # The design is a BATCH of interchangeable experiments: the regressor aggregates over them
     # permutation-invariantly, so all n_experiments! orderings are ONE design with ONE loss, and the
@@ -199,9 +240,14 @@ bo:
     # gets its best case rather than the keyed approximation the (fraction, temperature) pairs force).
     # Re-running both properly -- 20 analytic seeds, and the enzyme campaign at more than 12 -- is
     # owed before this default is called established.
+    # AT n_experiments = 1 THE SYMMETRY IS TRIVIAL. One experiment means one element, the permutation
+    # group is the identity, and every invariant kernel above collapses to the plain ARD RBF while
+    # paying its machinery cost. `ard-rbf` (user, 2026-08-11) is that kernel written honestly. The
+    # whole comment block above concerns batches of exchangeable experiments and applies again the
+    # moment n_experiments goes back above 1 -- restore `normalised-invariant-rbf` with
+    # `exchangeable: n_experiments` then.
     kernel:
-      normalised-invariant-rbf:
-        exchangeable: 4   # = n_experiments; the (enzyme_fraction, temperature) blocks permute TOGETHER
+      ard-rbf: {}
   ei:
     n_restarts: 32
     n_steps: 100
