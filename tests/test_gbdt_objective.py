@@ -38,7 +38,11 @@ def detector():
 def test_sample_shapes(detector):
   features, target = sample_design(detector, _batch(detector, 1.0 / 3.0, 50.0), np.arange(64))
   assert features.shape == (64, detector.n_experiments * detector.n_measurements)
-  assert target.shape == (64, )
+  # The target KEEPS its component axis, `(n_events, n_target)`. The melting point is one component,
+  # so this detector gives (64, 1) rather than (64,). Ravelling instead would silently interleave the
+  # components of a VECTOR target (`enzyme_mm`'s three Michaelis-Menten coefficients) into one column
+  # and would destroy a one-hot CLASS target (`enzyme_inhib`) entirely.
+  assert target.shape == (64, detector.target_dim())
   # normalize_target maps the melting prior onto [-1, 1]; the draw is uniform inside it.
   assert np.all(np.abs(target) <= 1.0 + 1e-5)
 

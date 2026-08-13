@@ -55,7 +55,6 @@ def run(seed=0, n_max_cap=16384):
         n_max_cap=n_max_cap,
         warmup_epochs=10,
         patience=10,
-        flatness_tol=1e-2,
         loss_precision=1e-2,
         val_fraction=0.2,
         device=device,

@@ -1,0 +1,68 @@
+# Which admissible DESIGN SPACE makes BO convert iterations into a better convergence curve?
+#
+# Pre-registered criterion, fixed before these ran (2026-08-11): the PER-SEED payoff over the
+# 15 -> 30 doubling, BO's gain divided by its own null's, > 1 -- with `best@15 / best@30 >= 1.15`
+# reported alongside but NOT sufficient on its own (on the reference campaign `sorting-rbf` scored
+# 1.333 there while winning only 6 of 12 seeds against the null). Reliability decides: per-seed win
+# rate, IQR and worst seed, not the median alone. Seeds 0-7 select, 8-15 confirm.
+#
+# 15 -> 30 is the doubling the neural campaign spans: at `loss_precision: 1.0e-2` and
+# `budget: 524288`, `from_scratch` completes ~20 designs (measured, output/calib3), `meta` far more.
+#
+# Kernel: `normalised-invariant-rbf`. At k=30 on the post-fix reference campaign it is both the best
+# and the most reliable of the three invariant kernels -- median 0.0553, 9/12 seeds beating the
+# null, worst seed 0.0760 -- while `sorting-rbf`'s advantage turns out to be a k=120 effect (6/12 at
+# k=30, largest IQR). Two BO-only arms re-test that at the new box.
+#
+# ---------------------------------------------------------------------------------------------
+# WHAT THE LANDSCAPE SCREENS ESTABLISHED (output/screen0 192 designs, output/screen1 384; no
+# optimiser in the loop). `E[sig|5]` = expected number of the 5 Sobol initial designs scoring >=20%
+# below the no-information level; `room` = median design / best design.
+#
+#   1. Signal falls monotonically with box width (4.87 at 20 C to 3.95 at 38 C) while room grows
+#      (2.30x to 3.39x). No width maximises both. The incumbent [25, 80] is the worst of both:
+#      E[sig|5] = 2.89.
+#   2. Narrowing the enzyme fraction to [0.2, 0.7] cuts the MEDIAN loss ~40% at a fixed box and gives
+#      the best optima measured anywhere. It removes the f->0 / f->1 corners (no enzyme, no
+#      substrate) -- dead volume in four of eight dimensions.
+#   3. ASYMMETRIC boxes centred at 55 C beat symmetric ones centred on the prior at EVERY width,
+#      on best AND room AND median, at equal signal:
+#           w24 [40,64] best 0.0447 room 2.56  ->  a24 [43,67] best 0.0415 room 2.72
+#           w27 [38,65] best 0.0465 room 2.70  ->  a27 [42,69] best 0.0393 room 2.98
+#           w33 [35,68] best 0.0460 room 3.26  ->  a33 [39,72] best 0.0383 room 3.52
+#      The informative window measured at [48, 62] is centred on 55, not on the prior's 51.5, so a
+#      symmetric box spends its cold half where every enzyme reads fully folded.
+#   4. Correlation length is NOT used: the same box measured 0.47 and 0.26 in the two rounds. This
+#      estimator has been wrong three times in this repo's history.
+#
+# Every arm is `both` (its own null): the acceptance guard compares the `overrides` list literally,
+# so an arm carrying --set cannot borrow a null that does not.
+# ---------------------------------------------------------------------------------------------
+
+# The incumbent config, unchanged -- the control everything else is measured against.
+t55    |both|--kernel normalised-invariant-rbf --set enzyme.temperature_bounds=[25.0,80.0]
+
+# Asymmetric boxes, the screens' strict improvement, at two widths: narrow (more initial signal,
+# less room) and wide (the reverse).
+a27    |both|--kernel normalised-invariant-rbf --set enzyme.temperature_bounds=[42.0,69.0]
+a33    |both|--kernel normalised-invariant-rbf --set enzyme.temperature_bounds=[39.0,72.0]
+
+# The two knobs together -- untested by any screen, and the predicted best of both: an asymmetric
+# box keeps room while the narrowed fraction restores the signal a wide box loses.
+a33f   |both|--kernel normalised-invariant-rbf --set enzyme.temperature_bounds=[39.0,72.0] --set enzyme.enzyme_fraction_bounds=[0.2,0.7]
+a27f   |both|--kernel normalised-invariant-rbf --set enzyme.temperature_bounds=[42.0,69.0] --set enzyme.enzyme_fraction_bounds=[0.2,0.7]
+
+# The symmetric counterpart of a33f, so "asymmetry helps" is measured with the fraction held fixed
+# rather than inferred across the screens.
+t33f   |both|--kernel normalised-invariant-rbf --set enzyme.temperature_bounds=[35.0,68.0] --set enzyme.enzyme_fraction_bounds=[0.2,0.7]
+
+# Batch size, at the best asymmetric box. The screen says m=3 is worse than m=4 on every axis
+# (E[sig|5] 3.75 vs 4.19, best 0.0492 vs 0.0352); kept because it is cheap (0.75x per design), it
+# halves the permutation group to 3! = 6, and the screen has mispredicted a campaign twice.
+m3     |both|--kernel normalised-invariant-rbf --set enzyme.temperature_bounds=[39.0,72.0] --set enzyme.n_experiments=3
+
+# Kernel re-test at the predicted-best box, BO-only: these borrow a33f's null
+# (`acceptance --null a33f`), legal because the guard excludes `kernel` from its settings comparison
+# and their --set overrides are byte-identical. Judge on reliability, not the median.
+a33fsort|bo |--kernel sorting-rbf --set enzyme.temperature_bounds=[39.0,72.0] --set enzyme.enzyme_fraction_bounds=[0.2,0.7]
+a33fpi  |bo |--kernel permutation-invariant-rbf --set enzyme.temperature_bounds=[39.0,72.0] --set enzyme.enzyme_fraction_bounds=[0.2,0.7]

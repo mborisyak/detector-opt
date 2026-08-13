@@ -1,0 +1,358 @@
+# Full config for the `enzyme_mm` detector (EnzymeMMDetector): EVERY __init__ parameter.
+# Michaelis-Menten COEFFICIENT RECOVERY on A + B -> C + D via an enzyme E -- the same chemistry as
+# config/detector/enzyme.yaml, but the batch has to estimate the enzyme's kinetic coefficients instead
+# of its melting point, the ATP concentration is a design coordinate, and the temperature box sits
+# below the melt. Plan: docs/task-mm-recovery.md. Gate: output/screen/provenance-mm.md.
+#
+# EVERY ENTRY CARRIES ITS SOURCE. `measured` = a literature value quoted in the plan; `ESTIMATE` = my
+# reasoning, stated. Concentrations are mM, times hours, temperatures degrees Celsius.
+#
+# THE READ-OUT IS THE MELT CONFIG'S: measurement_noise is 0.05 mM, exactly config/detector/enzyme.yaml's
+# (duration and n_measurements are the melt config's too, unchanged). It was 0.02 mM until 2026-08-13,
+# when it was RAISED because the integrator on THIS box cannot support the tolerance 0.02 mM implies --
+# the reason is written out at `measurement_noise` and `integration_tolerance`, and it is a numerics
+# reason, not an instrument one. The design bounds below are NOT restated against that floor -- see
+# concentration_A_bounds. The other structural change is that BOTH substrates are varied, over the SAME
+# box (below).
+#
+# ONE CONVENTION TO READ EVERYTHING BY: every kinetic constant below is its value at **25 C**, the
+# temperature enzyme kinetics are conventionally reported at and one inside the design box. The melt
+# model anchors at 0 C, which is fine for a nuisance and fatal for a target -- a 0 C-anchored constant
+# is reachable from a 10-35 C box only by extrapolating through its own Q10, and on this prior that
+# extrapolation alone spreads ln K by about as much as the parameter's own prior, i.e. it would sit at
+# ~1/3 of its prior variance however good the design. Re-anchoring is a change of coordinates on the
+# same van 't Hoff curve, not a change of physics (detopt/detector/enzyme_mm.py).
+#
+# THE MIXING CONSTRAINT IS WAIVED (user, 2026-08-12). The melt model derives every initial
+# concentration from one volume fraction (`A0 = concentration_A * (1 - fraction) / 2`); here each
+# initial concentration is its own coordinate with its own bounds. Stocks can be made up at whatever
+# strength the experiment needs, so the mixing ratio is bookkeeping rather than physics. What stays
+# physical is what each bound is stated FROM: solubility/practical stock strength at the top, the
+# read-out noise floor at the bottom for the MEASURED species, the min(A0, B0) conversion cap for the
+# co-substrate, and pipetting practicality for the enzyme.
+enzyme_mm:
+  # The designed batch: BO searches 4 * n_experiments dimensions -- [A]0 is a design coordinate here
+  # (concentration_A_bounds is set), not the baseline config's fixed assay constant. m ~ p, one
+  # experiment per IDENTIFIABLE coefficient (see target_parameters). That is the structural rule this
+  # task exists to satisfy: a D-optimal design for p parameters puts mass on ~p support points, so at
+  # m ~ p every experiment in the batch has a job and the information matrix has a clean interior
+  # maximum. m < p leaves the target underdetermined by construction; m > p makes the batch redundant,
+  # which is the melt benchmark's failure (p = 1 against m = 4, its best design being two useful probes
+  # plus junk). The screen runs m = 2, 3, 4 so the choice is visible rather than asserted.
+  n_experiments: 3
+  # [A] read-outs per experiment, evenly spaced, the last at `duration`. A FIXED grid, identical for
+  # every experiment and every design -- sampling times are NOT a design coordinate (plan section 4),
+  # which is what lets the combined element carry time positionally. Assay parameter, unchanged from
+  # the melt config.
+  n_measurements: 8
+
+  # ---------------------------------------------------------------------------------------------
+  # The assay -- UNCHANGED from config/detector/enzyme.yaml except where stated.
+  # ---------------------------------------------------------------------------------------------
+  # Enzyme stock concentration; the design's `enzyme_fraction` is the volume fraction taken from it, so
+  # E0 = concentration_E * enzyme_fraction. A PURE UNITS CHOICE, and provably not a tuning knob: the
+  # turnover calibration fixes the PRODUCT k_cat * E0 from `half_time`, so changing this constant
+  # changes k_cat by the exact inverse and leaves every trajectory identical. It is set so the reported
+  # k_cat lands in the 30-300 /s band measured for enzymes of this class -- i.e. so the model's numbers
+  # are physical rather than a 1000x-wrong bookkeeping artefact. MEASURED: scripts/validate_mm.py
+  # --mode build.
+  #
+  # RAISED 10x from the 8.0e-6 this variant inherited from the mm-gate config, by that rule alone and
+  # nothing else. The reference assay now sits at the HALF-SATURATION point of BOTH substrates
+  # (calibration_concentration_A = calibration_concentration_B = 0.3162), which fixes the extent it has
+  # to convert at 0.5 * min(A0, B0) = 0.1581 mM instead of the 0.0316 mM the old glucose reference gave;
+  # a longer reference conversion means a LARGER calibrated turnover, and at 8.0e-6 the median came out
+  # at 1004.5 /s (5-95% 229-5044), 3.3x above the top of the band. k_cat scales exactly as
+  # 1 / concentration_E -- MEASURED, not assumed: the rescale moved every percentile by exactly 10x and
+  # left the read-outs at all four known designs bit-identical -- so 8.0e-6 * (1004.5 / 100) = 8.0e-5.
+  # It gives median 100.4 /s, 5-95% 22.9-504.4 /s: the median sits next to the band's geometric centre
+  # sqrt(30 * 300) = 94.9 /s, and the tails run past it because the half_time prior is a factor of 8
+  # wide and no units choice can narrow a drawn distribution. NOTE this constant was ALREADY out of band
+  # before the calibration_concentration_A fix (median 353.6 /s at 8.0e-6).
+  concentration_E: 8.0e-5
+  duration: 1.0  # one experiment lasts an hour. Assay parameter, unchanged from the melt config.
+
+  # Read-out noise: ABSOLUTE Gaussian, sigma = measurement_noise, INDEPENDENT of the concentration
+  # being read -- the model carries no proportional term.
+  #
+  # RAISED 0.02 -> 0.05 mM on 2026-08-13. THE RULE THAT BINDS IT: `integration_tolerance` is 25% of this
+  # number (see integration_tolerance for the 25% rule and its derivation), so the read-out noise sets
+  # the bar the solver's own dt/dt-half guard has to clear. Under the OLD 10% rule 0.02 mM set that bar
+  # at 2.0e-3 mM, which the guard does NOT clear on this box: the known-good design of
+  # scripts/validate_mm.py measured 2.36e-3 mM over 4096 events at a design well
+  # inside the bounds ([A]0 = 3, [B]0 = 10 mM, 35 C, half the enzyme stock). Near that threshold the
+  # guard is reading FLOAT32 ROUNDING, not truncation: the error floors at ~8e-4 mM from 160 to 320
+  # steps and RISES again at 640, which truncation cannot do, so NO step count buys the missing margin
+  # (see n_steps_per_measurement). The campaign runs in float32 on GPU by choice -- float64 is slow
+  # there -- and a ~1e-3 mM arithmetic floor against 10 mM concentrations is 1e-4 RELATIVE, i.e.
+  # physically invisible. So the supportable fix is a coarser read-out, not a quieter integrator.
+  #
+  # WHY 0.05 SPECIFICALLY, and not the smallest number that would have passed: it is the melt config's
+  # own read-out (config/detector/enzyme.yaml), i.e. a value this repo already ships rather than one
+  # fitted to a guard measurement. Against the prior it is still an ordinary assay -- the lowest
+  # Michaelis constant in the symmetric prior is 0.1 mM = 2 sigma per reading, ~5.7 sigma over the
+  # eight-point progress curve on the usual sqrt(n) convention. The screen pre-registers 0.05 / 0.10 /
+  # 0.15 as its noise arms, with integration_tolerance following each by the 25% rule
+  # (1.25e-2 / 2.5e-2 / 3.75e-2), in BOTH directions. NOTE the design bounds below are NOT raised to
+  # this floor: their lower ends sit at 0.2 sigma, see concentration_A_bounds.
+  measurement_noise: 0.05
+
+  # ---------------------------------------------------------------------------------------------
+  # Design bounds. Design dimensionality is 4 * n_experiments: per experiment
+  # (enzyme_fraction, temperature, [A]0, [B]0) -- `concentration_A_bounds` is set, so [A]0 is a design
+  # coordinate and `_design_layout` appends it (detopt/detector/enzyme_mm.py).
+  #
+  # BOTH SUBSTRATES ARE VARIED HERE, over the SAME box and against the SAME prior, which is what this
+  # variant exists to test: in the baseline config glucose is held fixed and saturating because [A] is
+  # the species the photometer reads and its K_M prior lies below the read-out floor. Here K_M(glucose)
+  # is given K_M(ATP)'s prior (0.1-1 mM, see `parameters`) and the read-out is 0.05 mM, so the two
+  # substrates are interchangeable by construction and both K_M are SCORED; the rate's A/(A+K_A) and
+  # B/(B+K_B) factors are what the progress curve then identifies.
+  #
+  # The three MULTIPLICATIVE coordinates are scaled LOGARITHMICALLY onto [0, 1] (the detector's
+  # _to_scaled_flat). That is how an experimenter varies them -- a dilution series -- and a linear map
+  # would put essentially the whole Sobol sample above 0.1x the top of the range, so the sub-saturating
+  # half that identifies K_M would never be sampled. It changes the search MEASURE, not the admissible
+  # set: the box is the same box.
+  # ---------------------------------------------------------------------------------------------
+  # A DESIGN COORDINATE here, not the fixed assay constant of the baseline config, and this variant is
+  # the SYMMETRIC one: [A]0 and [B]0 get the SAME box and K_M(glucose) gets K_M(ATP)'s prior (0.1-1 mM,
+  # see `parameters`), so neither substrate is privileged. RULE, from that shared prior:
+  #   top   10 mM  = 10x the prior's highest (1 mM), the saturating arm;
+  #   floor 0.01 mM = 0.1x the prior's lowest (0.1 mM), the sub-saturating arm.
+  # UNLIKE the mm-gate variant, that floor is NOT then raised to the read-out floor: 0.01 mM is 0.2
+  # SIGMA of this config's read-out (measurement_noise 0.05 mM), so the bottom corner of the box is read
+  # BELOW the noise and nothing in the bounds keeps a design out of it. The bound is stated from the
+  # PRIOR and is deliberately NOT moved when the noise moves -- see `measurement_noise`.
+  concentration_A_bounds: [0.01, 10.0]
+  # RULE: the same box as [A]0 above -- that symmetry is what this variant exists to test. Top 10 mM =
+  # 10x the K_M(ATP) prior's highest (1 mM); floor 0.01 mM = 0.1x its lowest (0.1 mM), again 0.2 sigma of
+  # the 0.05 mM read-out rather than a multiple of it. The co-substrate conversion cap still bites there
+  # -- total conversion is min(A0, B0) -- so the bottom corner's whole progress curve is sub-noise.
+  concentration_B_bounds: [0.01, 10.0]
+  # RULE: instrument, independent of the prior. Upper = neat stock. Lower = 1%, the smallest volume
+  # fraction that can be pipetted reliably (1 uL into 100 uL). Strictly positive because the coordinate
+  # is log-scaled, and because "no enzyme at all" is not an experiment anyone runs. This axis matters
+  # for identifiability specifically: k_cat and E0 enter the initial rate only as a PRODUCT, so varying
+  # E0 is what separates them.
+  enzyme_fraction_bounds: [0.01, 1.0]
+  # RULE: upper = 5 C BELOW THE LOWEST MELTING POINT IN THE PRIOR (40 C), so no experiment probes the
+  # unfolding transition -- the defining property of this task, checked numerically by
+  # min_folded_fraction below. Lower = 10 C, a standard cold-room assay temperature and the coldest an
+  # aqueous buffer assay is routinely thermostatted at. The 25 K span gives Q10_cat = 2.2 a 5.7x rate
+  # swing, ample to identify a temperature slope.
+  temperature_bounds: [10.0, 35.0]
+
+  # ---------------------------------------------------------------------------------------------
+  # The target, CHOSEN BY IDENTIFIABILITY (plan section 5, acceptance section 4.2), not by taste.
+  # Only [A](t) is measured, so a target containing an unidentifiable direction would carry a floor no
+  # design can beat. scripts/validate_mm.py --mode fim computes the Fisher information of the measured
+  # [A](t) with jax.jacfwd straight through the solver, marginalises the nuisances with their own prior
+  # (I_eff = I_tt - I_tn (I_nn + 3I)^-1 I_nt; a uniform prior on [-1, 1] has precision 3) and reports the
+  # implied posterior variance against the prior's 1/3.
+  #
+  # THREE ROLES, and every drawn parameter has exactly one:
+  #   SCORED (this list)  log_K_A and log_K_B (the Michaelis constants of BOTH substrates) and Q10_cat
+  #                       (the turnover's temperature slope) -- the three the design has levers for: two
+  #                       substrate axes and a temperature axis. log_K_A is scored HERE, unlike the
+  #                       asymmetric configs, for the reason this variant exists: [A]0 is a design
+  #                       coordinate over the SAME box as [B]0 and against the SAME prior, so the design
+  #                       can put glucose on its sub-saturating arm exactly as it can ATP, and the
+  #                       A/(A+K_A) factor of the progress curve is then what identifies it. Whether the
+  #                       Fisher information actually supports all three is what scripts/validate_mm.py
+  #                       --mode fim measures; this list must be re-read against that measurement, since
+  #                       scoring a direction the data cannot support puts an irreducible floor on the
+  #                       loss. log_Ki_D joins them only if the Fisher information supports it.
+  #   DRAWN, NOT SCORED   Q10_A/B/C/D, log_Ki_C, log_Ki_D, delta_H, delta_C, T_melting -- real
+  #                       population variability the estimator must marginalise over.
+  #   FIXED               nothing that the melt model drew. No parameter was switched off.
+  # The loss is the MEAN over the scored components of the squared error in units of each component's OWN
+  # prior half-range (normalize_target), so every coefficient contributes comparably and predicting the
+  # prior mean still scores 1/3.
+  target_parameters: [log_K_A, log_K_B, Q10_cat]
+
+  # ---------------------------------------------------------------------------------------------
+  # Turnover calibration. The turnover SCALE is the one kinetic quantity not drawn: every enzyme is
+  # rescaled so that a FIXED reference assay half-converts at a time drawn log-uniformly from
+  # half_time_bounds. Turnover enters the rate as a single multiplicative factor, so this is an exact
+  # rescaling of every timescale. Without it a uniform prior over the turnover would put most enzymes
+  # either finished or untouched within the hour, carrying no information either way.
+  #
+  # The reference is design-INDEPENDENT on purpose: a design-dependent reference would make the drawn
+  # enzyme -- and therefore the target -- depend on the design, breaking the common-random-numbers
+  # contract the whole benchmark rests on.
+  # ---------------------------------------------------------------------------------------------
+  # FROM THE PRIOR, by the SAME rule as calibration_concentration_B below: the GEOMETRIC MEAN of the
+  # K_M(glucose) prior -- which in THIS variant IS the K_M(ATP) prior, log_K_A [-2.30, 0.0] = 0.1 .. 1
+  # mM -- so sqrt(0.1 * 1.0) = 0.3162 mM, the concentration at which the median enzyme is half
+  # saturated. It is NOT the asymmetric configs' 0.0632 = sqrt(0.02 * 0.2): that is the geometric mean
+  # of the NARROW glucose prior [-3.91, -1.61] this variant does not use, and under the symmetric
+  # prior it would put the reference assay at 0.2 x the median K_A instead of at it.
+  calibration_concentration_A: 0.3162
+  # FROM THE PRIOR: the GEOMETRIC MEAN of the K_M(ATP) prior, sqrt(0.1 * 1.0) -- the concentration at
+  # which the median enzyme is half saturated, which is the assay a competent experimenter runs first.
+  # The two are EQUAL here, as the symmetric prior requires: neither substrate is privileged.
+  calibration_concentration_B: 0.3162
+  # FROM THE PRIOR: the geometric mid-point of the enzyme dilution range, sqrt(0.01 * 1.0).
+  calibration_fraction: 0.1
+  # The anchor temperature: the same 25 C the drawn constants are the value at, so `half_time` is the
+  # half-conversion time of the reference assay at the reference temperature. Unlike the melt model there
+  # is NO search for the fastest temperature -- below the melt the rate is monotone in T, so "fastest"
+  # would simply be the top of the design box and would tie the meaning of half_time to the box.
+  calibration_temperature: 25.0
+  # ESTIMATE: the population spread of absolute turnover, bracketed so the reference assay is neither
+  # over within the first read-out interval (duration / n_measurements = 0.125 h) nor unfinished at
+  # `duration`. This calibration is what makes the whole prior measurable in one experiment. Unchanged
+  # from the melt config.
+  half_time_bounds: [0.25, 2.0]
+
+  # ---------------------------------------------------------------------------------------------
+  # Prior over an UNKNOWN HEXOKINASE-LIKE ENZYME -- the reaction this model describes is hexokinase's:
+  # glucose (A) + ATP (B) -> glucose-6-phosphate (C) + ADP (D), bi-substrate with both products
+  # inhibitory. HEXOKINASE-LIKE, not hexokinase: this is an OPTIMISATION BENCHMARK, so what a range has
+  # to be is PLAUSIBLE FOR AN ENZYME OF THIS CLASS, not a reproduction of one published preparation.
+  # Where a range is quoted against measurements below, they are the approximate literature spread
+  # across isoforms and species, NOT one isoform, and where this variant departs from them it says so
+  # (log_K_A). Every parameter is drawn uniformly within its range, so a `log_*` range is log-uniform on
+  # the quantity itself. Reported values are spread over three orders of magnitude across isozymes and
+  # assay conditions (free Mg2+ especially), so if anything these one-decade ranges are NARROWER than
+  # the literature supports.
+  # ---------------------------------------------------------------------------------------------
+  parameters:
+    # THE DEFINING CHANGE OF THIS VARIANT: glucose is given ATP's prior, Range 0.1 .. 1 mM at 25 C, so
+    # the two substrates share one prior and one box and neither is privileged. That is a
+    # HEXOKINASE-LIKE enzyme rather than a hexokinase: the measured glucose site is an order of
+    # magnitude tighter (yeast HK 0.14 +- 0.002 mM, ~50 uM by initial-velocity kinetics, HK I/II
+    # ~0.03-0.05 mM, i.e. the 0.02 .. 0.2 mM the asymmetric configs use), which is why those configs
+    # hold glucose fixed and saturating instead: that prior sits at or under their read-out floor (see
+    # the note above concentration_A_bounds). SCORED (see target_parameters).
+    log_K_A: [-2.30, 0.0]
+    # ESTIMATE: a Michaelis constant drifts only mildly with temperature and may go either way, so a
+    # range straddling 1. Same for Q10_B/C/D.
+    Q10_A: [0.7, 2.0]
+    # measured: yeast hexokinase K_M(ATP) 0.27 +- 0.02 mM. Range 0.1 .. 1 mM, at 25 C. SCORED.
+    log_K_B: [-2.30, 0.0]
+    Q10_B: [0.7, 2.0]
+    # measured: Ki(G6P) 65 uM, competing with ATP at the active site -- tight, as modelled.
+    # Range 0.02 .. 0.2 mM, at 25 C.
+    log_Ki_C: [-3.91, -1.61]
+    Q10_C: [0.7, 2.0]
+    # measured: Ki(ADP) Kis 0.86, Kii 1.0, Kid 1.9 mM -- weak, as modelled. Range 0.3 .. 3 mM, at 25 C.
+    log_Ki_D: [-1.20, 1.10]
+    Q10_D: [0.7, 2.0]
+    # measured/typical: Q10 2-3 for biological rates, Ea 50-100 kJ/mol typical for enzymic reactions.
+    # 1.8-2.6 is Ea 40-60 kJ/mol -- mildly conservative, and the plan notes widening to 2.0-3.0 would be
+    # defensible. Left as the melt config has it, since it is a shared population parameter. SCORED.
+    Q10_cat: [1.8, 2.6]
+    # ESTIMATE, and RAISED from the melt config's [4.5e4, 1.0e5]. Not a tuning knob -- a thermodynamic
+    # consistency requirement. `gibbs_fraction` is the Gibbs-Helmholtz stability curve, which has TWO
+    # roots: the melt and COLD DENATURATION below it, separated by delta_H / delta_C. The melt config's
+    # ratio (10-40) puts the cold root at 0-25 C: at its worst prior corner the folded fraction is 0.44
+    # at 25 C and ~0 at 10 C, so over THIS task's box the model would be measuring cold denaturation
+    # rather than Michaelis-Menten kinetics. Real globular proteins put cold denaturation below 250 K,
+    # which needs delta_H / delta_C >~ 37; this range gives 27-84. It is anchored on the measured
+    # specific unfolding enthalpy of small globular proteins near 50-70 C -- lysozyme ~500 kJ/mol at
+    # 14.3 kDa, RNase A ~450 kJ/mol at 13.7 kDa, i.e. 30-35 J/g -- applied to a ~50 kDa hexokinase
+    # monomer over a 20-35 J/g band. Over R that is 1.2e5 .. 2.1e5 K (= 1.0 .. 1.75 MJ/mol).
+    delta_H: [1.2e5, 2.1e5]
+    # ESTIMATE: ~50 J/mol/K per residue (lysozyme 6.5 kJ/mol/K over 129 residues) x ~450 residues for a
+    # ~50 kDa monomer. Over R that is 2.5e3 .. 4.5e3 K (= 21 .. 37 kJ/mol/K). Unchanged from the melt
+    # config.
+    delta_C: [2.5e3, 4.5e3]
+    # measured: yeast hexokinase B melts at ~41.9 C and inactivates dissociatively between 40 and 47 C;
+    # the upper end allows isoform/buffer spread. TIGHTENED from the melt config's [45, 58] to the enzyme
+    # the plan actually names -- which makes the constraint on the temperature box STRICTER, not looser.
+    # A NUISANCE here: drawn, never predicted, and inert because the box sits below it.
+    T_melting: [40.0, 50.0]
+
+  # ---------------------------------------------------------------------------------------------
+  # Numerics: the resolution of each numerical procedure. None of these change the physics -- they
+  # decide how accurately it is computed -- and each is re-measured for THIS rate law
+  # (scripts/validate_mm.py), never inherited from config/detector/enzyme.yaml.
+  # ---------------------------------------------------------------------------------------------
+  # The guard that makes "below the melt" a checked fact rather than a claim: the detector refuses to
+  # build if the folded fraction dips below this anywhere in temperature_bounds x the
+  # (delta_H, delta_C, T_melting) prior. The plan's own requirement is > 0.98.
+  min_folded_fraction: 0.98
+  # Trapezoid nodes for the calibration's tau = int_0^x_half dx/rate. The calibration is a quadrature
+  # over the EXTENT, not a time integration, so this is its only resolution knob. Unchanged from the
+  # melt config, where 33 nodes were already well inside the read-out precision.
+  n_quadrature: 33
+  # RKC2 steps per read-out interval, so 8 * 160 = 1280 steps per experiment, dt = 7.8125e-4 h (the
+  # comment here said 8 * 80 = 640 and dt = 1.5625e-3, which is the 80-step line of the scan below).
+  # RE-MEASURED for this rate law, not inherited: scripts/validate_mm.py --mode steps compares the
+  # shipped float32 chain against an INDEPENDENT float64 numpy implementation of the same scheme. The
+  # true error is minimised near this step -- below it truncation dominates, above it float32 roundoff
+  # in the Chebyshev recursion costs more than the shorter step buys (which is also why the dt/dt-half
+  # guard RISES with step count and must not be believed on its own).
+  #
+  # ⚠️ THE JUSTIFICATION BELOW IS DESIGN-DEPENDENT, AND MEASURING IT AT THE CORNER CHANGED IT (2026-08-13,
+  # scripts/probe_rkc2_stages.py, output/screen/probe-rkc2-stages.log). Everything below was measured at
+  # the KNOWN-GOOD design, where 160 is indeed the minimum. AT THE FAILING CORNER (fraction 1.0, 35 C,
+  # [A]0 = [B]0 = 10 mM) THE MINIMUM IS AT 320, NOT 160 -- max|fine - coarse| over 65536 events runs
+  # 4.66e-2 (80), 1.10e-2 (160), 5.14e-3 (320), 6.26e-3 (640), so 160 sits on the TRUNCATION side there
+  # and going to 320 roughly halves the corner error. The value is LEFT AT 160 pending the owner's
+  # decision; it is NOT changed here. See output/screen/provenance-mm-sym.md section 8.3.
+  #
+  # 160 IS DELIBERATE AND MUST NOT BE RAISED, and that is the opposite of the RuntimeError's own advice.
+  # History, measured 2026-08-13 after calibration_concentration_A was corrected to 0.3162: the corrected
+  # reference assay raises the calibrated turnover, and the KNOWN-GOOD design of scripts/validate_mm.py
+  # then tripped this config's guard at the OLD tolerance -- max|fine - coarse| = 2.36e-3 mM over 4096
+  # events against integration_tolerance 2.0e-3. That design is inside the box (its third experiment is
+  # [A]0 = 3, [B]0 = 10 mM at 35 C on half the enzyme stock), so a screen WILL hit it.
+  #
+  # The guard at that design over 4096 events, by step count: 1.08e-2 (80), 2.36e-3 (160), 1.40e-3 (320),
+  # 3.30e-3 (640). It FLOORS and then RISES, which truncation cannot do -- past ~160-320 steps the guard
+  # is measuring FLOAT32 ROUNDING in the Chebyshev recursion, not truncation error, and the float64
+  # reference agrees (validate_mm's own --mode steps machinery, 64 enzymes: TRUE 9.2e-4 mM at 160 steps,
+  # bottoming near 8e-4 at 320 rather than falling with the step). So "raise n_steps_per_measurement"
+  # cannot buy margin here and past the minimum it spends it. --mode steps does not see any of this
+  # because it samples 8 UNIFORM RANDOM designs, where 160 steps has a 14x margin -- the failing designs
+  # are the hot, substrate-rich corner, not the typical one.
+  #
+  # ADDRESSED in two steps, NEITHER of which touches this number: (1) `measurement_noise` was raised
+  # 0.02 -> 0.05, a read-out decision argued at that entry; (2) the noise-to-tolerance fraction was
+  # relaxed 10% -> 25% on a quadrature argument, derived at `integration_tolerance`. Together those take
+  # the bar from 2.0e-3 to 1.25e-2 mM. The step count stays at its measured error minimum either way.
+  n_steps_per_measurement: 160
+  # RKC2 stages per step: the scheme spends s rate evaluations to push a damped Chebyshev polynomial
+  # along the negative real axis, so its stability boundary grows like s^2 instead of Euler's fixed 2.
+  # The boundary is MEASURED in float32 on the target device (validate_mm.py --mode stability), and
+  # stability is not the binding constraint here -- accuracy is.
+  n_stages: 5
+  # Verwer's damping epsilon = 2/13. It lifts |R(z)| off 1 between the polynomial's extrema, turning the
+  # bare Chebyshev scheme's tangency into a strip of genuine stability.
+  damping: 0.153846
+  # Guard threshold, in mM, on the error the solve estimates for ITSELF: every integration runs a dt and
+  # a dt/2 chain and reports max|fine - coarse|, and __call__ raises if that exceeds this. NOT AN
+  # INDEPENDENT ACCURACY REQUIREMENT: it is a FRACTION OF THIS CONFIG'S READ-OUT NOISE -- the integration
+  # must not disturb what the read-out itself resolves, in the same absolute units.
+  #
+  # THE FRACTION IS 25% (relaxed from 10% on 2026-08-13, user), AND IT IS DERIVED, NOT PICKED. The
+  # integration error and the read-out noise are independent, so they ADD IN QUADRATURE: an integration
+  # error at a fraction f of sigma inflates the effective read-out noise by sqrt(1 + f^2). At f = 0.25
+  # that is 3%, which nothing in this experiment can resolve -- the drawn half_time prior alone is a
+  # factor of 8 wide. The old f = 0.10 bought sqrt(1 + 0.01) = 0.5%, i.e. it held the integration to a
+  # standard far stricter than the measurement can care about, and that is exactly what manufactured an
+  # unmeetable bar once measurement_noise was set low: at 0.02 mM noise it demanded 2.0e-3 mM of a solver
+  # whose float32 arithmetic floors near 1e-3 (see n_steps_per_measurement). 25% is still a real
+  # constraint -- it rejects an integration error comparable to the noise -- and it is applied in BOTH
+  # directions, tightening whenever the noise falls.
+  #
+  # IT THEREFORE MOVES WITH THE NOISE: 0.05 -> 1.25e-2 (shipped), and the pre-registered arms
+  # 0.10 -> 2.5e-2, 0.15 -> 3.75e-2. The coupling is never applied only where it helps.
+  #
+  # NOTE config/detector/enzyme_extremes.yaml DELIBERATELY KEEPS THE TIGHTER 10%. Its guard has never
+  # fired, so the stricter bar costs it nothing, and loosening a non-binding constraint would be using
+  # the coupling only in the direction that helps. A guard stricter than the rule requires needs no
+  # justification; a guard looser than it does.
+  #
+  # WHAT THE HEADROOM IS AND IS NOT. Near this threshold the guard reads float32 rounding rather than
+  # truncation (see n_steps_per_measurement), so the margin below is bounded by ARITHMETIC, not by the
+  # scheme's accuracy: it must NOT be read as an accuracy claim about the solve. The physical statement
+  # is separate and is the one the decision rests on -- a ~1e-3 mM rounding floor against 10 mM
+  # concentrations is 1e-4 relative, i.e. invisible in the read-out at any noise this config could carry.
+  # (An earlier note here claimed a "measured floor of 1.2e-3 mM at 160 steps" for this box. RETRACTED:
+  # no artefact on disk produces that number and nothing measured 2026-08-13 reproduces it. What replaces
+  # it is the screening-scale guard measurement recorded in output/screen/provenance-mm-sym.md section 8.)
+  integration_tolerance: 1.25e-2   # 25% of measurement_noise 0.05 (quadrature rule, above)

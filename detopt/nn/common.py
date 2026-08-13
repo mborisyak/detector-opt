@@ -79,12 +79,25 @@ class Model(nnx.Module):
         return loss_fn(self(features, mask, deterministic=deterministic, rngs=rngs), target)
 
     def regularization(self):
-        _, parameters, _ = nnx.split(self, nnx.Param, ...)
-        reg = sum(jnp.sum(jnp.square(p)) for p in jax.tree.leaves(parameters))
+        """``-log p(parameters)`` for THIS model, up to a constant: a scalar the caller adds to the
+        MEAN loss after dividing by the number of training rows.
 
-        n = sum(math.prod(p.shape) for p in jax.tree.leaves(parameters))
+        Each model implements its own, because which parameters carry a prior and at what scale is a
+        property of the architecture, not something a generic sweep over the parameter tree can decide.
+        A tree-walking default got both wrong: it penalised BIASES (offsets, to which no
+        input-to-output variance argument applies) and LEARNED ACTIVATION GAINS (initialised at 1.0,
+        so a pull toward 0 changes the shape of the nonlinearity rather than the size of the weights),
+        and it used one unit-variance scale for every layer regardless of fan-in.
 
-        return reg / n
+        THE SCALE. For a map ``y = W x`` to send ``x ~ N(0, I)`` to ``y ~ N(0, I)`` the prior must be
+        ``W_ji ~ N(0, 1/in_dim)``, giving ``in_dim * ||W||^2 / 2``. At initialisation that equals half
+        the kernel's parameter count, which is the invariant to test an implementation against.
+
+        THE COEFFICIENT IS THE CALLER'S. With a mean loss, MAP is
+        ``(1/N) sum_i loss_i + regularization() / N``: the prior's weight relative to the data falls as
+        ``1/N``, so a FIXED coefficient is a prior whose strength drifts with the window.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not define regularization()")
 
 
 class LeakyTanh(nnx.Module):

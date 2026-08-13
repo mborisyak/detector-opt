@@ -98,6 +98,7 @@ def fresh_design_network(trainer, init_seq, init_params):
     return (jax.device_put(params, d), jax.device_put(state, d), jax.device_put(opt_state, d))
 
 
+
 class Trainer:
     """Shared base: budget pools, JIT kernels, sampling, network lifecycle, checkpoints.
 
@@ -118,6 +119,7 @@ class Trainer:
         val_iteration_limit: int,
         val_fraction: float = 0.25,
         eval_batch: int | None = None,
+        prior_scale: float = 0.0,
         device=None,
         checkpoint_dir: str | None = None,
         seed: int = 0,
@@ -139,6 +141,14 @@ class Trainer:
         self.checkpoint_dir = checkpoint_dir  # only trainers that checkpoint set this
         self.seed = int(seed)
         self._val_ratio = self.val_fraction / (1.0 - self.val_fraction)
+        # MAP over the network's own prior. With a MEAN loss the posterior is
+        # ``(1/N) sum_i loss_i + regularization() / N``, so the coefficient is 1/N and the OUTER caller
+        # -- this trainer -- owns it: the model states `-log p(parameters)` and knows nothing about how
+        # much data it was shown. `prior_scale` multiplies that 1/N, so 0.0 is OFF (no prior term at
+        # all, the behaviour of every run before this existed) and 1.0 is the MAP coefficient exactly.
+        # It is NOT a weight-decay knob in disguise: the 1/N is what keeps the prior's say over the
+        # data fixed as the window grows, which a constant `weight_decay` does not do.
+        self.prior_scale = float(prior_scale)
 
         # Per-call window caps -- the shared kernels and ``_sample_round`` use these.
         self.iteration_limit = int(iteration_limit)
@@ -214,8 +224,11 @@ class Trainer:
         detector = self.detector
         members = self.n_ensemble
         batch = self.batch
+        weights = self._sample_weights()  # None = uniform; built once, static per trainer
 
-        def loss_fn(params, state, drop_key, event_b, mask_b, design_b, target_b):
+        prior_scale = self.prior_scale
+
+        def loss_fn(params, state, drop_key, event_b, mask_b, design_b, target_b, prior_n):
             # deterministic=False -> dropout ACTIVE; the rng is threaded in
             # explicitly (fresh per step) so it lives at the current trace level.
             reg = nnx.merge(reg_def, params, state)
@@ -233,11 +246,45 @@ class Trainer:
                 mask_e = emask.reshape((members, batch) + emask.shape[1:])
                 target_e = target.reshape((members, batch) + target.shape[1:])
                 per = reg.loss(detector.loss, feats_e, mask_e, target_e, deterministic=False, rngs=nnx.Rngs(drop_key))
-            loss = jnp.mean(per)
+            if weights is None:
+                loss = jnp.mean(per)
+            else:
+                # WEIGHTED mean over the minibatch. The strategy that builds the indices also says
+                # what each row is worth -- the continual trainer's batch is half current design and
+                # half replay, and those two halves do not deserve equal say in a gradient whose
+                # result is judged ONLY on the current design's window (`_eval_train` evaluates from
+                # `w0_train` forward, so replay rows contribute to the update and to nothing that is
+                # measured). `weights` is pre-normalised to mean 1 by the implementer, so the loss
+                # keeps the same scale as the unweighted case and `loss_precision` still means what
+                # it meant.
+                wb = weights.reshape(weights.shape + (1,) * (per.ndim - weights.ndim))
+                loss = jnp.mean(per * wb)
             _, _, new_state = nnx.split(reg, nnx.Param, nnx.Variable)
+            # MAP: the model states -log p(parameters) for its OWN kernels and the 1/N is applied HERE,
+            # because how much data the network has seen is the trainer's business, not the model's.
+            # `prior_scale` 0.0 leaves the objective exactly as it was before this term existed.
+            if prior_scale > 0.0:
+                loss = loss + prior_scale * reg.regularization() / jnp.maximum(jnp.asarray(prior_n, jnp.float32), 1.0)
             return loss, new_state
 
         return loss_fn
+
+    def _prior_count(self, start, count):
+        """How many rows of EVIDENCE the parameter prior is weighed against, as a 0-d ``jax.Array``.
+
+        ABSTRACT, because it is a property of what the strategy is FITTING, not of the trainer. MAP with
+        a mean loss is ``(1/N) sum_i loss_i + regularization() / N``, and ``N`` is the number of rows the
+        empirical mean stands for. For a per-design strategy that is the current window. For a
+        CONTINUAL one it is not: the network is fitted to the current window AND to everything replayed
+        from earlier designs, so charging it ``1/count`` would weigh the same prior against a fraction
+        of the evidence and over-regularise it -- by the ratio of the pool to the window, which reaches
+        20x or more late in a campaign. That would be an arm-asymmetric setting, which the benchmark's
+        NO TRICKS clause forbids.
+
+        ``start`` is the pool fill when this design began, i.e. the number of HISTORICAL rows;
+        ``count`` is the current design's window. Both are dynamic 0-d int32 ``jax.Array``.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not define _prior_count")
 
     def _sample_indices(self, key, start, count):
         """Minibatch indices for one train step (``members * batch``). ABSTRACT -- the strategy implements
@@ -245,11 +292,18 @@ class Trainer:
         the continual trainer mixes in replay from past iterations."""
         raise NotImplementedError()
 
+    def _sample_weights(self):
+        """Per-row weights for one train step, matching ``_sample_indices``' layout, or ``None`` for a
+        uniform mean. ABSTRACT -- the strategy that decides WHICH rows a batch holds also decides what
+        each is worth. Must be pre-normalised to mean 1 so the loss keeps its scale."""
+        raise NotImplementedError()
+
     def _build_train_epoch(self, reg_def):
         optimizer = self.optimizer
         steps = self.steps_per_epoch
         loss_fn = self._make_loss_fn(reg_def)
         sample_indices = self._sample_indices  # may be overridden (e.g. replay)
+        prior_count = self._prior_count  # strategy-specific: how much data the prior is weighed against
 
         def train_step(carry, key):
             params, state, opt_state, start, count, buffers = carry
@@ -264,6 +318,7 @@ class Trainer:
                 mask_buf[idx],
                 jax.tree.map(lambda a: a[idx], design_buf),  # raw Design minibatch (pytree)
                 jax.tree.map(lambda a: a[idx], target_buf),  # raw Target minibatch (pytree)
+                prior_count(start, count),  # the EVIDENCE the prior is weighed against -- strategy-specific
             )
             updates, new_opt_state = optimizer.update(grads, opt_state, params)
             new_params = optax.apply_updates(params, updates)

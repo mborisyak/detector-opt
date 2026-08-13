@@ -44,6 +44,11 @@ theoretical value, which is the whole reason to measure it), then searches the p
 ``|df/dx|`` and reports the step this allows. Getting it wrong is not a matter of accuracy -- past
 the boundary the extent runs beyond its physical maximum and never comes back.
 
+The recursion is arranged on the INCREMENT ``w_j - w_0`` rather than on the stage values, and the
+chain accumulates by compensated summation: :func:`rkc2_increment` and :func:`rkc2_chain` carry the
+argument and the measurements. It is the same scheme either way; the value form simply rounds at
+``ulp(x)`` per stage, coherently, which floors the error at a few hundred steps.
+
 The error is estimated **inside the solve**: every integration runs TWO chains over the same
 read-out times, one at ``dt`` and one at ``dt/2``, RETURNS THE ``dt`` ONE, and reports the largest
 ``|fine - coarse|`` over those times -- the solution handed out is the one the error was measured on.
@@ -77,7 +82,8 @@ REFERENCE_TEMPERATURE = 10.0 + ZERO_CELSIUS
 INV_TEMPERATURE_SPAN = 1 / ZERO_CELSIUS - 1 / REFERENCE_TEMPERATURE
 
 __all__ = [
-  'kinetics', 'vant_hoff', 'gibbs_fraction', 'PARAMETER_NAMES', 'rkc2_coefficients',
+  'kinetics', 'vant_hoff', 'gibbs_fraction', 'PARAMETER_NAMES', 'rkc2_coefficients', 'rkc2_increment',
+  'rkc2_step', 'rkc2_chain',
   'EnzymeDetector', 'EnzymeDesign', 'EnzymeEvent', 'EnzymeTarget', 'EnzymeGroundTruth'
 ]
 
@@ -186,6 +192,108 @@ def rkc2_coefficients(n_stages, damping):
     mu_tilde = 2.0 * b[j] * omega_1 / b[j - 1]
     rows.append((2.0 * b[j] * omega_0 / b[j - 1], -b[j] / b[j - 2], mu_tilde, -a[j - 1] * mu_tilde))
   return float(b[1] * omega_1), jnp.asarray(rows, jnp.float32)
+
+
+def rkc2_increment(coefficients, rate, state, dt):
+  """The INCREMENT ``w_s - w_0`` of one RKC2 step of size ``dt`` on ``dy/dt = rate(y)`` from ``state``.
+
+  The Chebyshev recursion of :func:`rkc2_coefficients`: ``n_stages`` rate evaluations, the first of
+  which (``rate(w_0)``) is reused by every later stage. The stages run as a ``jax.lax.scan`` over their
+  coefficients rather than an unrolled Python loop -- unrolling put ``n_stages`` copies of the rate
+  (five exponentials each) inside the time-step body, and with the half-step error monitor and the vmap
+  on top of that, XLA compilation became the dominant cost.
+
+  WHY THE INCREMENT AND NOT THE VALUE -- do NOT "simplify" this back to the textbook form. Verwer
+  writes the recursion on the stage VALUES,
+
+      w_j = (1 - mu_j - nu_j) w_0 + mu_j w_{j-1} + nu_j w_{j-2} + mu_tilde_j dt f(w_{j-1})
+            + gamma_tilde_j dt f(w_0)
+
+  with ``mu_j ~ 2`` and ``nu_j ~ -1``. Substituting ``w_j = w_0 + d_j`` cancels ``w_0`` EXACTLY, since
+  ``(1 - mu - nu) + mu + nu = 1``, and leaves
+
+      d_j = mu_j d_{j-1} + nu_j d_{j-2} + mu_tilde_j dt f(w_0 + d_{j-1}) + gamma_tilde_j dt f(w_0),
+      d_0 = 0,  d_1 = mu_tilde_1 dt f(w_0),   w_s = w_0 + d_s.
+
+  Same method, same coefficients, same order, same stability polynomial -- in exact arithmetic the two
+  are identical. What differs is the ARITHMETIC. The value form combines O(y)-sized terms whose leading
+  parts cancel to produce an O(dt f)-sized answer, so in float32 every stage rounds at ``ulp(y)`` --
+  9.5e-7 at 10 mM -- however small the increment is. That loss is ~0.66 ulp per step and COHERENT, so
+  it accumulates LINEARLY in the step count and overtakes the O(dt^2) truncation error at a few hundred
+  steps, i.e. exactly where a step refinement stops buying accuracy. The increment form rounds at
+  ``ulp(d_j)`` instead, which is smaller by the same ratio.
+
+  MEASURED (``output/screen/audit_rkc2.py --section increment``, max ``|float32 - float64|`` on the
+  extent of reaction at the enzyme corner, mM):
+
+      n_steps        value form     increment form    increment + Kahan (:func:`rkc2_chain`)
+           20          8.998e-5           4.413e-6                 2.160e-6
+          160          1.066e-3           1.145e-5                 2.148e-6
+          640          3.207e-3           1.498e-5                 2.088e-6
+  """
+  mu_tilde_1, stages = coefficients
+  slope_0 = rate(state)
+
+  def stage(carry, row):
+    previous, current = carry
+    mu, nu, mu_tilde, gamma_tilde = row
+    following = (mu * current + nu * previous
+                 + mu_tilde * dt * rate(state + current) + gamma_tilde * dt * slope_0)
+    return (current, following), None
+
+  start = (jnp.zeros_like(state), mu_tilde_1 * dt * slope_0)  # (d_0, d_1)
+  (_, final), _ = jax.lax.scan(stage, start, stages)
+  return final
+
+
+def rkc2_step(coefficients, rate, state, dt):
+  """One RKC2 step of size ``dt`` on ``dy/dt = rate(y)`` from ``state``: the new VALUE.
+
+  ``state + rkc2_increment(...)`` -- see :func:`rkc2_increment` for why the stages themselves are
+  computed on the increment. A CHAIN of steps should go through :func:`rkc2_chain`, which compensates
+  this one addition; this entry point is for single-step probes, above all the stability polynomial
+  ``R(z) = rkc2_step(., lambda y: z * y, 1, 1)``.
+
+  A free function taking ``coefficients`` rather than a method, so every enzyme-family detector shares
+  one copy of the scheme without subclassing -- concrete methods are FINAL in this codebase.
+  """
+  return state + rkc2_increment(coefficients, rate, state, dt)
+
+
+def rkc2_chain(coefficients, rate, initial, *, dt, n_steps, n_intervals):
+  """``n_intervals`` intervals of ``n_steps`` RKC2 steps of size ``dt`` from ``initial``, returning the
+  state at the END of every interval (the read-out times).
+
+  The running state is accumulated by KAHAN COMPENSATED SUMMATION. Each step adds an O(dt f)-sized
+  increment to an O(y)-sized state, and that single large-plus-small addition is the only place left
+  where ``ulp(y)`` enters at all; its error is coherent across steps, so uncompensated it grows
+  linearly in ``n_steps``. Carrying the lost low-order part into the next step removes that growth and
+  leaves the float32 error FLAT in the step count -- 2.160e-6 / 2.148e-6 / 2.088e-6 mM at 20 / 160 /
+  640 steps, against 4.413e-6 / 1.145e-5 / 1.498e-5 uncompensated (the table in
+  :func:`rkc2_increment`). The residual 2.1e-6 mM is the rate function's OWN float32 evaluation error,
+  which no summation scheme can remove.
+
+  The compensation is the classic ``(sum + y) - sum - y`` recovery, and it is only a recovery if the
+  arithmetic is NOT reassociated. XLA is entitled to reassociate float operations, so this is CHECKED
+  rather than assumed, on BOTH backends the code runs on: ``output/screen/audit_rkc2.py --section
+  increment`` builds the compensated and the uncompensated chain in the same compiler and prints them
+  side by side, and this function reproduces its compensated column bit for bit (measured 2026-08-13,
+  CPU and CUDA). If the two columns ever stop differing, the compensation has been optimised away and
+  the error is back to growing with ``n_steps`` -- there is no flag to restore it, only rewriting the
+  accumulation (e.g. carrying the running state as a two-float sum that is never re-added).
+  """
+  def step(carry, _):
+    state, compensation = carry
+    increment = rkc2_increment(coefficients, rate, state, dt) - compensation
+    advanced = state + increment
+    return (advanced, (advanced - state) - increment), None
+
+  def interval(carry, _):
+    carry, _ = jax.lax.scan(step, carry, None, length=n_steps)
+    return carry, carry[0]
+
+  _, trajectory = jax.lax.scan(interval, (initial, jnp.zeros_like(initial)), None, length=n_intervals)
+  return trajectory
 
 
 def _scale(values, bounds):
@@ -645,40 +753,16 @@ class EnzymeDetector(Detector):
     return measurements, jnp.max(errors)
 
   def rkc2_step(self, rate, extent, dt):
-    """One RKC2 step of size ``dt`` on ``dx/dt = rate(x)`` from ``extent``.
-
-    The Chebyshev recursion of :func:`rkc2_coefficients`: ``n_stages`` rate evaluations, the first of
-    which (``rate(w_0)``) is reused by every later stage. The stages run as a ``jax.lax.scan`` over
-    their coefficients rather than an unrolled Python loop -- unrolling put ``n_stages`` copies of the
-    rate (five exponentials each) inside the time-step body, and with the half-step error monitor and
-    the vmap over the temperature scan on top of that, XLA compilation became the dominant cost.
-    """
-    mu_tilde_1, coefficients = self._rkc2
-    slope_0 = rate(extent)
-
-    def stage(carry, row):
-      previous, current = carry
-      mu, nu, mu_tilde, gamma_tilde = row
-      following = ((1.0 - mu - nu) * extent + mu * current + nu * previous
-                   + mu_tilde * dt * rate(current) + gamma_tilde * dt * slope_0)
-      return (current, following), None
-
-    start = (extent, extent + mu_tilde_1 * dt * slope_0)  # (w_0, w_1)
-    (_, final), _ = jax.lax.scan(stage, start, coefficients)
-    return final
+    """One RKC2 step of size ``dt`` on ``dx/dt = rate(x)`` from ``extent``, with this detector's own
+    coefficients: the module-level :func:`rkc2_step`, which is what the bare name below resolves to (a
+    method body does not see class scope). Kept as a method because the stability probes reach for it
+    through the built detector."""
+    return rkc2_step(self._rkc2, rate, extent, dt)
 
   def _chain(self, rate, *, dt, n_steps, n_intervals):
     """One RKC2 chain: ``n_intervals`` intervals of ``n_steps`` steps of ``dt``, returning the extent
-    of reaction at the END of every interval (the measurement times)."""
-    def step(extent, _):
-      return self.rkc2_step(rate, extent, dt), None
-
-    def interval(extent, _):
-      extent, _ = jax.lax.scan(step, extent, None, length=n_steps)
-      return extent, extent
-
-    _, extents = jax.lax.scan(interval, jnp.zeros(()), None, length=n_intervals)
-    return extents
+    of reaction at the END of every interval (the measurement times). The extent starts at zero."""
+    return rkc2_chain(self._rkc2, rate, jnp.zeros(()), dt=dt, n_steps=n_steps, n_intervals=n_intervals)
 
   def _integrate(self, A0, B0, E0, temperature, parameters, log_k0_cat, *, n_steps, n_intervals):
     """RKC2 on the extent of reaction over ``duration``, split into ``n_intervals`` equal intervals.

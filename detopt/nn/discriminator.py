@@ -43,6 +43,11 @@ class SetDiscriminator(Model):
     def ensemble(self) -> int | None:
         return self.regressor.ensemble()
 
+    def regularization(self):
+        # Every parameter this discriminator has lives in the wrapped regressor; the conditioning is
+        # concatenated onto the features, not mapped by a head of its own.
+        return self.regressor.regularization()
+
     def __call__(self, features, mask, conditioning, *, deterministic: bool = True, rngs=None):
         cond = jnp.broadcast_to(conditioning[..., None, :], features.shape[:-1] + (conditioning.shape[-1],))
         feats = jnp.concatenate([features, cond], axis=-1)

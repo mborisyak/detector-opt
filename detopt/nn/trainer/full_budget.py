@@ -94,8 +94,15 @@ class FullBudgetTrainer(Trainer):
             seed=seed,
         )
 
+    def _prior_count(self, start, count):
+        # One window, one fit, no history: the window IS the evidence.
+        return count
+
     def _sample_indices(self, key, start, count):
         return window_sample_indices(self, key, start, count)  # uniform over the full budget window
+
+    def _sample_weights(self):
+        return None  # one window, one design: uniform
 
     def _init_design_network(self, init_seq, init_params):
         return fresh_design_network(self, init_seq, init_params)  # fresh, single design

@@ -7,6 +7,9 @@ from . import straw
 
 from .. import utils
 from .enzyme import EnzymeDetector
+from .enzyme_inhibitor import EnzymeInhibitorDetector
+from .enzyme_mm import EnzymeMMDetector
+from .growth import GrowthDetector
 from .straw import StrawDetector  # abstract base (no design scheme)
 from .free_straw import FreeStrawDetector, free_design_array
 from .stereo_straw import StereoStrawDetector
@@ -23,6 +26,16 @@ __detectors__: dict[str, type[Detector]] = {
     # Not a particle detector at all: the enzymatic-reaction single-batch design of experiments
     # (the proposal's bioprocess work package) under the same contract.
     "enzyme": EnzymeDetector,
+    # The same chemistry plus an inhibitor whose concentration is a design coordinate; the target is
+    # the compound's MECHANISM CLASS (3-way), scored by cross-entropy / ln 3.
+    "enzyme_inhib": EnzymeInhibitorDetector,
+    # Same chemistry, different QUESTION: the target is the enzyme's own Michaelis-Menten coefficients
+    # rather than its melting point, the substrate concentrations are design coordinates, and the
+    # temperature box sits below the melt.
+    "enzyme_mm": EnzymeMMDetector,
+    # Also not a particle detector: bacterial growth, one batch of cultures per design (CTMI cardinal
+    # temperatures + Monod batch kinetics), the strain's optimal growth temperature as the target.
+    "growth": GrowthDetector,
     "straw": FreeStrawDetector,  # free per-layer geometry + 4-feature combine
     "stereo_tracking": Stereo4Feature,  # stereo geometry + 4-feature combine (the default stereo detector)
     "stereo_tracker_truth": StereoTrackerTruth,  # + per-hit (x,y)/drift_r/tdc TRUTH for tracker experiments

@@ -1,0 +1,156 @@
+# Full default config for the `growth` detector (GrowthDetector): EVERY __init__ parameter, written at
+# its default value. Single-batch design of experiments on bacterial growth -- CTMI cardinal
+# temperatures + Monod batch kinetics -- with the strain's optimal growth temperature as the target.
+#
+# UNITS: biomass is optical density (OD600), substrate g/L of carbon source, time hours, temperature
+# degrees Celsius, growth rates 1/h.
+#
+# SOURCES. Every entry below carries its provenance. `plan` = quoted from
+# output/agent-docs/task-growth-cardinal-temperatures.md, which is the product of the argument that
+# selected this candidate; `ESTIMATE` = the plan is silent and the value is reasoned here, with the
+# reasoning stated. The full table, including the RULE behind every design bound, is in
+# output/screen/provenance-growth.md -- that file is the acceptance gate, this file is its
+# machine-readable half.
+growth:
+  # The designed batch: BO searches 3 * n_experiments dimensions (temperature, inoculum, substrate per
+  # culture). 3, from the plan's own ratio rule: "a single culture localises T_opt to roughly the flank
+  # scale, ~5-10 K, so a T_opt prior spanning 20-30 K gives ratio ~3, which is where m = 3-4 is
+  # non-redundant". With the T_opt prior below spanning 25 K and the upper flank 5-8 K wide, the ratio
+  # is 25/8 = 3.1. NOT chosen to make the search easy -- it is the smallest batch that can bracket a
+  # peak (one culture each side) plus one to pin the flank slope.
+  n_experiments: 3
+  # OD read-outs per culture, evenly spaced, the last at `duration`; t = 0 carries no information (the
+  # OD there is the design's own inoculum). 12 over 12 h = HOURLY readings, which is what a growth
+  # curve read by hand on a spectrophotometer looks like. ESTIMATE (assay parameter): a plate reader
+  # kept in an incubator would read every 10-20 min, so this is the conservative choice.
+  n_measurements: 12
+
+  # Run length. plan: "long enough that a mid-range culture reaches stationary phase, so that both the
+  # rate AND the plateau are visible". At the prior's geometric midpoint (mu_opt 0.87/h) and the design
+  # box's geometric midpoint (N0 6.3e-3 OD, S0 0.17 g/L -> capacity 0.19 OD) that takes ln(0.19/0.0063)
+  # = 3.4 e-foldings = 3.9 h, so 12 h leaves a plateau of several hours to read. It is deliberately NOT
+  # long enough for the slowest strain from the smallest inoculum (that needs ~90 h): a culture that
+  # does not finish is a real experimental outcome and its rate is still measurable.
+  duration: 12.0
+  # Std of the OD read-out. plan: "OD noise: absolute, ~0.01-0.02 OD units (plate-reader typical)".
+  # Set ONCE at the top of that range, before any landscape was measured, and it is not adjusted
+  # afterwards: 0.02 is the honest figure for a plate reader once blank drift, condensation and
+  # pipetting into the well are included, and it is the HARDER of the two for inference.
+  measurement_noise: 0.02
+  # Reader detection limit: readings below it are reported AT it (left-censored), which is what an
+  # instrument does -- a culture below the limit is indistinguishable from a blank. plan: "OD detection
+  # limit: ~0.02-0.05 -- below it a culture reads as 'no growth', which is itself informative but must
+  # be modelled explicitly". 0.03 is the middle of that range.
+  detection_limit: 0.03
+
+  # ---------------------------------------------------------------------------------------------
+  # DESIGN BOUNDS. Each is stated from the PRIOR and the NOISE FLOOR alone -- no number here came out
+  # of a landscape scan or a finished run (docs/benchmark-acceptance.md 1.1).
+  # ---------------------------------------------------------------------------------------------
+  # Culture temperature, LINEAR (an order-1 range). RULE: the T_opt prior [25, 50] C plus a 10 C margin
+  # either side -- the user's standing rule, the same one that fixed the melt task's box at the
+  # T_melting prior +- 10 C. The margin is 1.3x the widest upper flank (8 K) and generous below, so the
+  # best probe for any strain in the population sits well inside the box. Nothing above 58 C
+  # (max T_opt + max delta_max) can grow, so the top ~2 C is dead by construction; that is the price of
+  # a symmetric, prior-only rule and it is left in rather than trimmed.
+  temperature_bounds: [15.0, 60.0]
+  # Inoculum, LOG-scaled (it spans decades). RULE: a 1:10 to 1:10 000 dilution of a stationary
+  # preculture at OD 2 -- the standard bench range for starting a growth curve. A smaller inoculum
+  # spends longer in exponential phase (a better rate estimate) but risks never crossing the detection
+  # limit inside `duration`; that trade is the design's to make.
+  inoculum_bounds: [2.0e-4, 0.2]
+  # Initial substrate, LOG-scaled (the response depends on log(S0/K_S)). RULE: the biomass it yields
+  # must run from the detection limit to the top of the reader's LINEAR range, at the prior's midpoint
+  # yield 1.1 OD per g/L: 0.03 OD / 1.1 = 0.027 -> 0.03 g/L, and 1.2 OD / 1.1 = 1.09 -> 1.0 g/L.
+  # Stated from the noise floor and the instrument alone. (The linear ceiling is used as the RULE that
+  # fixes this bound, NOT modelled as a read-out saturation -- the box is confined to where the reader
+  # is linear, which is what an experimenter does.)
+  substrate_bounds: [0.03, 1.0]
+
+  # ---------------------------------------------------------------------------------------------
+  # STRAIN PRIOR. Drawn uniformly within each range, in PARAMETER_NAMES order; a `log_*` range is
+  # log-uniform on the quantity itself. The three cardinal temperatures are NOT drawn independently:
+  # T_opt is drawn over the population span and the two OFFSETS from their own narrow priors, because
+  # independent draws produce strains that do not exist (T_max < T_opt, or a 40 K collapse).
+  # ---------------------------------------------------------------------------------------------
+  parameters:
+    # THE TARGET. plan: "Mesophile-to-moderate-thermophile (T_opt in 25-50 C) is a real, single-genus
+    # span", chosen for the ratio (prior span)/(flank scale) ~ 3 that makes m = 3-4 non-redundant.
+    # Anchors quoted in the plan: E. coli K12 T_opt ~ 40 C, Listeria ~ 37 C, thermophiles 55-70 C.
+    # NOT a tuning knob -- widening it would change the objective (a different population, a different
+    # normaliser), not make the same one easier.
+    T_opt: [25.0, 50.0]
+    # T_opt - T_min. plan: "T_opt - T_min ~ 25-35 K -- the rise below it is always gradual". Consistent
+    # with the quoted anchors (E. coli T_min ~6-8.5 C against T_opt ~40; Listeria -1.7 vs 37).
+    delta_min: [25.0, 35.0]
+    # T_max - T_opt. plan: "T_max - T_opt ~ 5-8 K -- the collapse above the optimum is always sharp".
+    # Consistent with E. coli T_opt ~40, T_max ~46-47 and Listeria 37 / 45.
+    delta_max: [5.0, 8.0]
+    # Growth rate at the optimum, log-uniform over 0.3 .. 2.5 /h (doubling times 2.3 h .. 17 min).
+    # ESTIMATE: the plan gives no mu_opt range. E. coli in rich medium runs ~2 /h at 37-40 C (20 min
+    # doubling) and that is about the fastest a heterotroph goes; 0.3 /h is an unremarkable slow
+    # mesophile. Log-uniform because it spans a decade. The plan's risk section calls for exactly this
+    # width -- "real strains differ severalfold in growth rate" -- because a narrow mu_opt prior would
+    # let ONE culture localise T_opt from its rate alone and collapse the design problem.
+    log_mu_opt: [-1.204, 0.916]
+    # Monod half-saturation constant, log-uniform over 0.02 .. 0.2 g/L. ESTIMATE: the plan gives no
+    # K_S. Monod's classic value for E. coli on glucose is a few mg/L, but that is a CHEMOSTAT number;
+    # apparent half-saturation constants fitted to BATCH curves are consistently an order of magnitude
+    # or more higher, and this population spans genera and carbon sources. A decade centred on 60 mg/L
+    # is the compromise. It also sets the numerical cost: the substrate-exhaustion elbow has width
+    # Y*K_S/(mu*C), so a smaller K_S needs a proportionally smaller step (see n_steps_per_measurement).
+    # DECLARED, not tuned: chosen before any landscape was measured, and listed as a blocker.
+    log_K_S: [-3.912, -1.609]
+    # Biomass yield, OD units per g/L of substrate consumed. ESTIMATE: the plan gives no yield. 1 OD600
+    # ~ 0.4 g dry cell weight/L and a heterotroph's yield on glucose is ~0.4-0.5 g DCW per g, giving
+    # ~1.0-1.25 OD per g/L; widened to [0.8, 1.4] so the plateau height (= Y*S0) stays a genuine
+    # nuisance the design cannot assume away.
+    biomass_yield: [0.8, 1.4]
+
+  # ---------------------------------------------------------------------------------------------
+  # Numerics: the resolution of the integration. These do not change the physics, they decide how
+  # accurately it is computed.
+  # ---------------------------------------------------------------------------------------------
+  # RKC2 steps per read-out interval. With n_measurements = 12 over 12 h that is dt = 1/160 h = 22.5 s,
+  # 1920 steps a culture.
+  #
+  # ACCURACY, not stability, sets this -- the reverse of the enzyme detector. The only sharp feature is
+  # substrate exhaustion: for S << K_S the system linearises to a logistic of rate mu*C/(Y*K_S), i.e. a
+  # transient of width tau = Y*K_S/(mu*C) during which the last Y*K_S of biomass is made. At the
+  # sharpest corner of the prior and the box (mu_opt 2.5/h, K_S 0.02 g/L, Y 1.4, C = N0 + Y*S0 = 1.6 OD)
+  # tau = 25 s, and a second-order scheme errs by ~(Y*K_S)*(dt/tau)^2 there while dt >> tau, so the
+  # step has to RESOLVE the elbow. MEASURED at that corner in float32 on the CPU -- the device the
+  # screening protocol runs on (scripts/validate_growth.py --stage integrator), max|fine - coarse|
+  # against n_steps_per_measurement:
+  #
+  #     20 (dt 180.0 s)  1.271e-02      160 (dt 22.5 s)  7.153e-07
+  #     40 (dt  90.0 s)  1.915e-03      320 (dt 11.2 s)  0.000e+00
+  #     80 (dt  45.0 s)  1.788e-06      640 (dt  5.6 s)  2.384e-06
+  #
+  # -- truncation collapses by 4 orders of magnitude once dt < tau, and past 80 what is left is
+  # float32 roundoff accumulated over the chain, which grows with the step count (the exact-zero at
+  # 320 is a float32 tie between two chains that have both saturated, not a converged result; the
+  # rise at 640 is that roundoff). This corner is NOT the worst case, because it saturates before the
+  # first read-out and both chains then agree; the binding cases are cultures whose elbow lands
+  # BETWEEN read-out times. Over 262144 cultures drawn uniformly from the whole prior x box the error
+  # is max 2.659e-04 OD (99.99th pct 1.091e-04, 99.9th pct 4.272e-05, median 1.177e-06), i.e. 7.5x
+  # inside integration_tolerance. 160 is the smallest step count that puts that tail comfortably
+  # inside the tolerance, and the two-chain monitor VERIFIES it on EVERY call rather than trusting
+  # this table.
+  #
+  # Stability is far away by comparison: |df/dN| <= mu*C/(Y*K_S) = 143/h at that same corner, so
+  # z = |df/dN| * dt = 0.89 against a MEASURED RKC2 boundary of 6.18 at three stages in float32 -- a
+  # 6.9x margin.
+  n_steps_per_measurement: 160
+  # RKC2 stages per step. The boundary grows like s^2, and three stages measure z <= 6.18 (float32, the
+  # implemented step applied to y' = -lambda y). More would be wasted here: nothing in this system is
+  # stiff enough to need the enzyme's five, and the step is already set by accuracy, not stability.
+  n_stages: 3
+  # Verwer's damping epsilon = 2/13, as in the enzyme detector: it lifts |R(z)| off 1 between the
+  # stability polynomial's extrema, so the boundary is a strip rather than a set of touching points.
+  damping: 0.153846
+  # Guard threshold, in OD, on the error the solve estimates for ITSELF: every integration runs a dt
+  # and a dt/2 chain and reports max|fine - coarse| at the read-out times, and __call__ raises if that
+  # exceeds this. Set to 10% of measurement_noise -- the integration must not disturb what the read-out
+  # itself can resolve (the repo-wide integrator rule).
+  integration_tolerance: 2.0e-3

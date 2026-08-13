@@ -33,7 +33,10 @@ training:
   # Gradient-free evaluation batch for the sequential train+val loss passes.
   eval_batch: 2048
   # Mandatory unconditional epochs after every data addition.
-  warmup_epochs: 16
+  warmup_epochs: 4              # A SAFEGUARD, not a tuning knob: it only stops the procedure
+                                # acting before there is anything to act on. Small on purpose --
+                                # the settled-test is a POSTERIOR, so an unsettled early curve
+                                # already fails it through its own width. 2-4.
   # Shared detector-call budget for the run; pools are preallocated at this many rows (180 B/event).
   # 512 * 1024, doubled from 262144 on 2026-08-11 to pay for `loss_precision: 1.0e-2` below: at
   # ~27000 calls a design (measured, output/calib/from_scratch) this leaves `from_scratch` ~19
@@ -48,23 +51,13 @@ training:
   val_fraction: 0.25
   # Convergence: |val - train| + SEM < loss_precision, over a target scaled by the T_melting prior
   # half-range (6.5 C), so the no-information level is 1/3 and a good design reaches ~0.10.
-  flatness_tol: 1.0
-  # 1.0e-2 is needed to RESOLVE THE OPTIMUM, and the budget pays for it (2026-08-11).
-  #
-  # The criterion is `|val - train| + err < loss_precision`, so this is the slack the objective is
-  # allowed to carry. At 2.0e-2 that slack (0.02) is larger than the gap between a good design and
-  # the best one at the tuned settings -- measured over 384 random designs at [38, 65] x fraction
-  # [0.2, 0.7], the best scores 0.0329 and the 5th percentile ~0.045, a 0.012 spread. An optimiser
-  # cannot rank designs whose true difference sits inside its own evaluation slack, however many
-  # iterations it gets, which is the whole quantity this benchmark exists to show.
-  #
-  # The price, measured on `from_scratch` (output/calib/from_scratch, seed 1244111331, box [25, 80]):
-  # 32761 / 36856 / 20476 / 19111 calls per design against a median 10921 at 2.0e-2 -- ~2.5-3x, since
-  # `err ~ 1/sqrt(window)` and only more data clears a tighter bar. At budget 262144 that left ~8
-  # designs a run, under the 10-design floor; `budget` is therefore doubled below rather than this
-  # being relaxed.
   loss_precision: 1.0e-2
-  patience: 8
+  patience: 32                  # The horizon over which the loss must be STILL. Requiring N
+                                # epochs of stillness IS how the procedure waits for the
+                                # regressor's BIAS to disappear, so it must be long enough that
+                                # "still" means "the bias has finished moving" and not merely
+                                # "the noise was quiet". 16-32, scaling with `iteration_limit`,
+                                # which sets how much optimisation one epoch contains.
   optimizer:
     adamw:
       learning_rate: 2.5e-4
@@ -247,7 +240,8 @@ bo:
     # moment n_experiments goes back above 1 -- restore `normalised-invariant-rbf` with
     # `exchangeable: n_experiments` then.
     kernel:
-      ard-rbf: {}
+      normalised-invariant-rbf:
+        exchangeable: 4   # = n_experiments; the (enzyme_fraction, temperature) blocks permute TOGETHER
   ei:
     n_restarts: 32
     n_steps: 100

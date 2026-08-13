@@ -1,0 +1,86 @@
+# TEMPLATE for a candidate task's RUN config -- copy to config/<task>.yaml and fill the four numbers
+# marked FILL. It is the counterpart of config/enzyme.yaml (the melt task's run config): the detector
+# config says what the system IS, this says how a run of the benchmark is conducted on it.
+#
+#   cp config/_run_template.yaml config/enzyme_inhib.yaml     # then fill, then:
+#   ./scripts/campaign.sh enzyme_inhib output/campaign-inhib 5 meta from_scratch
+#
+# WHAT MUST BE MEASURED BEFORE THIS IS USABLE (all four come from a short calibration run, not from
+# taste; see docs/benchmark-acceptance.md 2.3):
+#   loss_precision  the slack the convergence criterion allows. It follows the task's read-out noise
+#                   and its target normalisation -- and criterion (d) is `gain > 10 * loss_precision`,
+#                   so this number decides what counts as an advantage. State where it came from.
+#   budget          calls per run. Set it from the measured calls-per-design so a run completes the
+#                   design count the screen assumed (typically 15-30).
+#   iteration_limit the EPOCH LENGTH (iteration_limit // batch SGD steps between convergence checks),
+#                   not merely a cap. Setting it equal to budget makes the "did not reach precision"
+#                   error unreachable, but a peer measured a coarse epoch inflating the converged
+#                   window 5x. Prefer ~8x the observed per-design spend over the full budget.
+#   exchangeable    = n_experiments, for the invariant kernel. The batch is a SET.
+
+detector: FILL_detector_name        # the key registered in detopt/detector/__init__.py
+
+regressor:
+  # A deep set over the batch: one ELEMENT per experiment, its features being that experiment's
+  # read-outs followed by its own design coordinates, so the network is design-conditioned and the
+  # inference is permutation-invariant in the experiments -- which is the symmetry of the problem.
+  # `alpha-set-regressor` is the residual variant (zero-init per-unit alpha, depth cheap to add);
+  # measured on the melt task, WIDTH made the converged level worse, so do not widen without cause.
+  set-regressor:
+    features: [[24, 16], [16, 24]]
+    n_models: 4      # ensemble: independent members, averaged at evaluation
+    p_dropout: 0.1   # NOTE (measured): dropout cost 0.0067 of level on an informative melt design
+                     # while buying a 5.3x cheaper exit. It is a bias/variance trade, not free.
+
+device: cuda
+
+training:
+  n0: 2048
+  n_increment: 1024
+  batch: 256
+  eval_batch: 2048
+  warmup_epochs: 4              # A SAFEGUARD, not a tuning knob: it only stops the procedure
+                                # acting before there is anything to act on. Small on purpose --
+                                # the settled-test is a POSTERIOR, so an unsettled early curve
+                                # already fails it through its own width. 2-4.
+  budget: FILL_budget
+  iteration_limit: FILL_iteration_limit
+  val_fraction: 0.25
+  loss_precision: FILL_loss_precision
+  patience: 32                  # The horizon over which the loss must be STILL. Requiring N
+                                # epochs of stillness IS how the procedure waits for the
+                                # regressor's BIAS to disappear, so it must be long enough that
+                                # "still" means "the bias has finished moving" and not merely
+                                # "the noise was quiet". 16-32, scaling with `iteration_limit`,
+                                # which sets how much optimisation one epoch contains.
+  optimizer:
+    adamw:
+      learning_rate: 2.5e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-6
+
+bo:
+  n_init: 5          # the user's criterion is stated for "BO with 5 initial Sobol points"
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    # Narrowed on two independent measurements on recorded runs; see config/enzyme.yaml for the
+    # evidence. The wide default permits both degenerate fits (K diagonal, or a constant objective).
+    log_lengthscale_prior_bounds: [-2.0, 1.0]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+    kernel:
+      normalised-invariant-rbf:
+        exchangeable: FILL_n_experiments
+  ei:
+    n_restarts: 32
+    n_steps: 100
+
+verify:
+  n_points: 10
+  epochs: 200
+  val_every_epochs: 10
+  budget: null
+  batch: null

@@ -44,7 +44,10 @@ training:
   # (no backprop, so it can exceed the training batch).
   eval_batch: 2048
   # Mandatory unconditional epochs after every data addition.
-  warmup_epochs: 32
+  warmup_epochs: 4               # A SAFEGUARD, not a tuning knob: it only stops the procedure
+                                # acting before there is anything to act on. Small on purpose --
+                                # the settled-test is a POSTERIOR, so an unsettled early curve
+                                # already fails it through its own width. 2-4.
   # Extended shared detector-call budget for the whole BO run.
   budget: 424288 #524288
   # Per-design upper limit on data (also sets epoch = iteration_limit / batch).
@@ -52,9 +55,13 @@ training:
 
   val_fraction: 0.25
   # Convergence: per-epoch-slope flatness tol, target loss precision, plateau window.
-  flatness_tol: 1.0
   loss_precision: 2.5e-2
-  patience: 32
+  patience: 32                  # The horizon over which the loss must be STILL. Requiring N
+                                # epochs of stillness IS how the procedure waits for the
+                                # regressor's BIAS to disappear, so it must be long enough that
+                                # "still" means "the bias has finished moving" and not merely
+                                # "the noise was quiet". 16-32, scaling with `iteration_limit`,
+                                # which sets how much optimisation one epoch contains.
   optimizer:
     adamw:
       learning_rate: 2.0e-4

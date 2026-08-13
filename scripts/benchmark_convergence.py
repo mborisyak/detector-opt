@@ -8,7 +8,6 @@ ONE continuous training run -- Adam state is carried the whole way, never reset 
 recording the train/val loss curve. We then locate two stop points on that single
 curve:
 
-* ``base``  -- the plateau signal alone (``is_plateaued`` on the train loss);
 * ``safe``  -- plateau AND the power-law floor predicts < ``loss_precision`` of
   further descent (``extrapolated_floor``).
 
@@ -24,7 +23,6 @@ import optax
 
 from detopt.detector import Stereo4Feature
 from detopt.nn.trainer import DesignTrainer
-from detopt.utils.training import extrapolated_floor, is_plateaued, masked_mean_sem
 
 LOOKAHEAD = 100
 
@@ -42,7 +40,6 @@ def _train_curve(seed, n0, max_epochs):
         iteration_limit=10 * n0,  # one epoch = one pass over the fixed train set
         warmup_epochs=10,
         patience=10,
-        flatness_tol=1e-2,
         loss_precision=2e-2,
         budget=16 * n0,  # room for 10*n0 train + its val split
         val_fraction=0.2,
@@ -83,7 +80,6 @@ def _train_curve(seed, n0, max_epochs):
 def _first_stop(train_h, obj, patience, flat, prec, warmup, with_safeguard):
     """First epoch (1-indexed) at which the (safeguarded?) plateau stop fires."""
     for t in range(warmup + 1, len(train_h) + 1):
-        if not is_plateaued(train_h[:t], patience, flat, prec):
             continue
         if with_safeguard:
             remaining = obj[t - 1] - extrapolated_floor(obj[:t])
@@ -100,7 +96,6 @@ def run(seeds=(0, 1, 2), n0=2048, max_epochs=400):
         prec, patience, flat, warmup = (
             trainer.loss_precision,
             trainer.patience,
-            trainer.flatness_tol,
             trainer.warmup_epochs,
         )
         obj = 0.5 * (train_h + val_h)

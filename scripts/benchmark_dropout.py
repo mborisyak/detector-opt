@@ -49,7 +49,6 @@ def run(seed=0, n_models=4, budget=400_000, iteration_limit=16384, loss_precisio
             iteration_limit=iteration_limit,
             warmup_epochs=10,
             patience=10,
-            flatness_tol=1e-2,
             loss_precision=loss_precision,
             budget=budget,
             val_fraction=0.2,

@@ -38,6 +38,8 @@ __all__ = [
     "EnsembleSetBlock",
     "EnsembleLinear",
     "EnsembleLeakyTanh",
+    "FixedActivation",
+    "make_activation",
     "masked_weighted_aggregate",
 ]
 
@@ -78,11 +80,30 @@ class EnsembleLinear(nnx.Module):
 
     def __init__(self, n_models: int | None, in_dim: int, out_dim: int, *, rngs: nnx.Rngs):
         self.n_models = n_models
+        self.in_dim = int(in_dim)
         std = 1.0 / math.sqrt(in_dim)
         kernel_shape = (in_dim, out_dim) if n_models is None else (n_models, in_dim, out_dim)
         bias_shape = (out_dim,) if n_models is None else (n_models, out_dim)
         self.kernel = nnx.Param(jax.random.normal(rngs.params(), kernel_shape) * std)
         self.bias = nnx.Param(jnp.zeros(bias_shape))
+
+    def regularization(self):
+        """``-log p(kernel)`` up to a constant, under the prior that maps a standard normal INPUT to a
+        standard normal OUTPUT.
+
+        ``y_j = sum_i W_ji x_i`` with ``x ~ N(0, I)`` has variance ``sum_i W_ji^2``, so ``y ~ N(0, 1)``
+        needs ``W_ji ~ N(0, 1/in_dim)`` -- which is the Lecun scale this layer is already INITIALISED
+        at, so the prior and the initialisation are the same distribution. The negative log density is
+        then ``in_dim * ||W||^2 / 2``, and at initialisation it equals HALF THE KERNEL'S PARAMETER
+        COUNT (every standardised coordinate contributes 1/2), which is the check to run on it.
+
+        The BIAS and the activation gains are deliberately absent. A bias is an offset, not a map, so
+        no input-to-output variance argument applies to it; and the gains initialise at 1.0 while a
+        penalty pulls toward 0, which would drag the nonlinearity from ``tanh(x) + x`` toward plain
+        ``tanh(x)`` -- a prior on the SHAPE of the activation rather than on the size of the network's
+        weights.
+        """
+        return 0.5 * self.in_dim * jnp.sum(jnp.square(self.kernel[...]))
 
     def __call__(self, x):
         if self.n_models is None:
@@ -116,6 +137,49 @@ class EnsembleLeakyTanh(nnx.Module):
         return jax.nn.tanh(x) + pos * jax.nn.softplus(x) - neg * jax.nn.softplus(-x)
 
 
+# --------------------------------------------------------------------------- #
+# Activations. ``leaky-tanh`` (the default, above) is LEARNABLE -- two gains per unit,
+# i.e. capacity. The alternatives below are FIXED functions with no parameters at all, so
+# selecting one removes that capacity without touching anything else in the architecture.
+# --------------------------------------------------------------------------- #
+_FIXED_ACTIVATIONS = {
+    # LeakyTanh FROZEN AT ITS OWN INITIALISATION. `softplus(x) - softplus(-x) == x` exactly,
+    # so `tanh(x) + 1*softplus(x) - 1*softplus(-x)` is `tanh(x) + x` -- the same SHAPE the
+    # learnable version starts from (unbounded, slope 2 at the origin, slope 1 asymptotically)
+    # with none of its learnable capacity. This is the CONTROL that separates "the shape is too
+    # expressive" from "the per-unit parameters are the capacity".
+    "fixed-leaky-tanh": lambda x: jax.nn.tanh(x) + x,
+    "tanh": jax.nn.tanh,  # BOUNDED (|f| <= 1) and slope 1 at the origin: the least expressive option
+    "relu": jax.nn.relu,  # unbounded, piecewise linear
+    "gelu": jax.nn.gelu,  # unbounded, smooth
+}
+
+
+class FixedActivation(nnx.Module):
+    """A parameter-free activation selected by name (see ``_FIXED_ACTIVATIONS``).
+
+    The name is a plain ``str`` attribute, not an ``nnx.Param``, so the module contributes
+    NOTHING to the parameter pytree -- which is the point: it is the zero-capacity comparison
+    against :class:`EnsembleLeakyTanh`.
+    """
+
+    def __init__(self, name: str):
+        if name not in _FIXED_ACTIVATIONS:
+            known = sorted(_FIXED_ACTIVATIONS) + ["leaky-tanh"]
+            raise ValueError(f"unknown activation {name!r}; known: {known}")
+        self.name = name
+
+    def __call__(self, x):
+        return _FIXED_ACTIVATIONS[self.name](x)
+
+
+def make_activation(name: str, n_models: int | None, dim: int):
+    """``leaky-tanh`` -> the learnable per-unit activation; anything else -> a fixed function."""
+    if name == "leaky-tanh":
+        return EnsembleLeakyTanh(n_models, dim)
+    return FixedActivation(name)
+
+
 class EnsembleSetBlock(nnx.Module):
     """Shared per-hit MLP block producing ``(value, weight_logit)`` of shape
     ``(..., M, out_dim)`` each; the weight logit becomes a non-negative aggregation gate
@@ -130,6 +194,7 @@ class EnsembleSetBlock(nnx.Module):
         in_dim: int,
         block_def: Sequence[int],
         p_dropout: float | None = None,
+        activation: str = "leaky-tanh",
         *,
         rngs: nnx.Rngs,
     ):
@@ -145,10 +210,16 @@ class EnsembleSetBlock(nnx.Module):
             if p_dropout is not None and p_dropout > 0:
                 layers.append(nnx.Dropout(rate=p_dropout, rngs=rngs))
             layers.append(EnsembleLinear(n_models, prev, h, rngs=rngs))
-            layers.append(EnsembleLeakyTanh(n_models, h))
+            layers.append(make_activation(activation, n_models, h))
             prev = h
         self.shared = nnx.List(layers)
         self.output = EnsembleLinear(n_models, prev, 2 * out_dim, rngs=rngs)
+
+    def regularization(self):
+        """This block's kernels: the shared MLP's linears plus its own output map. Dropout and the
+        activations contribute nothing -- the first has no parameters, the second has no kernel."""
+        shared = sum(layer.regularization() for layer in self.shared if isinstance(layer, EnsembleLinear))
+        return shared + self.output.regularization()
 
     def __call__(self, x, *, deterministic: bool = True, rngs=None):
         h = x
@@ -179,6 +250,9 @@ class SetRegressor(Model):
     n_models : ``None`` for a single network, or an int ``>= 1`` for an ensemble of that
         many independent members (``1`` is a one-member ensemble: a leading axis of size 1).
     p_dropout : optional dropout rate for the shared MLPs.
+    activation : the per-unit nonlinearity in every block. ``leaky-tanh`` (the default) is
+        LEARNABLE -- two gains per unit; ``fixed-leaky-tanh`` / ``tanh`` / ``relu`` / ``gelu``
+        are fixed functions with no parameters.
     """
 
     def __init__(
@@ -189,6 +263,7 @@ class SetRegressor(Model):
         features: Sequence[Sequence[int]],
         n_models: int | None = None,
         p_dropout: float | None = None,
+        activation: str = "leaky-tanh",
         *,
         rngs: nnx.Rngs,
     ):
@@ -203,7 +278,9 @@ class SetRegressor(Model):
         blocks: list[EnsembleSetBlock] = []
         n_in = self.n_features_in
         for block_def in features:
-            blocks.append(EnsembleSetBlock(self.n_models, n_in, block_def, p_dropout=p_dropout, rngs=rngs))
+            blocks.append(
+                EnsembleSetBlock(self.n_models, n_in, block_def, p_dropout=p_dropout, activation=activation, rngs=rngs)
+            )
             # After aggregation the next block sees [value_hit, event_repr].
             n_in = 2 * int(block_def[-1])
         self.blocks = nnx.List(blocks)
@@ -211,6 +288,13 @@ class SetRegressor(Model):
 
     def ensemble(self) -> int | None:
         return self.n_models
+
+    def regularization(self):
+        """Every kernel this regressor owns: one term per set block, plus the read-out map. Each is
+        scaled by its own fan-in (:meth:`EnsembleLinear.regularization`), so a wide layer and a narrow
+        one are penalised on the same footing rather than by raw parameter count. For an ensemble the
+        members' kernels are summed, since the members are independent draws from the same prior."""
+        return sum(block.regularization() for block in self.blocks) + self.output.regularization()
 
     def __call__(self, features, mask, *, deterministic: bool = True, rngs=None):
         # features: (..., M, F); mask: (..., M). Leading axes are (B,) for a single net or

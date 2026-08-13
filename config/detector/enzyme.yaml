@@ -12,7 +12,7 @@ enzyme:
   # lottery that random draws usually win -- which is exactly why iterations stopped paying.
   # Measured on 512-design Sobol landscapes, the spread within the best 10% (what BO must resolve at
   # the end) is 0.0084 at m = 4 against 0.0139 at m = 2, a 65% widening.
-  n_experiments: 1    # the designed batch: BO searches 2 * n_experiments dimensions
+  n_experiments: 4    # the designed batch: BO searches 2 * n_experiments dimensions
   n_measurements: 8   # [A] read-outs per experiment, evenly spaced, the last at `duration`
 
   # Stock solutions mixed at t = 0. The design gives the volume fraction taken by the enzyme stock;
@@ -212,7 +212,7 @@ enzyme:
   # against 0.12 at [25, 80] -- so the initial random designs carry signal more often, which is the
   # stated requirement for BO to have anything to model early. It also cuts the dead volume that
   # made uninformative designs the EXPENSIVE ones (a ceiling design measured at 68266 calls).
-  temperature_bounds: [35.0, 68.0]
+  temperature_bounds: [25.0, 80.0]
 
   # The objective: conversion of the 1/3 E : 1/3 A : 1/3 B mixture after `duration`. Its maximising
   # temperature is the target. (The mixing rule makes fraction = 1/3 exactly that mixture.)

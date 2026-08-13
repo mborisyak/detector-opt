@@ -21,7 +21,15 @@ it directly); each observation's GP noise is the loss estimate's own SEM.
 
 import json
 import os
+import pathlib
+import sys
 import time
+
+# USE THE TREE THIS SCRIPT LIVES IN. `python scripts/bo.py` puts the SCRIPT's directory on sys.path,
+# not the repo root, so with `detopt` no longer pip-installed the import fails outright -- and a run
+# launched from a git worktree would otherwise pick up whichever tree happened to be importable
+# rather than its own. Anchoring to this file makes a worktree run correct and needs no PYTHONPATH.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import matplotlib
 
@@ -77,6 +85,15 @@ def bo(output, seed: int, force: bool = False, **config):
     plots_dir = os.path.join(output, "plots")
     os.makedirs(plots_dir, exist_ok=True)
 
+    # PER-EPOCH plotting is a diagnostic and it is NOT free: `plot_iteration` renders a whole figure
+    # (and rewrites the design JSON) once an EPOCH on a background worker, and the design blocks on
+    # that queue when it exits. Measured on one design of this task it was ~36% of the wall clock,
+    # host-side CPU work done AFTER the network had converged -- which on a shared node is taken
+    # directly off the CPU-bound screening jobs. It is therefore a SETTING (`plot_per_epoch`), left
+    # ON by default so no existing run config changes behaviour, and turned off in the configs of
+    # runs that do not want it. Off means no callback at all, so the trainer also skips building the
+    # per-epoch history snapshot. The END-OF-DESIGN convergence plot is unaffected either way.
+    plot_per_epoch = bool(config.get("plot_per_epoch", True))
     bo_cfg = config["bo"]
     gp_cfg = dict(bo_cfg["gp"])
     ei_cfg = dict(bo_cfg["ei"])
@@ -134,7 +151,10 @@ def bo(output, seed: int, force: bool = False, **config):
                 default=float,
             )
 
-    print(f"BO: running until the budget pool fills " f"(budget={budget} detector calls, n_init={n_init}, d={d})")
+    print(
+        f"BO: running until the budget pool fills "
+        f"(budget={budget} detector calls, n_init={n_init}, d={d}, plot_per_epoch={plot_per_epoch})"
+    )
 
     i = 0
     while True:
@@ -154,6 +174,8 @@ def bo(output, seed: int, force: bool = False, **config):
             vlp = snapshot["val_loss_per_epoch"]
             live = float(vlp[-1]) if vlp.size > 0 else float("nan")
             plot_iteration(snapshot, iteration=_i, design=_d, val_loss=live, plots_dir=plots_dir)
+
+        on_epoch = _on_epoch if plot_per_epoch else None
 
         # Network init strategy (todo.md): from_scratch trains fresh; continue
         # warm-starts from the previous design; closest from the nearest previously trained design
@@ -178,7 +200,7 @@ def bo(output, seed: int, force: bool = False, **config):
             x_prop,
             root_seq.spawn(1)[0],
             init_params=init_params,
-            on_epoch=_on_epoch,
+            on_epoch=on_epoch,
             step=i,
         )
         if result is None:

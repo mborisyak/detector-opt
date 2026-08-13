@@ -1,0 +1,83 @@
+# ⚠️ REHEARSAL ONLY -- NOT A CANDIDATE CONFIG, NOT A RESULT. DELETE WHEN THE DRESS REHEARSAL IS DONE.
+#
+# This exists for ONE reason: `scripts/campaign.sh` hard-codes its gearup command line
+#
+#     python -u scripts/bo.py =CONFIG output=RUN seed=SEED nn_init_strategy=ARM
+#
+# and consumes every argument after SEEDS as an ARM name, so there is NO WAY to pass an extra
+# `key=value` override (e.g. `training.budget=...`) through it. bo.py itself accepts them -- gearup
+# applies the root token `=CONFIG` first and deeper paths afterwards (gearup/config.py, kwargs sorted
+# by path length) -- the launcher simply has no channel for them. The only way to run a SMALLER
+# version of a campaign through the REAL launcher is therefore a separate run config.
+#
+# It is config/enzyme_extremes.yaml verbatim except for `training.budget`, and it is prefixed with an
+# underscore (like config/_run_template.yaml) so it is visibly not one of the shipped candidates.
+#
+# NO NUMBER PRODUCED UNDER THIS CONFIG IS EVIDENCE ABOUT THE BINARY-EXTREMES CANDIDATE. The budget is
+# 8x smaller than the campaign's, so every run stops after a handful of designs at whatever level the
+# network happened to reach; the deliverable is that the PLUMBING works, not a loss.
+detector: enzyme_extremes
+
+regressor:
+  set-regressor:
+    features: [[24, 16], [16, 24]]
+    n_models: 4
+    p_dropout: 0.1
+
+device: cuda
+
+plot_per_epoch: false
+
+training:
+  n0: 2048
+  n_increment: 1024
+  batch: 256
+  eval_batch: 2048
+  warmup_epochs: 4               # A SAFEGUARD, not a tuning knob: it only stops the procedure
+                                # acting before there is anything to act on. Small on purpose --
+                                # the settled-test is a POSTERIOR, so an unsettled early curve
+                                # already fails it through its own width. 2-4.
+  # THE ONLY CHANGE. 2097152 / 8. Sized from the MEASURED per-design spend on this task
+  # (output/cost-extremes/results.json: 24571, 28666, 124216, 73711, 126946 calls for `from_scratch`,
+  # mean 75.6k) so a `from_scratch` run reaches ~3-4 designs and a `meta` run (mean 32k there) ~8 --
+  # i.e. the two arms end at DIFFERENT design counts, which is the thing the arm comparison must see.
+  budget: 262144
+  iteration_limit: 131072
+  val_fraction: 0.25
+  loss_precision: 8.0e-3
+  patience: 32                  # The horizon over which the loss must be STILL. Requiring N
+                                # epochs of stillness IS how the procedure waits for the
+                                # regressor's BIAS to disappear, so it must be long enough that
+                                # "still" means "the bias has finished moving" and not merely
+                                # "the noise was quiet". 16-32, scaling with `iteration_limit`,
+                                # which sets how much optimisation one epoch contains.
+  optimizer:
+    adamw:
+      learning_rate: 2.5e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-6
+
+bo:
+  n_init: 5
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds: [-2.0, 1.0]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+    kernel:
+      normalised-invariant-rbf:
+        exchangeable: 4
+
+  ei:
+    n_restarts: 32
+    n_steps: 100
+
+verify:
+  n_points: 10
+  epochs: 200
+  val_every_epochs: 10
+  budget: null
+  batch: null
