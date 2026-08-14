@@ -117,11 +117,14 @@ def _load_trajectory(path):
   }
 
 
-def _restore_design_network(run_dir, iteration):
+def _restore_design_network(run_dir, iteration, regressor):
   """The ``(parameters, state, design)`` of the network the run trained for ``iteration`` -- the last
   epoch checkpointed under ``<run_dir>/checkpoints/design_<iteration>``, which is the one whose loss
   the run reported. Parameters and state come back as pure dicts (load them into a freshly built
-  module's abstract state with ``nnx.replace_by_pure_dict``)."""
+  module's abstract state with ``nnx.replace_by_pure_dict``).
+
+  ``regressor`` is that module's ``(params, state)``: the checkpoint stores FLAT leaves, so the live
+  model is what supplies the structure to pour them back into."""
   path = os.path.join(run_dir, "checkpoints", f"design_{iteration:04d}")
   if not os.path.isdir(path):
     raise FileNotFoundError(
@@ -131,7 +134,7 @@ def _restore_design_network(run_dir, iteration):
   manager = io.get_checkpointer(path)
   if manager.latest_step() is None:
     raise ValueError(f"{path} holds no saved epoch")
-  parameters, state, design, _aux = io.restore_training_checkpoint(manager)
+  parameters, state, design, _aux = io.restore_training_checkpoint(manager, regressor=regressor)
   manager.close()
   return parameters, state, design
 
@@ -397,7 +400,7 @@ def verify(trajectory, seed: int = 0, output=None, progress: str = "bar", force:
     # ``from_config`` only supplies the architecture; the weights are replaced by the checkpoint's.
     point_model = detopt.nn.from_config(detector, config=config["regressor"], rngs=regressor_rngs(_seed(point_seq)))
     _, params, state = nnx.split(point_model, nnx.Param, nnx.Variable)
-    pure_params, pure_state, ckpt_design = _restore_design_network(run_dir, p)
+    pure_params, pure_state, ckpt_design = _restore_design_network(run_dir, p, (params, state))
     if not np.allclose(np.asarray(ckpt_design["scaled"], np.float32), np.asarray(traj["scaled"][p], np.float32)):
       raise ValueError(f"iteration {p}: the checkpoint's design differs from the one in results.json")
     nnx.replace_by_pure_dict(params, pure_params)

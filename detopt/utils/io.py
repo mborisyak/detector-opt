@@ -238,8 +238,8 @@ def save_training_checkpoint(manager, step, *, config, parameters, state, design
             config=ocp.args.JsonSave(config),
             regressor=ocp.args.PyTreeSave(
                 {
-                    "parameters": nnx.to_pure_dict(parameters),
-                    "state": nnx.to_pure_dict(state),
+                    "parameters": _leaves(nnx.to_pure_dict(parameters)),
+                    "state": _leaves(nnx.to_pure_dict(state)),
                 }
             ),
             design=ocp.args.PyTreeSave(design),
@@ -255,34 +255,36 @@ def restore_design(manager, step=None):
     return manager.restore(step, args=ocp.args.Composite(design=ocp.args.PyTreeRestore()))["design"]
 
 
-def restore_training_checkpoint(manager, step=None):
+def restore_training_checkpoint(manager, step=None, *, regressor=None):
     """Restore ``(parameters, state, design, aux)`` saved by :func:`save_training_checkpoint`.
 
     ``parameters`` / ``state`` come back as pure dicts -- load them into an abstract
     nnx state (``nnx.split`` of a freshly built module) with ``nnx.replace_by_pure_dict``.
     ``design`` is the ``{"scaled", "physical"}`` tree; ``aux`` the saved metrics.
 
-    ⚠️ RESTORES WITHOUT SHARDING INFO, which orbax warns about once per restore ("Sharding info not
-    provided when restoring. Populating sharding info from sharding file"). It is correct on a single
-    device -- reading the sharding file gives the right answer -- but slower, and orbax calls it unsafe
-    across a topology change. NOT FIXED: silencing it needs a ``restore_args`` tree matching the
-    CHECKPOINT's structure, and the live model does not reproduce it (``nnx.to_pure_dict`` yields lists
-    where orbax wrote string-keyed dicts, and coercing that exposes a further mismatch). MEASURED: a
-    target passed via ``item=`` changes nothing (20 warnings either way) and a single broadcast
-    ``ArrayRestoreArgs`` is rejected; the only construction that worked was a tree mapped over an
-    actual restore, i.e. restoring twice.
+    ``regressor`` is that freshly built module's ``(params, state)``. PASS IT: it supplies the
+    structure the flat leaves are poured back into (:func:`_leaves`) and the sharding orbax would
+    otherwise read back from the checkpoint's sharding file. Omitting it returns the raw stored form,
+    which for a current checkpoint is flat lists rather than pure dicts.
     """
     if step is None:
         step = manager.latest_step()
-    data = manager.restore(
-        step,
-        args=ocp.args.Composite(
-            regressor=ocp.args.PyTreeRestore(),
+    blob = None if regressor is None else {
+        "parameters": _leaves(nnx.to_pure_dict(regressor[0])),
+        "state": _leaves(nnx.to_pure_dict(regressor[1])),
+    }
+    data = _restore_maybe_legacy(
+        manager, step, lambda flat: ocp.args.Composite(
+            regressor=ocp.args.PyTreeRestore(
+                restore_args=_restore_args(blob) if (flat and blob is not None) else None),
             design=ocp.args.PyTreeRestore(),
             aux=ocp.args.PyTreeRestore(),
-        ),
+        )
     )
     reg = data["regressor"]
+    if regressor is not None:
+        return (_unleaves(nnx.to_pure_dict(regressor[0]), reg["parameters"]),
+                _unleaves(nnx.to_pure_dict(regressor[1]), reg["state"]), data["design"], data["aux"])
     return reg["parameters"], reg["state"], data["design"], data["aux"]
 
 
@@ -306,23 +308,86 @@ def save_model(parameters, state, optimizer_state):
 # loads the weights into freshly built models. New training -> config from the
 # config file; resume / test -> config from the checkpoint.
 # --------------------------------------------------------------------------- #
+def _leaves(tree):
+    """A pytree as a FLAT LIST of arrays -- the form everything is checkpointed in.
+
+    WHY FLAT. A nested pure dict does not round-trip through orbax as itself: ``nnx.to_pure_dict``
+    yields a LIST for an ``nnx.List`` (the regressor's blocks) and orbax writes that as an indexed
+    node, so the tree that comes back is not the tree that went in and cannot be reconstructed from
+    the live model. Everything downstream inherits that -- restoring cannot be given a target, which
+    is why every restore warned that no sharding was provided and read it back from the sharding file
+    instead (slower, and unsafe across a topology change, which is every GPU checkpoint read on CPU).
+
+    A flat list has no structure to reconstruct. The order is ``jax.tree.leaves``' own, which is
+    deterministic for a fixed pytree, and the STRUCTURE is recovered from the freshly built model at
+    load time (:func:`_unleaves`) -- the same trick already used for the optimiser state.
+    """
+    return jax.tree.leaves(tree)
+
+
+def _unleaves(reference, leaves):
+    """A flat list back into ``reference``'s structure.
+
+    ``leaves`` may come back from orbax as an int-keyed dict rather than a list (that is how it stores
+    a sequence), so both are accepted and the keys are ordered numerically. A dict whose keys are NOT
+    all numeric is a checkpoint from before this change -- a nested pure dict, already in the target
+    structure -- and is passed through untouched, so existing checkpoints keep loading."""
+    if isinstance(leaves, dict):
+        if not all(str(key).lstrip("-").isdigit() for key in leaves):
+            return leaves  # legacy nested pure dict
+        leaves = [leaves[key] for key in sorted(leaves, key=lambda k: int(k))]
+    return jax.tree.unflatten(jax.tree.structure(reference), list(leaves))
+
+
+def _restore_args(blob):
+    """Per-array restore arguments naming THIS process's device, shaped like ``blob``.
+
+    Without them orbax has no sharding for a jax array and reads it back from the checkpoint's
+    sharding file: slower, one warning per array, and by its own text unsafe when the topology differs
+    from the one that saved it. MEASURED on a flat blob: 14 warnings without, 0 with."""
+    sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+    return jax.tree.map(lambda _: ocp.ArrayRestoreArgs(sharding=sharding), blob)
+
+
+def _restore_maybe_legacy(manager, step, build_args):
+    """Restore, falling back to the pre-FLAT layout.
+
+    ``build_args`` takes a bool -- True for the current flat checkpoint (per-array ``restore_args``,
+    which is what silences the sharding warning), False for the nested pure dicts written before
+    :func:`_leaves`. The flat args are a structure mismatch against a legacy tree, and orbax says so
+    with a "pytree structure error"; that is the ONLY error retried, so a genuine mismatch (a model
+    rebuilt at the wrong width, say) still surfaces rather than being retried into a confusing
+    second failure. Legacy checkpoints therefore keep loading, with their warning, and
+    :func:`_unleaves` passes their nested dicts through untouched.
+    """
+    try:
+        return manager.restore(step, args=build_args(True))
+    except ValueError as error:
+        if "pytree structure error" not in str(error):
+            raise
+        return manager.restore(step, args=build_args(False))
+
+
 def _model_blob(params, state, optimizer_state):
-    """Live nnx ``(params, state, opt_state)`` -> the pure-dict blob orbax stores."""
+    """Live nnx ``(params, state, opt_state)`` -> the FLAT blob orbax stores (see :func:`_leaves`)."""
     return {
-        "parameters": nnx.to_pure_dict(params),
-        "state": nnx.to_pure_dict(state),
-        "optimizer_state": jax.tree.leaves(optimizer_state),
+        "parameters": _leaves(nnx.to_pure_dict(params)),
+        "state": _leaves(nnx.to_pure_dict(state)),
+        "optimizer_state": _leaves(optimizer_state),
     }
 
 
 def _load_model_blob(blob, params0, state0, optimizer):
     """Stored blob + a freshly built model's abstract ``(params0, state0)`` and its ``optimizer``
-    -> live ``(params, state, opt_state)`` (pure dicts loaded back into nnx state)."""
+    -> live ``(params, state, opt_state)``. The freshly built model supplies the STRUCTURE the flat
+    leaves are poured back into."""
     params = nnx.eval_shape(lambda: params0)
-    nnx.replace_by_pure_dict(params, blob["parameters"])
+    nnx.replace_by_pure_dict(params, _unleaves(nnx.to_pure_dict(params0), blob["parameters"]))
     state = nnx.eval_shape(lambda: state0)
-    nnx.replace_by_pure_dict(state, blob["state"])
-    opt_state = jax.tree.unflatten(jax.tree.structure(optimizer.init(params)), blob["optimizer_state"])
+    nnx.replace_by_pure_dict(state, _unleaves(nnx.to_pure_dict(state0), blob["state"]))
+    opt_state = jax.tree.unflatten(jax.tree.structure(optimizer.init(params)),
+                                   _unleaves([None] * len(jax.tree.leaves(optimizer.init(params))),
+                                             blob["optimizer_state"]))
     return params, state, opt_state
 
 
@@ -370,12 +435,20 @@ def restore_checkpoint(manager, step=None, *, design=None, aux=False, **models):
     the requested item names (``"regressor"``, ``"design"``, ...)."""
     if step is None:
         step = manager.latest_step()
-    spec = {name: ocp.args.PyTreeRestore() for name, triple in models.items() if triple is not None}
-    if design is not None:
-        spec["design"] = ocp.args.PyTreeRestore()
-    if aux:
-        spec["aux"] = ocp.args.PyTreeRestore()
-    data = manager.restore(step, args=ocp.args.Composite(**spec))
+    def build_args(flat):
+        spec = {
+            name: ocp.args.PyTreeRestore(
+                restore_args=_restore_args(_model_blob(p0, s0, opt.init(p0))) if flat else None)
+            for name, triple in models.items() if triple is not None
+            for p0, s0, opt in [triple]
+        }
+        if design is not None:
+            spec["design"] = ocp.args.PyTreeRestore()
+        if aux:
+            spec["aux"] = ocp.args.PyTreeRestore()
+        return ocp.args.Composite(**spec)
+
+    data = _restore_maybe_legacy(manager, step, build_args)
     out = {name: _load_model_blob(data[name], *triple) for name, triple in models.items() if triple is not None}
     if design is not None:
         theta = jnp.asarray(data["design"]["theta"], jnp.float32)
