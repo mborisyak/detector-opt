@@ -101,10 +101,10 @@ def run_bo(A, b, bounds, *, iters, seed):
     measure ``run_random`` samples, which is what makes the comparison fair.
     """
     low, high = bounds[:, 0], bounds[:, 1]
-    bo = BayesianOptimizer(bounds.shape[0], gp=_GP_CFG, ei=_EI_CFG, seed=seed)
+    bo = BayesianOptimizer(bounds.shape[0], gp=_GP_CFG, ei=_EI_CFG)
     best_f, best_x, curve = np.inf, None, []
     for _ in range(iters):
-        scaled = bo.propose()
+        scaled = bo.propose(int(seed) + step)
         x = low + np.asarray(scaled, dtype=np.float64) * (high - low)
         f = objective(A, b, x)
         bo.append(scaled, f, noise=_NOISE)

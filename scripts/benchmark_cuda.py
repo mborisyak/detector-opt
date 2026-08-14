@@ -15,7 +15,7 @@ import numpy as np
 
 # ── load shared libraries ────────────────────────────────────────────────────
 ROOT = os.path.join(os.path.dirname(__file__), "..")
-sys.path.insert(0, ROOT)
+
 
 import detopt.detector.straw_detector as _c_mod
 

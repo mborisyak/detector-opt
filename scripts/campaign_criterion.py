@@ -26,6 +26,8 @@ import os
 
 import numpy as np
 
+import detopt.utils.io as io
+
 
 def load(directory):
   """Every completed run under `directory`, as (seed, arm, losses, n_init)."""
@@ -34,12 +36,13 @@ def load(directory):
     with open(path) as f:
       data = json.load(f)
     seed, arm = path.split(os.sep)[-3], path.split(os.sep)[-2]
-    losses = np.array([r["loss"] for r in data["results"]], dtype=float)
+    rows = io.complete_results(data["results"])
+    losses = np.array([r["loss"] for r in rows], dtype=float)
     # `spent` in results.json is PER-DESIGN (verified: it is not monotone, and it sums to the run's
     # total), so the running budget is its cumulative sum. This is what makes an equal-BUDGET
     # comparison between arms possible at all -- see `compare_arms`, where cutting at equal design
     # count would delete the very effect being measured.
-    spent = np.cumsum(np.array([r.get("spent", 0) for r in data["results"]], dtype=float))
+    spent = np.cumsum(np.array([r.get("spent", 0) for r in rows], dtype=float))
     runs.append({
       "seed": seed,
       "arm": arm,

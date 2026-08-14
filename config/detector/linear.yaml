@@ -1,0 +1,14 @@
+# Full default config for the `linear` detector (LinearDetector): EVERY __init__ parameter, at its
+# default value. The DEBUG task -- probe positions on a linear response y = w x + b + eps, with
+# w, b ~ N(0, 1) drawn per event and eps ~ N(0, noise^2) per read-out.
+#
+# It exists to exercise the trainers, the BO driver and the resume protocol on a CPU in seconds, and
+# it is the only detector here whose answer is known in closed form: with X the (n_probes, 2) matrix
+# of rows (x_i, 1), the posterior covariance of (w, b) is (X^T X / noise^2 + I)^-1 and the achievable
+# loss is half its trace (LinearDetector.bayes_risk). For two probes the determinant of X^T X is
+# (x_1 - x_2)^2, so the optimum is the pair of box CORNERS -- in either order, since the design is a
+# set -- and at noise 0.1 that reads 0.00498 against 0.501 for two coincident probes.
+linear:
+  n_probes: 2
+  noise: 0.1
+  probe_bounds: [-1.0, 1.0]

@@ -36,6 +36,8 @@ recomputed (a settings mismatch recomputes everything -- the old data answers a 
 and ``--force`` recomputes every point regardless.
 """
 
+import sys
+
 import json
 import os
 import threading
@@ -53,6 +55,7 @@ import optax
 from flax import nnx
 
 import detopt
+from detopt.nn.trainer.common import regressor_rngs
 from detopt.utils import io
 from detopt.utils.config import resolve_device, split
 from detopt.utils.pools import RingBuffer
@@ -83,7 +86,12 @@ def _predict_shared(reg, feats, mask, members):
 
 def _key(seq):
   """A jax PRNGKey from the next child of a SeedSequence (advances ``seq`` deterministically)."""
-  return jax.random.PRNGKey(int(seq.spawn(1)[0].generate_state(1)[0]))
+  return jax.random.PRNGKey(_seed(seq))
+
+
+def _seed(seq):
+  """An INT seed from the next child of a SeedSequence -- what `regressor_rngs` takes."""
+  return int(seq.spawn(1)[0].generate_state(1)[0])
 
 
 def _load_trajectory(path):
@@ -97,7 +105,9 @@ def _load_trajectory(path):
     rs = json.load(f)["results"]
   if len(rs) == 0:
     raise ValueError(f"{path}: empty BO results")
-  io.check_bo_results(rs, path)
+  # RETURNS the scored rows: a finished run ends with an `incomplete` row -- the design the budget
+  # could not pay for -- whose `loss`/`spent` are null and must never reach arithmetic.
+  rs = io.check_bo_results(rs, path)
   return {
     "path": path,
     "physical": np.asarray([r["design"] for r in rs], np.float32),
@@ -227,7 +237,7 @@ def verify(trajectory, seed: int = 0, output=None, progress: str = "bar", force:
 
   # Template regressor: the graphdef (architecture) is shared by every point, so the JIT kernels
   # compile once; each point re-initialises fresh params below.
-  model = detopt.nn.from_config(detector, config=config["regressor"], rngs=nnx.Rngs(_key(template_seq)))
+  model = detopt.nn.from_config(detector, config=config["regressor"], rngs=regressor_rngs(_seed(template_seq)))
   reg_def = nnx.split(model, nnx.Param, nnx.Variable)[0]
   members = model.ensemble()
   # Single-cycle cosine-decayed learning rate over the whole per-point training (peak -> ~0),
@@ -264,7 +274,7 @@ def verify(trajectory, seed: int = 0, output=None, progress: str = "bar", force:
     loss = jnp.mean(
       _forward_loss(
         reg, detector.loss, feats, emask, detector.normalize_target(target_b), members, batch, deterministic=False,
-        rngs=nnx.Rngs(drop_key)
+        rngs=nnx.Rngs(dropout=jax.random.fold_in(drop_key, 0), dropconnect=jax.random.fold_in(drop_key, 1))
       )
     )
     _, _, new_state = nnx.split(reg, nnx.Param, nnx.Variable)
@@ -385,7 +395,7 @@ def verify(trajectory, seed: int = 0, output=None, progress: str = "bar", force:
     # network (the optimiser state is not checkpointed, so only its moments restart), so the two
     # numbers describe the same network and differ only in the data: all of it is fresh here.
     # ``from_config`` only supplies the architecture; the weights are replaced by the checkpoint's.
-    point_model = detopt.nn.from_config(detector, config=config["regressor"], rngs=nnx.Rngs(_key(point_seq)))
+    point_model = detopt.nn.from_config(detector, config=config["regressor"], rngs=regressor_rngs(_seed(point_seq)))
     _, params, state = nnx.split(point_model, nnx.Param, nnx.Variable)
     pure_params, pure_state, ckpt_design = _restore_design_network(run_dir, p)
     if not np.allclose(np.asarray(ckpt_design["scaled"], np.float32), np.asarray(traj["scaled"][p], np.float32)):

@@ -37,6 +37,7 @@ import os
 import numpy as np
 
 import detopt.detector
+import detopt.utils.io
 import detopt.utils.config
 from detopt.nn.trainer import ContinualTrainer, DesignTrainer
 
@@ -83,7 +84,7 @@ def main():
   targets = None
   if arguments.target_from is not None:
     with open(arguments.target_from) as f:
-      ranked = sorted(json.load(f)["results"], key=lambda r: r["loss"])
+      ranked = sorted(detopt.utils.io.complete_results(json.load(f)["results"]), key=lambda r: r["loss"])
     targets = [(np.asarray(r["x_scaled"], np.float32), float(r["loss"])) for r in ranked]
     print("targets (best-first): " + ", ".join(f"{loss:.4f}" for _, loss in targets[:arguments.n_repeats]),
           flush=True)
@@ -102,15 +103,15 @@ def main():
     meta = ContinualTrainer.from_config(detector, config, checkpoint_dir=None, seed=arguments.seed + repeat)
     history = []
     for step, design in enumerate(designs[:-1]):
-      result = meta.train(design, seeds.spawn(1)[0], step=step)
+      result = meta.train(design, int(seeds.spawn(1)[0].generate_state(1)[0]), step=step)
       if result is None:
         break
       history.append(float(result.objective_loss))
-    meta_result = meta.train(target, seeds.spawn(1)[0], step=arguments.n_warmup)
+    meta_result = meta.train(target, int(seeds.spawn(1)[0].generate_state(1)[0]), step=arguments.n_warmup)
 
     # (4) from_scratch: a fresh network on the SAME target, nothing carried.
     scratch = DesignTrainer.from_config(detector, config, checkpoint_dir=None, seed=arguments.seed + repeat)
-    scratch_result = scratch.train(target, seeds.spawn(1)[0], step=0)
+    scratch_result = scratch.train(target, int(seeds.spawn(1)[0].generate_state(1)[0]), step=0)
 
     row = {
         "repeat": repeat,

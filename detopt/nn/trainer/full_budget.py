@@ -94,10 +94,6 @@ class FullBudgetTrainer(Trainer):
             seed=seed,
         )
 
-    def _prior_count(self, start, count):
-        # One window, one fit, no history: the window IS the evidence.
-        return count
-
     def _sample_indices(self, key, start, count):
         return window_sample_indices(self, key, start, count)  # uniform over the full budget window
 
@@ -107,17 +103,24 @@ class FullBudgetTrainer(Trainer):
     def _init_design_network(self, init_seq, init_params):
         return fresh_design_network(self, init_seq, init_params)  # fresh, single design
 
-    def train(self, design_scaled, seed_seq, *, on_epoch=None) -> TrainResult:
+    def _carried_state(self):
+        return {}  # one design, one network: there is no boundary to carry anything across
+
+    def _load_carried_state(self, data):
+        """Nothing to load -- see :meth:`_carried_state`."""
+
+    def train(self, design_scaled, seed, *, on_epoch=None) -> TrainResult:
         """Train a fresh regressor on the full budget for ``max_epochs`` epochs.
 
         Samples the entire budget under ``design_scaled`` (one design) up front, then
-        runs exactly ``max_epochs`` epochs with the cosine-decayed LR. Returns the
-        final ``(train + val) / 2`` loss and its combined SEM.
+        runs exactly ``max_epochs`` epochs with the cosine-decayed LR. ``seed`` is an INT and drives
+        both the network draw and the training keys. Returns the final validation loss and its
+        combined SEM.
         """
         detector = self.detector
         design_scaled = np.asarray(design_scaled, dtype=np.float32)
         design = detector.to_nominal(design_scaled)  # physical Design namedtuple (what the pools store)
-        init_seq, training_seq = seed_seq.spawn(2)
+        init_seq, training_seq = np.random.SeedSequence(int(seed)).spawn(2)
 
         # Fresh, randomly initialised regressor + optimiser (cosine-scheduled LR).
         params, state, opt_state = self._init_design_network(init_seq, None)
@@ -175,7 +178,9 @@ class FullBudgetTrainer(Trainer):
                         ),
                     )
 
-        objective_loss = 0.5 * (train_mean + val_mean)
+        # The VALIDATION loss alone, matching `DesignTrainer` (user, 2026-08-14): the reported score
+        # must not be half training loss, or a regulariser is charged half its benefit as a cost.
+        objective_loss = val_mean
         # Same definition as DesignTrainer: the spread of the two averaged losses plus the error
         # of their means, so `objective_std` means one thing across trainers.
         objective_std = float(abs(val_mean - train_mean) + np.hypot(train_sem, val_sem))

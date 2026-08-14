@@ -27,7 +27,6 @@ Run it through SLURM, e.g.
 """
 import os
 import pathlib
-import sys
 
 # BLAS/OpenMP default to every core on the machine, which is wrong under a scheduler: SLURM says
 # which cores this job may use, not how many threads it should start. Set before numpy is imported.
@@ -36,7 +35,7 @@ for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXP
   os.environ.setdefault(_v, _allocated)
 
 # Use the tree this script lives in (`detopt` is not installed anywhere).
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
 
 import math
 import time

@@ -19,10 +19,7 @@ def save_all_data(seed, output, chunk_size=1000, **config):
 
     # Load data to get total number of events
     if detector._data_loader is None:
-        import sys
-        from pathlib import Path
 
-        sys.path.insert(0, str(Path(__file__).parent.parent))
         from detopt.data import HNLDataLoader
 
         detector._data_loader = HNLDataLoader(detector.data_dir, max_particles=detector.max_particles)

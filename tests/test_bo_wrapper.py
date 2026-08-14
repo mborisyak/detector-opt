@@ -22,8 +22,9 @@ _GP_CFG = dict(
 _EI_CFG = dict(n_restarts=4, n_steps=20)
 
 
-def _make_bo(d=3, n_init=5, seed=0):
-    return BayesianOptimizer(d, gp=_GP_CFG, ei=_EI_CFG, n_init=n_init, seed=seed)
+def _make_bo(d=3, n_init=5):
+    """``propose`` is seeded PER CALL by the driver, so there is no constructor seed to pass."""
+    return BayesianOptimizer(d, gp=_GP_CFG, ei=_EI_CFG, n_init=n_init)
 
 
 def test_append_requires_noise():
@@ -36,7 +37,7 @@ def test_append_requires_noise():
 def test_propose_random_during_init():
     """Before ``n_init`` observations, proposals are random and carry no GP info."""
     bo = _make_bo(d=3, n_init=5)
-    x = bo.propose()
+    x = bo.propose(0)
     assert x.shape == (3,)
     assert np.all(x >= 0.0) and np.all(x <= 1.0)
     assert bo.last_info is None
@@ -50,7 +51,7 @@ def test_propose_uses_gp_after_init():
         x = rng.uniform(0.0, 1.0, size=2).astype("float32")
         # Minimise ||x - 0.5||^2 (a simple convex objective with an INTERIOR optimum).
         bo.append(x, float(np.sum((x - 0.5) ** 2)), noise=1e-2)
-    x_next = bo.propose()
+    x_next = bo.propose(0)
     assert x_next.shape == (2,)
     assert np.all(x_next >= 0.0) and np.all(x_next <= 1.0)
     assert bo.last_info is not None
@@ -61,9 +62,9 @@ def test_gp_proposals_stay_in_the_cube():
     """Every EI-driven proposal is inside ``[0, 1]^d``, including against an objective whose optimum
     sits ON a corner -- the EI polish must clip rather than run out of the box."""
     rng = np.random.default_rng(2)
-    bo = _make_bo(d=3, n_init=5, seed=3)
-    for _ in range(20):
-        x = np.asarray(bo.propose(), dtype=np.float32)
+    bo = _make_bo(d=3, n_init=5)
+    for step in range(20):
+        x = np.asarray(bo.propose(3 + step), dtype=np.float32)
         assert np.all(x >= 0.0) and np.all(x <= 1.0), x
         bo.append(x, float(np.sum(x)), noise=1e-2)  # minimised at the all-zero CORNER
 
@@ -77,8 +78,13 @@ def test_initial_proposals_are_uniform_in_the_cube():
     """
     xs = []
     for seed in range(200):
-        bo = _make_bo(d=4, n_init=8, seed=seed)
-        xs.extend(np.asarray(bo.propose(), dtype=np.float64) for _ in range(8))
+        # One scrambled Sobol BLOCK per seed, consumed row by row -- the rows only advance as
+        # observations arrive, so each proposal is appended before the next is asked for.
+        bo = _make_bo(d=4, n_init=8)
+        for _ in range(8):
+            x = np.asarray(bo.propose(seed), dtype=np.float64)
+            xs.append(x)
+            bo.append(x.astype(np.float32), 0.0, noise=1e-2)
     x = np.asarray(xs)  # (1600, 4)
 
     outer = float(np.mean((x < 0.1) | (x > 0.9)))  # outer 20% of the range

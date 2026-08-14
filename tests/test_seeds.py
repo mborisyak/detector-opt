@@ -24,13 +24,21 @@ _GP = dict(
 _EI = dict(n_restarts=4, n_steps=20)
 
 
-def _bo(seed, d=3, n_init=4):
-    return BayesianOptimizer(d, gp=_GP, ei=_EI, n_init=n_init, seed=seed)
+def _bo(d=3, n_init=4):
+    """No constructor seed: every draw is seeded per call by the driver."""
+    return BayesianOptimizer(d, gp=_GP, ei=_EI, n_init=n_init)
 
 
 def _proposal_seq(seed, n=4):
-    bo = _bo(seed)
-    return [np.asarray(bo.propose()) for _ in range(n)]
+    """The initial block under ``seed``, consumed row by row (a row advances only as observations
+    arrive, so each proposal is appended before the next is asked for)."""
+    bo = _bo()
+    out = []
+    for _ in range(n):
+        x = np.asarray(bo.propose(seed))
+        out.append(x)
+        bo.append(x.astype(np.float32), 0.0, noise=1e-2)
+    return out
 
 
 def test_bo_init_proposals_advance_and_reproduce():
@@ -52,12 +60,12 @@ def test_bo_gp_proposal_reproducible():
     / acquisition keys are threaded from the BO seed, not hardcoded."""
 
     def run(seed):
-        bo = _bo(seed, n_init=4)
+        bo = _bo(n_init=4)
         rng = np.random.default_rng(0)  # fixed data, so only the BO seed varies
         for _ in range(6):
             x = rng.uniform(-3.0, 3.0, size=3).astype("float32")
             bo.append(x, float(np.sum(x**2)), noise=1e-2)
-        return np.asarray(bo.propose())
+        return np.asarray(bo.propose(seed))
 
     assert np.allclose(run(3), run(3))
     assert not np.allclose(run(3), run(4))
@@ -88,12 +96,12 @@ def _design_trainer(seed):
 def _loss(trainer, train_seed):
     det = analytic_detector()
     design = np.zeros(det.design_dim(), dtype=np.float32)
-    return float(trainer.train(design, np.random.SeedSequence(train_seed)).objective_loss)
+    return float(trainer.train(design, train_seed).objective_loss)
 
 
 def test_design_trainer_reproducible_by_train_seed():
-    """DesignTrainer init/data/training all come from the per-design ``seed_seq``:
-    same seq reproduces the loss exactly, a different seq changes it."""
+    """DesignTrainer init/data/training all come from the per-design ``seed``:
+    the same seed reproduces the loss exactly, a different one changes it."""
     a = _loss(_design_trainer(0), train_seed=0)
     b = _loss(_design_trainer(0), train_seed=0)
     c = _loss(_design_trainer(0), train_seed=1)

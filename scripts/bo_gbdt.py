@@ -165,7 +165,7 @@ def run(mode, seed, n_iterations, n_events, overrides, output, verify, fixed_fra
     kernel = detopt.bo.kernel_from_config(kernel_config, detector, gp_settings)
   optimiser = BayesianOptimizer(
     searched, gp=gp_settings, ei=EI, kernel=kernel,
-    n_init=int(n_init) if n_init is not None else gp_settings["n_folds"], seed=seed
+    n_init=int(n_init) if n_init is not None else gp_settings["n_folds"]
   )
   rng = np.random.default_rng(seed)
   # Normalised MSE -> C: the target is scaled to [-1, 1] over the T_melting prior, so one unit of
@@ -181,7 +181,7 @@ def run(mode, seed, n_iterations, n_events, overrides, output, verify, fixed_fra
     # the quantile encoding used to get wrong (it crippled BO and its null identically).
     x = (
       rng.uniform(0.0, 1.0, size=searched).astype(np.float32)
-      if mode == "random" else np.asarray(optimiser.propose(), dtype=np.float32)
+      if mode == "random" else np.asarray(optimiser.propose(int(seed) + index), dtype=np.float32)
     )
     design = np.asarray(to_design(x), dtype=np.float32)
 

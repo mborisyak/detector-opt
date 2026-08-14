@@ -10,6 +10,7 @@ from .enzyme import EnzymeDetector
 from .enzyme_inhibitor import EnzymeInhibitorDetector
 from .enzyme_mm import EnzymeMMDetector
 from .growth import GrowthDetector
+from .linear import LinearDetector
 from .straw import StrawDetector  # abstract base (no design scheme)
 from .free_straw import FreeStrawDetector, free_design_array
 from .stereo_straw import StereoStrawDetector
@@ -36,6 +37,10 @@ __detectors__: dict[str, type[Detector]] = {
     # Also not a particle detector: bacterial growth, one batch of cultures per design (CTMI cardinal
     # temperatures + Monod batch kinetics), the strain's optimal growth temperature as the target.
     "growth": GrowthDetector,
+    # The DEBUG task: probe positions on a linear response, no physics, no data, milliseconds on a
+    # CPU -- and the only detector here whose optimal design and achievable loss are known in closed
+    # form, so a driver can be checked against the answer rather than against its own output.
+    "linear": LinearDetector,
     "straw": FreeStrawDetector,  # free per-layer geometry + 4-feature combine
     "stereo_tracking": Stereo4Feature,  # stereo geometry + 4-feature combine (the default stereo detector)
     "stereo_tracker_truth": StereoTrackerTruth,  # + per-hit (x,y)/drift_r/tdc TRUTH for tracker experiments

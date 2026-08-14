@@ -130,7 +130,7 @@ def main():
       config["regressor"] = copy.deepcopy(regressor)
       trainer = DesignTrainer.from_config(detector, config, checkpoint_dir=None,
                                           seed=arguments.seed + index)
-      result = trainer.train(design, np.random.SeedSequence(arguments.seed + index), step=0)
+      result = trainer.train(design, arguments.seed + index, step=0)
       row = {"design": index, "variant": label.strip(), "regressor": regressor,
              "loss": None if result is None else float(result.objective_loss),
              "std": None if result is None else float(result.objective_std),

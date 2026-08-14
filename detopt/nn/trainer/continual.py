@@ -4,10 +4,29 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from .design import _DesignBase
 
 __all__ = ["ContinualTrainer"]
+
+
+def _is_key(leaf):
+    return jnp.issubdtype(jnp.asarray(leaf).dtype, jax.dtypes.prng_key)
+
+
+def _key_data(leaf):
+    """A leaf as something numpy can hold: a typed PRNG key becomes its raw key data."""
+    return jax.random.key_data(leaf) if _is_key(leaf) else leaf
+
+
+def _like(reference, stored):
+    """``stored`` back in ``reference``'s own dtype -- re-wrapping key data into a typed key, and using
+    the reference's key IMPLEMENTATION rather than the default, so a network built under a non-default
+    one restores as itself."""
+    if _is_key(reference):
+        return jax.random.wrap_key_data(jnp.asarray(stored, jnp.uint32), impl=jax.random.key_impl(reference))
+    return jnp.asarray(stored, reference.dtype)
 
 
 class ContinualTrainer(_DesignBase):
@@ -27,7 +46,7 @@ class ContinualTrainer(_DesignBase):
       design in the pool, so ``combine`` handles the mixed-design batch.
     """
 
-    def __init__(self, *args, replay_weight: float = 1.0, replay_alpha: float = 1.0, **kwargs):
+    def __init__(self, *args, replay_weight: float = 1.0, **kwargs):
         # What a REPLAY row is worth against a current-design row in the gradient. 1.0 reproduces the
         # original behaviour exactly (a plain mean over the 50/50 batch).
         #
@@ -43,9 +62,6 @@ class ContinualTrainer(_DesignBase):
         # on the same design's data -- 2.3 to 4.1 x `loss_precision`, at 23-41 sigma. It is a BIAS,
         # not a data shortage: doubling every per-design count recovers only 0 / 41 / 24% of it.
         self.replay_weight = float(replay_weight)
-        # How much a HISTORICAL row counts as evidence when the parameter prior is weighed against the
-        # data -- see `_prior_count`. Only read when `prior_scale > 0`; with the prior off it is inert.
-        self.replay_alpha = float(replay_alpha)
         super().__init__(*args, **kwargs)
         # ONE persistent network, continued across every design (the continual strategy IS the warm
         # start). Built eagerly here -- never lazily on the first train() call -- so no jax array is
@@ -62,26 +78,29 @@ class ContinualTrainer(_DesignBase):
     def _persist_network(self, params, state, opt_state):
         self._running = (params, state, opt_state)
 
-    def _prior_count(self, start, count):
-        """``count + replay_alpha * start`` -- the current window PLUS the history the replay half is
-        drawn from, since this network is fitted to both.
+    def _carried_state(self):
+        """The persistent network -- PARAMS AND BUFFER STATE, NOT THE OPTIMISER MOMENTS (user,
+        2026-08-14). The moments are re-initialised from the restored params on resume, so a resumed
+        continual run differs from an uninterrupted one by one design's worth of Adam warm-up on the
+        design that follows the restart. Say so rather than let it pass as an exact resume.
 
-        WHY IT IS NOT ``count``. The prior's weight against the data is ``1/N``, and ``N`` is the
-        evidence the objective actually represents. A continual network's objective is a mixture: half
-        of every minibatch comes from ``[0, start)``, so those rows are being fitted too. Charging it
-        ``1/count`` would weigh the same prior against only the current design's window -- and since
-        ``start`` grows with every design while ``count`` does not, the over-regularisation would GROW
-        with the campaign, reaching 20x or more by design 20. `from_scratch` would meanwhile be charged
-        correctly. That is an arm-asymmetric handicap manufactured by the trainer, on top of the
-        handicap the campaign is trying to measure.
+        The buffer state holds TYPED PRNG KEYS, which have no numpy representation; they are stored as
+        their raw key data and re-wrapped on load against the freshly built network's own dtypes."""
+        params, state, _ = self._running
+        payload = {}
+        for name, tree in (("param", params), ("buffer", state)):
+            for i, leaf in enumerate(jax.tree.leaves(tree)):
+                payload[f"net_{name}_{i}"] = np.asarray(_key_data(leaf))
+        return payload
 
-        ``replay_alpha`` is how much a historical row counts against a current one, and it belongs with
-        ``replay_weight``: at ``replay_weight = 1.0`` a replayed row has the same say in the gradient as
-        a current one, so it is the same kind of evidence and ``replay_alpha = 1.0`` matches. Setting
-        ``replay_weight = 0`` (no replay) should be paired with ``replay_alpha = 0``, which recovers the
-        per-design denominator exactly.
-        """
-        return count + self.replay_alpha * start
+    def _load_carried_state(self, data):
+        params, state, _ = self._running
+        restored = []
+        for name, tree in (("param", params), ("buffer", state)):
+            leaves, structure = jax.tree.flatten(tree)
+            loaded = [_like(leaf, data[f"net_{name}_{i}"]) for i, leaf in enumerate(leaves)]
+            restored.append(jax.device_put(jax.tree.unflatten(structure, loaded), self.device))
+        self._running = (restored[0], restored[1], self.optimizer.init(restored[0]))
 
     def _sample_indices(self, key, start, count):
         # Half of each member's batch from the current window [start, start+count),

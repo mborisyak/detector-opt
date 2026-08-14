@@ -13,7 +13,6 @@ import time
 
 import yaml
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 import regression as REG  # noqa: E402
 
 DESIGN = "config/design/initial_stereo.yaml"

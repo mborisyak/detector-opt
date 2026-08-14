@@ -19,6 +19,7 @@ rank them wrongly.
     python scripts/compare_strategies.py --output output/enzyme --strategies meta closest
 """
 
+
 import argparse
 import json
 import os
@@ -28,6 +29,7 @@ import matplotlib
 
 matplotlib.use("AGG")
 
+from detopt.utils import io
 from detopt.utils.viz.bo import plot_convergence_two_panel
 
 STRATEGIES = ["from_scratch", "continue", "closest", "meta"]
@@ -51,7 +53,9 @@ def main(out_root, strategies):
         verification = _load(os.path.join(run_dir, "verification.json"))
         if verification is None:
             print(f"  [warn] {strategy}: no verification.json -- plotting the self-evaluated curve only")
-        runs[strategy] = {"results": results["results"], "verification": verification}
+        # Only the SCORED rows: every finished run ends with an `incomplete` row (the design its
+        # budget could not pay for), carrying null loss/spent.
+        runs[strategy] = {"results": io.complete_results(results["results"]), "verification": verification}
     if len(runs) == 0:
         raise SystemExit(f"no results.json found under {out_root}/<strategy>/")
 

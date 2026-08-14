@@ -107,10 +107,10 @@ def run(arm, objective_name, m, seed, iterations):
   rng = np.random.default_rng(seed)
   optimiser = None
   if arm != "random":
-    optimiser = BayesianOptimizer(m, gp=GP, ei=EI, kernel=build(arm, m), n_init=GP["n_folds"], seed=seed)
+    optimiser = BayesianOptimizer(m, gp=GP, ei=EI, kernel=build(arm, m), n_init=GP["n_folds"])
   losses = []
   for _ in range(iterations):
-    x = rng.uniform(0.0, 1.0, size=m) if arm == "random" else np.asarray(optimiser.propose(), dtype=float)
+    x = rng.uniform(0.0, 1.0, size=m) if arm == "random" else np.asarray(optimiser.propose(int(seed) + step), dtype=float)
     value = objective(objective_name, x)
     if optimiser is not None:
       optimiser.append(x, value, noise=1e-8)  # the function is exact; this is a conditioning jitter

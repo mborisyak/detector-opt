@@ -11,6 +11,7 @@ test losses. The plotted values go next to the figure as JSON, so it regenerates
     python scripts/median_convergence.py --runs output/enzyme-42 output/enzyme-43 --output output/enzyme-median.png
 """
 
+
 import argparse
 import json
 import os
@@ -19,6 +20,7 @@ import matplotlib
 
 matplotlib.use("AGG")
 
+from detopt.utils import io
 from detopt.utils.viz.bo import plot_median_convergence
 
 STRATEGIES = ["from_scratch", "continue", "closest", "meta"]
@@ -44,7 +46,9 @@ def main(run_roots, output, strategies):
       verification = _load(os.path.join(run_dir, "verification.json"))
       if verification is None:
         print(f"  [warn] {run_dir}: no verification.json -- this seed enters the self-evaluated panel only")
-      seeds[os.path.basename(os.path.normpath(root))] = {"results": results["results"], "verification": verification}
+      # Only the SCORED rows -- a finished run ends with a null-loss `incomplete` row.
+      seeds[os.path.basename(os.path.normpath(root))] = {
+        "results": io.complete_results(results["results"]), "verification": verification}
     if len(seeds) > 0:
       runs[strategy] = seeds
   if len(runs) == 0:

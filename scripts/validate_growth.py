@@ -32,15 +32,8 @@ Stages:
 import argparse
 import math
 import os
-import pathlib
-import sys
 import time
 
-# USE THE TREE THIS SCRIPT LIVES IN. `detopt` is not installed anywhere, and `python
-# scripts/validate_growth.py` puts the SCRIPT's directory on sys.path, not the repo root -- so a run
-# from a worktree would either fail to import `detopt` at all or, worse, import the MAIN tree's copy
-# and validate somebody else's detector. Anchoring to this file makes that impossible.
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 # BLAS/OpenMP size their thread pools at import time and default to every core on the machine, which
 # is wrong under a scheduler: SLURM says WHICH cores this job may use, not how many threads to start.

@@ -6,10 +6,8 @@
 import argparse
 import json
 import os
-import sys
 import time
 from functools import partial
-from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -28,8 +26,6 @@ matplotlib.use("AGG")
 
 import detopt
 
-# Make load_hnl_data importable when running this script from the repo root.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from load_hnl_data import HNLDataLoader
 
 VALID_INIT_STRATEGIES = ("from_scratch", "continue", "closest")

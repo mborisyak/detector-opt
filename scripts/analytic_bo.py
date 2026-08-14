@@ -74,7 +74,7 @@ def run(mode, m, seed, n_iterations, kernel_name, noise):
                                 kernel=built, n_init=5, seed=seed)
   losses = []
   for _ in range(n_iterations):
-    x = rng.random(dimension) if mode == "random" else np.asarray(optimiser.propose(), dtype=float)
+    x = rng.random(dimension) if mode == "random" else np.asarray(optimiser.propose(int(seed) + index), dtype=float)
     value = objective(x, m, noise, rng)
     optimiser.append(x, value, noise=max(noise, 1e-6))
     losses.append(value)

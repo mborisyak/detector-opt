@@ -40,6 +40,8 @@ JAX implementation, deliberately:
 ``scripts/benchmark_gp.py`` and the GP tests; this driver never calls it.
 """
 
+import warnings
+
 import numpy as np
 from scipy.linalg import cho_solve
 from scipy.optimize import minimize
@@ -58,7 +60,7 @@ class BayesianOptimizer:
         config = dict(config)
         return cls(config.pop("d"), **config)
 
-    def __init__(self, d, *, gp, ei, kernel=None, n_init=None, seed=0):
+    def __init__(self, d, *, gp, ei, kernel=None, n_init=None):
         """``d`` is the design dimension. There are no bounds to pass: the caller works in the scaled
         box ``[0, 1]^d`` already, so the box IS the search space.
 
@@ -74,13 +76,19 @@ class BayesianOptimizer:
         self.ei_cfg = dict(ei)
         # Random proposals until there are enough points to fit anything sensible.
         self.n_init = int(n_init) if n_init is not None else int(self.gp_cfg["n_folds"])
-        self._rng = np.random.default_rng(int(seed))
-        self._seed = int(seed)
-        # Initial design: a SCRAMBLED SOBOL sequence, not independent uniform draws. On a landscape
-        # whose informative region is a small fraction of the box, i.i.d. points clump and leave
-        # holes. Scrambling keeps it randomised per seed (so seeds remain independent replicates)
-        # while guaranteeing the coverage.
-        self._sobol = qmc.Sobol(self.d, scramble=True, seed=int(seed))
+        # The initial block, drawn ONCE and then indexed. `None` until the first `propose`, which
+        # materialises it from the seed it is given; the remaining `n_init - 1` initial calls ignore
+        # their seed and read row `k`. It is PERSISTED, so a resumed run continues the same block
+        # rather than redrawing one.
+        #
+        # WHY A BLOCK AND NOT A POINT PER CALL: a Sobol sequence's low-discrepancy guarantee is a
+        # property of the SET -- point k is well placed relative to points 0..k-1 through the shared
+        # digital construction. Drawing one point from a freshly scrambled engine each call returns
+        # index 0 under a different scramble every time, and independent scrambles make the points
+        # marginally uniform AND mutually independent, i.e. plain Monte Carlo. The same argument kills
+        # the Latin-hypercube variant even more sharply: there the strata collected across independent
+        # designs form a permutation only with probability n!/n^n, which is 3.8% at n = 5.
+        self.init_seq = None
 
         # The config states the prior box in LOG space (that is how detopt.bo.jax_gp
         # parameterises it); sklearn wants the natural-scale bounds. The kernel is
@@ -135,6 +143,48 @@ class BayesianOptimizer:
         self.last_info = None
 
     # ------------------------------------------------------------------ #
+    def persist(self, path):
+        """STAGE everything a resumed run needs: the observations and the initial block.
+
+        Staged, not published: the driver persists the optimiser and the trainer and then commits the
+        SET (:func:`detopt.utils.io.commit`), so a run killed mid-save can never resume with this
+        optimiser's evidence beside a stale event pool.
+
+        NO RANDOM STATE IS STORED, because there is none -- every draw is seeded per call by the
+        driver, so a resumed run reproduces the same numbers by replaying its seed sequence. What
+        cannot be recomputed is the evidence (``X``, ``y``, ``noise``) and the initial block, which
+        was materialised from the seed of whichever call happened to be first.
+        """
+        from ..utils import io
+
+        io.stage(path, {
+            "X": self.X,
+            "y": self.y,
+            "noise": self.noise,
+            "init_seq": self.init_seq if self.init_seq is not None else np.zeros((0, self.d)),
+            "d": np.int32(self.d),
+            "n_init": np.int32(self.n_init),
+        })
+
+    def restore(self, path):
+        """Load a :meth:`persist` snapshot, honouring an interrupted multi-file commit."""
+        from ..utils import io
+
+        source = io.restore_path(str(path))
+        if source is None:
+            raise FileNotFoundError(f"no optimiser state at {path} (nor {path}.old)")
+        with np.load(source) as data:
+            if int(data["d"]) != self.d or int(data["n_init"]) != self.n_init:
+                raise ValueError(f"{source}: state is d={int(data['d'])} n_init={int(data['n_init'])}, "
+                                 f"this optimiser is d={self.d} n_init={self.n_init}")
+            self.X = np.asarray(data["X"], np.float32)
+            self.y = np.asarray(data["y"], np.float32)
+            self.noise = np.asarray(data["noise"], np.float32)
+            block = np.asarray(data["init_seq"], np.float64)
+            self.init_seq = None if block.shape[0] == 0 else block
+        self.last_info = None
+
+    # ------------------------------------------------------------------ #
     def append(self, X, y, noise):
         """Record observation(s) in the SCALED box ``[0, 1]``.
 
@@ -153,7 +203,7 @@ class BayesianOptimizer:
     # ------------------------------------------------------------------ #
     # Surrogate + acquisition
     # ------------------------------------------------------------------ #
-    def _fit(self, X, y_centered, noise):
+    def _fit(self, X, y_centered, noise, seed):
         """Fit the ARD-RBF GP on the given observations.
 
         ``alpha`` is the per-observation noise VARIANCE placed on the kernel diagonal,
@@ -166,7 +216,7 @@ class BayesianOptimizer:
             alpha=np.maximum(noise.astype(np.float64) ** 2, 1e-12),
             n_restarts_optimizer=self.n_gp_restarts,
             normalize_y=False,
-            random_state=self._seed,
+            random_state=seed,
         )
         return model.fit(X.astype(np.float64), y_centered.astype(np.float64))
 
@@ -221,7 +271,7 @@ class BayesianOptimizer:
         grad_sigma = (grad_prior - 2.0 * (jac.T @ v)) / (2.0 * sigma)
         return float(ei), -cdf * grad_mean + pdf * grad_sigma
 
-    def _optimise_ei(self, model, y_best, low, high):
+    def _optimise_ei(self, model, y_best, low, high, seed):
         """Maximise EI over the box ``[low, high]`` (the scaled cube):
         coarse random sweep, then local polish.
 
@@ -236,7 +286,7 @@ class BayesianOptimizer:
         n_candidates = max(4096, 512 * self.d)
 
         # Uniform in the box, which IS the cube, so this is a uniform DESIGN.
-        candidates = low + self._rng.random((n_candidates, self.d)) * (high - low)
+        candidates = low + np.random.default_rng(seed).random((n_candidates, self.d)) * (high - low)
         ei = self._expected_improvement(model, candidates, y_best)
         order = np.argsort(-ei)
         best_x, best_ei = candidates[order[0]], float(ei[order[0]])
@@ -259,12 +309,31 @@ class BayesianOptimizer:
         return best_x, best_ei
 
     # ------------------------------------------------------------------ #
-    def propose(self):
-        """Return the next design to evaluate, in the SCALED box ``[0, 1]``."""
+    def propose(self, seed):
+        """Return the next design to evaluate, in the SCALED box ``[0, 1]``.
+
+        ``seed`` is REQUIRED and supplied per call by the driver, which derives it from the run's
+        single seed sequence. This class holds no random state of its own beyond :attr:`init_seq`, so a
+        run is reproducible from (root seed, iteration index) alone and resuming needs only to replay
+        the sequence -- there is no generator position to persist.
+
+        The seed materialises the initial block on the FIRST call and drives the GP fit and the EI
+        restarts on every later one. The remaining initial calls IGNORE it and read the next row of
+        :attr:`init_seq`; the block must stay one Sobol sequence to be space-filling.
+        """
+        if self.init_seq is None:
+            with warnings.catch_warnings():
+                # scipy warns that balance properties hold for powers of two. `n_init` is a
+                # pre-registered benchmark quantity, not ours to round.
+                warnings.simplefilter("ignore", UserWarning)
+                self.init_seq = np.asarray(
+                    qmc.Sobol(self.d, scramble=True, seed=int(seed)).random(self.n_init), dtype=np.float64
+                )
         # Space-filling initial design, before there is anything worth fitting.
-        if self.X.shape[0] < self.n_init:
+        drawn = self.X.shape[0]
+        if drawn < self.n_init:
             self.last_info = None
-            return np.clip(self._sobol.random(1)[0], 0.0, 1.0).astype(np.float32)
+            return np.clip(self.init_seq[drawn], 0.0, 1.0).astype(np.float32)
 
         # Center y (the GP has a zero prior mean); never scaled. A constant shift leaves EI's argmax
         # -- and hence the proposal -- unchanged; it only makes the fitted lengthscale/amplitude
@@ -272,9 +341,9 @@ class BayesianOptimizer:
         # agree about what "improvement" means.
         y_mean = float(np.mean(self.y))
         y_centered = self.y - y_mean
-        model = self._fit(self.X, y_centered, self.noise)
+        model = self._fit(self.X, y_centered, self.noise, int(seed))
         x_best, ei = self._optimise_ei(model, float(np.min(y_centered)),
-                                       np.zeros(self.d), np.ones(self.d))
+                                       np.zeros(self.d), np.ones(self.d), int(seed))
 
         amplitude2, length_scale = model.kernel_.constant_value, model.kernel_.length_scale
         self.last_info = {

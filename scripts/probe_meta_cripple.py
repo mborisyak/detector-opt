@@ -60,11 +60,7 @@ import gc
 import json
 import math
 import os
-import pathlib
-import sys
 import time
-
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import matplotlib
 

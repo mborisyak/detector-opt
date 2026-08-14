@@ -49,13 +49,13 @@ def _fitted(d, n, seed):
     """A fitted sklearn GP on a smooth objective + the centered incumbent."""
     rng = np.random.default_rng(seed)
     w = rng.normal(size=d)
-    bo = BayesianOptimizer(d, gp=_GP_CFG, ei=_EI_CFG, n_init=5, seed=seed)
+    bo = BayesianOptimizer(d, gp=_GP_CFG, ei=_EI_CFG, n_init=5)
     X = rng.random((n, d))
     y = np.sin(2.0 * X @ w) + 0.5 * ((X - 0.5) ** 2).sum(1)
     for i in range(n):
         bo.append(X[i], float(y[i]), noise=0.02)
     y_centered = bo.y - bo.y.mean()
-    return bo._fit(bo.X, y_centered, bo.noise), float(np.min(y_centered))
+    return bo._fit(bo.X, y_centered, bo.noise, seed), float(np.min(y_centered))
 
 
 def _jax_ei(model, x, y_best):

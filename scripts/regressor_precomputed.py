@@ -149,10 +149,7 @@ def regress(
     print(f"Spawn probability: {detector.p_spawn_single}")
 
     # Load precomputed data
-    import sys
-    from pathlib import Path
 
-    sys.path.insert(0, str(Path(__file__).parent.parent))
     from load_precomputed_data import PrecomputedDataLoader
 
     data_loader = PrecomputedDataLoader(precomputed_dir)

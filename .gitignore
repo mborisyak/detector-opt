@@ -141,3 +141,4 @@ release/
 /meta-detector-optimization
 
 .snakemake
+*.pdf

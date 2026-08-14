@@ -132,7 +132,6 @@ class _DesignBase(Trainer):
         param_mix: float = 0.0,
         val_fraction: float = 0.25,
         eval_batch: int | None = None,
-        prior_scale: float = 0.0,
         device=None,
         checkpoint_dir: str | None = None,
         seed: int = 0,
@@ -190,7 +189,6 @@ class _DesignBase(Trainer):
             val_iteration_limit=val_iteration_limit,
             val_fraction=val_fraction,
             eval_batch=eval_batch,
-            prior_scale=prior_scale,
             device=device,
             checkpoint_dir=checkpoint_dir,
             seed=seed,
@@ -199,7 +197,7 @@ class _DesignBase(Trainer):
     def train(
         self,
         design_scaled,
-        seed_seq,
+        seed,
         *,
         init_params=None,
         on_epoch=None,
@@ -208,8 +206,9 @@ class _DesignBase(Trainer):
         """Train a regressor for one *scaled* design.
 
         Appends this design's events into the shared budget pools (a fresh window)
-        and trains within that window. ``seed_seq`` is a
-        :class:`numpy.random.SeedSequence`; ``init_params`` optionally warm-starts
+        and trains within that window. ``seed`` is an INT and drives everything random in this call --
+        the network draw and the training keys -- so a design is reproducible from it alone and the
+        driver need only replay its seed sequence to resume. ``init_params`` optionally warm-starts
         the params from a previously trained design (the buffer state stays fresh).
 
         Returns a :class:`TrainResult`, or ``None`` if the shared budget pool is
@@ -220,7 +219,7 @@ class _DesignBase(Trainer):
         design = detector.to_nominal(design_scaled)  # physical Design namedtuple (what the pools store)
         design_phys = np.asarray(detector.flatten_design(design), dtype=np.float32)  # flat, for the checkpoint tree
 
-        init_seq, training_seq = seed_seq.spawn(2)
+        init_seq, training_seq = np.random.SeedSequence(int(seed)).spawn(2)
 
         # Network for this design (base: fresh / optionally warm-started; the
         # continual trainer keeps and continues the same one across designs).
@@ -377,7 +376,16 @@ class _DesignBase(Trainer):
                         if diff + err > self.loss_precision:
                             pass  # (2.1) settled but the gap is still wide -> add data
                         else:
-                            objective = (0.5 * (train_mean + val_mean), diff + err)  # (2.2)
+                            # THE OBJECTIVE IS THE VALIDATION LOSS ALONE (user, 2026-08-14). It was
+                            # `(train + val)/2`, half of which is training loss -- so any intervention
+                            # that trades training fit for generalisation was charged half its benefit
+                            # as a cost, and anything that overfit harder was rewarded. MEASURED: it
+                            # inflated every regulariser's apparent price by about 2x, and it hid a
+                            # train-down/validation-up divergence under the growth schedule. The
+                            # UNCERTAINTY is unchanged -- `|val - train| + hypot(sems)` -- so the
+                            # convergence test above still requires the gap to close before a design
+                            # is scored; only what is REPORTED changes, never a decision.
+                            objective = (val_mean, diff + err)  # (2.2)
                             print(
                                 f"  [converged/bayes] train={train_mean:.4f} val={val_mean:.4f} "
                                 f"diff={diff:.4f} err={err:.4f} prec={self.loss_precision:.4f} | "
@@ -458,11 +466,6 @@ class DesignTrainer(_DesignBase):
     """The standard per-design strategy: a FRESH network per design, minibatches drawn uniformly over the
     current window (history-ignoring)."""
 
-    def _prior_count(self, start, count):
-        """The current design's window. A fresh network per design is fitted to that window and nothing
-        else, so the window IS the evidence; ``start`` only locates it in the pool."""
-        return count
-
     def _sample_indices(self, key, start, count):
         return window_sample_indices(self, key, start, count)
 
@@ -471,3 +474,9 @@ class DesignTrainer(_DesignBase):
 
     def _init_design_network(self, init_seq, init_params):
         return fresh_design_network(self, init_seq, init_params)
+
+    def _carried_state(self):
+        return {}  # nothing survives a design boundary: every design gets its own network
+
+    def _load_carried_state(self, data):
+        """Nothing to load -- see :meth:`_carried_state`."""

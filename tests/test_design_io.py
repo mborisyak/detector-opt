@@ -72,8 +72,14 @@ def test_check_bo_results_rejects_pre_migration_runs():
   """results.json from before the migration keys the searched design as ``x_encoded`` in N(0,1)
   units. Those do not convert to scaled, so the reader refuses the file."""
   current = [{"iteration": 0, "x_scaled": [0.1, 0.2], "design": [1.0, 2.0], "loss": 0.5}]
-  assert io.check_bo_results(current, "results.json") is current
+  # EQUAL, not identical: the reader now goes through `complete_results`, which drops the `incomplete`
+  # row a killed run records and therefore returns a new list even when it drops nothing.
+  assert io.check_bo_results(current, "results.json") == current
   assert io.check_bo_results([], "results.json") == []  # an empty run is not a stale one
+
+  incomplete = current + [{"iteration": 1, "x_scaled": [0.3, 0.4], "design": [3.0, 4.0], "loss": None,
+                           "status": "incomplete"}]
+  assert io.check_bo_results(incomplete, "results.json") == current  # the unscored row never reaches arithmetic
 
   stale = [{"iteration": 0, "x_encoded": [0.1, 0.2], "design": [1.0, 2.0], "loss": 0.5}]
   with pytest.raises(ValueError, match="pre-migration BO results"):

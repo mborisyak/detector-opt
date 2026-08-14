@@ -45,10 +45,6 @@ accident.
 import argparse
 import json
 import os
-import pathlib
-import sys
-
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import matplotlib
 
@@ -191,7 +187,7 @@ def main():
     history = {}
     sequence = np.random.SeedSequence(arguments.seed)
     try:
-      result = trainer.train(x_scaled, sequence.spawn(1)[0], step=0, on_epoch=history.update)
+      result = trainer.train(x_scaled, int(sequence.spawn(1)[0].generate_state(1)[0]), step=0, on_epoch=history.update)
       # `objective_std` IS the convergence slack `diff + err` (detopt/nn/trainer/design.py: the
       # objective is set to `(0.5 * (train + val), diff + err)`), so it is directly the quantity that
       # decides whether a design can converge at a given `loss_precision`.

@@ -82,6 +82,20 @@ class Pool(Buffered):
     self._buffers = self.assign(self._buffers, index, chunk)
     self.current += n
 
+  def state(self):
+    """Serialisable snapshot (slots + fill cursor) for checkpointing.
+
+    The CURSOR is as important as the contents: it decides where the next design's window opens and
+    therefore which slice of the run's event index that design consumes. Restoring rows without the
+    cursor would silently re-use events.
+    """
+    return {"slots": tuple(self.buffers()), "current": np.int32(self.current)}
+
+  def load_state(self, state):
+    """Restore from a :meth:`state` snapshot."""
+    self._buffers = jax.tree.map(lambda a: jax.device_put(jnp.asarray(a), self.device), tuple(state["slots"]))
+    self.current = int(state["current"])
+
   def __len__(self):
     return self.current
 

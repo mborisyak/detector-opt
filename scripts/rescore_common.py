@@ -85,8 +85,7 @@ def main():
       # instance would let an earlier design's events into a later design's window.
       trainer = FullBudgetTrainer.from_config(detector, config, max_epochs=arguments.max_epochs,
                                               seed=arguments.seed)
-      result = trainer.train(np.asarray(record["x_scaled"], np.float32),
-                             np.random.SeedSequence(arguments.seed))
+      result = trainer.train(np.asarray(record["x_scaled"], np.float32), arguments.seed)
       row = {"run": path, "iteration": int(record["iteration"]),
              "reported": float(record["loss"]), "reported_std": float(record["loss_std"]),
              "rescored": float(result.objective_loss), "rescored_std": float(result.objective_std),

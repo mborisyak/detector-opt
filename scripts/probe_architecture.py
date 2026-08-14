@@ -47,11 +47,7 @@ import argparse
 import gc
 import json
 import os
-import pathlib
-import sys
 import time
-
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import matplotlib
 
@@ -334,7 +330,7 @@ def main():
       history = {}
       started = time.time()
       try:
-        result = trainer.train(x_scaled, sequence.spawn(1)[0], step=0, on_epoch=history.update)
+        result = trainer.train(x_scaled, int(sequence.spawn(1)[0].generate_state(1)[0]), step=0, on_epoch=history.update)
         status = "converged"
         level, spent = float(result.objective_loss), int(result.spent)
       except RuntimeError as error:

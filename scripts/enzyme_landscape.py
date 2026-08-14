@@ -43,6 +43,7 @@ import numpy as np
 
 import detopt
 import detopt.utils.config
+import detopt.utils.io
 from detopt.bo.gbdt import score_design
 
 CONFIG = "config/detector/enzyme.yaml"
@@ -406,7 +407,8 @@ def main():
     evaluated = []
     for path in sorted(globbing.glob(os.path.join(arguments.campaign, "*", "*", "results.json"))):
       with open(path) as f:
-        evaluated.extend((np.asarray(r["design"], np.float32), float(r["loss"])) for r in json.load(f)["results"])
+        evaluated.extend((np.asarray(r["design"], np.float32), float(r["loss"]))
+                         for r in detopt.utils.io.complete_results(json.load(f)["results"]))
     if len(evaluated) == 0:
       raise SystemExit(f"no <seed>/<strategy>/results.json under {arguments.campaign}")
     neural = np.array([loss for _, loss in evaluated])

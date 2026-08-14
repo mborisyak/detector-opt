@@ -30,10 +30,7 @@ measures it; nothing here is a tick-box.
 import argparse
 import itertools
 import os
-import pathlib
-import sys
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 # BLAS/OpenMP default to every core on the machine, which is wrong under a scheduler. Set before numpy.
 _allocated = os.environ.get("SLURM_CPUS_PER_TASK", "4")

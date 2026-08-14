@@ -43,10 +43,7 @@ rather than one number that could be either:
 """
 import argparse
 import os
-import pathlib
-import sys
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 _allocated = os.environ.get("SLURM_CPUS_PER_TASK", "4")
 for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):

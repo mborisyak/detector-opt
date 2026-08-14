@@ -71,7 +71,7 @@ def run(seed=0, n_max_cap=16384):
         try:
             result = trainer.train(
                 design,
-                np.random.SeedSequence(seed),
+                seed,
                 remaining=400_000,
                 on_epoch=lambda s, e=epochs: e.__setitem__(0, e[0] + 1),
             )

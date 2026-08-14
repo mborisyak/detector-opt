@@ -3,6 +3,7 @@ import os
 import flax
 import jax.tree
 import jax.numpy as jnp
+import numpy as np
 from flax import nnx
 
 import orbax.checkpoint as ocp
@@ -102,6 +103,88 @@ def check_scaled_design(design_scaled, where):
     return design_scaled
 
 
+def stage(path, payload):
+    """Write one object's arrays to ``<path>.new``, where they are INVISIBLE to :func:`restore_path`.
+
+    Staging is phase one of the two-phase commit described in :func:`commit`. It is what an object's
+    ``persist(path)`` calls, so several objects can be written independently and made visible
+    TOGETHER: a run killed between two plain per-file replaces would leave, say, a new optimiser state
+    beside an old event pool, and resume into a silently inconsistent run.
+
+    ``payload`` maps name -> array, as :func:`numpy.savez` takes them. ONE file per object,
+    overwritten in place; never one file per step.
+    """
+    path = str(path)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path + ".new", "wb") as handle:
+        np.savez(handle, **payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def commit(paths):
+    """Publish every staged ``<path>.new`` at once -- phase two.
+
+      1. rename every existing ``<path>`` aside to ``<path>.old``;
+      2. rename every ``<path>.new`` into place;
+      3. delete the ``<path>.old`` files.
+
+    Renaming the whole previous generation aside FIRST means the old set survives intact until the new
+    set is complete, so a crash at any point leaves one readable generation and never a mixture. Any
+    ``.old`` left on disk is a positive signal that a commit was interrupted -- see
+    :func:`restore_path`.
+    """
+    paths = [str(path) for path in paths]
+    missing = [path for path in paths if not os.path.exists(path + ".new")]
+    if len(missing) > 0:
+        raise FileNotFoundError(f"nothing staged for {missing}; call stage() for every path before commit()")
+    moved = []
+    for path in paths:
+        if os.path.exists(path):
+            os.replace(path, path + ".old")
+            moved.append(path)
+    for path in paths:
+        os.replace(path + ".new", path)
+    for path in moved:
+        os.remove(path + ".old")
+
+
+def atomic_save(payloads):
+    """:func:`stage` every ``path -> payload`` in ``payloads``, then :func:`commit` the set."""
+    for path, payload in payloads.items():
+        stage(path, payload)
+    commit(payloads.keys())
+
+
+def restore_path(path):
+    """The file to read for ``path``, honouring an interrupted :func:`atomic_save`.
+
+    A leftover ``<path>.old`` means a commit was cut short. If ``<path>`` exists the new generation
+    landed and the stale ``.old`` is ignored; if it does not, the rename-aside had happened but the
+    rename-into-place had not, and ``.old`` is the last consistent state. Returns ``None`` when neither
+    exists.
+    """
+    if os.path.exists(path):
+        return path
+    if os.path.exists(path + ".old"):
+        return path + ".old"
+    return None
+
+
+def complete_results(results):
+    """The SCORED rows of a ``results.json``, dropping any marked ``incomplete``.
+
+    BACKWARD COMPATIBILITY ONLY. `scripts/bo.py` no longer writes anything but completed iterations --
+    a run in flight is `partial.json` and a finished one `results.json`, so the FILENAME carries the
+    completeness and every row has a real ``loss`` and ``spent``. For a brief window it instead
+    appended the design a run stopped on as a row with ``status: "incomplete"`` and null fields; since
+    budget exhaustion is the normal end of a run, EVERY trajectory written in that window carries one,
+    and ``np.array([..., None], dtype=float)`` turns it into a NaN rather than raising. Those files are
+    on disk, so readers keep going through this. Rows with no ``status`` are complete.
+    """
+    return [r for r in results if r.get("status", "complete") == "complete"]
+
+
 def check_bo_results(results, path):
     """Reject a ``results.json`` written before the encoded->scaled migration.
 
@@ -109,6 +192,7 @@ def check_bo_results(results, path):
     are not scaled designs: pushing them through ``to_nominal`` extrapolates linearly outside the
     design box, so the file must not simply be re-keyed. The ``"design"`` column is physical and is
     the only safe re-entry point. Returns ``results`` unchanged when the file is current."""
+    results = complete_results(results)
     if len(results) > 0 and "x_scaled" not in results[0]:
         found = "x_encoded" if "x_encoded" in results[0] else "neither x_scaled nor x_encoded"
         raise ValueError(
@@ -177,6 +261,16 @@ def restore_training_checkpoint(manager, step=None):
     ``parameters`` / ``state`` come back as pure dicts -- load them into an abstract
     nnx state (``nnx.split`` of a freshly built module) with ``nnx.replace_by_pure_dict``.
     ``design`` is the ``{"scaled", "physical"}`` tree; ``aux`` the saved metrics.
+
+    ⚠️ RESTORES WITHOUT SHARDING INFO, which orbax warns about once per restore ("Sharding info not
+    provided when restoring. Populating sharding info from sharding file"). It is correct on a single
+    device -- reading the sharding file gives the right answer -- but slower, and orbax calls it unsafe
+    across a topology change. NOT FIXED: silencing it needs a ``restore_args`` tree matching the
+    CHECKPOINT's structure, and the live model does not reproduce it (``nnx.to_pure_dict`` yields lists
+    where orbax wrote string-keyed dicts, and coercing that exposes a further mismatch). MEASURED: a
+    target passed via ``item=`` changes nothing (20 warnings either way) and a single broadcast
+    ``ArrayRestoreArgs`` is rejected; the only construction that worked was a tree mapped over an
+    actual restore, i.e. restoring twice.
     """
     if step is None:
         step = manager.latest_step()

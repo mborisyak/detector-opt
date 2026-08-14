@@ -40,11 +40,8 @@ epochs, NOT the trainer's data warmup), ``precision``. ``baseline`` means the co
 import argparse
 import gc
 import json
-import pathlib
 import sys
 import time
-
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import matplotlib
 
@@ -298,7 +295,7 @@ def main():
       tee = _Tee(sys.stdout)
       try:
         sys.stdout = tee
-        result = trainer.train(x_scaled, np.random.SeedSequence(seed), step=0)
+        result = trainer.train(x_scaled, seed, step=0)
       except RuntimeError as error:
         sys.stdout = tee.stream
         row = {"status": "did not converge", "loss": float("nan"), "slack": float("nan"), "spent": -1}

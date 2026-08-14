@@ -26,6 +26,12 @@
 # CPUS (env, default 4) is the per-job CPU request. Training runs on the GPU and needs few host
 # threads, so 2 is enough to let a campaign share the node with CPU-bound screening jobs; SLURM queues
 # whatever does not fit rather than oversubscribing, which is the whole point of going through it.
+#
+# GRES (env, default `shard:1`) is the accelerator request. Set it EMPTY for a task whose run config
+# declares `device: cpu`, so it runs beside the GPU work instead of queueing behind a shard it will
+# never use:
+#
+#     GRES= CPUS=2 TIME_LIMIT=00:30:00 ./scripts/campaign.sh <task> output/campaign-<task> 5
 set -euo pipefail
 
 CONFIG=${1:?config name, e.g. enzyme_inhib}
@@ -69,7 +75,9 @@ for ((i = 0; i < SEEDS; i++)); do
   seed=${ALL_SEEDS[$i]}
   for arm in "${ARMS[@]}"; do
     run="${OUT}/${seed}/${arm}"
-    if [ -f "${run}/results.json" ] && "$PY" -c "import json,sys; sys.exit(0 if json.load(open('${run}/results.json')).get('completed') else 1)" 2>/dev/null; then
+    # `results.json` EXISTS ONLY FOR A FINISHED RUN -- bo.py writes `partial.json` while in flight and
+    # renames at the end -- so its presence is the completion test, no field to read.
+    if [ -f "${run}/results.json" ]; then
       echo "  skip  ${seed}/${arm} (already complete)"
       continue
     fi
@@ -80,16 +88,18 @@ for ((i = 0; i < SEEDS; i++)); do
       echo "  skip  ${seed}/${arm} (already queued or running)"
       continue
     fi
-    # A CRASHED RUN IS A REPLAY, NOT A RETRY. `bo.py` has no mid-run resume: an incomplete
-    # results.json is restarted from design 1 and OVERWRITTEN, and because the seed is fixed the
-    # replay re-proposes the same designs and hits the same unconvergeable one again. Preserve the
-    # evidence rather than destroying it, and say so instead of silently relaunching.
-    if [ -f "${run}/results.json" ]; then
-      stamp=$(date +%Y%m%d-%H%M%S)
-      mv "${run}/results.json" "${run}/results.incomplete-${stamp}.json"
-      [ -f "${run}/run.log" ] && mv "${run}/run.log" "${run}/run.incomplete-${stamp}.log"
-      echo "  note  ${seed}/${arm}: previous INCOMPLETE run preserved as results.incomplete-${stamp}.json"
-      echo "        (same seed -> same proposals; if it died on an unconvergeable design it will die again)"
+    # A CRASHED RUN IS RESUMED, and its `partial.json` is therefore LEFT WHERE IT IS. `bo.py`
+    # restarts an interrupted run at the design boundary from that file plus the state pair it
+    # commits between designs, so the scored designs are read back rather than re-measured; moving it
+    # aside (which this used to do to results.json, when there was no resume) would throw that away
+    # and pay for every design again.
+    #
+    # A run killed by an UNCONVERGEABLE DESIGN still repeats: the seed is fixed, so the resumed run
+    # proposes the same design and fails on it again. That is a task setting to fix, not something a
+    # relaunch can clear -- the failing design is on the record as an `incomplete` row.
+    if [ -f "${run}/partial.json" ]; then
+      [ -f "${run}/run.log" ] && mv "${run}/run.log" "${run}/run.$(date +%Y%m%d-%H%M%S).log"
+      echo "  note  ${seed}/${arm}: previous run INCOMPLETE -- resuming from its committed state"
     fi
     mkdir -p "$run"
     # --time IS REQUIRED, AND MUST BE TIGHT. With no limit SLURM's backfill scheduler cannot compute
@@ -99,7 +109,7 @@ for ((i = 0; i < SEEDS; i++)); do
     # backfill where 00:25:00 started in 38 s. Size it just above the measured run length.
     # --mem-per-cpu likewise: the 2000 MB/CPU default reserves 8 GB per job at CPUS=4, and two of
     # those exhaust the node's 20 GB declaration and deadlock every other job on the box.
-    id=$(sbatch --parsable --gres=shard:1 --cpus-per-task="${CPUS}" --mem-per-cpu="${MEM_PER_CPU}" \
+    id=$(sbatch --parsable ${GRES:+--gres=${GRES}} --cpus-per-task="${CPUS}" --mem-per-cpu="${MEM_PER_CPU}" \
       --time="${TIME_LIMIT}" \
       -J "camp-${arm}-${seed}" -o "${run}/run.log" \
       --wrap="env XLA_PYTHON_CLIENT_PREALLOCATE=false OMP_NUM_THREADS=${CPUS} \

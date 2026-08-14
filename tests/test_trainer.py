@@ -80,7 +80,7 @@ def test_design_trainer_converges(seed):
         budget=20_000,
         seed=seed,
     )
-    result = trainer.train(np.zeros(det.design_dim(), dtype=np.float32), np.random.SeedSequence(seed))
+    result = trainer.train(np.zeros(det.design_dim(), dtype=np.float32), seed)
     assert isinstance(result, TrainResult)
     assert np.isfinite(result.objective_loss) and result.objective_loss > 0
     # Accept invariant: the loss estimate's own SEM is within precision.
@@ -93,13 +93,13 @@ def test_design_trainer_crashes_when_iteration_limit_exceeded(seed):
     """An unreachable precision must crash loudly at iteration_limit, never silently."""
     det, trainer = _small_trainer(1e-9, n0=64, n_increment=64, iteration_limit=128, budget=100_000, seed=seed)
     with pytest.raises(RuntimeError, match="did not reach precision within iteration_limit"):
-        trainer.train(np.zeros(det.design_dim(), dtype=np.float32), np.random.SeedSequence(seed))
+        trainer.train(np.zeros(det.design_dim(), dtype=np.float32), seed)
 
 
 def test_design_trainer_returns_none_when_budget_too_small(seed):
     """If the budget pool can't fit the initial sample, return None (not crash)."""
     det, trainer = _small_trainer(0.5, n0=256, n_increment=128, iteration_limit=512, budget=10, seed=seed)
-    result = trainer.train(np.zeros(det.design_dim(), dtype=np.float32), np.random.SeedSequence(seed))
+    result = trainer.train(np.zeros(det.design_dim(), dtype=np.float32), seed)
     assert result is None
 
 
@@ -107,9 +107,9 @@ def test_pool_accumulates_across_designs(seed):
     """Designs append into the shared budget pool (windows accumulate)."""
     det, trainer = _small_trainer(0.5, n0=256, n_increment=128, iteration_limit=512, budget=20_000, seed=seed)
     design = np.zeros(det.design_dim(), dtype=np.float32)
-    assert trainer.train(design, np.random.SeedSequence(seed)) is not None
+    assert trainer.train(design, seed) is not None
     after_first = trainer.train_pool.current
-    assert trainer.train(design, np.random.SeedSequence(seed + 1)) is not None
+    assert trainer.train(design, seed + 1) is not None
     after_second = trainer.train_pool.current
     assert 0 < after_first < after_second  # the second design appended more data
 
@@ -147,7 +147,7 @@ def test_continual_trainer_persists_and_replays(seed):
     assert trainer._running is not None  # eager: the network exists before any training
     before = jax.tree.map(np.asarray, trainer._running[0])
 
-    assert trainer.train(design, np.random.SeedSequence(seed)) is not None
+    assert trainer.train(design, seed) is not None
     after_first = trainer.train_pool.current
     trained = jax.tree.map(np.asarray, trainer._running[0])
     # Training WROTE BACK to the persistent tuple: at least one leaf moved.
@@ -155,7 +155,7 @@ def test_continual_trainer_persists_and_replays(seed):
     # The next design continues that same net -- init hands back the persisted tuple unchanged.
     assert trainer._init_design_network(np.random.SeedSequence(0), None) is trainer._running
     # ... and appends to the pool, so history is available for replay.
-    assert trainer.train(design, np.random.SeedSequence(seed + 1)) is not None
+    assert trainer.train(design, seed + 1) is not None
     assert trainer.train_pool.current > after_first
 
 

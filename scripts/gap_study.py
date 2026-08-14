@@ -13,7 +13,6 @@ import traceback
 
 import yaml
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 import regression as REG  # noqa: E402
 
 OUT = "data/gap_study"

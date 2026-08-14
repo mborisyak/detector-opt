@@ -68,7 +68,7 @@ def confirm(results, max_epochs: int = 100, seed: int = 0, **config):
         f"Sampling the full budget ({budget} detector calls) under this design and "
         f"training a fresh regressor for {max_epochs} epochs (cosine LR, seed={seed})..."
     )
-    result = trainer.train(design_scaled, np.random.SeedSequence(seed), on_epoch=_progress)
+    result = trainer.train(design_scaled, seed, on_epoch=_progress)
 
     print(
         f"\nConfirmed loss = {result.objective_loss:.4f} ± {result.objective_std:.4f} "

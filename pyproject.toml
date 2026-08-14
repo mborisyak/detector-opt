@@ -46,7 +46,7 @@ dev = [
 Homepage = 'https://github.com/mborisyak/detector-opt'
 
 [tool.setuptools.packages.find]
-exclude = ['contrib', 'examples', 'docs', 'tests']
+include = ["detopt*"]
 
 # Formatter: yapf (NOT black -- black forces 4-space and splatters calls one-arg-per-line).
 # 2-space indent; keep a call on one line if it fits column_limit (the heuristics below stop the

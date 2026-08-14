@@ -60,7 +60,7 @@ def run(seed=0, n_models=4, budget=400_000, iteration_limit=16384, loss_precisio
         try:
             result = trainer.train(
                 design,
-                np.random.SeedSequence(seed),
+                seed,
                 on_epoch=lambda s, e=epochs: e.__setitem__(0, e[0] + 1),
             )
             if result is None:

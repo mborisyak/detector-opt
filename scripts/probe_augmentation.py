@@ -35,10 +35,7 @@ the same event in train and validation and drive the gap to zero for the wrong r
 import argparse
 import json
 import os
-import pathlib
-import sys
 
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 # Cap BLAS threads BEFORE numpy is imported (SLURM restricts WHICH cores, not how many threads).
 _threads = os.environ.get("SLURM_CPUS_PER_TASK", "4")

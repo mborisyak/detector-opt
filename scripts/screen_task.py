@@ -42,19 +42,8 @@ the worked example of failure, and no other task's numbers are compared with its
 import argparse
 import json
 import os
-import pathlib
-import sys
 import time
 
-# USE THE TREE THIS SCRIPT LIVES IN. Two things conspire otherwise. `python scripts/screen_task.py`
-# puts the SCRIPT's directory on sys.path, not the repo root; and `detopt` used to be a pip EDITABLE
-# install pointing at the main checkout, whose generated finder resolved the import there whatever
-# the working directory said. A screen launched from a git worktree therefore ran the MAIN tree's
-# detectors and died with "growth does not appear to be a valid object" while the worktree's own
-# growth.py sat there, registered and ignored. The editable install has since been removed (so cwd
-# now decides), but anchoring the path to this file keeps a worktree run correct either way and
-# spares every caller an exported PYTHONPATH.
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 # BLAS/OpenMP default to every core on the machine, which is wrong under a scheduler: SLURM says
 # which cores this job may use, not how many threads it should start. Several jobs each spawning a
@@ -176,7 +165,7 @@ def proxy_runs(detector, n_iterations, seeds, n_events, mode, kernel_name, excha
     losses, sems = [], []
     for iteration in range(n_iterations):
       # `x` is the SCALED design the optimiser works in; the detector needs it in nominal units.
-      x = rng.random(dimension) if mode == "random" else np.asarray(optimiser.propose(), dtype=float)
+      x = rng.random(dimension) if mode == "random" else np.asarray(optimiser.propose(int(seed) + index), dtype=float)
       nominal = np.asarray(detector.flatten_design(detector.to_nominal(np.asarray(x, np.float32))),
                            dtype=np.float32)
       score = score_design(detector, nominal, n_events=n_events,

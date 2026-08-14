@@ -192,13 +192,13 @@ def run(arm, seed, iterations, n_events, detector, low, high):
     if arm in ("sym", "symnorm"):
       kernel.length_scale = np.full(kernel.n_length_scales, float(np.ravel(kernel.length_scale)[0]))
 
-  optimiser = BayesianOptimizer(d, gp=GP, ei=EI, kernel=kernel, n_init=GP["n_folds"], seed=seed)
+  optimiser = BayesianOptimizer(d, gp=GP, ei=EI, kernel=kernel, n_init=GP["n_folds"])
   rng = np.random.default_rng(seed)
   results, best = [], np.inf
   for iteration in range(iterations):
     start = time.time()
     x = (rng.uniform(0.0, 1.0, d).astype(np.float32) if arm == "random"
-         else np.asarray(optimiser.propose(), dtype=np.float32))
+         else np.asarray(optimiser.propose(int(seed) + step), dtype=np.float32))
     design = to_design(x)
     score = score_design(detector, design, n_events=n_events, event_offset=0, seed=0)
     if arm != "random":
