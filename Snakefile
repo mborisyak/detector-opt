@@ -83,7 +83,7 @@
 # RUNNING UNDER SLURM. This machine schedules everything through SLURM: one GPU exposed as TWO
 # shards on partition `main`, so at most two GPU jobs run at once and the rest queue. Launch with
 #
-#   snakemake --executor slurm --default-resources slurm_partition=main -j8
+#   snakemake --executor slurm --default-resources slurm_partition=main --slurm-status-command squeue -j8
 #
 # and let SLURM, not snakemake, do the queueing -- `-j` only bounds how many jobs snakemake has in
 # flight, while the shard count bounds how many actually run. The heavy rules (`bo`, `verify`)
@@ -104,6 +104,34 @@
 #
 # All four are per-task, taken from the run config's own `device` (see `device()` below).
 #
+# `--slurm-status-command squeue` IS MANDATORY HERE AND OMITTING IT HANGS THE WORKFLOW FOREVER,
+# silently, with every job already finished. This box runs slurmctld with NO slurmdbd
+# (`AccountingStorageType = (null)`), but the `sacct` BINARY is installed all the same. The plugin
+# picks its status command by `which sacct` alone (`_get_status_command_default`), so it chooses
+# `sacct`; every query then exits 1 with "Slurm accounting storage is disabled", `query_job_status`
+# returns `(None, None)`, and `check_active_jobs` burns its five attempts and leaves `status_of_jobs`
+# None -- which skips the whole report-and-yield block. The jobs are neither reported finished nor
+# re-yielded as active, so they simply VANISH from the executor's `active_jobs` list while the
+# scheduler goes on waiting for them. What you see is a live driver at 0% CPU, an empty `squeue`, all
+# outputs on disk, and a log whose last line is the final submission. Reproduced 2026-08-15 on a
+# one-job workflow: SLURM job 899 wrote its output and exited COMPLETED, the driver logged five
+# "could not check status of job <run-uuid>" lines and then "No active jobs; skipping status query."
+# every cycle until it was killed. With the flag the same workflow reports "1 of 1 steps (100%) done"
+# and exits 0.
+#
+# `squeue` works because SLURM keeps a finished job queryable for `MinJobAge` (300 s here) and the
+# plugin polls at most every `max_sleep_time` = 180 s (the interval grows by 10 s per idle cycle and
+# resets on every completion), so a COMPLETED state is always observed with ~120 s to spare. That
+# margin is the whole safety story: if MinJobAge is ever lowered below ~200 s, or the driver is
+# starved for minutes at a time, a completion can be purged before it is seen and the plugin's
+# `status_lookup_id is None` branch re-yields that job as active forever -- the same silent hang by a
+# different door. The plugin agrees with this reading: with the flag set it validates MinJobAge
+# against 3x the initial poll interval and says "'squeue' should work reliably for status queries".
+#
+# The guard below refuses to build the DAG if `--executor slurm` is asked for without the flag on a
+# machine where an `sacct` status query actually fails. It costs one `sacct` call at parse time and
+# stays quiet on any cluster with working accounting.
+#
 # TWO SPELLINGS THAT DO NOT WORK, both verified against snakemake-executor-plugin-slurm 2.8.0:
 #
 #   slurm_extra="'--gres=shard:1'" is REJECTED outright -- the plugin reserves --gres for itself
@@ -120,6 +148,45 @@
 import glob
 import os
 import random
+import shutil
+import subprocess
+import sys
+
+from snakemake.exceptions import WorkflowError
+
+
+def command_line_value(name):
+  for index, argument in enumerate(sys.argv):
+    if argument == name and index + 1 < len(sys.argv):
+      return sys.argv[index + 1]
+    if argument.startswith(f"{name}="):
+      return argument.split("=", 1)[1]
+  return None
+
+
+def sacct_status_queries_work():
+  if shutil.which("sacct") is None:
+    return False
+  probe = subprocess.run(
+    ["sacct", "-X", "--parsable2", "--noheader", "--format=JobIdRaw,State"], capture_output=True, text=True
+  )
+  return probe.returncode == 0
+
+
+REQUESTED_EXECUTOR = command_line_value("--executor")
+if REQUESTED_EXECUTOR is None:
+  REQUESTED_EXECUTOR = command_line_value("-e")
+
+STATUS_COMMAND = command_line_value("--slurm-status-command")
+
+if REQUESTED_EXECUTOR == "slurm" and STATUS_COMMAND != "squeue" and not sacct_status_queries_work():
+  raise WorkflowError(
+    "The SLURM executor would poll job status with 'sacct', which fails on this machine "
+    "(slurmctld without slurmdbd), and the workflow would then hang forever with every job "
+    "already finished. Add --slurm-status-command squeue:\n\n"
+    "  snakemake --executor slurm --default-resources slurm_partition=main "
+    "--slurm-status-command squeue -j8 <targets>\n"
+  )
 
 # Every run config under config/ is a task. Leading-underscore files are templates and rehearsals,
 # not campaigns, so they are excluded -- which also keeps the wildcard alternation short.
@@ -149,7 +216,7 @@ SUPER_SEED = 123456
 rng = random.Random(SUPER_SEED)
 SEEDS = [rng.randint(0, 2 ** 31 - 1) for _ in range(2)]
 
-STRATEGIES = ["from_scratch", "meta"]
+STRATEGIES = ["from_scratch", "continue", "closest", "meta"]
 
 # Prepended to every command below, so a job carries its environment explicitly rather than
 # inheriting one: preallocation off (concurrent jobs must take only the GPU memory they actually

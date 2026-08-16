@@ -1,0 +1,81 @@
+# Environment mirror for the preemptible cloud box `bo`.
+#
+# Every version here was read off `pip freeze` on the workstation on 2026-08-16, so a campaign run
+# there and a campaign run here are the same experiment. Pinning matters most for jax/XLA, which
+# decides the numerics; the rest are pinned for the same reason, not because they were suspected.
+#
+# jax-cuda13 is the workstation's own choice AND what this card needs: the RTX PRO 6000 Blackwell is
+# sm_120 and requires CUDA 13, which driver 580.173.02 provides. There is no compromise between
+# mirroring and running here. Note the box's driver is OLDER than the workstation's (580.173.02 /
+# CUDA 13.0 against 595.84 / CUDA 13.3); the pinned NVIDIA wheels are all 13.0.x, so a CUDA 13.0
+# runtime on a >= 580 driver is in spec, and the mirror works BECAUSE of the pins, not despite them.
+#
+# THE NVIDIA WHEELS ARE PINNED EXPLICITLY AND MUST STAY THAT WAY. `jax-cuda13-plugin` alone does not
+# pull them: it declares them only under an extra, so pinning the plugin by version installs a
+# plugin that then cannot find cuDNN and jax falls back to CPU with a warning, not an error. That is
+# what happened on the first provisioning attempt here, and only the acceptance assert caught it.
+# The unsuffixed `nvidia-*` names ARE the CUDA 13 series (NVIDIA dropped the suffix at 13); the
+# `-cu13` ones are those that kept it.
+#
+# NOT mirrored, deliberately: the workstation's snakemake SLURM executor plugins (this box has no
+# SLURM -- Snakefile.cloud drives it locally), and the ~300 packages in the workstation env that
+# detopt never imports.
+#
+# Transitive dependencies are left to pip. `scripts/provision_bo.sh` diffs the resulting freeze
+# against the workstation for everything detopt imports, and reports a divergence rather than
+# hiding it.
+
+jax==0.10.2
+jaxlib==0.10.2
+jax-cuda13-pjrt==0.10.2
+jax-cuda13-plugin==0.10.2
+ml_dtypes==0.5.3
+opt_einsum==3.4.0
+
+cuda-bindings==13.2.0
+cuda-pathfinder==1.5.2
+cuda-toolkit==13.0.2
+nvidia-cublas==13.1.0.3
+nvidia-cuda-crt==13.0.88
+nvidia-cuda-cupti==13.0.85
+nvidia-cuda-nvcc==13.0.88
+nvidia-cuda-nvrtc==13.0.88
+nvidia-cuda-runtime==13.0.96
+nvidia-cudnn-cu13==9.19.0.56
+nvidia-cufft==12.0.0.61
+nvidia-cufile==1.15.1.6
+nvidia-curand==10.4.0.35
+nvidia-cusolver==12.0.4.66
+nvidia-cusparse==12.6.3.3
+nvidia-cusparselt-cu13==0.8.0
+nvidia-nccl-cu13==2.28.9
+nvidia-nvjitlink==13.0.88
+nvidia-nvshmem-cu13==3.4.5
+nvidia-nvtx==13.0.85
+nvidia-nvvm==13.0.88
+
+flax==0.12.1
+optax==0.2.6
+chex==0.1.91
+orbax-checkpoint==0.12.1
+jaxtyping==0.3.5
+treescope==0.1.10
+tensorstore==0.1.84
+etils==1.13.0
+msgpack==1.1.2
+
+numpy==2.4.6
+scipy==1.16.2
+scikit-learn==1.8.0
+matplotlib==3.10.7
+xgboost==3.2.0
+PyYAML==6.0.3
+tqdm==4.67.1
+absl-py==2.3.1
+
+omegaconf==2.3.0
+antlr4-python3-runtime==4.9.3
+
+snakemake==9.15.0
+pytest==8.4.2
+yapf==0.43.0

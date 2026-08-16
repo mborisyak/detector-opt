@@ -1,0 +1,106 @@
+# CAMPAIGN CONFIG -- the `extremes` task at the WIDER network and a COARSER growth schedule.
+#
+# ⚠️ TWO VALUES DIFFER from config/enzyme_extremes.yaml, so this is NOT a single-variable comparison
+# and no difference against that campaign can be attributed to either change alone:
+#
+#   regressor.features  [[24,16],[16,24]] -> [[32,24],[24,32]]   12648 -> 22888 parameters at
+#                       n_models=4 (1.81x; both counted from the BUILT model, not from the layer
+#                       arithmetic)
+#   training.n0          8192 -> 12288                            (1.5x)
+#   training.n_increment 4096 -> 6144                             (1.5x)
+#
+# Everything else is identical, including the seeds, the budget, `loss_precision`, `iteration_limit`
+# and every trainer default. Read enzyme_extremes.yaml for what each of those rests on; only what
+# differs is argued here.
+#
+# WHY THIS IS WORTH RUNNING AT ALL, given the width was already rejected once. The rejection
+# (recorded in enzyme_extremes.yaml) is that the wider net "buys 0.0000 on a single design and costs
+# 33% more detector calls; its 0.0078 gain appears only on a ten-design joint fit, which is
+# meta-only". That is ONE SEED and ONE DESIGN for the per-design number. The campaign it was used to
+# justify has since shown that on this task the outcome varies MORE BY SEED THAN BY STRATEGY -- one
+# arm spanned 0.3570 to 0.6048 in verified loss across five seeds -- so a single-seed null is not
+# evidence of no effect at campaign scale. This re-tests it at 5 seeds x 4 arms.
+#
+# THE BUDGET IS DELIBERATELY UNCHANGED AT 2097152, and that has a consequence which must be stated
+# BEFORE the run rather than discovered in it: a wider network costs more detector calls per design,
+# so at a fixed budget it funds FEWER DESIGNS. The measured cost was +33% per design at this width.
+# Design counts in the narrow campaign were 12-32 against the criterion's declared 20 -> 40 pair, so
+# the wide campaign should be expected to sit lower, and a loss difference between the two campaigns
+# therefore CONFOUNDS CAPACITY WITH DESIGN COUNT. It is not a clean capacity measurement and must not
+# be reported as one. Holding designs fixed instead would need a larger budget, which was considered
+# and declined (user, 2026-08-16) in favour of the single-variable comparison.
+#
+# THE GROWTH SCHEDULE IS RAISED BY HALF because the wider network is expected to cost more per design
+# and most of the wall clock goes into proving flatness across growth rounds. It is the same argument
+# that took the narrow task from 4096/2048 to 8192/4096. 1.5x rather than 2x is a deliberate scaling
+# back (user, 2026-08-17) of the doubling first written here, for the reason below.
+#
+# ⚠️ RAISING `n0` DOES NOT ONLY MAKE DESIGNS CHEAPER, and the reason is in the measured distribution
+# of the narrow campaign (468 designs over 20 completed runs): min 10923, p10 38228, p25 49150,
+# median 70994, p75 109221, p90 158370, max 376810, mean 87657. The minimum IS `n0` divided by
+# (1 - val_fraction) -- a design that converged on the first window with no growth at all, which 8 of
+# 468 did -- so the FLOOR moves with `n0`: 10923 at 8192, 16384 at 12288, 21845 at 16384. A quarter
+# of designs currently stop at or below 49150, and every one of them now faces a coarser grid to exit
+# on, so cheap designs get MORE expensive while expensive ones get cheaper. At 1.5x the floor rises
+# by 5461 calls rather than 10922, which is the trade being made: fewer growth rounds bought without
+# doubling the cost of the cheapest quarter of designs. Whether design counts rise or fall at a fixed
+# budget is still genuinely open, and is a thing to MEASURE against the numbers above rather than
+# assume.
+#
+# NOT A TUNING RUN. `loss_precision` 1.0e-2 stays where it is, and it is already known to sit AT THE
+# EDGE on this task -- pooled over 138 designs every arm averaged 93-95% of the bar, and the first
+# design measured on the cloud box came in at 95.5%. If the wider network changes how often designs
+# clear it, that is a RESULT, not a reason to move the bar (docs/benchmark-acceptance.md, NO TRICKS).
+
+detector: enzyme_extremes
+
+regressor:
+  set-regressor:
+    features: [[32, 24], [24, 32]]
+    n_models: 4
+    dropconnect: 0.1
+
+device: cuda
+plot_per_epoch: false
+
+training:
+  n0: 12288
+  n_increment: 6144
+  batch: 256
+  eval_batch: 2048
+  warmup_epochs: 2
+  patience: 16
+  budget: 2097152
+  iteration_limit: 524288
+  val_fraction: 0.25
+  loss_precision: 1.0e-2
+  param_mix: 0.25
+  optimizer:
+    adamaxw:
+      learning_rate: 2.5e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-3
+
+bo:
+  n_init: 5
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds: [-2.0, 1.0]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+    kernel:
+      normalised-invariant-rbf:
+        exchangeable: 4
+  ei:
+    n_restarts: 32
+    n_steps: 100
+
+verify:
+  n_points: 10
+  epochs: 200
+  val_every_epochs: 10
+  budget: null
+  batch: null

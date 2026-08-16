@@ -167,10 +167,33 @@ class Trainer:
     # split (the detector is a deterministic function of (design, event_index), no internal pools).
     # Built ONCE; designs accumulate into the pools, consuming these indices in fill order (oversampled
     # by wrapping when budget > detector.size()).
-    budget_index = shuffled_event_index(detector.size(), train_budget + val_budget, self.seed)
-    self._train_index = budget_index[:train_budget]
-    self._val_index = budget_index[train_budget:]
+    # GENERATIONS, not one cut. Each entry is a (train, val) block of the seeded event stream, taken
+    # in order; with a single entry this is exactly `stream[:train]` and `stream[train:train+val]`.
+    # The list exists so a run RESUMED UNDER A RAISED BUDGET keeps every position it has already
+    # consumed and takes the increment from fresh stream positions instead. Cutting the stream at
+    # `train_budget` alone cannot do that: the cut MOVES when the budget changes, so the resumed
+    # training pool would refill from exactly the positions the validation pool already holds -- at
+    # 2097152 -> 3145728 that is all 524288 stored validation events reappearing as training data.
+    self._generations = [(int(train_budget), int(val_budget))]
+    self._rebuild_event_index()
     self._build_kernels(seed)
+
+  def _rebuild_event_index(self):
+    """Build ``_train_index`` / ``_val_index`` from ``_generations`` over the run's seeded stream.
+
+        The stream is a function of (detector size, seed) alone, so a longer draw shares its prefix
+        with a shorter one and every already-consumed position keeps the event it had.
+        """
+    total = sum(train + val for train, val in self._generations)
+    stream = shuffled_event_index(self.detector.size(), total, self.seed)
+    train_parts, val_parts, at = [], [], 0
+    for train, val in self._generations:
+      train_parts.append(stream[at:at + train])
+      at += train
+      val_parts.append(stream[at:at + val])
+      at += val
+    self._train_index = np.concatenate(train_parts) if len(train_parts) > 1 else train_parts[0]
+    self._val_index = np.concatenate(val_parts) if len(val_parts) > 1 else val_parts[0]
 
   def _make_pools(self, detector, budget, device):
     """Allocate the train + val event pools, split by ``val_fraction``.
@@ -417,6 +440,39 @@ class Trainer:
   def _persist_network(self, params, state, opt_state):
     """Base trainer keeps nothing -- each design is independent."""
 
+  def restore_design_parameters(self, iteration):
+    """The PARAMETERS this run trained for ``iteration``, read back from that design's checkpoint.
+
+        THIS IS WHAT A WARM START READS, and reading it from disk rather than from a list on the
+        driver is what makes the warm-start strategies resumable. The per-design checkpoint is written
+        ONCE, at convergence, holding exactly the network whose loss the run reported (:meth:`train`
+        saves it immediately before it returns), so warm-starting from the checkpoint is warm-starting
+        from the same arrays the design ended on -- with the difference that they survive the process.
+        A run resumed at a design boundary can therefore still warm-start from every design it measured
+        before the interruption, instead of from the ones it happens to still hold in memory.
+
+        The checkpoint stores FLAT leaves, so a freshly built regressor supplies the structure they are
+        poured back into; every one of its own random values is overwritten, which is why the seed it
+        is built with does not matter.
+        """
+    from ...utils import io
+
+    if self.checkpoint_dir is None or len(self.checkpoint_dir) == 0:
+      raise ValueError("a warm start reads the per-design checkpoints, so a run that warm-starts must "
+                       "have been given a checkpoint_dir")
+    path = os.path.join(self.checkpoint_dir, f"design_{iteration:04d}")
+    if not os.path.isdir(path):
+      raise FileNotFoundError(f"no checkpoint at {path} -- a warm start continues the network this run "
+                              f"reported for design {iteration}, so that design's checkpoint must be kept")
+    manager = io.get_checkpointer(path)
+    if manager.latest_step() is None:
+      raise ValueError(f"{path} holds no saved epoch")
+    _, params, state = self._build_regressor(self.seed)
+    parameters, _state, _design, _aux = io.restore_training_checkpoint(manager, regressor=(params, state))
+    manager.close()
+    nnx.replace_by_pure_dict(params, parameters)
+    return jax.device_put(params, self.device)
+
   # ------------------------------------------------------------------ #
   # Resume state. `scripts/bo.py` restarts an interrupted run at the design boundary: the design it
   # died on is REDONE from its start, so nothing mid-design is kept -- no epoch counter, no
@@ -438,7 +494,12 @@ class Trainer:
         """
     from ...utils import io
 
-    payload = {"seed": np.int64(self.seed)}
+    payload = {
+      "seed": np.int64(self.seed),
+      # The event-index LAYOUT, not just the pools. Without it a resumed run cannot tell which stream
+      # positions its stored events came from, and a raised budget would re-issue them.
+      "generations": np.asarray(self._generations, dtype=np.int64),
+    }
     for name, pool in (("train", self.train_pool), ("val", self.val_pool)):
       payload[f"{name}_current"] = np.int64(pool.current)
       for i, leaf in enumerate(jax.tree.leaves(pool.buffers())):
@@ -457,13 +518,40 @@ class Trainer:
       if int(data["seed"]) != self.seed:
         raise ValueError(f"{source}: state was written at seed {int(data['seed'])}, this trainer is at "
                          f"{self.seed}; the seed fixes the train/val split and the event order")
-      for name, pool in (("train", self.train_pool), ("val", self.val_pool)):
+      # THE LAYOUT COMES BACK FROM THE STATE, and a raised budget EXTENDS it rather than recutting it.
+      # A state written before generations existed is read as the single block it was.
+      if "generations" in data:
+        stored = [(int(train), int(val)) for train, val in np.asarray(data["generations"]).reshape(-1, 2)]
+      else:
+        stored = [(self.train_pool.capacity, self.val_pool.capacity)]
+      spent_train = sum(train for train, _ in stored)
+      spent_val = sum(val for _, val in stored)
+      extra_train = self.train_pool.capacity - spent_train
+      extra_val = self.val_pool.capacity - spent_val
+      if extra_train < 0 or extra_val < 0:
+        raise ValueError(f"{source}: state was written for a budget of {spent_train}+{spent_val} events and "
+                         f"this trainer is configured for {self.train_pool.capacity}+{self.val_pool.capacity}; "
+                         f"a budget may be RAISED between runs but never lowered -- the smaller pools cannot "
+                         f"hold events already paid for")
+      self._generations = stored if extra_train == 0 and extra_val == 0 else stored + [(extra_train, extra_val)]
+      self._rebuild_event_index()
+      # Release the allocated pool BEFORE building the restored one, and keep the leaves on the HOST
+      # until `Pool.load` places them -- either way round, two pools on the device at once doubles the
+      # high-water mark permanently.
+      for name, attribute in (("train", "train_pool"), ("val", "val_pool")):
+        pool = getattr(self, attribute)
         structure = jax.tree.structure(pool.buffers())
-        leaves = [jnp.asarray(data[f"{name}_leaf_{i}"]) for i in range(structure.num_leaves)]
-        pool.load_state({
+        leaves = [data[f"{name}_leaf_{i}"] for i in range(structure.num_leaves)]
+        # THIS trainer's configured capacity, not the snapshot's -- a run resumed under a RAISED
+        # budget must come back with the larger pool, or the raise is silently discarded and the run
+        # ends immediately on a pool that is already full.
+        specs, device, capacity = pool.specs, pool.device, pool.capacity
+        for buffer in jax.tree.leaves(pool.buffers()):
+          buffer.delete()
+        setattr(self, attribute, Pool.load({
           "slots": jax.tree.unflatten(structure, leaves),
           "current": int(data[f"{name}_current"]),
-        })
+        }, specs, capacity=capacity, device=device))
       self._load_carried_state(data)
 
   def _carried_state(self):

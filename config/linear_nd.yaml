@@ -1,0 +1,129 @@
+# RUN config for the `linear` task at the operating point stage 1 of `docs/linear-highdim.md` picked,
+# and the config the SLACK MEASUREMENT of that document was taken at. CPU only.
+#
+# ⚠️ IT IS 1-DIMENSIONAL, DELIBERATELY. The question this config serves is whether `linear` in d = 2
+# or 3 dimensions can be a benchmark; stage 1 answered NO. The task is SOLVED before the criterion's
+# `n`: criterion (c) is algebraically the requirement that the optimiser still be a sixth of the whole
+# baseline-to-optimum range away after n iterations, and at n = 20 the measured residual is 0-19% of
+# the range at every (d, n_probes, sigma) tried, so no scorer can rescue it. `LinearDetector` was
+# therefore never extended with `n_dimensions` and there is no d-dimensional detector for a config to
+# name. What remains worth measuring is the ONE estimate the stage-1 table rested on -- the
+# train/validation gap as a fraction of the loss level, carried over from the 1-dimensional campaign
+# at `noise` 0.1 -- because at n = 10 one cell survives criteria (a)-(c) and turns on exactly that
+# number. It is measured HERE, at the raised noise the stage-1 pick rule chose, where the loss levels
+# are closest to the d-dimensional cells'.
+#
+# THE DETECTOR IS INLINE rather than the usual `detector: linear` string reference. The referenced
+# file `config/detector/linear.yaml` is what the LIVE 1-dimensional campaign is running off, and every
+# SLURM job re-reads it at start, so overriding `noise` through it would corrupt a run in flight.
+#
+# noise -- 0.7 against the fixture's 0.1. The stage-1 pick rule, fixed before any cell was scored:
+#   among the cells whose gain clears `10 x (predicted slack)`, take the largest margin. In d = 1 with
+#   2 probes that is sigma 0.7 (margin +0.139), and its ceiling of 0.598 sits in the same range as the
+#   d-dimensional candidates' 0.71 (d=2, 3 probes) and 0.78 (d=3, 4 probes), which is what makes a
+#   gap-over-level measured here transferable to them. At sigma 0.1 the landscape spans a hundredfold
+#   (0.005 to 0.50) and both slack terms scale with the level, so the bad designs bind; at 0.7 it
+#   spans threefold (0.197 to 0.598).
+#
+#   ⚠️ NO INSTRUMENT STANDS BEHIND THIS NUMBER, and `docs/benchmark-acceptance.md` requires one for
+#   any noise that is moved. `linear` has no instrument at all -- it is a synthetic fixture -- which is
+#   itself part of the verdict in `docs/linear-highdim.md` and the reason this config is a measurement
+#   tool rather than a campaign config.
+#
+# regressor.features -- [[16, 8], [8, 16]], 3304 parameters at n_models 4. NOT a free choice: MEASURED
+#   on this task at the ceiling design `corner-high`, the wider [[16, 16], [16, 16]] (7048) never
+#   converges (persistent gap 0.0150) while this one closes to 0.0021 in 61 s. Capacity is the lever on
+#   the binding term here, which is the opposite of the enzyme tasks, where the regulariser was.
+#
+# regressor.dropconnect / p_dropout / n_models / training.param_mix / weight_decay -- the settled
+#   defaults (user, 2026-08-15), copied from `config/enzyme_extremes.yaml`, which is the verified
+#   reference. `param_mix` is NOT optional: at each data addition the parameters are pulled a quarter
+#   of the way back toward the network the run started from, and without it plain growth reports a
+#   score 0.026 too high on average and 0.058 at worst and fails to converge 3 of 6 -- an upward bias
+#   that would land directly on the slack numbers this config exists to measure.
+#
+# training.batch -- 64, against the fixture's 128, and the SAME 64 in every cell compared. The fixture's
+#   batch was sized for a GPU, where it is free; this study runs on CPU beside GPU campaigns that must
+#   not be disturbed. CONSEQUENCE, stated because the convergence procedure's constants are written in
+#   EPOCH units: `steps_per_epoch = iteration_limit // batch` and that coupling is definitional, so an
+#   epoch still holds exactly `iteration_limit` samples but now splits them into twice as many, half-
+#   sized optimisation steps -- i.e. an epoch contains MORE optimisation than it did at batch 128, and
+#   `warmup_epochs` and `patience` span more work than the measurements they were set from.
+#
+# training.eval_batch -- 1024. The evaluation passes carry no gradient, so they may be wider than the
+#   training batch; 1024 keeps the masked pass over the largest window to 256 kernel calls while
+#   staying small enough to be a CPU-sized working set.
+#
+# training.iteration_limit -- ALSO THE EPOCH LENGTH, and exactly a quarter of `budget`, which is a
+#   power of two. At batch 64 that is 4096 steps an epoch.
+#
+# training.n0 / n_increment -- 16384 each, i.e. 15 data additions to reach the cap. The fixture's
+#   4096/4096 gives the same 15 rounds at its own quarter-sized cap, so the SHAPE of the growth
+#   schedule is unchanged and only its scale moves with `iteration_limit`.
+#
+# training.loss_precision -- 2.0e-2, inherited from the fixture, where it was set so EVERY design in
+#   the box can converge. Stage 1 demands below 0.0275 at this operating point, so 2.0e-2 is consistent
+#   with it rather than chosen against it. It is NOT the deliverable: the deliverable is what
+#   `scripts/probe_precision.py` measures at the binding designs.
+#
+# bo.gp.kernel.exchangeable -- 2, the number of probes. The design is a SET: reading at (-1, +1) is the
+#   same experiment as reading at (+1, -1). In d dimensions this would stay `n_probes` and the
+#   detector would expose one design FIELD per coordinate, each of length `n_probes`, so that
+#   `detopt.bo._exchangeable_blocks` finds d blocks permuted TOGETHER.
+
+detector:
+  linear:
+    n_probes: 2
+    noise: 0.7
+    probe_bounds: [-1.0, 1.0]
+
+regressor:
+  set-regressor:
+    features: [[16, 8], [8, 16]]
+    n_models: 4
+    dropconnect: 0.1
+
+device: cpu
+plot_per_epoch: false
+
+training:
+  n0: 16384
+  n_increment: 16384
+  batch: 64
+  eval_batch: 1024
+  warmup_epochs: 2
+  patience: 16
+  budget: 1048576
+  iteration_limit: 262144
+  val_fraction: 0.25
+  loss_precision: 2.0e-2
+  param_mix: 0.25
+  optimizer:
+    adamaxw:
+      learning_rate: 2.5e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-3
+
+bo:
+  n_init: 5
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds: [-2.0, 1.0]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+    kernel:
+      normalised-invariant-rbf:
+        exchangeable: 2
+  ei:
+    n_restarts: 32
+    n_steps: 100
+
+verify:
+  n_points: 10
+  epochs: 200
+  val_every_epochs: 10
+  budget: null
+  batch: null

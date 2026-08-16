@@ -21,8 +21,12 @@
 # training.loss_precision -- 2.0e-2, set so EVERY design in the box can converge, which is the only
 #   thing this bar has to do here. THE BINDING DESIGNS ARE THE BAD ONES, the opposite of the enzyme
 #   tasks: both terms of the slack scale with the loss LEVEL, and the level spans a hundredfold. The
-#   per-event loss is a mean of two squared Gaussians, so its standard deviation equals its own mean
-#   and `err` is level/sqrt(N) -- intrinsic, nothing to tune. MEASURED at the coincident-probe
+#   per-event loss is a mean of squared Gaussians, so `err` is proportional to the level over sqrt(N)
+#   -- intrinsic, nothing to tune. The constant is NOT 1: the standard-deviation-to-mean ratio is
+#   `sqrt(2 sum mu^2)/sum mu` over the posterior eigenvalues, which is exactly 1.0 at the OPTIMUM
+#   design (two equal eigenvalues) and 1.41 at the ceiling designs, where it is the value that
+#   matters. The earlier "standard deviation equals its own mean" was right where it is harmless and
+#   41% low where it was applied (D102). MEASURED at the coincident-probe
 #   designs, which are the worst in the box, at `iteration_limit` 65536 and both seeds: `centre`
 #   converges at 0.0088 / 0.0100, `corner-low` CAPS at 0.0155 / 0.0133. So 1.0e-2 is unreachable and
 #   2.0e-2 clears the worst measured slack by 29%.
@@ -68,7 +72,7 @@ training:
   loss_precision: 2.0e-2
   param_mix: 0.25
   optimizer:
-    adamw:
+    adamaxw:
       learning_rate: 2.5e-4
       b1: 0.9
       b2: 0.999

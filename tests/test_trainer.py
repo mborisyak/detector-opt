@@ -47,7 +47,7 @@ def test_dropout_active_only_when_training(seed):
     assert not np.allclose(np.asarray(c), np.asarray(d))
 
 
-def _small_trainer(loss_precision, *, n0, n_increment, iteration_limit, budget, seed):
+def _small_trainer(loss_precision, *, n0, n_increment, iteration_limit, budget, seed, checkpoint_dir=None):
     det = analytic_detector()
     return det, DesignTrainer(
         det,
@@ -64,9 +64,34 @@ def _small_trainer(loss_precision, *, n0, n_increment, iteration_limit, budget, 
         val_fraction=0.25,
         eval_batch=128,
         device=None,
-        checkpoint_dir=None,
+        checkpoint_dir=checkpoint_dir,
         seed=seed,
     )
+
+
+def test_warm_start_reads_the_design_checkpoint(seed, tmp_path):
+    """A warm start loads a design's CHECKPOINT, and it is the network that design ended on.
+
+    ``scripts/bo.py`` keeps no historical parameters: ``continue`` and ``closest`` choose a design
+    NUMBER and the trainer reads that design's checkpoint back, so the pool a warm start may draw from
+    is everything the run has measured rather than everything this process still holds -- which is what
+    lets a resumed run warm-start from designs scored before the interruption. The identity that makes
+    the two equivalent is asserted here: what comes back off disk is what ``train`` returned, leaf for
+    leaf. A missing checkpoint must RAISE, never silently degrade to a cold start."""
+    det, trainer = _small_trainer(
+        0.5, n0=256, n_increment=128, iteration_limit=512, budget=20_000, seed=seed, checkpoint_dir=str(tmp_path)
+    )
+    design = np.zeros(det.design_dim(), dtype=np.float32)
+    result = trainer.train(design, seed, step=0)
+    assert result is not None
+
+    restored = trainer.restore_design_parameters(0)
+    trained, back = jax.tree.leaves(result.params), jax.tree.leaves(restored)
+    assert len(trained) > 0 and len(trained) == len(back)
+    assert all(np.array_equal(np.asarray(a), np.asarray(b)) for a, b in zip(trained, back))
+
+    with pytest.raises(FileNotFoundError):
+        trainer.restore_design_parameters(1)
 
 
 def test_design_trainer_converges(seed):
@@ -152,8 +177,12 @@ def test_continual_trainer_persists_and_replays(seed):
     trained = jax.tree.map(np.asarray, trainer._running[0])
     # Training WROTE BACK to the persistent tuple: at least one leaf moved.
     assert any(not np.allclose(a, b) for a, b in zip(jax.tree.leaves(before), jax.tree.leaves(trained)))
-    # The next design continues that same net -- init hands back the persisted tuple unchanged.
-    assert trainer._init_design_network(np.random.SeedSequence(0), None) is trainer._running
+    # The next design continues that same net -- params and buffers are handed back UNCHANGED -- but
+    # the OPTIMISER IS RESTARTED, so Adam's moments never cross a design boundary. That is what makes
+    # the carried state complete and a resumed run exact, so it is asserted rather than assumed.
+    next_params, next_state, next_opt = trainer._init_design_network(np.random.SeedSequence(0), None)
+    assert next_params is trainer._running[0] and next_state is trainer._running[1]
+    assert all(np.allclose(np.asarray(leaf), 0.0) for leaf in jax.tree.leaves(next_opt))
     # ... and appends to the pool, so history is available for replay.
     assert trainer.train(design, seed + 1) is not None
     assert trainer.train_pool.current > after_first

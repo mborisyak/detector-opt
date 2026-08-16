@@ -35,15 +35,28 @@ def batch_dim(item):
   return n
 
 class Buffered:
-  def __init__(self, capacity, specs, device=None):
+  def __init__(self, capacity, specs, device=None, buffers=None):
+    """``buffers`` supplies the slots instead of allocating them, checked against ``specs``.
+
+        Allocating zeros and then replacing them holds two pools at once, and XLA keeps that
+        high-water mark for the process's life."""
     self.capacity = capacity
     self.device = device
     self.specs = tuple(specs)
 
-    self._buffers = jax.tree.map(
-      lambda s: jnp.zeros(shape=(capacity, *s.shape), dtype=s.dtype, device=device),
-      specs
-    )
+    if buffers is None:
+      self._buffers = jax.tree.map(
+        lambda s: jnp.zeros(shape=(capacity, *s.shape), dtype=s.dtype, device=device),
+        specs
+      )
+    else:
+      given, expected = jax.tree.structure(tuple(buffers)), jax.tree.structure(self.specs)
+      if given != expected:
+        raise ValueError(f"buffers do not match specs: {given} vs {expected}")
+      for array, spec in zip(jax.tree.leaves(tuple(buffers)), jax.tree.leaves(self.specs)):
+        if array.shape != (capacity, *spec.shape):
+          raise ValueError(f"buffer of shape {array.shape} is not a slot of {(capacity, *spec.shape)}")
+      self._buffers = jax.tree.map(lambda a: jax.device_put(jnp.asarray(a), device), tuple(buffers))
 
     def assign(buffers, index, values):
       return jax.tree.map(
@@ -68,8 +81,8 @@ class Pool(Buffered):
   ``combine`` be design-conditioned -- each event is combined with its own design.
   """
 
-  def __init__(self, capacity, specs, device=None):
-    super().__init__(capacity, specs, device=device)
+  def __init__(self, capacity, specs, device=None, buffers=None):
+    super().__init__(capacity, specs, device=device, buffers=buffers)
     self.current = 0
 
   def append(self, *chunk):
@@ -91,10 +104,45 @@ class Pool(Buffered):
     """
     return {"slots": tuple(self.buffers()), "current": np.int32(self.current)}
 
-  def load_state(self, state):
-    """Restore from a :meth:`state` snapshot."""
-    self._buffers = jax.tree.map(lambda a: jax.device_put(jnp.asarray(a), self.device), tuple(state["slots"]))
-    self.current = int(state["current"])
+  @classmethod
+  def load(cls, state, specs, capacity=None, device=None):
+    """A pool of ``capacity`` slots holding a :meth:`state` snapshot. Release what you are replacing
+        BEFORE calling it.
+
+        CAPACITY IS THE POOL'S, NOT THE SNAPSHOT'S. It defaults to the snapshot's leading dimension --
+        the same pool that was saved -- but a caller that has been configured for a LARGER budget
+        passes that budget, and the restored rows are placed in the first ``current`` slots of a pool
+        sized for it. Taking capacity from the data instead, as this once did, silently discarded a
+        raised budget: the pool came back full at the old size and the run ended on its first round
+        with "pool exhausted", having added nothing.
+
+        A capacity BELOW the stored fill is refused rather than truncated: those events were paid for
+        with detector calls and the fill cursor decides which slice of the event index every later
+        design consumes, so dropping rows would corrupt the run rather than shrink it.
+        """
+    slots = tuple(state["slots"])
+    stored = int(jax.tree.leaves(slots)[0].shape[0])
+    current = int(state["current"])
+    if capacity is None:
+      capacity = stored
+    capacity = int(capacity)
+    if capacity < current:
+      raise ValueError(f"capacity {capacity} is below the snapshot's fill {current}: restoring would "
+                       f"drop events that have already been paid for")
+    if capacity == stored:
+      # The saved arrays ARE the buffers: no allocation, no copy, no doubled high-water mark.
+      pool = cls(capacity, specs, device=device, buffers=slots)
+      pool.current = current
+      return pool
+    # Growing: allocate at the NEW capacity and place the stored rows into the first `current` slots.
+    # The snapshot's leaves are on the host, so only one pool is ever resident on the device.
+    pool = cls(capacity, specs, device=device)
+    if current > 0:
+      index = jnp.arange(current, dtype=jnp.int32)
+      head = jax.tree.map(lambda a: jnp.asarray(a)[:current], slots)
+      pool._buffers = pool.assign(pool._buffers, index, head)
+    pool.current = current
+    return pool
 
   def __len__(self):
     return self.current
@@ -107,8 +155,8 @@ class RingBuffer(Buffered):
   ``state``/``load_state`` round-trip the slots + cursor so the ring survives a checkpoint.
   """
 
-  def __init__(self, capacity, specs, device=None):
-    super().__init__(capacity, specs, device=device)
+  def __init__(self, capacity, specs, device=None, buffers=None):
+    super().__init__(capacity, specs, device=device, buffers=buffers)
     self.current = 0
     self.cursor = 0  # next write position (mod capacity)
     self.filled = 0  # number of valid rows so far (<= capacity)

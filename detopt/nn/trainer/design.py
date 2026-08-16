@@ -161,9 +161,12 @@ class _DesignBase(Trainer):
         # isotropic ball whose largest tested radius, eps = 0.03, is ~47x short of the distance to a
         # fresh init (two independent draws at the same scale sit about `sqrt(2) * rms` apart).
         #
-        # And it keeps the ADAM MOMENTS, which `reinit_on_grow` discards along with everything else. So
-        # `param_mix = 1.0` is exactly `reinit_on_grow` MINUS the optimiser reset, and differencing the
-        # two isolates the optimiser state -- the one control neither existing knob separates.
+        # It RESETS THE OPTIMISER, as `reinit_on_grow` does (user, 2026-08-16): the moments are a
+        # summary of the trajectory that produced the current parameters, and a rewind throws part of
+        # that trajectory away, so carrying them forward would step the rewound network under second
+        # moments it never earned. What remains between the two knobs is the network they move toward
+        # -- `param_mix = 1.0` rewinds to the network THIS RUN STARTED FROM, `reinit_on_grow` draws a
+        # NEW one -- and the buffer state, which only `reinit_on_grow` rebuilds.
         #
         # CONFOUND, stated because it is not removable by construction: if the current parameters and a
         # fresh draw have similar scale and are roughly independent, their average has ~0.71 of their
@@ -430,10 +433,13 @@ class _DesignBase(Trainer):
                     # the accumulated fit and nothing else. A fresh draw would confound "throw away what
                     # was learned" with "land in a different random basin", and would inject randomness
                     # that differs between two arms whose whole point is a matched initialisation.
-                    # lambda = 1 rewinds to the initial network exactly; the buffer state and the Adam
-                    # moments are left alone in every case.
+                    # lambda = 1 rewinds to the initial network exactly; the buffer state is left alone.
+                    # THE OPTIMISER IS RESET with the rewind: Adam's moments describe the trajectory
+                    # that reached the current parameters, and the rewind discards a fraction of that
+                    # trajectory, so they no longer describe the network they would be stepping.
                     mix = self.param_mix
                     params = jax.tree.map(lambda p, q: q + (1.0 - mix) * (p - q), params, initial_params)
+                    opt_state = self.optimizer.init(params)
                 round_start = len(train_loss_history)
                 epoch_in_round = 0
                 print(f"  [grow] window -> {tp.current - w0_train}, pool {tp.current}/{tp.capacity}")

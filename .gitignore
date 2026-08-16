@@ -131,6 +131,7 @@ release/
 
 /data
 /output
+/output-bo
 
 *.md
 !README.md

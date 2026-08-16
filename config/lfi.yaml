@@ -25,7 +25,7 @@ device: cuda
 training:
   # Network (regressor) optimizer.
   optimizer:
-    adamw:
+    adamaxw:
       learning_rate: 2.0e-4
       b1: 0.9
       b2: 0.999
@@ -34,7 +34,7 @@ training:
 
   # Discriminator optimizer.
   discriminator_optimizer:
-    adamw:
+    adamaxw:
       learning_rate: 2.0e-4
       b1: 0.9
       b2: 0.999

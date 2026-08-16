@@ -39,12 +39,12 @@ enzyme_mm:
   # maximum. m < p leaves the target underdetermined by construction; m > p makes the batch redundant,
   # which is the melt benchmark's failure (p = 1 against m = 4, its best design being two useful probes
   # plus junk). The screen runs m = 2, 3, 4 so the choice is visible rather than asserted.
-  n_experiments: 3
+  n_experiments: 4
   # [A] read-outs per experiment, evenly spaced, the last at `duration`. A FIXED grid, identical for
   # every experiment and every design -- sampling times are NOT a design coordinate (plan section 4),
   # which is what lets the combined element carry time positionally. Assay parameter, unchanged from
   # the melt config.
-  n_measurements: 8
+  n_measurements: 16
 
   # ---------------------------------------------------------------------------------------------
   # The assay -- UNCHANGED from config/detector/enzyme.yaml except where stated.

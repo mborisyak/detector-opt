@@ -54,7 +54,7 @@ training:
                                 # "the noise was quiet". 16-32, scaling with `iteration_limit`,
                                 # which sets how much optimisation one epoch contains.
   optimizer:
-    adamw:
+    adamaxw:
       learning_rate: 2.5e-4
       b1: 0.9
       b2: 0.999

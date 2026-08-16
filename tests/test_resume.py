@@ -192,8 +192,9 @@ def test_trainer_restore_refuses_another_seed(tmp_path):
 
 def test_continual_trainer_restores_its_persistent_network(tmp_path):
     """The continual strategy carries ONE network across designs, so resuming without it would throw
-    away every design's training. Params and buffer state come back exactly; the Adam moments do not
-    (they are re-initialised), which is the one documented difference from an uninterrupted run."""
+    away every design's training. Params and buffer state come back exactly, and they are ALL that
+    crosses a design boundary -- the optimiser is restarted at each one either way -- so a resumed
+    continual run starts the next design from exactly the state an uninterrupted one would."""
     path = str(tmp_path / "trainer.npz")
     detector, original = _trainer(ContinualTrainer, seed=5)
     design = np.full(detector.design_dim(), 0.5, np.float32)
@@ -207,6 +208,32 @@ def test_continual_trainer_restores_its_persistent_network(tmp_path):
     trained, after = jax.tree.leaves(original._running[0]), jax.tree.leaves(restored._running[0])
     assert any(not np.allclose(np.asarray(x), np.asarray(y)) for x, y in zip(before, trained))
     for x, y in zip(trained, after):
+        assert np.array_equal(np.asarray(x), np.asarray(y))
+
+
+def test_a_resumed_run_warm_starts_from_a_design_it_did_not_train(tmp_path):
+    """The property the driver's warm start rests on ACROSS a resume, tested on the pipeline.
+
+    ``scripts/bo.py`` holds no historical parameters. ``continue`` and ``closest`` choose a design
+    NUMBER out of ``proposed_scaled`` -- which the resume rebuilds from ``partial.json``, so it spans
+    the whole run -- and the trainer reads that design's checkpoint. A process that trained NONE of
+    those designs must therefore recover any of them, which is what this asserts: a second trainer,
+    holding nothing, reproduces the first one's trained parameters exactly.
+
+    It is the case the previous scheme could not serve. The driver kept the networks in a list that a
+    resume left empty while restoring the design rows beside it, so ``closest`` indexed a one-element
+    list with a row number drawn from the full history and went out of range on the second design after
+    any restart."""
+    detector, original = _trainer(DesignTrainer, seed=3, checkpoint_dir=str(tmp_path / "checkpoints"))
+    design = np.full(detector.design_dim(), 0.25, np.float32)
+    result = original.train(design, 11, step=0)
+    assert result is not None
+
+    _, resumed = _trainer(DesignTrainer, seed=3, checkpoint_dir=str(tmp_path / "checkpoints"))
+    warm = jax.tree.leaves(resumed.restore_design_parameters(0))
+    trained = jax.tree.leaves(result.params)
+    assert len(trained) > 0 and len(trained) == len(warm)
+    for x, y in zip(trained, warm):
         assert np.array_equal(np.asarray(x), np.asarray(y))
 
 

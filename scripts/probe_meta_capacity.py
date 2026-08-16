@@ -148,12 +148,21 @@ def design_band(landscape, detector, q_low, q_high, n_designs):
   return chosen
 
 
-def run_config_for(config, *, features, budget, param_mix, dropconnect, p_dropout, iteration_limit=None, device=None):
+def run_config_for(
+  config, *, features, budget, param_mix, dropconnect, p_dropout, iteration_limit=None, device=None, loss_precision=None
+):
   """A deep copy of the run config with this arm's overrides applied (nothing is written to disk).
 
-  Everything else -- optimiser, weight decay, `n_models`, the convergence knobs, `loss_precision` --
-  is the shipped config's, because the handicap is a property of THAT operating point and a run at
-  different settings follows a different trajectory and is not comparable.
+  Everything else -- optimiser, weight decay, `n_models`, the convergence knobs -- is the shipped
+  config's, because the handicap is a property of THAT operating point and a run at different
+  settings follows a different trajectory and is not comparable.
+
+  `loss_precision` is the ONE exception, and only when it is passed explicitly: it is the BAR the
+  two arms are measured against, and the arm ratio is a function of it (a design stops when its
+  train/validation gap plus its statistical error fits under the bar, so an arm whose gap is a large
+  share of the bar gains far more from relaxing it). Sweeping it is the point of the sweep; a run at
+  one value is still not comparable to a run at another EXCEPT through that ratio, and the value is
+  recorded in the output either way. Default None keeps the shipped value.
   """
   run = json.loads(json.dumps(config))  # plain JSON-able yaml
   (regressor_name, ), = (run["regressor"].keys(), )
@@ -166,6 +175,8 @@ def run_config_for(config, *, features, budget, param_mix, dropconnect, p_dropou
   regressor["dropconnect"] = None if dropconnect is None else float(dropconnect)
   run["training"]["param_mix"] = float(param_mix)
   run["training"]["budget"] = int(budget)
+  if loss_precision is not None:
+    run["training"]["loss_precision"] = float(loss_precision)
   if iteration_limit is not None:
     run["training"]["iteration_limit"] = int(iteration_limit)
   if device is not None:
@@ -418,6 +429,11 @@ def main():
   parser.add_argument("--p-dropout", type=float, default=None, help="regressor `p_dropout`; unset means None (no layer built)")
   parser.add_argument("--dropconnect", type=float, default=0.1, help="regressor `dropconnect` (weight dropping)")
   parser.add_argument("--param-mix", type=float, default=0.25, help="`training.param_mix` at every data addition")
+  parser.add_argument(
+    "--loss-precision", type=float, default=None, metavar="P",
+    help="the convergence BAR both arms are measured against; unset means the config's own. Sweeping "
+    "it measures how the arm ratio depends on the bar, which is the one thing the arms do NOT share"
+  )
   parser.add_argument("--pretrain-block", type=int, default=6, help="epochs per block in the pretraining stopping rule")
   parser.add_argument(
     "--pretrain-tolerance", type=float, default=5.0e-4,
@@ -460,15 +476,16 @@ def main():
 
   pretrain_run = run_config_for(
     config, features=features, budget=pretrain_budget, param_mix=arguments.param_mix, dropconnect=arguments.dropconnect,
-    p_dropout=arguments.p_dropout, iteration_limit=pooled_train, device=arguments.device
+    p_dropout=arguments.p_dropout, loss_precision=arguments.loss_precision, iteration_limit=pooled_train,
+    device=arguments.device
   )
   measure_run = run_config_for(
     config, features=features, budget=measure_budget, param_mix=arguments.param_mix, dropconnect=arguments.dropconnect,
-    p_dropout=arguments.p_dropout, device=arguments.device
+    p_dropout=arguments.p_dropout, loss_precision=arguments.loss_precision, device=arguments.device
   )
   meta_run = run_config_for(
     config, features=features, budget=meta_budget, param_mix=arguments.param_mix, dropconnect=arguments.dropconnect,
-    p_dropout=arguments.p_dropout, device=arguments.device
+    p_dropout=arguments.p_dropout, loss_precision=arguments.loss_precision, device=arguments.device
   )
   (regressor_name, ), = (measure_run["regressor"].keys(), )
 
@@ -583,13 +600,13 @@ def main():
   if "meta" in arguments.arms:
     print("\n=== meta: ContinualTrainer, PRETRAINED persistent network + history in the replay pool", flush=True)
     trainer = ContinualTrainer.from_config(detector, meta_run, checkpoint_dir=None, seed=int(arguments.seed))
-    # The persistent network's PARAMS become the pretrained ones; its freshly built buffer state and
-    # optimiser state are kept. Neither carries information: the buffer state is rng counters, never
-    # read during training (the dropout key is threaded fresh) or evaluation (deterministic), and
-    # AdamW's `init` produces zero moments whose tree depends on the params' SHAPES alone -- so
-    # keeping them is identical to rebuilding them around the pretrained params.
-    _, state, opt_state = trainer._running
-    trainer._running = (pretrained, state, opt_state)
+    # The persistent network's PARAMS become the pretrained ones; its freshly built buffer state is
+    # kept, and carries no information (rng counters, never read during training -- the dropout key is
+    # threaded fresh -- nor during evaluation, which is deterministic). `_running` is a 2-tuple:
+    # the optimiser is no longer carried on it at all, because `ContinualTrainer` rebuilds it at every
+    # design boundary.
+    _, state = trainer._running
+    trainer._running = (pretrained, state)
     # THE HISTORY FIRST, then the measurement stream: the replay sampler draws from `[0, w0)`, so the
     # ten designs must be in the pool BEFORE the evaluation design's window opens, and the window
     # must then open on the same events the other two arms see.

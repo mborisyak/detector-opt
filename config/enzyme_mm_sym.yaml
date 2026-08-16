@@ -1,4 +1,4 @@
-# RUN config for the MM-SYM candidate (detector: config/detector/enzyme_mm_sym.yaml).
+# CAMPAIGN CONFIG -- MM-SYM candidate (detector: config/detector/enzyme_mm_sym.yaml).
 # The detector config says what the system IS; this says how a benchmark run is conducted on it.
 #
 # WHY IT EXISTS. The Stage A screen judged this candidate through the XGBoost proxy objective and it
@@ -7,56 +7,85 @@
 # columns, 64 here, deliberately WITHOUT the design coordinates (`detopt/bo/gbdt.py`, `sample_design`)
 # -- while the neural objective sees one set element per experiment carrying its own read-outs AND its
 # own design coordinates, and is permutation-invariant across experiments. The proxy may therefore be
-# understating what this task supports. This config exists to re-score the proxy's best, median and
-# worst designs through the SetRegressor and find out.
+# understating what this task supports.
 #
 # THE TARGET IS A VECTOR of 3 numbers (log_K_A, log_K_B, Q10_cat), not a class, so the no-information
 # level is the target's own variance (1/3 for the uniform prior) rather than an exact 1.0. That is the
 # structural difference from `enzyme_extremes`: the whole baseline-to-best range measured by the proxy
 # is 0.2438 -> 0.1406, i.e. 0.103, which is where criterion (d)'s bar of 0.1 becomes hard.
+#
+# THE TRAINER SETTINGS ARE THE SETTLED DEFAULTS, taken from `config/enzyme_extremes.yaml`, which is the
+# VERIFIED reference config (user, 2026-08-15). They are not tuned per task, and the measurements
+# behind each are recorded in that file's header. What that fixes here, against the version of this
+# config that predated them:
+#
+#   regressor.p_dropout REMOVED, regressor.dropconnect 0.1 -- dropout is off by default. It used to be
+#     applied to raw inputs and to the pooled aggregate, which cost 0.11 of loss at the kinetic task's
+#     best design and VOIDS every neural number measured before 2026-08-14. With dropout now on
+#     activations only and one hidden width per block, it has nowhere to act, so it is omitted rather
+#     than set to a value that does nothing. DropConnect replaces it: unregularised, the network fails
+#     to converge and bo.py raises.
+#
+#   training.param_mix 0.25 -- ADDED; this config had no rewind at all. At each data addition the
+#     parameters are pulled a quarter of the way back toward the network the run started from. Plain
+#     growth reports a score 0.026 too high on average, 0.058 at worst, and fails to converge 3 of 6.
+#     Without it the `meta` arm carries that pathology into the comparison.
+#
+#   training.iteration_limit 524288 = budget / 4 -- ALSO THE EPOCH LENGTH: steps_per_epoch =
+#     iteration_limit // batch, so this gives 2048-step epochs. The coupling is definitional and must
+#     not be broken -- warmup_epochs, patience and the convergence posterior are all written in epoch
+#     units, so separating them would silently retune the procedure.
+#
+#   training.patience 16 -- was 32. Patience is the horizon over which the loss must be STILL and is
+#     specified to scale WITH iteration_limit; at 2048-step epochs an epoch holds four times the
+#     optimisation the 16-32 range was written against, so 16 is the correct end of it.
+#
+#   training.warmup_epochs 2 -- a SAFEGUARD, not a tuning knob: it only stops the procedure acting
+#     before there is anything to act on. Kept low deliberately, since the settled-test is a POSTERIOR
+#     and an unsettled early curve already fails it through its own width.
+#
+#   optimizer.adamw.weight_decay 1.0e-3 -- was 1.0e-6.
+#
+# NOT CHANGED, and NOT covered by the defaults: n0 2048 and n_increment 1024 are this task's own data
+# schedule, half of the `extremes` values. They were left as they were rather than aligned, because
+# nothing has been measured that says what they should be here.
+#
+# training.loss_precision -- 1.0e-2, matching the reference config. STILL A DECLARED PLACEHOLDER on
+# this task: it has never been measured to the pre-registration section 5 protocol -- the MAXIMUM
+# slack over at least 8 designs x 2 seeds -- on THIS detector. Every number produced with this config
+# must say which of its claims depend on it. It also sets criterion (d)'s bar at 10x, i.e. 0.10,
+# against a proxy-measured baseline-to-best range of 0.103.
+
 detector: enzyme_mm_sym
 
 regressor:
-  # A deep set over the batch: one ELEMENT per experiment, its features being that experiment's
-  # read-outs followed by its own design coordinates, so the network is design-conditioned and the
-  # inference is permutation-invariant in the experiments -- the symmetry of the problem.
   set-regressor:
     features: [[24, 16], [16, 24]]
-    n_models: 4      # ensemble: independent members, averaged at evaluation
-    p_dropout: 0.1   # measured on the melt task: costs 0.0067 of level, buys a 5.3x cheaper exit
+    n_models: 4
+    dropconnect: 0.1
 
 device: cuda
-
 plot_per_epoch: false
 
 training:
-  n0: 2048
-  n_increment: 1024
+  n0: 8192
+  n_increment: 4096
   batch: 256
   eval_batch: 2048
-  warmup_epochs: 4              # A SAFEGUARD, not a tuning knob: it only stops the procedure
-                                # acting before there is anything to act on. Small on purpose --
-                                # the settled-test is a POSTERIOR, so an unsettled early curve
-                                # already fails it through its own width. 2-4.
+  warmup_epochs: 2
+  patience: 16
   budget: 2097152
-  iteration_limit: 131072
+  iteration_limit: 524288
   val_fraction: 0.25
-  loss_precision: 1.0e-2         # DECLARED PLACEHOLDER, not a measurement (scripts/stage_a.sh, CANDIDATES).
-                                 # It has never been measured on this task. Every number produced with this
-                                 # config must say which of its claims depend on it.
-  patience: 32                  # The horizon over which the loss must be STILL. Requiring N
-                                # epochs of stillness IS how the procedure waits for the
-                                # regressor's BIAS to disappear, so it must be long enough that
-                                # "still" means "the bias has finished moving" and not merely
-                                # "the noise was quiet". 16-32, scaling with `iteration_limit`,
-                                # which sets how much optimisation one epoch contains.
+  loss_precision: 1.0e-3
+  param_mix: 0.25
   optimizer:
-    adamw:
+    adamaxw:
       learning_rate: 2.5e-4
       b1: 0.9
       b2: 0.999
       eps: 1.0e-8
-      weight_decay: 1.0e-6
+      weight_decay: 1.0e-3
 
 bo:
   n_init: 5
@@ -68,8 +97,7 @@ bo:
     log_amplitude_prior_bounds: [-6.0, 1.5]
     kernel:
       normalised-invariant-rbf:
-        exchangeable: 4   # = n_experiments: the batch is a SET
-
+        exchangeable: 4
   ei:
     n_restarts: 32
     n_steps: 100

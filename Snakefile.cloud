@@ -1,0 +1,196 @@
+# Snakemake driver for the cloud campaign box -- the SLURM-free twin of `Snakefile`.
+#
+#   snakemake -s Snakefile.cloud -c<cores> --resources local_gpu=<K> --config n_seeds=5 \
+#             output/enzyme_extremes/median.json
+#
+# WHY A SEPARATE FILE rather than a flag on the shared one. `Snakefile` is written for a box where
+# SLURM owns the queue: its heavy rules declare `gres`, `mem_mb`, `runtime` and `cpus_per_task` for
+# the executor, and it REFUSES to build a DAG if `--executor slurm` is asked for without
+# `--slurm-status-command squeue`. None of that applies here -- this box has no scheduler at all, so
+# snakemake itself is the queue and concurrency is capped by the `local_gpu` resource. Bolting a
+# mode switch onto the shared file would put the two campaigns' scheduling in one place where a
+# change for one silently reaches the other; the local box is still running off `Snakefile` while
+# this file drives the cloud.
+#
+# WHAT IS IDENTICAL, deliberately: the rules, their shell commands, their output paths, and the seed
+# generator. A run produced here and a run produced there are the same experiment, and the artefacts
+# land at the same paths so every downstream script works unchanged.
+#
+# SEEDS. `SUPER_SEED = 123456` and `random.Random(SUPER_SEED).randint(0, 2**31 - 1)` drawn n_seeds
+# times -- the SAME generator as `Snakefile`, extended, so seeds 1 and 2 are bit-for-bit the pair the
+# earlier campaigns used and seeds 3-5 are its continuation rather than a fresh draw:
+#
+#   n_seeds=2 -> [1244111331, 126382657]
+#   n_seeds=5 -> [1244111331, 126382657, 750143450, 9577242, 330924253]
+#
+# Set it with `--config n_seeds=5`. It defaults to 5 here because that is what this box exists for.
+#
+# CONCURRENCY. `-c<cores>` bounds total cores and each heavy job declares `cpus_per_task`, so cores
+# alone can cap concurrency; `--resources local_gpu=K` caps the GPU-heavy jobs explicitly and is the
+# knob to set from the MPS probe (scripts/probe_mps.py, scripts/probe_mps.sh). A `device: cpu` task
+# declares `local_gpu=0` and is therefore not throttled by that counter at all.
+#
+# ⚠️ THE TWO CAPS MUST AGREE OR THE ONE YOU SET IS NOT THE ONE THAT BINDS. `-c24` with
+# `cpus_per_task=4` admits 6 jobs, so `--resources local_gpu=8` would never bind and the campaign
+# would quietly run at 6. `cpus_per_task` is therefore 3, which is MEASURED rather than declared: a
+# campaign job sits at ~0.9 of a core in steady state and bursts to ~2.5 while XLA compiles. At 3,
+# `-c24` admits exactly 8 and `local_gpu` is what actually caps.
+#
+# THE BLAS THREAD CAPS IN ENV EXIST FOR THE SAME REASON. Between designs `bo.py` fits the GP and
+# maximises EI on the host, and numpy's BLAS defaults to one thread per core -- at 8 concurrent jobs
+# that is 8 x 24 threads fighting over 24 cores. Capping each job at its `cpus_per_task` share keeps
+# the acquisition from thrashing. It is a scheduling knob, not a modelling one, and every run in the
+# campaign gets the same value.
+#
+# WHERE K = 8 COMES FROM (scripts/probe_mps.sh, 2026-08-16, this box, one campaign design per
+# worker): aggregate throughput 1.00x at N=1 (160 s), 1.86x at 2, 3.46x at 4, 5.66x at 8, 6.46x at
+# 12 -- per-worker efficiency 100, 93, 87, 71, 54%. The knee is between 8 and 12.
+#
+# CUDA MPS IS REQUIRED FOR REAL CONCURRENCY and its absence is SILENT. Without an MPS server, N
+# processes time-slice the device instead of co-running -- the jobs still finish, the logs still look
+# healthy, and aggregate throughput is simply flat in N. ENV therefore routes every job through the
+# pipe directory, and the daemon must be up before the campaign starts:
+#
+#   CUDA_MPS_PIPE_DIRECTORY=$HOME/.mps nvidia-cuda-mps-control -d
+#   echo quit | CUDA_MPS_PIPE_DIRECTORY=$HOME/.mps nvidia-cuda-mps-control     # to stop it
+#
+# THE DAEMON DIES WITH THE MACHINE. This box is PREEMPTIBLE, so that is not a rare event: after every
+# preemption the daemon must be restarted before work resumes, or the campaign silently reverts to
+# time-slicing. scripts/monitor_bo.sh checks for it on every heartbeat.
+#
+# PREEMPTION more generally: the disk is persistent and `bo.py` rewrites `results.json` plus its
+# state pair between designs, so a preempted run resumes at the design boundary and loses at most the
+# design in flight. What does NOT survive is the driver -- a dead snakemake stops submitting, which
+# is the failure to watch for, and is why the campaign runs under tmux + flock and is monitored.
+#
+# ⚠️ MIGRATING A TREE BUILT UNDER THE OLD SCHEME. The `bo`/`verify` rules used to declare
+# `results.json` and `verification.png` as their outputs; they now declare `done.txt` and
+# `verified.txt`. A tree produced before that change has no markers, so THIS FILE WOULD RE-RUN EVERY
+# RUN IN IT -- 20 BO runs and their pools, thrown away silently. Run `scripts/migrate_markers.sh
+# <prefix>/<task>` over such a tree first: it touches the markers for runs that are already complete,
+# and only for those.
+import glob
+import os
+import random
+
+TASKS = sorted(
+  os.path.splitext(os.path.basename(path))[0] for path in glob.glob("config/*.yaml")
+  if not os.path.basename(path).startswith("_")
+)
+DEFAULT_TASK = config.get("task", "enzyme_extremes")
+DEFAULT_PREFIX = config.get("prefix", "output")
+
+
+def device(task):
+  import yaml
+
+  with open(f"config/{task}.yaml") as handle:
+    return str((yaml.safe_load(handle) or {}).get("device", "cuda")).strip().lower()
+
+
+CPU_ONLY = {task for task in TASKS if device(task) == "cpu"}
+
+SUPER_SEED = 123456
+N_SEEDS = int(config.get("n_seeds", 5))
+rng = random.Random(SUPER_SEED)
+SEEDS = [rng.randint(0, 2 ** 31 - 1) for _ in range(N_SEEDS)]
+
+STRATEGIES = ["from_scratch", "continue", "closest", "meta"]
+
+ENV = (
+  "XLA_PYTHON_CLIENT_PREALLOCATE=false PYTHONUNBUFFERED=1 "
+  "CUDA_MPS_PIPE_DIRECTORY=$HOME/.mps "
+  "OMP_NUM_THREADS=3 OPENBLAS_NUM_THREADS=3 MKL_NUM_THREADS=3"
+)
+
+wildcard_constraints:
+  prefix=".+",
+  task="|".join(TASKS),
+  seed="|".join(str(seed) for seed in SEEDS),
+  strategy="|".join(STRATEGIES),
+
+
+def local_gpu(wildcards):
+  return 0 if wildcards.task in CPU_ONLY else 1
+
+
+def cpus_per_task(wildcards):
+  return 2 if wildcards.task in CPU_ONLY else 3
+
+
+rule all:
+  input:
+    expand(f"{DEFAULT_PREFIX}/{DEFAULT_TASK}/{{seed}}/comparison.txt", seed=SEEDS),
+    f"{DEFAULT_PREFIX}/{DEFAULT_TASK}/median.png",
+
+
+# THE DECLARED OUTPUT IS A MARKER, NOT THE TRAJECTORY. `bo.py` rewrites `results.json` after every
+# iteration and it always holds everything measured so far; `done.txt` is touched here only once the
+# run returns, i.e. once its budget pool has filled. Snakemake DELETES a rule's declared outputs
+# before running it, so making the trajectory the output meant a rescheduled run could have the file
+# its own resume needs cleared out from under it -- now the only thing at risk is a marker.
+#
+# It also makes invalidation a one-liner, which is the point: `rm done.txt` reopens a finished run at
+# the design it stopped on, so a campaign can be CONTINUED under a raised budget. `rm verified.txt`
+# does the same for the re-scoring, independently, which is what re-verifying a continued run needs.
+rule bo:
+  output:
+    touch("{prefix}/{task}/{seed}/{strategy}/done.txt"),
+  resources:
+    local_gpu=local_gpu,
+    cpus_per_task=cpus_per_task,
+  shell:
+    f"{ENV} python scripts/bo.py \"={{wildcards.task}}\" "
+    "output={wildcards.prefix}/{wildcards.task}/{wildcards.seed}/{wildcards.strategy} "
+    "seed={wildcards.seed} nn_init_strategy={wildcards.strategy}"
+
+
+rule verify:
+  input:
+    "{prefix}/{task}/{seed}/{strategy}/done.txt",
+  output:
+    touch("{prefix}/{task}/{seed}/{strategy}/verified.txt"),
+  resources:
+    local_gpu=local_gpu,
+    cpus_per_task=cpus_per_task,
+  shell:
+    f"{ENV} python scripts/verify_trajectory.py \"={{wildcards.task}}\" "
+    "trajectory={wildcards.prefix}/{wildcards.task}/{wildcards.seed}/{wildcards.strategy} "
+    "seed={wildcards.seed} progress=plain"
+
+
+rule compare:
+  input:
+    expand("{{prefix}}/{{task}}/{{seed}}/{strategy}/done.txt", strategy=STRATEGIES),
+    expand("{{prefix}}/{{task}}/{{seed}}/{strategy}/verified.txt", strategy=STRATEGIES),
+  output:
+    "{prefix}/{task}/{seed}/comparison.txt",
+    "{prefix}/{task}/{seed}/convergence_all.png",
+    "{prefix}/{task}/{seed}/convergence_all.json",
+  shell:
+    f"{ENV} python scripts/compare_strategies.py "
+    "--output {wildcards.prefix}/{wildcards.task}/{wildcards.seed}"
+
+
+rule median:
+  input:
+    expand("{{prefix}}/{{task}}/{seed}/{strategy}/done.txt", seed=SEEDS, strategy=STRATEGIES),
+    expand("{{prefix}}/{{task}}/{seed}/{strategy}/verified.txt", seed=SEEDS, strategy=STRATEGIES),
+  output:
+    "{prefix}/{task}/median.png",
+    "{prefix}/{task}/median.json",
+  params:
+    runs=lambda wildcards: " ".join(f"{wildcards.prefix}/{wildcards.task}/{seed}" for seed in SEEDS),
+  shell:
+    f"{ENV} python scripts/median_convergence.py --runs {{params.runs}} "
+    "--output {wildcards.prefix}/{wildcards.task}/median.png"
+
+
+rule bo_all:
+  input:
+    expand(f"{DEFAULT_PREFIX}/{DEFAULT_TASK}/{{seed}}/{{strategy}}/done.txt", seed=SEEDS, strategy=STRATEGIES),
+
+
+rule verify_all:
+  input:
+    expand(f"{DEFAULT_PREFIX}/{DEFAULT_TASK}/{{seed}}/{{strategy}}/verified.txt", seed=SEEDS, strategy=STRATEGIES),

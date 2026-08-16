@@ -41,7 +41,7 @@ device: cuda
 # Network (regressor) optimizer.
 training:
   optimizer:
-    adamw:
+    adamaxw:
       learning_rate: 2.0e-4
       b1: 0.9
       b2: 0.999

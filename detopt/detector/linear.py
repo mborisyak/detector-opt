@@ -6,24 +6,26 @@ protocol, the tests) can be exercised end to end without waiting on a simulator.
 having rather than a random-number stub is that its answer is KNOWN IN CLOSED FORM, so a driver that
 finds the wrong optimum on it is wrong, not unlucky.
 
-* **design** -- ``n_probes`` probe POSITIONS ``x_i`` in ``[-1, 1]``. Nothing else.
-* **event** -- one linear response drawn per event: ``w ~ N(0, 1)`` (slope), ``b ~ N(0, 1)``
-  (intercept). It is read out at each probe as ``y_i = w x_i + b + eps_i``, ``eps_i ~ N(0, sigma^2)``
+* **design** -- ``n_probes`` probe POSITIONS ``x_i`` in ``[-1, 1]^d``, ``d = n_dimensions``.
+* **event** -- one linear response drawn per event: ``w ~ N(0, I_d)`` (slope vector), ``b ~ N(0, 1)``
+  (intercept). It is read out at each probe as ``y_i = w . x_i + b + eps_i``, ``eps_i ~ N(0, sigma^2)``
   with ``sigma = noise`` (0.1 by default). The draw depends on ``event_index`` ALONE, so the same
   response is re-measured under every design (common random numbers) and no design can move its own
   label.
-* **target** -- ``(w, b)``. Already standard normal, so the loss needs no rescaling and reads on a
-  fixed absolute scale.
-* **loss** -- mean squared error over the two components. Predicting the prior mean scores 1.0
-  exactly, which is the no-information level.
+* **target** -- ``(w, b)``, ``d + 1`` components. Already standard normal, so the loss needs no
+  rescaling and reads on a fixed absolute scale.
+* **loss** -- mean squared error over the ``d + 1`` components. Predicting the prior mean scores 1.0
+  exactly, which is the no-information level, at every ``d``.
 
 THE OPTIMUM, and why it is a design problem at all
 --------------------------------------------------
-With ``X`` the ``(n_probes, 2)`` matrix of rows ``(x_i, 1)``, the posterior covariance of ``(w, b)``
-under the standard-normal prior is ``Sigma = (X^T X / sigma^2 + I)^-1`` and the achievable loss is
-``tr(Sigma) / 2`` -- a Bayes risk, so it is what a perfect regressor reaches and the network's floor.
-For two probes ``det(X^T X) = (x_1 - x_2)^2``, so the information is driven ENTIRELY by how far apart
-the probes are: coincident probes measure ``w + b`` twice and never separate the two coefficients.
+With ``X`` the ``(n_probes, d + 1)`` matrix of rows ``(x_i, 1)``, the posterior covariance of
+``(w, b)`` under the standard-normal prior is ``Sigma = (X^T X / sigma^2 + I)^-1`` and the achievable
+loss is ``tr(Sigma) / (d + 1)`` -- a Bayes risk, so it is what a perfect regressor reaches and the
+network's floor. At ``d = 1`` with two probes ``det(X^T X) = (x_1 - x_2)^2``, so the information is
+driven ENTIRELY by how far apart the probes are: coincident probes measure ``w + b`` twice and never
+separate the two coefficients. At ``n_probes <= d`` the design is RANK DEFICIENT by construction and
+the unmeasured directions sit at their prior variance.
 
 At ``sigma = 0.1`` and two probes that gives 0.00498 at the corners ``{-1, +1}`` against 0.501 with
 both probes together -- a hundredfold span with the optimum on the boundary of the box, in BOTH
@@ -34,6 +36,7 @@ exchangeable kernel should see them as one point).
 found instead of asserting that it found something.
 """
 
+import collections
 from typing import NamedTuple
 
 import jax
@@ -47,8 +50,22 @@ __all__ = ['LinearDetector', 'LinearDesign', 'LinearEvent', 'LinearTarget', 'Lin
 
 
 class LinearDesign(NamedTuple):
-  """Where the response is read out: one position per probe, NOMINAL (i.e. in ``[-1, 1]``)."""
+  """Where the response is read out, in ONE dimension: one position per probe, NOMINAL."""
   probe: jax.Array  # (n_probes,)
+
+
+def design_type(n_dimensions):
+  """The design record for ``n_dimensions``: ONE FIELD PER AXIS, each holding that axis' coordinate
+    for every probe.
+
+    Not one ``(n_probes, d)`` field, because `detopt.bo._exchangeable_blocks` builds one exchangeable
+    block per design field whose width matches the group size -- so d fields of width ``n_probes`` are
+    what let the invariant kernel permute PROBES (the design is a set of probes) rather than
+    coordinates. It is the enzyme batch's layout, where `enzyme_fraction` and `temperature` are two
+    blocks permuted together. At d = 1 it is :class:`LinearDesign` unchanged."""
+  if n_dimensions == 1:
+    return LinearDesign
+  return collections.namedtuple("LinearDesignND", [f"probe_{i}" for i in range(n_dimensions)])
 
 
 class LinearEvent(NamedTuple):
@@ -57,13 +74,13 @@ class LinearEvent(NamedTuple):
 
 
 class LinearTarget(NamedTuple):
-  """What the regressor predicts: the drawn slope and intercept."""
-  coefficients: jax.Array  # (2,) == (w, b)
+  """What the regressor predicts: the drawn slope vector and intercept."""
+  coefficients: jax.Array  # (n_dimensions + 1,) == (w, b)
 
 
 class LinearGroundTruth(NamedTuple):
   """The drawn response itself (== conditioning). The target is the whole of it here."""
-  coefficients: jax.Array  # (2,) == (w, b)
+  coefficients: jax.Array  # (n_dimensions + 1,) == (w, b)
 
 
 class LinearDetector(Detector):
@@ -73,12 +90,17 @@ class LinearDetector(Detector):
   read-out noise and the probe box.
   """
 
-  def __init__(self, *, n_probes: int = 2, noise: float = 0.1, probe_bounds: tuple = (-1.0, 1.0)):
+  def __init__(self, *, n_probes: int = 2, n_dimensions: int = 1, noise: float = 0.1,
+               probe_bounds: tuple = (-1.0, 1.0)):
     self.n_probes = int(n_probes)
+    self.n_dimensions = int(n_dimensions)
     self.noise = float(noise)
     self.probe_bounds = (float(probe_bounds[0]), float(probe_bounds[1]))
     if self.n_probes < 1:
       raise ValueError(f'n_probes must be at least 1, got {n_probes}')
+    if self.n_dimensions < 1:
+      raise ValueError(f'n_dimensions must be at least 1, got {n_dimensions}')
+    self._design_type = design_type(self.n_dimensions)
     if not self.noise > 0.0:
       raise ValueError(f'noise is a standard deviation and must be strictly positive, got {noise}')
     if not self.probe_bounds[0] < self.probe_bounds[1]:
@@ -92,22 +114,28 @@ class LinearDetector(Detector):
     return LinearEvent(response=jax.ShapeDtypeStruct((self.n_probes, ), np.float32))
 
   def target_spec(self):
-    return LinearTarget(coefficients=jax.ShapeDtypeStruct((2, ), np.float32))
+    return LinearTarget(coefficients=jax.ShapeDtypeStruct((self.n_dimensions + 1, ), np.float32))
 
   def ground_truth_spec(self):
-    return LinearGroundTruth(coefficients=jax.ShapeDtypeStruct((2, ), np.float32))
+    return LinearGroundTruth(coefficients=jax.ShapeDtypeStruct((self.n_dimensions + 1, ), np.float32))
 
   def design_shape(self):
-    return (self.n_probes, )
+    return (self.n_dimensions, self.n_probes)  # field-major: one field per axis, `n_probes` wide
 
   def design_spec(self):
-    return LinearDesign(probe=jax.ShapeDtypeStruct((self.n_probes, ), np.float32))
+    leaf = jax.ShapeDtypeStruct((self.n_probes, ), np.float32)
+    return self._design_type(*([leaf] * self.n_dimensions))
 
   def design_bounds(self):
-    return {'probe': self.probe_bounds}
+    return {name: self.probe_bounds for name in self._design_type._fields}
+
+  def _probe_positions(self, flat):
+    """Flat design (..., d * n_probes), field-major, -> probe positions (..., n_probes, d)."""
+    axes = jnp.reshape(flat, flat.shape[:-1] + (self.n_dimensions, self.n_probes))
+    return jnp.swapaxes(axes, -1, -2)
 
   def combined_event_shape(self):
-    return (self.n_probes, 2)  # element == probe; its features are its own reading and its position
+    return (self.n_probes, 1 + self.n_dimensions)  # element == probe: its reading and its position
 
   def size(self):
     return None  # an analytic source: every index is a fresh response
@@ -134,10 +162,12 @@ class LinearDetector(Detector):
     ``[0, 1]``. ``mask`` is unused -- every probe of the design is real (the element axis is the
     design's, not a hit count)."""
     design_scaled = jnp.asarray(design_scaled, jnp.float32)
-    if design_scaled.ndim == 1:  # one design for the whole event batch
-      design_scaled = jnp.broadcast_to(design_scaled[None, :], event.response.shape[:-1] + design_scaled.shape)
-    scale = float(np.hypot(max(abs(self.probe_bounds[0]), abs(self.probe_bounds[1])), 1.0))
-    return jnp.stack([event.response / scale, design_scaled], axis=-1)
+    positions = self._probe_positions(jnp.reshape(design_scaled, design_scaled.shape[:-1] + (-1, )))
+    if positions.ndim == 2:  # one design for the whole event batch
+      positions = jnp.broadcast_to(positions, event.response.shape[:-1] + positions.shape)
+    edge = max(abs(self.probe_bounds[0]), abs(self.probe_bounds[1]))
+    scale = float(np.sqrt(self.n_dimensions * edge**2 + 1.0))
+    return jnp.concatenate([(event.response / scale)[..., None], positions], axis=-1)
 
   def element_mask(self, event, mask):
     return mask  # element == probe
@@ -161,20 +191,21 @@ class LinearDetector(Detector):
     return 'MSE (slope, intercept; prior N(0, 1))'
 
   def metric_labels(self):
-    return ('loss', 'slope', 'intercept')
+    return ('loss', ) + tuple(f'slope_{i}' for i in range(self.n_dimensions)) + ('intercept', )
 
   def loss(self, predicted, target):
     return jnp.mean(jnp.square(predicted - target), axis=-1)
 
   def metric(self, predicted, target):
     squared = jnp.square(predicted - target)
-    return {'loss': jnp.mean(squared, axis=-1), 'slope': squared[..., 0], 'intercept': squared[..., 1]}
+    metrics = {'loss': jnp.mean(squared, axis=-1), 'intercept': squared[..., self.n_dimensions]}
+    for i in range(self.n_dimensions):
+      metrics[f'slope_{i}'] = squared[..., i]
+    return metrics
 
   def metric_real_rmse(self, metric_means):
-    return {
-      'slope': (float(np.sqrt(metric_means['slope'])), 'prior sd'),
-      'intercept': (float(np.sqrt(metric_means['intercept'])), 'prior sd')
-    }
+    named = [f'slope_{i}' for i in range(self.n_dimensions)] + ['intercept']
+    return {name: (float(np.sqrt(metric_means[name])), 'prior sd') for name in named}
 
   # ------------------------------------------------------------------ #
   # The closed-form answer
@@ -187,10 +218,11 @@ class LinearDetector(Detector):
     is the floor the network is trying to reach -- not an approximation to it. ``design`` is NOMINAL
     (a ``LinearDesign``, a config mapping or a flat array), matching :meth:`__call__`.
     """
-    probe = np.asarray(self.flatten_design(design), np.float64).reshape(-1)
-    rows = np.stack([probe, np.ones_like(probe)], axis=-1)  # (n_probes, 2)
-    precision = rows.T @ rows / self.noise**2 + np.eye(2)
-    return float(np.trace(np.linalg.inv(precision)) / 2.0)
+    flat = np.asarray(self.flatten_design(design), np.float64).reshape(-1)
+    probe = flat.reshape(self.n_dimensions, self.n_probes).T
+    rows = np.concatenate([probe, np.ones((self.n_probes, 1), np.float64)], axis=-1)
+    precision = rows.T @ rows / self.noise**2 + np.eye(self.n_dimensions + 1)
+    return float(np.trace(np.linalg.inv(precision)) / (self.n_dimensions + 1))
 
   # ------------------------------------------------------------------ #
   # Event generation
@@ -202,8 +234,8 @@ class LinearDetector(Detector):
     the target is a property of the event only."""
     event_index = np.asarray(event_index, np.int64)
     n = event_index.shape[0]
-    width = self.n_probes
-    probe = jnp.broadcast_to(jnp.reshape(self.flatten_design(design), (-1, width)), (n, width))
+    flat = jnp.reshape(jnp.asarray(self.flatten_design(design), jnp.float32), (-1, self.design_dim()))
+    probe = jnp.broadcast_to(self._probe_positions(flat), (n, self.n_probes, self.n_dimensions))
     response, coefficients = self._generate(probe, jnp.asarray(event_index, jnp.int32))
     mask = jnp.ones((n, self.n_probes), jnp.int32)
     return (
@@ -212,9 +244,9 @@ class LinearDetector(Detector):
     )
 
   def _event(self, probe, event_index):
-    """One event: draw ``(w, b)`` and read the line out at every probe. ``probe`` is ``(n_probes,)``;
-    every draw uses ``event_index`` only."""
+    """One event: draw ``(w, b)`` and read the plane out at every probe. ``probe`` is
+    ``(n_probes, n_dimensions)``; every draw uses ``event_index`` only."""
     key_line, key_noise = jax.random.split(jax.random.PRNGKey(event_index), 2)
-    coefficients = jax.random.normal(key_line, (2, ), jnp.float32)
-    clean = coefficients[0] * probe + coefficients[1]
-    return clean + self.noise * jax.random.normal(key_noise, probe.shape, jnp.float32), coefficients
+    coefficients = jax.random.normal(key_line, (self.n_dimensions + 1, ), jnp.float32)
+    clean = probe @ coefficients[:self.n_dimensions] + coefficients[self.n_dimensions]
+    return clean + self.noise * jax.random.normal(key_noise, clean.shape, jnp.float32), coefficients

@@ -65,58 +65,52 @@ def bo(output, seed: int, force: bool = False, **config):
     if nn_init_strategy not in VALID_INIT_STRATEGIES:
         raise ValueError(f"nn_init_strategy {nn_init_strategy!r} not in {VALID_INIT_STRATEGIES}")
 
-    # TWO FILES, AND `results.json` MEANS FINISHED. A run in progress writes `partial.json`; only a
-    # run whose budget pool filled writes `results.json`, and `partial.json` is removed at that
-    # moment. So the mere EXISTENCE of `results.json` is the completion flag, and no consumer -- or
-    # build system -- ever sees a half-written trajectory under the name it asks for. Snakemake in
-    # particular declares `results.json` as this rule's output: a killed run leaves that output
-    # absent, so the rule is simply rescheduled and `bo.py` resumes from `partial.json`, instead of
-    # the run being flagged incomplete and cleared by DELETING the very file the resume needs.
+    # ONE TRAJECTORY FILE, AND COMPLETION IS A MARKER BESIDE IT. `results.json` is rewritten after
+    # every iteration and always holds everything measured so far; the workflow touches `done.txt`
+    # once the run's budget pool has filled, and `done.txt` -- not `results.json` -- is the rule's
+    # declared output. Two consequences, and both are the reason for the change:
     #
-    # The `completed` field inside the file is kept for readers written against the old single-file
-    # layout, where >= 90% of the budget spent was the only way to infer completion.
+    #   * NOTHING DELETES THE TRAJECTORY. Snakemake removes a rule's declared outputs before running
+    #     it, so while `results.json` was the output a rescheduled run could have the very file its
+    #     resume needs cleared out from under it. Now only `done.txt` is at risk, and losing that
+    #     costs a marker.
+    #   * INVALIDATING A FINISHED RUN IS `rm done.txt`. The run reopens at the design it stopped on
+    #     and keeps going -- which is exactly what continuing a campaign under a RAISED budget needs.
+    #     Under the old scheme the same act meant either starting over or hand-editing file names.
+    #
+    # A run whose budget is unchanged reopens, finds its pool already full, and finishes immediately
+    # having added nothing, so re-running is idempotent rather than destructive.
+    #
+    # `partial.json` is the OLD name for the in-flight trajectory. It is still READ, so a run
+    # interrupted under the previous scheme resumes rather than being lost, and it is removed once
+    # `results.json` has been written in its place.
     results_path = os.path.join(output, "results.json")
     partial_path = os.path.join(output, "partial.json")
     budget_configured = int(config["training"]["budget"])
     resume = None
+    prior_path = None
     if force:
-        # A forced run starts over: leave no partial for the resume path to pick up.
-        if os.path.exists(partial_path):
-            os.remove(partial_path)
-    elif os.path.exists(results_path) and json.load(open(results_path)).get("completed") is False:
-        # AN OLD-SCHEME PARTIAL. Before the split, an unfinished run wrote `results.json` with
-        # `completed: false`; now the FILENAME carries that, so such a file would be mistaken for a
-        # finished run and silently skipped. Treat it as the partial it is -- which also means a run
-        # interrupted under the old code resumes rather than being lost.
-        with open(results_path) as f:
-            prior = json.load(f)
-        used = int(prior.get("detector_calls_used", 0))
-        print(f"[migrate] {results_path}: written by the pre-`partial.json` code and NOT complete "
-              f"({used}/{budget_configured} calls) -- reading it as a partial.")
-        resume = detopt.utils.io.complete_results(prior.get("results", []))
-        if detopt.utils.io.restore_path(os.path.join(output, "optimizer.npz")) is None:
-            print(f"[warning] no state beside it -- restarting from scratch.")
-            resume = None
+        # A forced run starts over: leave nothing for the resume path to pick up.
+        for path in (results_path, partial_path):
+            if os.path.exists(path):
+                os.remove(path)
     elif os.path.exists(results_path):
-        with open(results_path) as f:
-            prior = json.load(f)
-        used = int(prior.get("detector_calls_used", 0))
-        print(
-            f"[skip] {results_path}: run already completed "
-            f"({prior.get('n_iterations_completed', 0)} iterations, best={prior.get('best_loss', float('nan')):.5f}, "
-            f"{used}/{budget_configured} detector calls). Pass --force (or delete results.json) to re-run."
-        )
-        return prior.get("best_loss"), prior.get("best_design"), prior.get("results")
+        prior_path = results_path
     elif os.path.exists(partial_path):
-        with open(partial_path) as f:
+        prior_path = partial_path
+
+    if prior_path is not None:
+        with open(prior_path) as f:
             prior = json.load(f)
         used = int(prior.get("detector_calls_used", 0))
-        # Only the COMPLETE rows resume: the row the run stopped on records a design that was never
+        # Only the COMPLETE rows resume: the row a run stopped on records a design that was never
         # scored, and it is re-proposed rather than re-read.
         resume = detopt.utils.io.complete_results(prior.get("results", []))
+        state = "complete" if prior.get("completed") is True else "in flight"
+        print(f"[resume] {prior_path}: {len(resume)} scored designs, {used}/{budget_configured} detector "
+              f"calls, previously {state}.")
         if detopt.utils.io.restore_path(os.path.join(output, "optimizer.npz")) is None:
-            print(f"[warning] {partial_path}: previous run is INCOMPLETE ({used}/{budget_configured} detector "
-                  f"calls) and left no state to resume from -- restarting from scratch.")
+            print(f"[warning] no committed state beside it -- restarting from scratch.")
             resume = None
 
     os.makedirs(output, exist_ok=True)
@@ -174,8 +168,12 @@ def bo(output, seed: int, force: bool = False, **config):
     optimizer_state_path = os.path.join(output, "optimizer.npz")
     trainer_state_path = os.path.join(output, "trainer.npz")
 
-    proposed_scaled = []  # row-aligned with trained_params (warm-start)
-    trained_params = []
+    # One entry per COMPLETED iteration: the design that iteration proposed, in the scaled cube. It is
+    # the warm-start index -- `closest` measures distances in it and the row it picks IS the design
+    # number, so the network for that row is read from `checkpoints/design_<row>`. Historical networks
+    # are never held in memory: the checkpoint is the one copy, and it is the copy that survives an
+    # interruption, so this list is restored on resume and warm starts keep working across one.
+    proposed_scaled = []
     results = []
     best_loss, best_design = np.inf, None
 
@@ -217,20 +215,22 @@ def bo(output, seed: int, force: bool = False, **config):
         # REPLAY, do not re-derive: the iteration seed of step k is the k-th spawn of this branch, so
         # skipping k spawns puts the resumed run on exactly the stream it would have been on.
         iteration_seq.spawn(start_iteration)
-        # The per-design networks themselves are NOT kept (they are a design's private result, not run
-        # state), so the warm-start strategies have no history to start from on the first resumed
-        # design. It trains cold; every later one warm-starts normally.
-        if nn_init_strategy in ("continue", "closest"):
-            print(f"[resume] {nn_init_strategy}: no stored per-design networks, so iteration "
-                  f"{start_iteration} starts cold; later iterations warm-start as usual.")
         print(f"[resume] {output}: continuing at iteration {start_iteration} "
               f"({trainer.train_pool.current + trainer.val_pool.current}/{budget} detector calls spent, "
               f"best={best_loss:.5f})")
 
     def _save_results(n_completed, completed):
-        """Dump the trajectory: to ``partial.json`` while the run is in flight, to ``results.json``
-        once its budget pool has filled -- and then remove the partial, so exactly one of the two
-        exists and its NAME says which.
+        """Dump the trajectory to ``results.json``, in flight and at the end alike.
+
+        ONE FILE, AND COMPLETION IS A SEPARATE MARKER. `results.json` is written after every
+        iteration and always holds everything measured so far; `done.txt` is touched by the workflow
+        only once the run's budget pool has filled. The file name no longer carries the completion
+        signal, and that is the point: `results.json` is never a workflow OUTPUT, so nothing deletes
+        it when a rule is rescheduled, and a resumed run always has the full trajectory to read back.
+        INVALIDATING A FINISHED RUN IS THEN `rm done.txt` -- the run reopens exactly where it stopped
+        instead of starting over, which is what continuing a campaign under a raised budget needs.
+        The `completed` field inside the file records the same fact for readers that only have the
+        JSON.
 
         ONLY COMPLETED ITERATIONS ARE STORED. Every entry has a real ``loss`` and ``spent``, so a
         consumer can do arithmetic on the array without filtering it first, and the FILENAME is the
@@ -244,22 +244,22 @@ def bo(output, seed: int, force: bool = False, **config):
         ``int(None)``. ``detopt.utils.io.complete_results`` remains, and readers still go through it,
         only because files written under that scheme are already on disk.
         """
-        with open(results_path if completed else partial_path, "w") as f:
-            json.dump(
-                {
-                    "results": results,
-                    "best_loss": float(best_loss),
-                    "best_design": best_design,
-                    "n_iterations_completed": n_completed,
-                    "detector_calls_used": int(trainer.train_pool.current + trainer.val_pool.current),
-                    "method": "JAX-GP+EI",
-                    "completed": completed,
-                },
-                f,
-                indent=2,
-                default=float,
-            )
-        if completed and os.path.exists(partial_path):
+        payload = {
+            "results": results,
+            "best_loss": float(best_loss),
+            "best_design": best_design,
+            "n_iterations_completed": n_completed,
+            "detector_calls_used": int(trainer.train_pool.current + trainer.val_pool.current),
+            "method": "JAX-GP+EI",
+            "completed": completed,
+        }
+        staged = results_path + ".new"
+        with open(staged, "w") as f:
+            json.dump(payload, f, indent=2, default=float)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(staged, results_path)
+        if os.path.exists(partial_path):
             os.remove(partial_path)
 
     print(
@@ -295,16 +295,21 @@ def bo(output, seed: int, force: bool = False, **config):
         # uniform across each range instead of stretched near the bounds.
         # Warm-start applies only to the per-design DesignTrainer strategies; the
         # "meta" ContinualTrainer carries its own persistent network.
+        # THE NETWORK IS READ FROM THAT DESIGN'S CHECKPOINT, never from a list kept here. The driver
+        # holds no historical parameters at all: the checkpoint written at convergence is the one copy
+        # and it is on disk, so the warm-start pool is whatever the run has MEASURED rather than
+        # whatever this process happens to remember -- and a resumed run warm-starts from designs
+        # scored before the interruption exactly as an uninterrupted one does.
         init_params = None
         warm_from = None
-        if len(trained_params) > 0 and nn_init_strategy in ("continue", "closest"):
+        if len(proposed_scaled) > 0 and nn_init_strategy in ("continue", "closest"):
             if nn_init_strategy == "continue":
-                warm_from = len(trained_params) - 1
+                warm_from = len(proposed_scaled) - 1
             else:  # closest
                 dists = np.linalg.norm(np.asarray(proposed_scaled) - x_prop[None, :], axis=1)
                 warm_from = int(np.argmin(dists))
                 print(f"  [warm-start] closest = iter {warm_from} (dist={float(dists[warm_from]):.3f})")
-            init_params = trained_params[warm_from]
+            init_params = trainer.restore_design_parameters(warm_from)
 
         used = trainer.train_pool.current + trainer.val_pool.current
         print(f"[iter {i+1}] training... ({budget - used} detector calls left)")
@@ -331,7 +336,6 @@ def bo(output, seed: int, force: bool = False, **config):
 
         bo_opt.append(x_prop, loss, noise=result.objective_std)
         proposed_scaled.append(x_prop)
-        trained_params.append(result.params)
 
         improved = loss < best_loss
         if improved:

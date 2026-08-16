@@ -1,0 +1,18 @@
+# The `linear` detector at the operating point the d>1 profile selected: 4 dimensions, 5 probes,
+# sigma 0.7. Design is 20-dimensional -- one field per axis, each 5 wide, so the invariant kernel
+# permutes PROBES.
+#
+# SELECTED by `scripts/linear_exact_bo.py` over {(3,4), (4,5)} x sigma {0.3, 0.5, 0.7, 1.0}, on the
+# pre-registered rule with P(loss@2n < loss@n) > 0.75 replacing the per-seed count of condition (b).
+# At this cell the 10 -> 20 pair passes (a) 5/5, (b) P = 1.00 on 5 seeds and (c) 5/5, and FAILS (d) by
+# 1.17x. Landscape (exact): ceiling 0.817851, optimum 0.097632, median random design 0.387998.
+#
+# ⚠️ THE OPTIMUM IS A CORNER DESIGN, in all 32 profiled cells at every sigma, and the exact-scorer BO
+# incumbents end with 75-90% of their coordinates pinned to +-1. `docs/benchmark-acceptance.md` 1.1
+# names that as the gate's failure mode: the box IS the answer. This config is an OPERATING POINT, not
+# a passed gate, and nothing measured with it may be reported as one.
+linear:
+  n_probes: 5
+  n_dimensions: 4
+  noise: 0.7
+  probe_bounds: [-1.0, 1.0]

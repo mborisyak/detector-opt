@@ -35,10 +35,18 @@ class ContinualTrainer(_DesignBase):
     Same shared budget pools, design-conditioned features, and convergence
     procedure as :class:`DesignTrainer`; two things differ:
 
-    * **Persistent network** -- params, non-param state and optimiser state are
-      kept on the instance and carried from one :meth:`train` call to the next
-      (the network is created once, never re-initialised per design; warm-start
-      arguments are ignored).
+    * **Persistent network** -- params and non-param state are kept on the
+      instance and carried from one :meth:`train` call to the next (the network
+      is created once, never re-initialised per design; warm-start arguments are
+      ignored). The OPTIMISER IS RESTARTED AT EVERY DESIGN BOUNDARY: what is
+      continued is the network, not Adam's moment estimates, which are a
+      property of the window just finished rather than of what has been learned.
+      Within a design the moments are likewise rebuilt at every ``param_mix``
+      rewind (``design.py``), for the same reason.
+
+      That makes the carried state COMPLETE -- params and buffers are all there
+      is -- so :meth:`_carried_state` persists everything a design boundary
+      needs and a resumed run is EXACT, not approximate.
     * **Replay sampling** -- each minibatch is half from the current design's
       window ``[w0, w0 + count)`` and half drawn uniformly from all past
       iterations' data ``[0, w0)``. The first design (``w0 == 0``, no history)
@@ -67,26 +75,31 @@ class ContinualTrainer(_DesignBase):
         # start). Built eagerly here -- never lazily on the first train() call -- so no jax array is
         # cached behind a None. _persist_network writes the continued net back after each design.
         _, params, state = self._build_regressor(self.seed)
-        opt_state = self.optimizer.init(params)
         d = self.device
-        self._running = (jax.device_put(params, d), jax.device_put(state, d), jax.device_put(opt_state, d))
+        self._running = (jax.device_put(params, d), jax.device_put(state, d))
 
     def _init_design_network(self, init_seq, init_params):
-        # The persistent net is the network for every design; warm-start args are ignored.
-        return self._running
+        """The persistent network, with a FRESH optimiser state. Warm-start arguments are ignored --
+        the continual strategy IS the warm start. See the class docstring for why the moments are not
+        among the things carried."""
+        params, state = self._running
+        return params, state, self.optimizer.init(params)
 
     def _persist_network(self, params, state, opt_state):
-        self._running = (params, state, opt_state)
+        """Keep the trained network for the next design. The optimiser state is DISCARDED here rather
+        than stored and ignored, so nothing on the instance can be mistaken for carried moments."""
+        self._running = (params, state)
 
     def _carried_state(self):
-        """The persistent network -- PARAMS AND BUFFER STATE, NOT THE OPTIMISER MOMENTS (user,
-        2026-08-14). The moments are re-initialised from the restored params on resume, so a resumed
-        continual run differs from an uninterrupted one by one design's worth of Adam warm-up on the
-        design that follows the restart. Say so rather than let it pass as an exact resume.
+        """The persistent network -- PARAMS AND BUFFER STATE, which is ALL that crosses a design
+        boundary (user, 2026-08-14; the optimiser restart of the class docstring is what makes that
+        true). A resumed continual run therefore starts the next design from exactly the state an
+        uninterrupted one would: same params, same buffers, and moments that both rebuild from
+        scratch.
 
         The buffer state holds TYPED PRNG KEYS, which have no numpy representation; they are stored as
         their raw key data and re-wrapped on load against the freshly built network's own dtypes."""
-        params, state, _ = self._running
+        params, state = self._running
         payload = {}
         for name, tree in (("param", params), ("buffer", state)):
             for i, leaf in enumerate(jax.tree.leaves(tree)):
@@ -94,13 +107,13 @@ class ContinualTrainer(_DesignBase):
         return payload
 
     def _load_carried_state(self, data):
-        params, state, _ = self._running
+        params, state = self._running
         restored = []
         for name, tree in (("param", params), ("buffer", state)):
             leaves, structure = jax.tree.flatten(tree)
             loaded = [_like(leaf, data[f"net_{name}_{i}"]) for i, leaf in enumerate(leaves)]
             restored.append(jax.device_put(jax.tree.unflatten(structure, loaded), self.device))
-        self._running = (restored[0], restored[1], self.optimizer.init(restored[0]))
+        self._running = (restored[0], restored[1])
 
     def _sample_indices(self, key, start, count):
         # Half of each member's batch from the current window [start, start+count),

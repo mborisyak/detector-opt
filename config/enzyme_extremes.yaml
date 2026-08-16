@@ -75,8 +75,8 @@ device: cuda
 plot_per_epoch: false
 
 training:
-  n0: 4096
-  n_increment: 2048
+  n0: 8192
+  n_increment: 4096
   batch: 256
   eval_batch: 2048
   warmup_epochs: 2
@@ -87,7 +87,7 @@ training:
   loss_precision: 1.0e-2
   param_mix: 0.25
   optimizer:
-    adamw:
+    adamaxw:
       learning_rate: 2.5e-4
       b1: 0.9
       b2: 0.999
