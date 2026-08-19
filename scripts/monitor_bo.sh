@@ -15,6 +15,12 @@
 # WHAT IT CHECKS, and why each one can fail independently:
 #
 #   REACHABLE   ssh answers at all. A preempted instance fails here.
+# ⚠️ THE PROCESS PATTERNS ARE SCOPED TO THIS CAMPAIGN'S PATH, because more than one campaign can be
+# running on the box at once. Unscoped patterns count every campaign's jobs and report them against
+# whichever one is being asked about -- which read as `bo=12` for a campaign that had no BO jobs left
+# at all. `gpujobs` stays deliberately GLOBAL: it is compared against the MPS client count, which is
+# a property of the box rather than of a campaign.
+#
 #   DRIVER      a snakemake process is alive. The disk is persistent and bo.py resumes from
 #               partial.json, so a preemption costs the design in flight -- but a dead DRIVER stops
 #               submitting new work while leaving every finished artefact in place, which looks
@@ -81,12 +87,39 @@ fi
 TASK=${1:-enzyme_extremes}
 PREFIX=${2:-output/cloud}
 HOST=${HOST:-bo}
+# WHICH CHECKOUT ON BO OWNS THIS CAMPAIGN. Two can coexist -- one carrying new code while an older
+# campaign finishes in the original -- and each drives its own output tree, so the remote root is a
+# parameter rather than a constant.
+REMOTE_ROOT=${REMOTE_ROOT:-detector-opt}
 LOCAL_ROOT=${LOCAL_ROOT:-/home/max/dev/detector-opt}
 MIRROR=${MIRROR:-$LOCAL_ROOT/$PREFIX}
 CAMPAIGN=$PREFIX/$TASK
 STATE=$MIRROR/.monitor-state
 LOG=$LOCAL_ROOT/logs/monitor-bo.log
 STAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+# ⚠️ STALLED NEEDS A MINIMUM INTERVAL, not just "nothing changed since last time". The slowest thing
+# a healthy campaign does is write one verification point, which takes of order 12 MINUTES, so any
+# beat closer together than that sees no change and would report a stall on a perfectly healthy box.
+# Two beats 48 s apart did exactly that. The bar is therefore elapsed TIME since the previous beat,
+# and a beat that arrives sooner cannot raise the alarm at all -- it just refreshes the state.
+STALL_AFTER=${STALL_AFTER:-1800}
+# ⚠️ `gpujobs` AND `clients` BOTH COME FROM THE SAME `nvidia-smi` PROCESS TABLE, and that is the only
+# way this comparison is meaningful. Counting jobs with `pgrep` instead compares two different
+# populations: a job launched through `bash -c ... timeout 800 python scripts/bo.py ...` puts that
+# path in the argv of the SHELL and of the `timeout` wrapper, neither of which ever opens a CUDA
+# context, so no bracket trick or `python` prefix can exclude them -- the string really is in their
+# command lines. It reported 4 "jobs" against 2 genuine `M+C` clients while both real processes were
+# correctly attached. Taken from the process table, `gpujobs` counts rows that hold a CUDA context
+# (minus the MPS server's own row) and `clients` counts the `M+C` subset of those rows, so a
+# difference means an actual bypass and nothing else.
+#
+# ⚠️ THE MPS CLIENT COUNT AND THE JOB COUNT ARE SAMPLED SEPARATELY, microseconds apart in the remote
+# probe, so a job that starts or exits between the two makes them disagree by one through no fault of
+# the campaign. Jobs turn over constantly at a phase boundary, so an exact comparison reports a
+# BYPASS that is not there -- it did, on a box where all 18 jobs were `M+C` with the pipe directory
+# set. The slack is what the race can produce; a REAL bypass is a job that never attaches at all, and
+# persists across beats rather than appearing for one.
+MPS_CLIENT_SLACK=${MPS_CLIENT_SLACK:-1}
 
 mkdir -p "$MIRROR" "$(dirname "$LOG")"
 
@@ -97,21 +130,25 @@ emit() {
 REMOTE=$(timeout 45 ssh -o BatchMode=yes -o ConnectTimeout=15 "$HOST" "
   set -u
   campaign=$CAMPAIGN
-  driver=\$(pgrep -f '[s]nakemake.*Snakefile.cloud' 2>/dev/null | wc -l)
-  boruns=\$(pgrep -f '[s]cripts/bo.py' 2>/dev/null | wc -l)
-  verifies=\$(pgrep -f '[s]cripts/verify_trajectory.py' 2>/dev/null | wc -l)
+  root=$REMOTE_ROOT
+  driver=\$(pgrep -f \"[s]nakemake.*\$campaign\" 2>/dev/null | wc -l)
+  boruns=\$(pgrep -f \"[s]cripts/bo.py.*\$campaign\" 2>/dev/null | wc -l)
+  verifies=\$(pgrep -f \"[s]cripts/verify_trajectory.py.*\$campaign\" 2>/dev/null | wc -l)
+  smi=\$(nvidia-smi 2>/dev/null | sed -n '/ PID /,\$p')
+  gpujobs=\$(printf '%s\\n' \"\$smi\" | grep -cE '^\\|+[ 0-9N/A]+[0-9]+ +(M\\+)?C ' | tr -d ' ')
+  gpujobs=\$(( gpujobs - \$(printf '%s\\n' \"\$smi\" | grep -c 'nvidia-cuda-mps-server') ))
   mps=0; [ -S \"\$HOME/.mps/control\" ] && mps=1
-  results=\$(find \$HOME/detector-opt/\$campaign -name results.json 2>/dev/null | wc -l)
-  verifications=\$(find \$HOME/detector-opt/\$campaign -name verification.png 2>/dev/null | wc -l)
-  comparisons=\$(find \$HOME/detector-opt/\$campaign -name comparison.txt 2>/dev/null | wc -l)
-  newest=\$(find \$HOME/detector-opt/\$campaign \\( -name 'partial.json' -o -name 'results.json' \
+  results=\$(find \$HOME/\$root/\$campaign -name results.json 2>/dev/null | wc -l)
+  verifications=\$(find \$HOME/\$root/\$campaign -name verification.png 2>/dev/null | wc -l)
+  comparisons=\$(find \$HOME/\$root/\$campaign -name comparison.txt 2>/dev/null | wc -l)
+  newest=\$(find \$HOME/\$root/\$campaign \\( -name 'partial.json' -o -name 'results.json' \
             -o -name 'verification.json' -o -name 'comparison.txt' -o -name 'median.json' \\) \
             -printf '%T@\n' 2>/dev/null | sort -n | tail -1)
   newest=\${newest:-0}
   gpu=\$(nvidia-smi --query-gpu=utilization.gpu,power.draw,memory.used --format=csv,noheader 2>/dev/null | tr -d ' ')
   clients=\$(nvidia-smi 2>/dev/null | grep -c 'M+C')
   up=\$(cut -d. -f1 /proc/uptime)
-  echo \"\$driver \$boruns \$verifies \$mps \$results \$verifications \$comparisons \${newest%.*} \$up \$gpu \$clients\"
+  echo \"\$driver \$boruns \$verifies \$gpujobs \$mps \$results \$verifications \$comparisons \${newest%.*} \$up \$gpu \$clients\"
 " 2>/dev/null)
 
 if [ -z "$REMOTE" ]; then
@@ -119,19 +156,22 @@ if [ -z "$REMOTE" ]; then
   exit 1
 fi
 
-read -r DRIVER BORUNS VERIFIES MPS RESULTS VERIFICATIONS COMPARISONS NEWEST UPTIME GPU CLIENTS <<< "$REMOTE"
+read -r DRIVER BORUNS VERIFIES GPUJOBS MPS RESULTS VERIFICATIONS COMPARISONS NEWEST UPTIME GPU CLIENTS <<< "$REMOTE"
 
 PREVIOUS_NEWEST=0
 PREVIOUS_UPTIME=0
+PREVIOUS_BEAT=0
 if [ -f "$STATE" ]; then
-  read -r PREVIOUS_NEWEST PREVIOUS_UPTIME < "$STATE" 2>/dev/null || true
+  read -r PREVIOUS_NEWEST PREVIOUS_UPTIME PREVIOUS_BEAT < "$STATE" 2>/dev/null || true
 fi
-printf '%s %s\n' "$NEWEST" "$UPTIME" > "$STATE"
+NOW=$(date +%s)
+SINCE=$(( NOW - ${PREVIOUS_BEAT:-0} ))
+printf '%s %s %s\n' "$NEWEST" "$UPTIME" "$NOW" > "$STATE"
 
 timeout 900 rsync -a --no-i-r --prune-empty-dirs \
   --exclude 'checkpoints/' \
   --include '*/' --include '*.json' --include '*.png' --exclude '*' \
-  "$HOST:detector-opt/$PREFIX/" "$MIRROR/" >/dev/null 2>&1
+  "$HOST:$REMOTE_ROOT/$PREFIX/" "$MIRROR/" >/dev/null 2>&1
 PULL=$?
 
 for finished in "$MIRROR/$TASK"/*/*/results.json; do
@@ -153,14 +193,15 @@ if [ "${MPS:-0}" -eq 0 ]; then
   [ "$STATUS" = "OK" ] && STATUS="NO_MPS"
   NOTES="$NOTES MPS control socket absent: concurrent jobs are TIME-SLICING."
 fi
-RUNNING=$(( ${BORUNS:-0} + ${VERIFIES:-0} ))
-if [ "${MPS:-0}" -eq 1 ] && [ "$RUNNING" -gt 0 ] && [ "${CLIENTS:-0}" -lt "$RUNNING" ]; then
+RUNNING=${GPUJOBS:-0}
+if [ "${MPS:-0}" -eq 1 ] && [ "$RUNNING" -gt 0 ] && [ "${CLIENTS:-0}" -lt $(( RUNNING - MPS_CLIENT_SLACK )) ]; then
   [ "$STATUS" = "OK" ] && STATUS="MPS_BYPASSED"
-  NOTES="$NOTES only $CLIENTS of $RUNNING GPU jobs show as MPS clients (Type M+C): the rest bypassed the server and are TIME-SLICING."
+  NOTES="$NOTES only $CLIENTS of $RUNNING GPU jobs show as MPS clients (Type M+C), beyond the $MPS_CLIENT_SLACK-job sampling skew: the rest bypassed the server and are TIME-SLICING."
 fi
-if [ "${NEWEST:-0}" -le "${PREVIOUS_NEWEST:-0}" ] && [ "${PREVIOUS_NEWEST:-0}" -gt 0 ]; then
+if [ "${NEWEST:-0}" -le "${PREVIOUS_NEWEST:-0}" ] && [ "${PREVIOUS_NEWEST:-0}" -gt 0 ] \
+   && [ "$SINCE" -ge "$STALL_AFTER" ]; then
   [ "$STATUS" = "OK" ] && STATUS="STALLED"
-  NOTES="$NOTES no output file advanced since the previous beat."
+  NOTES="$NOTES nothing advanced in the ${SINCE}s since the previous beat (bar ${STALL_AFTER}s)."
 fi
 if [ "$PULL" -ne 0 ]; then
   NOTES="$NOTES (rsync pull exited $PULL)"

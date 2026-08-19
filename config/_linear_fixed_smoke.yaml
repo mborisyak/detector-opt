@@ -1,0 +1,53 @@
+# SMOKE TEST ONLY for the fixed-data procedure (scripts/bo_fixed.py). Tiny budget, CPU.
+# Not a benchmark setting and not comparable to any growth-procedure run.
+detector: linear
+regressor:
+  set-regressor:
+    features:
+    - - 16
+      - 8
+    - - 8
+      - 16
+    n_models: 4
+device: cpu
+plot_per_epoch: 8
+training:
+  batch: 128
+  eval_batch: 4096
+  warmup_epochs: 2
+  patience: 16
+  budget: 65536
+  val_fraction: 0.25
+  loss_precision: 0.02
+  optimizer:
+    adamaxw:
+      learning_rate: 0.00025
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-08
+      weight_decay: 0.001
+  n_per_design: 8192
+bo:
+  n_init: 5
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds:
+    - -2.0
+    - 1.0
+    log_amplitude_prior_bounds:
+    - -6.0
+    - 1.5
+    kernel:
+      normalised-invariant-rbf:
+        exchangeable: 2
+  ei:
+    n_restarts: 32
+    n_steps: 100
+verify:
+  n_points: 10
+  epochs: 200
+  val_every_epochs: 10
+  budget: null
+  batch: null

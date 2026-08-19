@@ -1,0 +1,175 @@
+# CAMPAIGN CONFIG -- `linear` at (d=4, n_probes=5) WITH A WORKING GROWTH SCHEDULE.
+#
+# It is `config/linear_d4n5.yaml` with the growth bug fixed, the read-out noise lowered, and the
+# budget, precision, network and batch resized to match. `iteration_limit`, `param_mix`, `patience`,
+# `warmup_epochs`, `val_fraction`, the optimiser and the whole `bo` block are untouched. Seven values
+# differ:
+#
+#   detector           linear_d4n5 -> linear_d4n5_growth   (noise 0.7 -> 0.5)
+#   regressor.features   [[64,32],[32,64]] -> [[32,24],[24,32]]   45460 -> 19316 params (0.42x),
+#                        both counted from the BUILT model
+#   training.n0             262144 ->    4096
+#   training.n_increment    262144 ->    2048
+#   training.batch              64 ->     128
+#   training.budget        8388608 ->  524288                (2^19)
+#   training.loss_precision 7.5e-3 ->  5.0e-3
+#
+# ⛔️ THE BUG THIS FIXES (docs/handoff-linear-campaign.md). In `linear_d4n5.yaml`,
+# `n0 = n_increment = iteration_limit = 262144`, so the FIRST growth round fills the entire
+# per-design cap and NO GROWTH IS POSSIBLE. Every design of the completed 5-seed campaign spent
+# exactly 349525 detector calls -- one distinct value across all 240 designs. With a fixed per-design
+# cost, equal design count IS equal budget, which structurally denies `meta` its only established
+# advantage (buying MORE designs per detector call). The arm comparison on that campaign is void
+# whatever it says, and that is why this re-run exists.
+#
+# WHY 4096/2048, which sits BETWEEN the two schedules the handoff discusses (user, 2026-08-17). The
+# 1024/512 of `linear_d4n5_grow.yaml` was rejected on its own header's objection, repeated by the
+# handoff: at its budget of 131072 the train pool is 98304, BELOW the 155641 a worst-case design
+# needs, so a hard design exhausts the pool and the run dies. That objection is about the BUDGET, not
+# the granularity: the granularity only sets how FINELY a design may stop, never how much pool exists.
+# At the 524288 budget here the pool is 393216, a 2.5x margin rather than that file's 0.6x, so the
+# finer grid is affordable where its was not.
+#
+# ⚠️ THE COST OF THE FINER GRID IS GROWTH ROUNDS, and the handoff records that the wall-clock effect
+# is UNMEASURED. Reaching the probe's three converged windows takes 10 / 18 / 22 rounds at 4096/2048,
+# against 2 / 4 / 5 at 8192/8192 and 46 / 78 / 94 at 1024/512. Each round re-trains from the
+# `param_mix` rewind. So this buys a stopping grid 4x finer than the conservative option -- which is
+# what lets a cheap design stop cheaply, and therefore what lets `meta` convert cheaper designs into
+# MORE designs, the entire point of fixing the growth bug -- and pays for it in rounds.
+#
+# THE SCHEDULE IS ANCHORED ON MEASURED WINDOWS: `scripts/probe_precision.py --n0 8192
+# --n-increment 8192` converged real designs at 24576, 40960 and 49152. Both 4096 and 2048 divide all
+# three exactly, so those windows remain reachable on the grid rather than being straddled.
+#
+# NOISE 0.5 AND `loss_precision` 5.0e-3 (user, 2026-08-17). See the detector config for why `noise`
+# has no provenance on this task either way. What matters here is the COUPLING the acceptance doc
+# insists on -- "noise sets `loss_precision`" -- so 7.5e-3 could not simply carry over: it was
+# MEASURED at noise 0.7 (10 designs x 2 seeds, max slack 0.00502, 1.5x headroom). Computed from the
+# closed form, dropping noise to 0.5 takes the optimum from 0.0976 to 0.0525, a level ratio of 0.537,
+# which would scale the measured bar to 0.00403. 5.0e-3 is set above that: looser in absolute terms
+# than the scaling implies, and 9.5% of the optimum level against 7.7% at the old setting. Looser
+# means designs converge on less data, which is what makes them cheap enough to be numerous at this
+# budget. It is a SCALED-AND-ROUNDED value, NOT a measured one; `scripts/probe_precision.py` is what
+# would settle it.
+#
+# WHY BUDGET 524288 (2^19). The measured windows above cost `window / (1 - val_fraction)` = 32768, 54613 and
+# 65536 detector calls, so 2^19 funds roughly 8-16 designs. ⚠️ THAT IS BELOW THE 20 the acceptance
+# criterion's 10->20 pair needs, and it is known before the run rather than discovered in it; the
+# budget is deliberately started small and RAISED IF NECESSARY (user, 2026-08-17), which the
+# results.json + done.txt resume semantics now make a one-line change rather than a re-run. The
+# looser 5.0e-3 bar and the 5461 floor both push the design count up relative to those probe windows,
+# which were measured at the tighter 7.5e-3 and at noise 0.7.
+#
+# ⚠️ TWO THINGS TO WATCH AT THIS BUDGET. The train pool is 393216, only 2.5x the 155641 a worst-case
+# design needs, so pool exhaustion is possible where it was not at 2^21. And `iteration_limit` 262144
+# is 0.67 of that pool, so ONE capped design would consume two thirds of a run. Neither is expected
+# -- the probe's designs converged at 24576-49152 -- but both are failure modes to recognise rather
+# than debug from scratch.
+#
+# ⚠️ `iteration_limit` STAYS AT 262144 and must. It is the per-design window CAP, and the worst-case
+# design needs 155641; anything lower risks designs that cannot converge. It is ALSO the epoch length
+# (`steps_per_epoch = iteration_limit // batch = 2048` at batch 128), so at a small window one epoch makes many
+# passes over that window -- the handoff's warning that small windows overfit fast. That is what
+# `loss_precision` and the train/val gap test exist to catch, and the probe converged at these very
+# windows, so the regime is measured rather than assumed.
+#
+# ⛔️ `bo.gp.log_lengthscale_prior_bounds` IS `[-2.0, 1.0]` AND IS NOT TO BE MOVED. sklearn reports the
+# GP fit pinned at the upper bound, so relaxing it would make BO converge faster and the acceptance
+# criterion EASIER to pass. That is exactly the NO TRICKS clause of docs/benchmark-acceptance.md.
+#
+# ⚠️ RUN AT FIVE SEEDS FIRST (user, 2026-08-17), and five CANNOT settle the arm question -- known in
+# advance, not to be discovered afterwards. The completed campaign had `from_scratch` ahead on 5/5
+# seeds with a mean advantage of 0.0329, but re-running one cell at the SAME seed moves `best@24`
+# with sd 0.0406 -- larger than the arm effect -- and a 5/5 sign test gives p = 0.0625, the strongest
+# five seeds can produce, which still misses. The handoff puts the power requirement at ~10 seeds.
+# Five is the first look; the seed generator is a prefix, so `--config n_seeds=10` later EXTENDS this
+# campaign with five more rather than replacing it, and the done.txt markers make the first five
+# skip.
+#
+# ⚠️ RUNS ARE NOT REPRODUCIBLE ON GPU. Same seed, same arm, same config: the `n_init` block agrees to
+# <= 7e-7, then proposals diverge at design 6 in all five seeds and `best@24` differs by up to 0.047.
+# Two runs at one seed are NOT a replication.
+
+#
+# 2026-08-18 -- regressor.dropconnect SET TO 0.0. MEASURED on `linear`, 72 crossed cells (2 arms x
+# 4 doses x 3 designs x 3 seeds, paired within design and seed, `bo`): dropconnect adds BIAS THAT THE
+# CRITERION CANNOT SEE. Held-out excess against the closed-form floor rises monotonically to +0.00479
+# at dose 0.2 -- 48% of the bar -- while `gap`, the only overfitting signal the exit test has, FALLS
+# (-0.00041), and the exit window is UNCHANGED (ratio 1.00 at every dose in both arms). The procedure
+# therefore buys no extra data in compensation and reports a worse number at the same price. `meta` is
+# hurt about half as much as `from_scratch` (+0.00262 against +0.00479 at 0.2), so replay is partly
+# REDUNDANT with dropconnect rather than protected from it.
+
+#
+# 2026-08-18 (later) -- dropconnect 0.05, NOT null. Reverted from the `null` set earlier the same day.
+#
+# TURNING IT OFF REMOVED THE TERMINATION MECHANISM FROM BOTH PROCEDURES, which the bias measurement
+# did not anticipate:
+#   growth  -- the gap gate `gap + err <= loss_precision` needs the gap held down; unregularised the
+#              config's own record says designs cap (later shown to be an artefact of a 131072 cap,
+#              but the cost is real: 278512 calls/design against ~98281, i.e. 2.8x).
+#   fixed   -- stops on the TRAIN-SETTLED test alone, so the only thing that can end a design is the
+#              training curve flattening. MEASURED: with dropconnect 0.1, 394 of 394 designs
+#              terminated, median 109 s, max 271 s. With dropconnect null, median 476 s, max 2919 s,
+#              and designs still running past 3500 epochs with validation rising since epoch 600.
+#
+# 0.05 RATHER THAN 0.1 because that is where the bias is negligible. MEASURED on `linear`, 72 crossed
+# cells, held-out excess against the closed-form floor, paired within (design, seed):
+#     dose    from_scratch   meta
+#     0.05      +0.00007    +0.00001
+#     0.10      +0.00110    +0.00050
+#     0.20      +0.00479    +0.00262
+# and this task's own earlier record puts 0.05 at -0.0004 on the objective, i.e. free. 0.05 therefore
+# buys termination at a bias two orders of magnitude below the dose that motivated turning it off.
+
+detector: linear_d4n5_growth
+
+regressor:
+  set-regressor:
+    features: [[32, 24], [24, 32]]
+    n_models: 4
+    dropconnect: 0.05
+device: cuda
+plot_per_epoch: 8
+
+training:
+  n0: 4096
+  n_increment: 2048
+  batch: 128
+  eval_batch: 1024
+  warmup_epochs: 2
+  patience: 16
+  budget: 524288
+  iteration_limit: 262144
+  val_fraction: 0.25
+  loss_precision: 5.0e-3
+  param_mix: 0.25
+  optimizer:
+    adamaxw:
+      learning_rate: 2.5e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-3
+
+bo:
+  n_init: 5
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds: [-2.0, 1.0]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+    kernel:
+      normalised-invariant-rbf:
+        exchangeable: 5
+  ei:
+    n_restarts: 32
+    n_steps: 100
+
+verify:
+  n_points: 10
+  epochs: 200
+  val_every_epochs: 10
+  budget: null
+  batch: null

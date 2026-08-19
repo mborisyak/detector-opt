@@ -1,0 +1,172 @@
+# MM campaign at loss_precision 5.0e-3, budget 2^19, 5 seeds.
+#
+# Detector unchanged: `enzyme_mm_sym_m3` (n_experiments 3, measurement_noise 0.05), the cell chosen by
+# the proxy screen -- P(best@20 < best@10) = 0.809 +/- 0.027 over 60 independent runs, PASS-STRICT.
+# Regressor, optimiser and BO block unchanged from `enzyme_mm_sym_m3.yaml`.
+#
+# ------------------------------------------------------------------------------------------------
+# 1. training.loss_precision: 5.0e-3, relaxed from 2.0e-3.
+#
+# 2. training.n0 = 2048 and training.n_increment = 1024 FOLLOW FROM THAT, they are not a guess.
+#
+#    This task's error term was MEASURED as `err = 0.307 / sqrt(window)`, reproduced at both 1.0e-3
+#    (window 172032 -> err 0.0008; window 192512 -> err 0.0007) and 2.0e-3 (window 36864 ->
+#    err 0.0016). `diff` is 0.0001-0.0002, i.e. negligible against the bar, so the window a design
+#    needs scales as 1 / bar^2 and moving 2.0e-3 -> 5.0e-3 shrinks every window by 6.25x.
+#
+#    Rescaling the 59 designs the 2.0e-3 campaign actually scored (output/campaign-mm):
+#
+#        window at 2.0e-3     min 20480   p10 32767   p50 53246   p90 135980   max 229363
+#        window at 5.0e-3     min  3277   p10  5243   p50  8519   p90  21757   max  36698
+#        spend  at 5.0e-3     min  4369   p10  6990   p50 11359   p90  29009   max  48931
+#
+#    Cross-check: the pure-`err` floor `(0.307 / 0.005)^2` is 3770, against the observed minimum of
+#    3277. The scaling holds.
+#
+#    n0 = 2048 sits BELOW the cheapest design's 3277, so no design overshoots on its first round --
+#    and at 2048 the error term alone is 0.0068, above the 0.005 bar, so EVERY design grows at least
+#    once and the schedule can never be degenerate. That degeneracy (n0 = n_increment =
+#    iteration_limit, every design costing the same, growth impossible) is exactly what voided the
+#    `linear` campaign's arm comparison, and it is the failure this line exists to prevent.
+#
+#    n_increment = 1024 is 12% of the median design's cost, matching the ~10% quantisation used
+#    elsewhere in this project. The median design converges in ~7 rounds, the worst in ~34. If fewer
+#    rounds are wanted at the cost of resolution, 2048 gives 4 and 18 rounds at 24% quantisation.
+#
+# 3. training.budget: 2^19 = 524288, RAISED FROM 2^18 (user, 2026-08-17) and the campaign restarted
+#    clean rather than extended -- a mid-flight extension builds a TWO-GENERATION event index
+#    (196608+65536 drawn twice) where a fresh 2^19 run draws one contiguous shuffled stream, so the
+#    two are not the same experiment and must not appear in one campaign.
+#
+#    ⚠️ THE `n -> 2n` CRITERION DOES NOT APPLY HERE. It is a SCREENING criterion for choosing the
+#    problem, and it was already settled on the proxy when this cell was picked
+#    (P(best@20 < best@10) = 0.809 +/- 0.027 over 60 runs, PASS-STRICT). The campaign's job is the
+#    ARM COMPARISON, so the design count matters only insofar as BO needs GP-driven proposals for the
+#    arms to be distinguishable at all -- with `n_init: 5`, a run of k designs gives k-5 of them.
+#
+#    At 2^18 the measured throughput gave ~14-15 designs, i.e. ~9 proposals. 2^19 roughly doubles
+#    that. The failure this guards against is the one `linear` demonstrated: runs that end short
+#    return their Sobol best, every arm reports the same number, and the comparison carries no
+#    information. The diagnostic to read is how many runs improved on their Sobol block at all.
+#
+# 4. training.iteration_limit: 65536, HELD FIXED when the budget doubled, so it is now budget/8 and
+#    no longer the parent's budget/4. ⚠️ THIS IS THE ONE JUDGEMENT CALL IN THIS FILE.
+#
+#    It is held because its justification is ABSOLUTE, not a ratio: 65536 already sits above the
+#    36698 the worst rescaled design needs, so as a per-design cap it binds on nothing, while as the
+#    EPOCH LENGTH it is the only thing keeping an epoch at 32 passes over a 2048-row window -- the
+#    regime `err = 0.307/sqrt(window)` was measured in. Following budget/4 to 131072 would double
+#    that to 64 passes and inflate `diff` at exactly the small windows this schedule depends on,
+#    which is the failure mode the paragraph below already warns about. The ratio's own purpose,
+#    stopping one design from eating the pool, is served strictly better at budget/8.
+#
+#    `iteration_limit` IS THE EPOCH LENGTH (`steps_per_epoch = iteration_limit // batch`), and
+#    `warmup_epochs`, `patience` and the convergence posterior are all written in epoch units.
+#    Keeping the parent's 524288 against a 2048-row window would make ONE EPOCH 256 PASSES over that
+#    window, which would inflate `diff` precisely at the small windows this whole schedule depends
+#    on -- and `diff` staying negligible is the assumption every number above rests on. At 65536 it
+#    is 32 passes, back in the regime where `err = 0.307/sqrt(window)` was measured. NOTE the pass
+#    count is set by `iteration_limit` ALONE -- an epoch covers `iteration_limit` samples whatever
+#    the batch is -- so batch 128 (512 steps/epoch) changes gradient noise, not epoch length.
+#
+#    CONSEQUENCE, STATED AND NOT ACTED ON: an epoch is now 8x shorter, so `patience: 16` spans 8x
+#    less optimisation than it did when the 16-32 range was fixed. 16 is the BOTTOM of that range and
+#    was chosen for a LONGER epoch; the shorter epoch argues for moving toward 32. It is left at 16
+#    because that range came from measurements not re-run here. WATCH FOR premature plateau calls --
+#    designs converging in very few rounds at a suspiciously small window.
+#
+#    As a per-design CAP, 65536 is harmless either way: it sits above the 36698 the worst rescaled
+#    design needs.
+#
+# 5. Seeds: 5, passed to scripts/campaign.sh, not set here.
+#
+#        NAME_PREFIX=mm5 ./scripts/campaign.sh enzyme_mm_sym_m3_p5e3 \
+#            output/campaign-mm-p5e3 5 meta from_scratch
+#
+#    ⚠️ Always pass an explicit --time. A job without one gets TimeLimit=UNLIMITED and sched/backfill
+#    will never start it; two jobs stalled indefinitely here with 7 of 11 cores idle.
+# ------------------------------------------------------------------------------------------------
+
+#
+# 2026-08-18 -- regressor.dropconnect SET TO 0.0. MEASURED on `linear`, 72 crossed cells (2 arms x
+# 4 doses x 3 designs x 3 seeds, paired within design and seed, `bo`): dropconnect adds BIAS THAT THE
+# CRITERION CANNOT SEE. Held-out excess against the closed-form floor rises monotonically to +0.00479
+# at dose 0.2 -- 48% of the bar -- while `gap`, the only overfitting signal the exit test has, FALLS
+# (-0.00041), and the exit window is UNCHANGED (ratio 1.00 at every dose in both arms). The procedure
+# therefore buys no extra data in compensation and reports a worse number at the same price. `meta` is
+# hurt about half as much as `from_scratch` (+0.00262 against +0.00479 at 0.2), so replay is partly
+# REDUNDANT with dropconnect rather than protected from it.
+
+#
+# 2026-08-18 (later) -- dropconnect 0.05, NOT null. Reverted from the `null` set earlier the same day.
+#
+# TURNING IT OFF REMOVED THE TERMINATION MECHANISM FROM BOTH PROCEDURES, which the bias measurement
+# did not anticipate:
+#   growth  -- the gap gate `gap + err <= loss_precision` needs the gap held down; unregularised the
+#              config's own record says designs cap (later shown to be an artefact of a 131072 cap,
+#              but the cost is real: 278512 calls/design against ~98281, i.e. 2.8x).
+#   fixed   -- stops on the TRAIN-SETTLED test alone, so the only thing that can end a design is the
+#              training curve flattening. MEASURED: with dropconnect 0.1, 394 of 394 designs
+#              terminated, median 109 s, max 271 s. With dropconnect null, median 476 s, max 2919 s,
+#              and designs still running past 3500 epochs with validation rising since epoch 600.
+#
+# 0.05 RATHER THAN 0.1 because that is where the bias is negligible. MEASURED on `linear`, 72 crossed
+# cells, held-out excess against the closed-form floor, paired within (design, seed):
+#     dose    from_scratch   meta
+#     0.05      +0.00007    +0.00001
+#     0.10      +0.00110    +0.00050
+#     0.20      +0.00479    +0.00262
+# and this task's own earlier record puts 0.05 at -0.0004 on the objective, i.e. free. 0.05 therefore
+# buys termination at a bias two orders of magnitude below the dose that motivated turning it off.
+
+detector: enzyme_mm_sym_m3
+
+regressor:
+  set-regressor:
+    features: [[24, 16], [16, 24]]
+    n_models: 4
+    dropconnect: 0.05
+device: cuda
+plot_per_epoch: 8
+
+training:
+  n0: 2048
+  n_increment: 1024
+  batch: 128
+  eval_batch: 2048
+  warmup_epochs: 2
+  patience: 16
+  budget: 524288
+  iteration_limit: 65536
+  val_fraction: 0.25
+  loss_precision: 5.0e-3
+  param_mix: 0.25
+  optimizer:
+    adamaxw:
+      learning_rate: 2.5e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-3
+
+bo:
+  n_init: 5
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds: [-2.0, 1.0]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+    kernel:
+      normalised-invariant-rbf:
+        exchangeable: 3
+  ei:
+    n_restarts: 32
+    n_steps: 100
+
+verify:
+  n_points: 10
+  epochs: 200
+  val_every_epochs: 10
+  budget: null
+  batch: null

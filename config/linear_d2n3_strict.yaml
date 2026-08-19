@@ -1,0 +1,160 @@
+# STRICT-CRITERION twin of config/linear_d2n3_growth.yaml, for scripts/bo_strict.py.
+#
+# EVERY OTHER VALUE IS IDENTICAL to that file -- same detector, same n0/n_increment, same budget,
+# same iteration_limit, same loss_precision, same param_mix, same optimiser, same regressor, same BO
+# block. The ONLY differences are `warmup_epochs` and `patience`, and they differ because each
+# criterion is run AT ITS OWN SPECIFIED SETTINGS:
+#
+#   bayesian (config/linear_d2n3_growth.yaml, scripts/bo.py)
+#     warmup_epochs 2, patience 16 -- the project's settled defaults for that procedure
+#     converge on `P(|slope| * patience < loss_precision/2) > 0.9`
+#
+#   strict (this file, scripts/bo_strict.py)
+#     warmup_epochs 32, patience 10 -- as specified by the user 2026-08-18
+#     converge on `patience` epochs with NO IMPROVEMENT on the validation loss
+#
+# The scoring gate is the SAME in both: add data while `gap + err > loss_precision`, return the
+# validation loss with `gap + err` as its noise. So a difference between the two runs is a
+# difference between CONVERGENCE TESTS and nothing else.
+#
+# `linear` is the task for this because `LinearDetector.bayes_risk` gives the EXACT per-design floor,
+# so `reported - floor` measures the criterion's BIAS directly rather than by proxy. Landscape for
+# this cell, closed form over 4096 Sobol designs: ceiling 0.3333, best 0.1053, median 0.3593,
+# span 0.2534. The optimum is NOT at a box corner for (d=2, n_probes=3).
+# GROWTH procedure (`detopt/nn/trainer/design.py`) on `linear` at d = 2, n_probes = 3, noise = 0.5.
+#
+# WHY IT EXISTS. `config/linear_d2n3_fixed.yaml` is the FIXED-data sibling: it carries `n_per_design`
+# and no `n0`/`n_increment`, so it cannot drive the window-growing convergence procedure at all. This
+# file is that config with the growth keys added and the four values that had to move with them; the
+# detector, the regressor, `batch`, `warmup_epochs`, `patience`, `val_fraction`, `loss_precision`, the
+# optimiser and the whole `bo` block are IDENTICAL, so a growth run here is comparable to the fixed
+# trajectory in `output/linear-d2n3-fixed/`.
+#
+# LANDSCAPE, exact and closed form (`LinearDetector.bayes_risk`, `output/linear-criterion/landscape.json`,
+# 4096 Sobol designs): optimum 0.09368, best CORNER 0.10588 (`optimum_is_corner: false` -- a corner
+# enumeration understates it), median random 0.36033, p90 0.46468, worst design in the box 0.69231.
+# Span (median - optimum) 0.26664. Every reported loss can be checked against the per-design floor,
+# which is the only reason this task is worth running.
+#
+# THE FOUR VALUES THAT MOVE, and why each is what it is.
+#
+# n0 1024. The convergence test cannot fire below the window at which `err = hypot(train_sem, val_sem)`
+#   alone drops under `loss_precision`. Per-event loss is a mean of `d + 1 = 3` squared Gaussians, so
+#   its standard deviation is between 0.82 and 1.41 times the LEVEL (0.82 with equal posterior
+#   eigenvalues, 1.41 when one dominates), and with `val_fraction` 0.25 the validation window is a
+#   third of the train window, giving `err ~ 2 * sd / sqrt(window)`. At the optimum end (level 0.097)
+#   that is 0.006 at a window of 1024, so the best designs converge at `n0` and pay nothing; at the
+#   median (0.377) it is 0.015 at 4096; at the worst design visited (0.496) it needs ~8000. So 1024 is
+#   the largest starting window that still lets the cheap end stop immediately, and the expensive end
+#   is reached by growth rather than paid for up front.
+#
+# n_increment 512. The stopping GRID: it sets how finely a design may stop, and therefore the
+#   resolution of "detector calls to convergence", which is the quantity this config exists to
+#   measure. At the expected windows above (1024 / ~4600 / ~8200) 512 resolves the window to 11% at
+#   the median and 6% at the worst. Half of `n0`, so every window is a whole number of increments and
+#   `iteration_limit` lands exactly on the grid.
+#
+# iteration_limit 32768 = n0 + 62 * n_increment. The per-design window CAP; exceeding it is a hard
+#   error under `bo.py` and a `capped` status under the probe scripts. The arithmetic above puts the
+#   worst design visited at ~8000-12000, so this is a 2.7-4x margin -- deliberately generous, because a
+#   cap is an unusable cell rather than a slow one. It is ALSO THE EPOCH LENGTH
+#   (`steps_per_epoch = iteration_limit // batch` = 256), which is why it cannot simply be raised
+#   further: `patience` and `warmup_epochs` are written in epochs, so doubling it doubles the real
+#   optimisation inside one patience horizon and silently changes the stopping rule's meaning.
+#
+# budget 262144 (2^18). The pools are sized from it: train 196608, validation 65536. A single design
+#   needs at most `iteration_limit` 32768 train rows, so the train pool holds a full worst-case window
+#   plus 163840 rows of accumulated history -- enough for a 20-design run at the mixture of windows
+#   above, and enough for the replay-history probes, which lay ~55k rows down before the design under
+#   test opens its window. It is NOT `iteration_limit * 4`: that identity is the enzyme campaigns'
+#   settled default and it is a statement about how many designs a campaign buys, not a constraint;
+#   here the cap is set by the worst design's window and the budget by how many designs must fit.
+#
+# EVERYTHING ELSE IS THE FIXED CONFIG'S OWN VALUE.
+#   loss_precision 2.0e-2 -- measured on this task (decision log D96): the BINDING designs are the BAD
+#     ones, both terms of the slack scale with the LEVEL, and the worst measured slack at this width
+#     was 0.0155, which 2.0e-2 clears by 29%.
+#   patience 16, warmup_epochs 2, batch 128, val_fraction 0.25, adamaxw at 2.5e-4 with weight_decay
+#     1.0e-3, `n_models` 4, features [[32, 16], [16, 32]] -- the settled defaults.
+#   param_mix 0.25 -- the rewind, ABSENT from the fixed config because the fixed procedure has no
+#     data addition to rewind at. Added here because growth does, and because it is a settled default.
+#   NO dropconnect. On `linear` it was measured to do nothing at the narrow width (slack 0.00879 with
+#     against 0.00883 without, decision log D96) -- capacity, not regularisation, is the lever on this
+#     task -- and the settled default's 0.1 was set on the enzyme detectors. It stays off here and is
+#     swept explicitly by the probe scripts rather than assumed.
+#   bo.gp.kernel.exchangeable 3 = n_probes. The design is field-major, one field per axis of width
+#     n_probes, and the probes within an axis are a SET.
+
+#
+# 2026-08-18 (later) -- dropconnect 0.05, NOT null. Reverted from the `null` set earlier the same day.
+#
+# TURNING IT OFF REMOVED THE TERMINATION MECHANISM FROM BOTH PROCEDURES, which the bias measurement
+# did not anticipate:
+#   growth  -- the gap gate `gap + err <= loss_precision` needs the gap held down; unregularised the
+#              config's own record says designs cap (later shown to be an artefact of a 131072 cap,
+#              but the cost is real: 278512 calls/design against ~98281, i.e. 2.8x).
+#   fixed   -- stops on the TRAIN-SETTLED test alone, so the only thing that can end a design is the
+#              training curve flattening. MEASURED: with dropconnect 0.1, 394 of 394 designs
+#              terminated, median 109 s, max 271 s. With dropconnect null, median 476 s, max 2919 s,
+#              and designs still running past 3500 epochs with validation rising since epoch 600.
+#
+# 0.05 RATHER THAN 0.1 because that is where the bias is negligible. MEASURED on `linear`, 72 crossed
+# cells, held-out excess against the closed-form floor, paired within (design, seed):
+#     dose    from_scratch   meta
+#     0.05      +0.00007    +0.00001
+#     0.10      +0.00110    +0.00050
+#     0.20      +0.00479    +0.00262
+# and this task's own earlier record puts 0.05 at -0.0004 on the objective, i.e. free. 0.05 therefore
+# buys termination at a bias two orders of magnitude below the dose that motivated turning it off.
+
+detector: linear_d2n3
+
+regressor:
+  set-regressor:
+    features: [[32, 16], [16, 32]]
+    n_models: 4
+    dropconnect: 0.05
+device: cuda
+plot_per_epoch: 8
+
+training:
+  n0: 4096
+  n_increment: 2048
+  batch: 128
+  eval_batch: 4096
+  warmup_epochs: 32
+  patience: 10
+  budget: 2097152
+  iteration_limit: 262144
+  val_fraction: 0.25
+  loss_precision: 1.0e-2
+  param_mix: 0.25
+  optimizer:
+    adamaxw:
+      learning_rate: 2.5e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-3
+
+bo:
+  n_init: 5
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds: [-2.0, 1.0]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+    kernel:
+      normalised-invariant-rbf:
+        exchangeable: 3
+  ei:
+    n_restarts: 32
+    n_steps: 100
+
+verify:
+  n_points: 10
+  epochs: 200
+  val_every_epochs: 10
+  budget: null
+  batch: null

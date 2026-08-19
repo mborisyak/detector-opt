@@ -1,5 +1,7 @@
 # detector: stereo_layerwise
 detector: stereo_layerwise
+
+plot_per_epoch: 8
 design: initial_stereo
 
 regressor:

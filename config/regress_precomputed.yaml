@@ -1,5 +1,7 @@
 detector: straw
 
+plot_per_epoch: 8
+
 regressor:
   bayes-deep-set:
     features: [[64, 128], [128, 96]]

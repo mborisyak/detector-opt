@@ -1,0 +1,22 @@
+# The `linear` detector at 3 dimensions with 4 probes, sigma 0.5 -- the cell docs/linear-highdim.md
+# section 3.2 identifies as the ONLY non-degenerate candidate that survives an oracle scorer, and the
+# reason it is used here is the one property that document measures and this study needs: the search
+# is still running at 20 designs.
+#
+# MEASURED in that document, closed form over 200000 uniform designs: optimum 0.0588, median random
+# 0.3284, ceiling 0.7647, structural floor 0.0000 (n_probes = d + 1, so no design is rank deficient),
+# span (median - optimum) 0.2696. On the repo's own BO driver against the closed form, 10 seeds, the
+# median residual is 42% of the range at 10 designs and 16% at 20 -- against 0.0% and -1.0% for the
+# shipped d = 1 cell, which is solved outright by design 10. That gap is the whole reason this file
+# exists: an arm comparison can only measure a difference in SEARCH where a search is still running.
+#
+# The A-optimal design is the classical 2^(3-1) half-fraction {(-1,-1,-1), (-1,1,1), (1,-1,1),
+# (1,1,-1)} and its odd-parity twin, so the answer is a corner design. `noise` 0.5 follows
+# config/detector/linear_d4n5_growth.yaml at the user's 2026-08-17 instruction; NEITHER value has an
+# instrument to cite, which is why anything measured here is a MACHINERY comparison against
+# `LinearDetector.bayes_risk` and not evidence about the acceptance gate.
+linear:
+  n_probes: 4
+  n_dimensions: 3
+  noise: 0.5
+  probe_bounds: [-1.0, 1.0]

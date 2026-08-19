@@ -52,16 +52,57 @@
 # design measured on the cloud box came in at 95.5%. If the wider network changes how often designs
 # clear it, that is a RESULT, not a reason to move the bar (docs/benchmark-acceptance.md, NO TRICKS).
 
+#
+# 2026-08-18 -- regressor.dropconnect SET TO 0.0 (user). MEASURED on `linear`, 72 crossed cells: it
+# adds BIAS THE CRITERION CANNOT SEE -- held-out excess rises to +0.00479 at dose 0.2 (48% of the bar)
+# while `gap` FALLS and the exit window is unchanged (ratio 1.00), so no extra data is bought in
+# compensation. `meta` is hurt about half as much, so replay is partly redundant with it.
+#
+# ⚠️ THE CLAIM THIS OVERRIDES -- NOW TESTED AND REFUTED. The block below records "UNREGULARISED, the
+# network converges 0 of 3 -- its persistent train/validation gap is 0.0096-0.0129, above the bar".
+# That was measured at `iteration_limit` 131072 with 512-step epochs (D93). MEASURED 2026-08-18 at
+# THIS config's 524288 with 2048-step epochs, 3 designs x 2 arms on `bo` (jobs 36/37, output in
+# `output/extremes-nodc/`): 6 of 6 CONVERGED, 0 capped, gap 0.0047-0.0069 -- not 0.0096-0.0129 -- with
+# `gap + err` at 0.0093-0.0099 against the 0.010 bar. The gap is NOT persistent; it had not finished
+# falling when the old cap bit. Five of the six needed 172k-250k rows, MORE than the old 131072 limit,
+# so every one would have been scored "does not converge" under it.
+#
+# ⚠️ THE COST IS REAL: median 278512 calls per design against the ~98281 recorded at dropconnect 0.1,
+# i.e. 2.8x. On `budget` 2097152 that is ~7-8 designs a run instead of ~21, BELOW what the n -> 2n
+# acceptance criterion needs. Running this task unregularised requires the budget raised roughly 3x;
+# leaving the budget unchanged silently shortens every run.
+
+#
+# 2026-08-18 (later) -- dropconnect 0.05, NOT null. Reverted from the `null` set earlier the same day.
+#
+# TURNING IT OFF REMOVED THE TERMINATION MECHANISM FROM BOTH PROCEDURES, which the bias measurement
+# did not anticipate:
+#   growth  -- the gap gate `gap + err <= loss_precision` needs the gap held down; unregularised the
+#              config's own record says designs cap (later shown to be an artefact of a 131072 cap,
+#              but the cost is real: 278512 calls/design against ~98281, i.e. 2.8x).
+#   fixed   -- stops on the TRAIN-SETTLED test alone, so the only thing that can end a design is the
+#              training curve flattening. MEASURED: with dropconnect 0.1, 394 of 394 designs
+#              terminated, median 109 s, max 271 s. With dropconnect null, median 476 s, max 2919 s,
+#              and designs still running past 3500 epochs with validation rising since epoch 600.
+#
+# 0.05 RATHER THAN 0.1 because that is where the bias is negligible. MEASURED on `linear`, 72 crossed
+# cells, held-out excess against the closed-form floor, paired within (design, seed):
+#     dose    from_scratch   meta
+#     0.05      +0.00007    +0.00001
+#     0.10      +0.00110    +0.00050
+#     0.20      +0.00479    +0.00262
+# and this task's own earlier record puts 0.05 at -0.0004 on the objective, i.e. free. 0.05 therefore
+# buys termination at a bias two orders of magnitude below the dose that motivated turning it off.
+
 detector: enzyme_extremes
 
 regressor:
   set-regressor:
     features: [[32, 24], [24, 32]]
     n_models: 4
-    dropconnect: 0.1
-
+    dropconnect: 0.05
 device: cuda
-plot_per_epoch: false
+plot_per_epoch: 8
 
 training:
   n0: 12288

@@ -33,6 +33,7 @@ regressor:
                      # while buying a 5.3x cheaper exit. It is a bias/variance trade, not free.
 
 device: cuda
+plot_per_epoch: 8
 
 training:
   n0: 2048
@@ -59,8 +60,7 @@ training:
       b1: 0.9
       b2: 0.999
       eps: 1.0e-8
-      weight_decay: 1.0e-6
-
+      weight_decay: 1.0e-3
 bo:
   n_init: 5          # the user's criterion is stated for "BO with 5 initial Sobol points"
   gp:

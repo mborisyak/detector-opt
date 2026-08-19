@@ -58,6 +58,10 @@ from detopt.utils.viz.bo import plot_iteration, plot_convergence
 # replay. All are design-conditioned (combine sees each event's real scaled design).
 VALID_INIT_STRATEGIES = ("from_scratch", "continue", "closest", "meta")
 
+# THE TWO TRAINER CLASSES THIS DRIVER USES. "per_design" backs from_scratch / continue / closest
+# (they differ only in the warm start this driver passes), "meta" backs the continual strategy.
+TRAINERS = {"per_design": DesignTrainer, "meta": ContinualTrainer}
+
 
 def bo(output, seed: int, force: bool = False, **config):
     seed = int(seed)
@@ -117,15 +121,15 @@ def bo(output, seed: int, force: bool = False, **config):
     plots_dir = os.path.join(output, "plots")
     os.makedirs(plots_dir, exist_ok=True)
 
-    # PER-EPOCH plotting is a diagnostic and it is NOT free: `plot_iteration` renders a whole figure
-    # (and rewrites the design JSON) once an EPOCH on a background worker, and the design blocks on
-    # that queue when it exits. Measured on one design of this task it was ~36% of the wall clock,
-    # host-side CPU work done AFTER the network had converged -- which on a shared node is taken
-    # directly off the CPU-bound screening jobs. It is therefore a SETTING (`plot_per_epoch`), left
-    # ON by default so no existing run config changes behaviour, and turned off in the configs of
-    # runs that do not want it. Off means no callback at all, so the trainer also skips building the
-    # per-epoch history snapshot. The END-OF-DESIGN convergence plot is unaffected either way.
-    plot_per_epoch = bool(config.get("plot_per_epoch", True))
+    # PER-DESIGN CONVERGENCE PLOTS, as a STRIDE rather than a switch. `plot_per_epoch: 8` renders
+    # every 8th epoch, `1` every epoch, `0`/`false` never. `true` means 1, so old configs are
+    # unchanged. A stride exists because the render is the expensive half: `plot_iteration` draws a
+    # whole figure and rewrites the design JSON on a background worker, measured at ~36% of a
+    # design's wall clock when done every epoch -- host-side work performed AFTER the network has
+    # converged, which on a shared box comes straight off the other jobs. At a stride of 8 the
+    # diagnostic costs about an eighth of that and still shows the shape of every design's curve.
+    plot_every = config.get("plot_per_epoch", 8)
+    plot_every = (1 if plot_every else 0) if isinstance(plot_every, bool) else int(plot_every)
     bo_cfg = config["bo"]
     gp_cfg = dict(bo_cfg["gp"])
     ei_cfg = dict(bo_cfg["ei"])
@@ -153,7 +157,7 @@ def bo(output, seed: int, force: bool = False, **config):
     # generator position to persist and no way for a resumed run to drift onto a different stream.
     network_seq, iteration_seq = np.random.SeedSequence(int(seed)).spawn(2)
 
-    trainer_cls = ContinualTrainer if nn_init_strategy == "meta" else DesignTrainer
+    trainer_cls = TRAINERS["meta"] if nn_init_strategy == "meta" else TRAINERS["per_design"]
     trainer = trainer_cls.from_config(
         detector,
         config,
@@ -264,7 +268,7 @@ def bo(output, seed: int, force: bool = False, **config):
 
     print(
         f"BO: running until the budget pool fills "
-        f"(budget={budget} detector calls, n_init={n_init}, d={d}, plot_per_epoch={plot_per_epoch})"
+        f"(budget={budget} detector calls, n_init={n_init}, d={d}, plot_per_epoch={plot_every})"
     )
 
     i = start_iteration
@@ -284,10 +288,16 @@ def bo(output, seed: int, force: bool = False, **config):
 
         def _on_epoch(snapshot, _i=i, _d=design_phys):
             vlp = snapshot["val_loss_per_epoch"]
+            # The snapshot's length IS the epoch count, so the stride gates here. The FIRST epoch and
+            # every `plot_every`-th one are drawn: without the first, a design that converges inside
+            # one stride would produce no plot at all.
+            epoch = int(vlp.size)
+            if epoch != 1 and epoch % plot_every != 0:
+                return
             live = float(vlp[-1]) if vlp.size > 0 else float("nan")
             plot_iteration(snapshot, iteration=_i, design=_d, val_loss=live, plots_dir=plots_dir)
 
-        on_epoch = _on_epoch if plot_per_epoch else None
+        on_epoch = _on_epoch if plot_every > 0 else None
 
         # Network init strategy (todo.md): from_scratch trains fresh; continue
         # warm-starts from the previous design; closest from the nearest previously trained design

@@ -1,5 +1,51 @@
 # Extended-budget BO run on the stereo straw detector over the FairShip ship2numpy
 # events, warm-starting each design's network from the nearest previously trained one.
+#
+# layer_bounds[0] IS TIED TO THE DATA. The ship2numpy pool injects every particle at
+# boundary_z = 8312.0 cm moving forward and the solver never propagates backward, so a station
+# placed upstream of that plane records nothing. Station 0's centre range starts at
+# layer_bounds[0] + station_width/2 and its layers span the centre +- 8.366 cm, which makes
+# 8312.0 + 8.366 - 50 = 8270.37 the lowest bound whose whole footprint is downstream of the
+# injection plane; 8275.0 takes that with 4.6 cm of margin. At the previous 8200.0 the lowest
+# 12.9% of the first design coordinate produced a blind station 0 (95 hits against 5507 at the
+# nominal design) -- a dead plateau the GP had to spend observations mapping. Revisit this bound
+# if data_dir changes: boundary_z is read from the event files, not from this config.
+# THE BAR IS 2.0e-2 AND THAT IS A THROUGHPUT CONSTRAINT, NOT A PRECISION PREFERENCE. This task's
+# pipeline runs at a MEASURED 30 detector calls/s and does NOT scale with concurrency: one process
+# alone delivers 30 calls/s (21841 calls in 728 s, a completed design) and twelve processes together
+# deliver the same ~30 aggregate, sampled over four multi-minute intervals with the GPU pinned at
+# 100% SM / 96% memory controller / 371 W. So the whole box makes a FIXED number of designs per day
+# and the only levers are the bar and the number of cells.
+#
+# The detector is NOT the constraint and speeding it up buys nothing: it is a CPU C extension running
+# at ~14000 events/s (measured, both machines), so simulating this entire 1048576-call budget takes
+# 1.2-1.5 MINUTES. The cost is the training loop re-reading those events across epochs.
+#
+# At 1.0e-2 a design costs ~87000 calls, i.e. ~9.7 h, giving 2-3 designs per cell in a 24 h limit --
+# fewer than n_init = 5, so every design produced is one of the shared random draws and ZERO are
+# BO-guided. That configuration cannot produce a trajectory at any budget the clock allows. At 2.0e-2
+# a design costs ~21841 calls, the box makes ~119 designs/24 h, and 12 cells get ~9.9 each: short,
+# but a real trajectory with ~5 BO-guided steps.
+
+# n_models: null -- ONE network, not a 4-member ensemble, and this OVERRIDES a settled default.
+# `null` is not merely "ensemble of size 1": it takes the non-ensembled path, so kernels are
+# (in, out) rather than (1, in, out) and the eval calls the MODEL's own `loss`. For `set-regressor`
+# that is numerically the same thing -- it does not override `Model.loss`, which is just
+# `loss_fn(self(features, mask), target)` -- but it would NOT be equivalent for `masked-set`,
+# `predictive` or `hierarchical`, which do override it.
+#
+# WHY: MEASURED, `scripts/probe_epoch_cost.py` on this exact config at fixed steps per epoch --
+# n_models 1 costs 0.815 s/epoch (0.80 ms/step, eval 0.234 s) against n_models 4 at 3.448 s/epoch
+# (3.37 ms/step, eval 0.899 s). That is 4.23x for 4x the members: the loop is ARITHMETIC-bound in the
+# capacity dimension, so dropping the ensemble is a ~4x cut to per-epoch cost, by far the largest
+# lever measured on this task. The detector is not a lever at all (14000 events/s, 0.2% of wall).
+#
+# WHAT IT COSTS: the ensemble was a settled default and its averaging is what damped the reported
+# loss's variance. Expect a NOISIER per-design estimate, which the criterion sees through `err` and
+# pays for by buying a larger window -- so the 4x is an upper bound on the real speedup, not a
+# guarantee. If windows grow sharply against the previous leg, that is the ensemble's variance
+# reduction being bought back as data.
+
 detector:
   stereo_tracking:
     n_stations_upstream: 2    # stations upstream of the magnet (z < z0)
@@ -14,13 +60,13 @@ detector:
     field_integral: -1.071 # T.m, int Bx dz (FairShip MainSpectrometerField, negative polarity; -0.151 T peak derived w/ B_sigma=283)
     z0: 8957.0             # magnet centre (FairShip c.z = 89.57 m, map z_local=0)
     B_sigma: 283.0         # cm; proper-Gaussian std-dev matched to MainSpectrometerField on-axis Bx(z) (int Bx dz ~ -1.07 T.m)
-    layer_bounds: [8200.0, 9750.0]
+    layer_bounds: [8275.0, 9750.0]
     max_particles: 1024    # DEBUG-only now (trajectory/tree slots); does not gate hits or input
-    max_hits_per_event: 384  # NN-facing per-event hit cap (solver emits the M earliest-TDC straws)
+    max_hits_per_event: 128  # NN-facing per-event hit cap (solver emits the M earliest-TDC straws)
     max_dt: 1.0
     max_time: 300.0
     material: kapton
-    data_dir: "data/mc/numpy_newFS"  # 36k events across the 50 files; boundary crossings are upstream of the magnet (magnet-independent)
+    data_dir: "data/mc/numpy_newFS"  # ~4.31M events across 996 files (verified 2026-08-18); boundary crossings are upstream of the magnet (magnet-independent)
 
 # Nominal (initial/baseline) design -- NOT detector state. A named physical-design dict the
 # detector scales via to_scaled (BO itself seeds from random proposals).
@@ -32,9 +78,10 @@ regressor:
   set-regressor:
     features: [[24, 32], [32, 24]]
     n_models: null
-    p_dropout: 0.1
+    p_dropout: null
 
 device: cuda
+plot_per_epoch: 8
 
 ### target 10+ steps
 training:
@@ -63,14 +110,14 @@ training:
                                 # "still" means "the bias has finished moving" and not merely
                                 # "the noise was quiet". 16-32, scaling with `iteration_limit`,
                                 # which sets how much optimisation one epoch contains.
+  param_mix: 0.1
   optimizer:
     adamaxw:
       learning_rate: 2.0e-4
       b1: 0.9
       b2: 0.999
       eps: 1.0e-8
-      weight_decay: 1.0e-4
-
+      weight_decay: 1.0e-3
 # Independent trajectory verification (scripts/verify_trajectory.py): re-score <= n_points designs
 # of a finished run's results.json (uniform in cumulative detector calls, always the last) on a
 # 6:2:2 train/val/test split; best-val network scored once on the held-out test buffer.

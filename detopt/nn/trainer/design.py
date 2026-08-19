@@ -385,10 +385,33 @@ class _DesignBase(Trainer):
                             # as a cost, and anything that overfit harder was rewarded. MEASURED: it
                             # inflated every regulariser's apparent price by about 2x, and it hid a
                             # train-down/validation-up divergence under the growth schedule. The
-                            # UNCERTAINTY is unchanged -- `|val - train| + hypot(sems)` -- so the
-                            # convergence test above still requires the gap to close before a design
-                            # is scored; only what is REPORTED changes, never a decision.
-                            objective = (val_mean, diff + err)  # (2.2)
+                            # THE OBJECTIVE IS THE MIDPOINT (user, 2026-08-18), reverting the
+                            # validation-only report. The estimand is the loss in the limit of
+                            # INFINITE TRAINING DATA, which is a property of the DESIGN. At finite
+                            # data the two channels straddle it -- train below, because the network
+                            # fitted its own sample; val above, because the network is short of the
+                            # limit -- so `L_inf` lies inside `[train, val]` and, under ignorance of
+                            # where, the uniform model over that interval is the honest one: mean at
+                            # the midpoint, standard deviation `(val - train) / sqrt(12)`.
+                            #
+                            # THE NOISE IS THE UNIFORM SPREAD AND THE MIDPOINT'S OWN SAMPLING
+                            # ERROR, IN QUADRATURE. The estimator is the midpoint, so its sampling
+                            # error is `0.5 * hypot(train_sem, val_sem)` -- HALF `err`, because
+                            # `Var[(a+b)/2] = (var_a + var_b)/4`; charging it the full `err` would be
+                            # the error of the DIFFERENCE, not of the average. The two terms are
+                            # independent -- where `L_inf` sits inside the bracket has nothing to do
+                            # with the noise in locating the bracket's ends -- so they add in
+                            # variance, not linearly.
+                            # `scripts/bo.py` passes this straight to the GP as that observation's
+                            # noise (`bo_opt.append(..., noise=result.objective_std)`), which the GP
+                            # takes as a per-observation standard deviation and does not fit.
+                            #
+                            # NOTHING ABOVE CHANGES: the two exit clauses and every `_sample_round`
+                            # decision are untouched. Only what is REPORTED changes, never a decision.
+                            objective = (
+                                0.5 * (train_mean + val_mean),
+                                float(np.hypot(diff / np.sqrt(12.0), 0.5 * err)),
+                            )  # (2.2)
                             print(
                                 f"  [converged/bayes] train={train_mean:.4f} val={val_mean:.4f} "
                                 f"diff={diff:.4f} err={err:.4f} prec={self.loss_precision:.4f} | "

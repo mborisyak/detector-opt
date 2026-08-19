@@ -1,0 +1,90 @@
+# FIXED-DATA procedure (scripts/bo_fixed.py) on the `enzyme_extremes` task.
+#
+# n_per_design: 49152 = 48 * 1024, set to `meta`'s OWN typical consumption under the growth procedure.
+#   MEASURED over the finished campaign in output/enzyme_extremes (58 meta designs, 2 seeds): median
+#   49150, mean 70994, p90 123420. The other arms cost more per design -- from_scratch median 79186,
+#   closest 76455, continue 84646 -- so this budget is the CHEAPEST arm's typical spend handed
+#   uniformly to all four. That is the point: under a fixed budget no arm can buy extra designs by
+#   converging early, so the comparison is at equal cost by construction rather than by accident.
+#   Train share 36864 rows, validation 12288, at val_fraction 0.25.
+# budget: 2097152, unchanged from the growth config, giving 2097152 / 49152 = 42 designs a run.
+# iteration_limit is NOT set: under this procedure it IS the training window, derived from
+#   n_per_design, so one epoch is one pass over the data (144 steps at batch 256).
+# loss_precision 1.0e-2 no longer gates scoring -- it only sets the stillness threshold of the
+#   training-settled test, `P(train change over +patience < loss_precision/2) > 0.9`.
+# n0 / n_increment / param_mix are ABSENT and would be rejected: there is no growth, so the rewind
+#   never fires and the growth quanta have no meaning.
+#
+# ⚠️ NOT COMPARABLE to output/enzyme_extremes. Different data schedule, different stopping rule, and a
+# different objective -- the midpoint (train + val) / 2 rather than the validation loss alone.
+
+#
+# 2026-08-18 (later) -- dropconnect 0.05, NOT null. Reverted from the `null` set earlier the same day.
+#
+# TURNING IT OFF REMOVED THE TERMINATION MECHANISM FROM BOTH PROCEDURES, which the bias measurement
+# did not anticipate:
+#   growth  -- the gap gate `gap + err <= loss_precision` needs the gap held down; unregularised the
+#              config's own record says designs cap (later shown to be an artefact of a 131072 cap,
+#              but the cost is real: 278512 calls/design against ~98281, i.e. 2.8x).
+#   fixed   -- stops on the TRAIN-SETTLED test alone, so the only thing that can end a design is the
+#              training curve flattening. MEASURED: with dropconnect 0.1, 394 of 394 designs
+#              terminated, median 109 s, max 271 s. With dropconnect null, median 476 s, max 2919 s,
+#              and designs still running past 3500 epochs with validation rising since epoch 600.
+#
+# 0.05 RATHER THAN 0.1 because that is where the bias is negligible. MEASURED on `linear`, 72 crossed
+# cells, held-out excess against the closed-form floor, paired within (design, seed):
+#     dose    from_scratch   meta
+#     0.05      +0.00007    +0.00001
+#     0.10      +0.00110    +0.00050
+#     0.20      +0.00479    +0.00262
+# and this task's own earlier record puts 0.05 at -0.0004 on the objective, i.e. free. 0.05 therefore
+# buys termination at a bias two orders of magnitude below the dose that motivated turning it off.
+
+detector: enzyme_extremes
+
+regressor:
+  set-regressor:
+    features: [[24, 16], [16, 24]]
+    n_models: 4
+    dropconnect: 0.05
+device: cuda
+plot_per_epoch: 8
+
+training:
+  n_per_design: 49152
+  batch: 256
+  eval_batch: 2048
+  warmup_epochs: 2
+  patience: 16
+  budget: 2097152
+  val_fraction: 0.25
+  loss_precision: 1.0e-3
+  optimizer:
+    adamaxw:
+      learning_rate: 2.5e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-3
+
+bo:
+  n_init: 5
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds: [-2.0, 1.0]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+    kernel:
+      normalised-invariant-rbf:
+        exchangeable: 4
+  ei:
+    n_restarts: 32
+    n_steps: 100
+
+verify:
+  n_points: 10
+  epochs: 200
+  val_every_epochs: 10
+  budget: null
+  batch: null

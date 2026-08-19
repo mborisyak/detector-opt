@@ -1,0 +1,134 @@
+# LINEAR at 2^20 budget with the bar TIGHTENED to 1.0e-2, sized for ~40 designs a run.
+#
+# Delta against `config/linear.yaml`: `training.loss_precision` 2.0e-2 -> 1.0e-2. NOTHING else --
+# the network is whatever `config/linear.yaml` carries, budget stays 1048576 (2^20).
+#
+# WHY 1.0e-2, AND WHY ~40 DESIGNS FOLLOWS. MEASURED on 1921 converged exits across the linear logs on
+# disk: `diff` median 0.00030, p10 0.00000, p90 0.00160. That is far below the bar, so the exit is
+# governed by `err = c/sqrt(window)` alone and the window scales as 1/bar^2. At the parent bar of
+# 2.0e-2 a design costs a MEASURED 6512 calls (median over 8 runs at this budget), so halving the bar
+# quadruples that to ~26000 and 2^20 buys ~40 designs. The parent bar buys ~161 designs instead --
+# more search than a 2-dimensional problem needs, at less precision per design than it can use.
+#
+# ⛔️ THIS CONFIG IS WRONG AND SHOULD NOT BE RUN. The claim below that "nothing becomes
+# unconvergeable" rests on `diff` percentiles taken over CONVERGED EXITS ONLY -- survivorship. The
+# designs that FAILED to converge are by construction absent from that sample, so the percentiles
+# understate the tail. MEASURED afterwards: at bar 1.0e-2, 2.2% of designs need a window past
+# `iteration_limit` 65536 and raise, which crashes roughly 66% of 48-design runs. `config/linear.yaml`
+# own header already recorded coincident designs capping at slack 0.0133-0.0155.
+# The fix is `iteration_limit: 262144` with `batch: 512` to hold the epoch length -- NOT applied here,
+# because the screen that found this also found a better regime entirely
+# (`config/linear_meta_d2n3_n2048.yaml`: buy DESIGNS, not precision).
+#
+# NOTHING BECOMES UNCONVERGEABLE. The gate is `diff + err <= loss_precision` and `diff` is irreducible
+# by data, so any design whose `diff` already exceeds the bar can never exit and burns its whole
+# iteration_limit. Here p90(diff) = 0.00160 sits 6x below the new bar, so that fraction is ~0. The
+# same calculation is what forbade going below 8.0e-3 on `extremes`, where p90(diff) = 0.00657.
+#
+# PURPOSE: REPLICATES. Every arm comparison run so far has had 3 seeds, and on both `extremes` and MM
+# the seed spread was an order of magnitude larger than the arm spread -- the ranking flips depending
+# on which design count you cut at. `linear` is the only task cheap enough to buy seeds instead of
+# arguing about estimators, and it has a closed-form floor (`bayes_risk`) to score against.
+
+# RUN config for the DEBUG task (`linear`): probe positions on a linear response. The detector is two
+# Gaussian draws and an affine map, so a whole campaign is minutes rather than hours.
+#
+# WHY IT EXISTS. Every other task in this repo answers "did BO find something good?" with a number
+# nobody can check independently. Here the optimum is the pair of box corners and the achievable loss
+# is a Bayes risk in closed form (LinearDetector.bayes_risk), so a campaign can be scored against the
+# ANSWER: 0.00498 at {-1, +1}, 0.501 with the two probes on top of each other, 1.0 for a regressor
+# that has learned nothing. That makes it the right place to test driver machinery -- the resume
+# protocol, the seed sequence, the trainers -- where a silent mistake would otherwise look like noise.
+#
+# regressor -- a tiny MLP over the set of probes: one element per probe, its features being its own
+#   reading and its own position, so the network is design-conditioned and permutation-invariant in
+#   the probes, which is the symmetry of the problem. The bottleneck is deliberate and it is the whole
+#   reason the task runs at all: CAPACITY IS THE LEVER ON THE BINDING TERM. MEASURED at `corner-high`
+#   (+1, +1), the worst design in the box, at `iteration_limit` 65536 -- at [[16,16],[16,16]] (7048
+#   parameters) the train/validation gap sticks at diff 0.0150 and the design NEVER converges; at
+#   [[16,8],[8,16]] (3304) the same gap is diff 0.0021 and it converges in 61 s. Half the parameters,
+#   a sevenfold smaller gap. Dropconnect was tried at the narrow width and is NOT used: it moved the
+#   slack by 0.00004 (0.00879 against 0.00883), so there is nothing left for it to regularise.
+#
+# training.loss_precision -- 2.0e-2, set so EVERY design in the box can converge, which is the only
+#   thing this bar has to do here. THE BINDING DESIGNS ARE THE BAD ONES, the opposite of the enzyme
+#   tasks: both terms of the slack scale with the loss LEVEL, and the level spans a hundredfold. The
+#   per-event loss is a mean of squared Gaussians, so `err` is proportional to the level over sqrt(N)
+#   -- intrinsic, nothing to tune. The constant is NOT 1: the standard-deviation-to-mean ratio is
+#   `sqrt(2 sum mu^2)/sum mu` over the posterior eigenvalues, which is exactly 1.0 at the OPTIMUM
+#   design (two equal eigenvalues) and 1.41 at the ceiling designs, where it is the value that
+#   matters. The earlier "standard deviation equals its own mean" was right where it is harmless and
+#   41% low where it was applied (D102). MEASURED at the coincident-probe
+#   designs, which are the worst in the box, at `iteration_limit` 65536 and both seeds: `centre`
+#   converges at 0.0088 / 0.0100, `corner-low` CAPS at 0.0155 / 0.0133. So 1.0e-2 is unreachable and
+#   2.0e-2 clears the worst measured slack by 29%.
+#
+#   LOOSENING IT COSTS NOTHING HERE, and that is a statement about this task rather than a general
+#   one. BO is handed the MEASURED uncertainty per design, not this bar -- ±0.0004 near the optimum --
+#   so its resolution where the landscape matters is unchanged, and a looser bar only stops the junk
+#   end of the landscape from growing its window. The check that this did not degrade anything is not
+#   another slack screen: it is `bayes_risk`, which says what every design's loss should have been.
+#
+# training.budget -- the ceiling designs are what it has to pay for. A design near the optimum
+#   converges at n0 for 5461 calls; `corner-high` grows to a window of 45056 and spends 60071, 11x
+#   more, and 29% of uniform designs sit in that region. 2^20 funds ~40 designs at that mix, which is
+#   the acceptance criterion's declared 20 -> 40 pair, at roughly 20 minutes of wall clock per run.
+#
+# training.iteration_limit -- ALSO THE EPOCH LENGTH: steps_per_epoch = iteration_limit // batch, so
+#   this gives 512-step epochs. The coupling is definitional and must not be broken -- warmup_epochs,
+#   patience and the convergence posterior are all written in epoch units.
+#
+# bo.gp.kernel.exchangeable -- n_probes. The design is a SET: reading at (-1, +1) is the same
+#   experiment as reading at (+1, -1), and the invariant kernel is what says so.
+
+detector: linear
+
+regressor:
+  set-regressor:
+    features: [[24, 32], [32, 24]]
+    n_models: 4
+
+device: cuda
+plot_per_epoch: 8
+
+training:
+  n0: 4096
+  n_increment: 4096
+  batch: 128
+  eval_batch: 4096
+  warmup_epochs: 2
+  patience: 16
+  budget: 1048576
+  iteration_limit: 65536
+  val_fraction: 0.25
+  loss_precision: 1.0e-2
+  param_mix: 0.25
+  optimizer:
+    adamaxw:
+      learning_rate: 2.5e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-3
+
+bo:
+  n_init: 5
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds: [-2.0, 1.0]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+    kernel:
+      normalised-invariant-rbf:
+        exchangeable: 2
+  ei:
+    n_restarts: 32
+    n_steps: 100
+
+verify:
+  n_points: 10
+  epochs: 200
+  val_every_epochs: 10
+  budget: null
+  batch: null

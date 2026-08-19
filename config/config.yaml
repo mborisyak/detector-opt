@@ -1,4 +1,6 @@
 detector: straw
+
+plot_per_epoch: 8
 method: subgradient
 
 ### for direct training

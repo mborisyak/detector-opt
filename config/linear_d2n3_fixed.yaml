@@ -1,0 +1,66 @@
+# FIXED-DATA procedure (scripts/bo_fixed.py) on `linear` at d = 2, n_probes = 3, noise = 0.5.
+#
+# LANDSCAPE, computed in closed form from `LinearDetector.bayes_risk` over 4096 Sobol designs before
+# anything was run: no-information ceiling 0.3333, optimum (best corner) 0.1059, median random 0.3593,
+# worst 0.6659. SPAN (median - optimum) = 0.2534. n_probes 3 > n_dimensions 2, so no design is rank
+# deficient. The task has an EXACT answer, so every reported loss can be checked against it.
+#
+# n_per_design: 8192 detector calls, drawn ONCE per design and never added to -- 6144 train rows and
+#   2048 validation at val_fraction 0.25. Sized so the reported noise sits far below the 0.2534 span:
+#   a d=1 smoke run at the same n_per_design reported noise 0.0003-0.0044.
+# budget: 163840 = 20 x 8192, i.e. EXACTLY 20 BO steps. The run ends when the shared pool fills.
+# iteration_limit is NOT set: under this procedure it IS the training window and is derived from
+#   n_per_design, so one epoch is one pass over the data (see detopt/nn/trainer/fixed.py).
+# loss_precision 2.0e-2 no longer gates scoring -- it only sets the stillness threshold of the
+#   training-settled test, `P(train change over +patience < loss_precision/2) > 0.9`.
+# bo.gp.kernel.exchangeable: 3 = n_probes. The design is field-major, one field per axis of width
+#   n_probes, and the probes within an axis are a SET -- at 2 the kernel would model the wrong group.
+
+detector: linear_d2n3
+
+regressor:
+  set-regressor:
+    features: [[32, 16], [16, 32]]
+    n_models: 4
+
+device: cuda
+plot_per_epoch: 8
+
+training:
+  n_per_design: 8192
+  batch: 128
+  eval_batch: 4096
+  warmup_epochs: 2
+  patience: 16
+  budget: 163840
+  val_fraction: 0.25
+  loss_precision: 2.0e-2
+  optimizer:
+    adamaxw:
+      learning_rate: 2.5e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-3
+
+bo:
+  n_init: 5
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds: [-2.0, 1.0]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+    kernel:
+      normalised-invariant-rbf:
+        exchangeable: 3
+  ei:
+    n_restarts: 32
+    n_steps: 100
+
+verify:
+  n_points: 10
+  epochs: 200
+  val_every_epochs: 10
+  budget: null
+  batch: null

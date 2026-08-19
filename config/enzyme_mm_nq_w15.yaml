@@ -1,0 +1,94 @@
+# WIDTH x1.5 AND LADDER x2 against `config/enzyme_mm_nq.yaml`:
+#   features    [[24,16],[16,24]] -> [[36,24],[24,36]]
+#   n0          2048 -> 4096
+#   n_increment 1024 -> 2048
+# Nothing else moves -- same detector (Q10 dropped, m=3), same bar 3.0e-3, same budget 2^18, same
+# p_dropout 0.1, same n_models 4, same optimiser and seed, so a difference against that run is these
+# three settings'. NOTE they move TOGETHER, so this run cannot attribute an effect to the width alone
+# or to the ladder alone; it is a combined step, not a controlled contrast.
+#
+# THE WIDTH IS NOT FREE, AND AN EARLIER VERSION OF THIS HEADER CLAIMED IT WAS. That claim rested on the
+# loop being launch-latency bound. `scripts/probe_epoch_cost.py` MEASURED the opposite on the SHiP
+# config at fixed steps per epoch: n_models 1 costs 0.815 s/epoch (0.80 ms/step) and n_models 4 costs
+# 3.448 s/epoch (3.37 ms/step) -- 4.23x for 4x the members, i.e. very nearly linear, so the loop is
+# ARITHMETIC-bound in the capacity dimension. Expect the widening to cost roughly quadratically in the
+# layer widths, ~2x wall clock per epoch here.
+#
+# THAT COSTS WALL CLOCK, NOT DESIGNS. `budget` counts DETECTOR CALLS, and a wider network consumes no
+# more of them -- it only makes each epoch slower. So this run should still reach a comparable design
+# count to its parent (6-8) and simply take longer, on the order of 70 min per arm against 34.
+#
+# WHY THE LADDER DOUBLES. The parent run's designs took 18-37 growth rounds to reach final windows of
+# 20480-39936. Every round pays `warmup_epochs` unconditionally and then however many epochs the
+# settled test needs, so the ROUND COUNT is a direct multiplier on wall clock that buys nothing once
+# the window is already near the exit. Doubling n0 and n_increment halves the rounds. The cost is
+# granularity: the ladder can now overshoot the exit window by up to 2048 events instead of 1024,
+# which is 5-10% of a typical final window here -- small against the 18x spread in window that the
+# campaign already shows across designs.
+
+# loss_precision: 3.0e-3, NOT the 1.0e-3 first considered. The gate is `gap + err <= bar` with
+# `err = c / sqrt(window)` and c measured at 0.307 on this task, so a 1.0e-3 bar needs >= 94249 events
+# per design -- 2.8 designs inside a 2^18 budget, against n_init = 5. Worse, the measured `gap` regimes
+# are 0.0005 (seed 1) and 0.0024 (seed 2), so at a 1.0e-3 bar a seed-2-regime design has `gap` ALONE
+# above the bar and can never satisfy the gate however much data it buys. 3.0e-3 implies ~10472 events
+# per design, ~25 designs in budget, and sits above both measured gap regimes.
+#
+# dropconnect 0.05 -> p_dropout 0.1. The `set-regressor` block order is linear -> activation -> dropout,
+# so dropout acts on ACTIVATIONS ONLY and never on a block's input; the raw detector features are not
+# dropped. (`detopt/nn/mlp.py` is the opposite -- it inserts Dropout BEFORE every linear including the
+# first -- but nothing here uses it.)
+#
+# EVERY MM NUMBER ON DISK was taken at dropconnect 0.1, so this run is not comparable to them on the
+# regulariser axis either. It is a fresh baseline, not a continuation.
+
+detector: enzyme_mm_sym_m3_nq
+
+regressor:
+  set-regressor:
+    features: [[36, 24], [24, 36]]
+    n_models: 4
+    p_dropout: 0.1
+device: cuda
+plot_per_epoch: 8
+
+training:
+  n0: 4096
+  n_increment: 2048
+  batch: 128
+  eval_batch: 2048
+  warmup_epochs: 2
+  patience: 16
+  budget: 262144
+  iteration_limit: 65536
+  val_fraction: 0.25
+  loss_precision: 3.0e-3
+  param_mix: 0.25
+  optimizer:
+    adamaxw:
+      learning_rate: 2.5e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-3
+
+bo:
+  n_init: 5
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds: [-2.0, 1.0]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+    kernel:
+      normalised-invariant-rbf:
+        exchangeable: 3
+  ei:
+    n_restarts: 32
+    n_steps: 100
+
+verify:
+  n_points: 10
+  epochs: 200
+  val_every_epochs: 10
+  budget: null
+  batch: null

@@ -56,16 +56,47 @@
 # must say which of its claims depend on it. It also sets criterion (d)'s bar at 10x, i.e. 0.10,
 # against a proxy-measured baseline-to-best range of 0.103.
 
+#
+# 2026-08-18 -- regressor.dropconnect SET TO 0.0. MEASURED on `linear`, 72 crossed cells (2 arms x
+# 4 doses x 3 designs x 3 seeds, paired within design and seed, `bo`): dropconnect adds BIAS THAT THE
+# CRITERION CANNOT SEE. Held-out excess against the closed-form floor rises monotonically to +0.00479
+# at dose 0.2 -- 48% of the bar -- while `gap`, the only overfitting signal the exit test has, FALLS
+# (-0.00041), and the exit window is UNCHANGED (ratio 1.00 at every dose in both arms). The procedure
+# therefore buys no extra data in compensation and reports a worse number at the same price. `meta` is
+# hurt about half as much as `from_scratch` (+0.00262 against +0.00479 at 0.2), so replay is partly
+# REDUNDANT with dropconnect rather than protected from it.
+
+#
+# 2026-08-18 (later) -- dropconnect 0.05, NOT null. Reverted from the `null` set earlier the same day.
+#
+# TURNING IT OFF REMOVED THE TERMINATION MECHANISM FROM BOTH PROCEDURES, which the bias measurement
+# did not anticipate:
+#   growth  -- the gap gate `gap + err <= loss_precision` needs the gap held down; unregularised the
+#              config's own record says designs cap (later shown to be an artefact of a 131072 cap,
+#              but the cost is real: 278512 calls/design against ~98281, i.e. 2.8x).
+#   fixed   -- stops on the TRAIN-SETTLED test alone, so the only thing that can end a design is the
+#              training curve flattening. MEASURED: with dropconnect 0.1, 394 of 394 designs
+#              terminated, median 109 s, max 271 s. With dropconnect null, median 476 s, max 2919 s,
+#              and designs still running past 3500 epochs with validation rising since epoch 600.
+#
+# 0.05 RATHER THAN 0.1 because that is where the bias is negligible. MEASURED on `linear`, 72 crossed
+# cells, held-out excess against the closed-form floor, paired within (design, seed):
+#     dose    from_scratch   meta
+#     0.05      +0.00007    +0.00001
+#     0.10      +0.00110    +0.00050
+#     0.20      +0.00479    +0.00262
+# and this task's own earlier record puts 0.05 at -0.0004 on the objective, i.e. free. 0.05 therefore
+# buys termination at a bias two orders of magnitude below the dose that motivated turning it off.
+
 detector: enzyme_mm_sym
 
 regressor:
   set-regressor:
     features: [[24, 16], [16, 24]]
     n_models: 4
-    dropconnect: 0.1
-
+    dropconnect: 0.05
 device: cuda
-plot_per_epoch: false
+plot_per_epoch: 8
 
 training:
   n0: 8192

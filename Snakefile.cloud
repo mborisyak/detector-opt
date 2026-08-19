@@ -25,6 +25,14 @@
 #
 # Set it with `--config n_seeds=5`. It defaults to 5 here because that is what this box exists for.
 #
+# THE ARM SET IS ALSO A CONFIG KEY, `--config strategies=meta,from_scratch`, defaulting to all four.
+# It is not cosmetic: the arms appear in `wildcard_constraints`, so a subset is what stops snakemake
+# from building the two arms a campaign did not ask for when it resolves `comparison.txt`. A campaign
+# whose config documents a two-arm comparison (enzyme_mm_sym_m3_p5e3) would otherwise silently cost
+# twice its budget. Arms are a pure ADDITION -- each lives in its own directory and the comparison
+# re-derives from whatever is present -- so a two-arm campaign can be widened later by relaunching
+# with the larger set, without redoing the arms already scored.
+#
 # CONCURRENCY. `-c<cores>` bounds total cores and each heavy job declares `cpus_per_task`, so cores
 # alone can cap concurrency; `--resources local_gpu=K` caps the GPU-heavy jobs explicitly and is the
 # knob to set from the MPS probe (scripts/probe_mps.py, scripts/probe_mps.sh). A `device: cpu` task
@@ -95,7 +103,10 @@ N_SEEDS = int(config.get("n_seeds", 5))
 rng = random.Random(SUPER_SEED)
 SEEDS = [rng.randint(0, 2 ** 31 - 1) for _ in range(N_SEEDS)]
 
-STRATEGIES = ["from_scratch", "continue", "closest", "meta"]
+ALL_STRATEGIES = ["from_scratch", "continue", "closest", "meta"]
+STRATEGIES = [name.strip() for name in str(config.get("strategies", ",".join(ALL_STRATEGIES))).split(",")]
+if len(STRATEGIES) == 0 or any(name not in ALL_STRATEGIES for name in STRATEGIES):
+  raise ValueError(f"strategies must be a comma-separated subset of {ALL_STRATEGIES}, got {STRATEGIES}")
 
 ENV = (
   "XLA_PYTHON_CLIENT_PREALLOCATE=false PYTHONUNBUFFERED=1 "

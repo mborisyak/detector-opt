@@ -25,6 +25,7 @@ regressor:
     p_dropout: 0.1   # halves the train-val gap at 8k events, no cost in val loss
 
 device: cuda
+plot_per_epoch: 8
 
 training:
   n0: 2048
@@ -64,8 +65,7 @@ training:
       b1: 0.9
       b2: 0.999
       eps: 1.0e-8
-      weight_decay: 1.0e-6
-
+      weight_decay: 1.0e-3
 bo:
   # No fixed iteration count -- the run continues until the shared `budget` is exhausted.
   # Random proposals before the GP takes over. Written explicitly (user, 2026-08-11) rather than

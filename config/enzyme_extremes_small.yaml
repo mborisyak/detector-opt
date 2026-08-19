@@ -1,0 +1,146 @@
+# CAMPAIGN CONFIG -- the WIDE network at a HALVED budget. A cheap probe of the small-budget regime.
+#
+# It is `config/enzyme_extremes_wide.yaml` with the budget halved and the three settings that must
+# move with it. Everything else -- the network, the seeds, `loss_precision`, `param_mix`, the
+# optimiser, the BO block -- is identical.
+#
+#   training.budget           2097152 -> 1048576   (2^20)
+#   training.iteration_limit   524288 ->  262144
+#   training.n0                 12288 ->    4096
+#   training.n_increment         6144 ->    2048
+#
+# ⚠️ IT IS NOT A SINGLE-VARIABLE COMPARISON against either the wide campaign or the parent, and it
+# cannot separate budget from window size from growth granularity. It is a probe of a regime, not a
+# controlled contrast, and must not be reported as one.
+#
+# ⚠️ EXPECT ~12-14 DESIGNS PER RUN, against the criterion's declared 20 -> 40 pair. That is known
+# BEFORE the run, not discovered in it: the wide campaign's 412 designs cost a MEAN of 100094
+# detector calls each, and 1048576 / 100094 = 10.5. The parent's cheaper designs (mean 87657) would
+# give 12.0. Accepted deliberately (user, 2026-08-17) as a cheap look at the regime; this campaign
+# cannot address the 20 -> 40 criterion and nothing here should be read against it.
+#
+# WHY `iteration_limit` HAD TO MOVE, and it is the first-order change here. It caps the PER-DESIGN
+# window. The parent config's stated principle is that the train share covers THREE full windows:
+#
+#   budget 2097152 -> train 1572864;  iteration_limit 524288 = 3.0 windows
+#   budget 1048576 -> train  786432;  iteration_limit 524288 = 1.5 windows   <- one design, 2/3 of the run
+#   budget 1048576 -> train  786432;  iteration_limit 262144 = 3.0 windows   <- this
+#
+# At 1.5 windows a single expensive design consumes two thirds of a run's entire training budget and
+# two of them end it. 262144 restores the principle.
+#
+# CONSEQUENCE FOR THE CONVERGENCE PROCEDURE, which is the coupling that makes this a real decision
+# rather than a knob: `iteration_limit` is ALSO the epoch length (`steps_per_epoch = iteration_limit
+# // batch`), and `warmup_epochs`, `patience` and the convergence posterior are all written in epoch
+# units. At 262144 the epoch is 1024 steps, against the 512 every convergence measurement of
+# 2026-08-14 was taken at -- so `patience` 16 now spans TWICE the measured horizon where at 524288 it
+# spanned four times. This is closer to the measured regime than the campaigns before it, not further
+# from it, which is why the value is 262144 and not something chosen to keep the epoch unchanged.
+#
+# WHY `n0` AND `n_increment` ARE ONLY A SECOND-ORDER LEVER, measured rather than assumed. Across 880
+# designs of the two finished campaigns, only 2% converged AT the floor (`n0 / (1 - val_fraction)`):
+#
+#   parent  n0  8192  floor 10923   2% at floor   p25 49150   median 70994   mean  87657
+#   wide    n0 12288  floor 16384   2% at floor   p25 65536   median 90112   mean 100094
+#
+# A design costs what it costs because of how much data it needs to converge; `n0` sets the FLOOR and
+# the granularity of the stopping grid, not the median. So the reduction here is a THIRD of the wide
+# campaign's, not the half the budget change alone would suggest (user, 2026-08-17): floor 16384 ->
+# 5461, and a stopping grid three times finer relative to the budget. It buys the cheapest designs a
+# much finer stop and pays for it in extra growth rounds, i.e. wall clock -- and the runbook records
+# that proving flatness across many small growth rounds is where the wall clock went before `n0` was
+# doubled to 8192. That cost is accepted here to get as many designs as this budget can fund.
+
+#
+# 2026-08-18 -- regressor.dropconnect SET TO 0.0 (user). MEASURED on `linear`, 72 crossed cells: it
+# adds BIAS THE CRITERION CANNOT SEE -- held-out excess rises to +0.00479 at dose 0.2 (48% of the bar)
+# while `gap` FALLS and the exit window is unchanged (ratio 1.00), so no extra data is bought in
+# compensation. `meta` is hurt about half as much, so replay is partly redundant with it.
+#
+# ⚠️ THE CLAIM THIS OVERRIDES -- NOW TESTED AND REFUTED. The block below records "UNREGULARISED, the
+# network converges 0 of 3 -- its persistent train/validation gap is 0.0096-0.0129, above the bar".
+# That was measured at `iteration_limit` 131072 with 512-step epochs (D93). MEASURED 2026-08-18 at
+# THIS config's 524288 with 2048-step epochs, 3 designs x 2 arms on `bo` (jobs 36/37, output in
+# `output/extremes-nodc/`): 6 of 6 CONVERGED, 0 capped, gap 0.0047-0.0069 -- not 0.0096-0.0129 -- with
+# `gap + err` at 0.0093-0.0099 against the 0.010 bar. The gap is NOT persistent; it had not finished
+# falling when the old cap bit. Five of the six needed 172k-250k rows, MORE than the old 131072 limit,
+# so every one would have been scored "does not converge" under it.
+#
+# ⚠️ THE COST IS REAL: median 278512 calls per design against the ~98281 recorded at dropconnect 0.1,
+# i.e. 2.8x. On `budget` 2097152 that is ~7-8 designs a run instead of ~21, BELOW what the n -> 2n
+# acceptance criterion needs. Running this task unregularised requires the budget raised roughly 3x;
+# leaving the budget unchanged silently shortens every run.
+
+#
+# 2026-08-18 (later) -- dropconnect 0.05, NOT null. Reverted from the `null` set earlier the same day.
+#
+# TURNING IT OFF REMOVED THE TERMINATION MECHANISM FROM BOTH PROCEDURES, which the bias measurement
+# did not anticipate:
+#   growth  -- the gap gate `gap + err <= loss_precision` needs the gap held down; unregularised the
+#              config's own record says designs cap (later shown to be an artefact of a 131072 cap,
+#              but the cost is real: 278512 calls/design against ~98281, i.e. 2.8x).
+#   fixed   -- stops on the TRAIN-SETTLED test alone, so the only thing that can end a design is the
+#              training curve flattening. MEASURED: with dropconnect 0.1, 394 of 394 designs
+#              terminated, median 109 s, max 271 s. With dropconnect null, median 476 s, max 2919 s,
+#              and designs still running past 3500 epochs with validation rising since epoch 600.
+#
+# 0.05 RATHER THAN 0.1 because that is where the bias is negligible. MEASURED on `linear`, 72 crossed
+# cells, held-out excess against the closed-form floor, paired within (design, seed):
+#     dose    from_scratch   meta
+#     0.05      +0.00007    +0.00001
+#     0.10      +0.00110    +0.00050
+#     0.20      +0.00479    +0.00262
+# and this task's own earlier record puts 0.05 at -0.0004 on the objective, i.e. free. 0.05 therefore
+# buys termination at a bias two orders of magnitude below the dose that motivated turning it off.
+
+detector: enzyme_extremes
+
+regressor:
+  set-regressor:
+    features: [[32, 24], [24, 32]]
+    n_models: 4
+    dropconnect: 0.05
+device: cuda
+plot_per_epoch: 8
+
+training:
+  n0: 4096
+  n_increment: 2048
+  batch: 256
+  eval_batch: 2048
+  warmup_epochs: 2
+  patience: 16
+  budget: 1048576
+  iteration_limit: 262144
+  val_fraction: 0.25
+  loss_precision: 1.0e-2
+  param_mix: 0.25
+  optimizer:
+    adamaxw:
+      learning_rate: 2.5e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-3
+
+bo:
+  n_init: 5
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds: [-2.0, 1.0]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+    kernel:
+      normalised-invariant-rbf:
+        exchangeable: 4
+  ei:
+    n_restarts: 32
+    n_steps: 100
+
+verify:
+  n_points: 10
+  epochs: 200
+  val_every_epochs: 10
+  budget: null
+  batch: null

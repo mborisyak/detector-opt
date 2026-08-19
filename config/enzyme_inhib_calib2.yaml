@@ -20,6 +20,7 @@ regressor:
     p_dropout: 0.1   # measured on the melt task: costs 0.0067 of level, buys a 5.3x cheaper exit
 
 device: cuda
+plot_per_epoch: 8
 
 training:
   n0: 2048
@@ -46,8 +47,7 @@ training:
       b1: 0.9
       b2: 0.999
       eps: 1.0e-8
-      weight_decay: 1.0e-6
-
+      weight_decay: 1.0e-3
 bo:
   n_init: 5          # the user's criterion is stated for "BO with 5 initial Sobol points"
   gp:

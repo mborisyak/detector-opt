@@ -27,6 +27,9 @@ set -euo pipefail
 TASK=${1:-enzyme_extremes}
 PREFIX=${2:-output/cloud}
 HOST=${HOST:-bo}
+# The checkout on bo that owns this campaign -- one per campaign, since snakemake locks its working
+# directory and two campaigns cannot share a tree.
+REMOTE_ROOT=${REMOTE_ROOT:-detector-opt}
 LOCAL_ROOT=${LOCAL_ROOT:-/home/max/dev/detector-opt}
 CAMPAIGN=$PREFIX/$TASK
 LOG=$LOCAL_ROOT/logs/pull-full-$TASK.log
@@ -40,10 +43,10 @@ if [ "${PULL_FULL_LOCKED:-0}" != "1" ]; then
 fi
 
 {
-  echo "=== $(date -u +%FT%TZ) full pull start: $HOST:$CAMPAIGN -> $LOCAL_ROOT/$CAMPAIGN"
+  echo "=== $(date -u +%FT%TZ) full pull start: $HOST:$REMOTE_ROOT/$CAMPAIGN -> $LOCAL_ROOT/$CAMPAIGN"
   status=0
   timeout 21600 rsync -a --partial --info=stats2 \
-    "$HOST:detector-opt/$CAMPAIGN/" "$LOCAL_ROOT/$CAMPAIGN/" || status=$?
+    "$HOST:$REMOTE_ROOT/$CAMPAIGN/" "$LOCAL_ROOT/$CAMPAIGN/" || status=$?
   echo "=== $(date -u +%FT%TZ) full pull finished, rsync exit $status"
   du -sh "$LOCAL_ROOT/$CAMPAIGN"
   exit $status

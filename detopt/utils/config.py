@@ -43,8 +43,17 @@ def optimizer(config: dict[str, Any], n_total_steps: int | None = None):
     name, arguments = split(config)
     if "learning_rate" in arguments:
         if isinstance(arguments["learning_rate"], dict):
+            import inspect
+
             lr_name, lr_arguments = split(arguments["learning_rate"])
-            arguments["learning_rate"] = getattr(optax, lr_name)(**lr_arguments, decay_steps=n_total_steps)
+            schedule = getattr(optax, lr_name)
+            # `decay_steps` is injected ONLY for schedules that declare it and only when a step count
+            # is known. `optax.exponential_decay` takes `transition_steps` instead and raises on an
+            # unexpected `decay_steps`, so passing it unconditionally made every such schedule
+            # unusable from a config.
+            if n_total_steps is not None and "decay_steps" in inspect.signature(schedule).parameters:
+                lr_arguments = {**lr_arguments, "decay_steps": n_total_steps}
+            arguments["learning_rate"] = schedule(**lr_arguments)
 
     return getattr(optax, name)(**arguments)
 

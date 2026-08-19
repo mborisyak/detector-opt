@@ -54,13 +54,20 @@ __all__ = ["GBDTScore", "score_design", "sample_design"]
 class GBDTScore(NamedTuple):
   """One design's score. ``loss`` is what BO minimises, ``sem`` is the GP's observation noise.
 
-  ``train``/``val`` are MSE for a scalar or vector target and cross-entropy / ``ln K`` for a class."""
+  ``train``/``val`` are MSE for a scalar or vector target and cross-entropy / ``ln K`` for a class.
+
+  ``train_sem``/``val_sem`` are the two sides' OWN standard errors, reported separately because the
+  neural convergence procedure (``detopt/nn/trainer/design.py``) spells its resolution as
+  ``|val - train| + hypot(train_sem, val_sem)`` and ``sem`` -- the standard error of the AVERAGE --
+  is not that quantity. Both are the per-SAMPLE spread over the events at the stopping point."""
   loss: float  # (train + val) / 2 at the validation minimum
   sem: float  # its standard error
   train: float  # train loss at the stopping point
   val: float  # val loss at the stopping point (the minimum over stages)
   n_learners: int  # the stopping point itself: how many base learners the design could support
   n_events: int
+  train_sem: float = float("nan")
+  val_sem: float = float("nan")
 
 
 def n_classes_of(detector) -> int:
@@ -115,16 +122,16 @@ def score_design(
   train_target, val_target = target[:n_train], target[n_train:]
 
   settings = dict(
-    max_learners=max_learners, learning_rate=learning_rate, max_leaf_nodes=max_leaf_nodes,
-    min_samples_leaf=min_samples_leaf, patience=patience, n_threads=n_threads, seed=seed
+    max_learners=max_learners, learning_rate=learning_rate, max_leaf_nodes=max_leaf_nodes, min_samples_leaf=min_samples_leaf,
+    patience=patience, n_threads=n_threads, seed=seed
   )
 
   if n_classes > 1:
     # ONE classifier over all K classes (not K regressions): the classes are mutually exclusive and
     # softmax couples them, which is the same coupling the neural objective's cross-entropy has.
     train_loss, val_loss, stopping = _fit_class(
-      train_features, np.argmax(train_target, axis=1), val_features, np.argmax(val_target, axis=1),
-      n_classes=n_classes, **settings
+      train_features, np.argmax(train_target, axis=1), val_features, np.argmax(val_target, axis=1), n_classes=n_classes,
+      **settings
     )
     stopping = [stopping]
   else:
@@ -145,10 +152,18 @@ def score_design(
   train_mean, val_mean = float(train_loss.mean()), float(val_loss.mean())
   # loss = (train + val) / 2, so its variance is a quarter of the sum of the two means' variances.
   sem = 0.5 * float(np.sqrt(train_loss.var() / train_loss.size + val_loss.var() / val_loss.size))
+  train_sem = float(np.sqrt(train_loss.var() / train_loss.size))
+  val_sem = float(np.sqrt(val_loss.var() / val_loss.size))
   return GBDTScore(
-    loss=0.5 * (train_mean + val_mean), sem=sem, train=train_mean, val=val_mean,
+    loss=0.5 * (train_mean + val_mean),
+    sem=sem,
+    train=train_mean,
+    val=val_mean,
     # the DEEPEST component's stopping point: how many base learners the design could support at all
-    n_learners=int(max(stopping)) + 1, n_events=int(n_events)
+    n_learners=int(max(stopping)) + 1,
+    n_events=int(n_events),
+    train_sem=train_sem,
+    val_sem=val_sem
   )
 
 
@@ -176,23 +191,23 @@ def _parameters(*, learning_rate, max_leaf_nodes, min_samples_leaf, n_threads, s
 
 
 def _fit_component(
-  train_features, train_target, val_features, val_target, *, max_learners, learning_rate, max_leaf_nodes,
-  min_samples_leaf, patience, n_threads, seed
+  train_features, train_target, val_features, val_target, *, max_learners, learning_rate, max_leaf_nodes, min_samples_leaf,
+  patience, n_threads, seed
 ):
   """One component of a regression target: fit, stop at the validation minimum, return the per-SAMPLE
   squared errors there (train, val) and the stopping index."""
   train_matrix = xgb.DMatrix(train_features, label=train_target)
   val_matrix = xgb.DMatrix(val_features, label=val_target)
   parameters = _parameters(
-    learning_rate=learning_rate, max_leaf_nodes=max_leaf_nodes, min_samples_leaf=min_samples_leaf,
-    n_threads=n_threads, seed=seed
+    learning_rate=learning_rate, max_leaf_nodes=max_leaf_nodes, min_samples_leaf=min_samples_leaf, n_threads=n_threads,
+    seed=seed
   )
   parameters['objective'] = 'reg:squarederror'
   # `early_stopping_rounds` finds the validation minimum without fitting all `max_learners` trees;
   # the patience is generous so a plateau is not mistaken for the minimum.
   model = xgb.train(
-    parameters, train_matrix, num_boost_round=int(max_learners),
-    evals=[(val_matrix, 'val')], early_stopping_rounds=int(patience), verbose_eval=False
+    parameters, train_matrix, num_boost_round=int(max_learners), evals=[(val_matrix, 'val')],
+    early_stopping_rounds=int(patience), verbose_eval=False
   )
   stopping = int(model.best_iteration)
 
@@ -204,8 +219,8 @@ def _fit_component(
 
 
 def _fit_class(
-  train_features, train_label, val_features, val_label, *, n_classes, max_learners, learning_rate,
-  max_leaf_nodes, min_samples_leaf, patience, n_threads, seed
+  train_features, train_label, val_features, val_label, *, n_classes, max_learners, learning_rate, max_leaf_nodes,
+  min_samples_leaf, patience, n_threads, seed
 ):
   """A one-hot class target: fit a softmax classifier, stop at the validation minimum of ``mlogloss``
   (the SAME quantity the score reports, exactly as the regressor stops on validation MSE), and return
@@ -216,13 +231,13 @@ def _fit_class(
   train_matrix = xgb.DMatrix(train_features, label=train_label)
   val_matrix = xgb.DMatrix(val_features, label=val_label)
   parameters = _parameters(
-    learning_rate=learning_rate, max_leaf_nodes=max_leaf_nodes, min_samples_leaf=min_samples_leaf,
-    n_threads=n_threads, seed=seed
+    learning_rate=learning_rate, max_leaf_nodes=max_leaf_nodes, min_samples_leaf=min_samples_leaf, n_threads=n_threads,
+    seed=seed
   )
   parameters.update({'objective': 'multi:softprob', 'num_class': int(n_classes), 'eval_metric': 'mlogloss'})
   model = xgb.train(
-    parameters, train_matrix, num_boost_round=int(max_learners),
-    evals=[(val_matrix, 'val')], early_stopping_rounds=int(patience), verbose_eval=False
+    parameters, train_matrix, num_boost_round=int(max_learners), evals=[(val_matrix, 'val')],
+    early_stopping_rounds=int(patience), verbose_eval=False
   )
   stopping = int(model.best_iteration)
 

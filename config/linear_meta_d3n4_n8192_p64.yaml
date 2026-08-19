@@ -1,0 +1,88 @@
+# ⚠️ WAVE-2 VARIANT of config/linear_meta_d3n4_n8192.yaml: `training.patience` 16 -> 64, and NOTHING ELSE.
+#
+# WHY. The measured reason `meta` trains less per design is that half of every minibatch is
+# replay, so it applies roughly half the current design's gradient per epoch, while `patience`
+# counts EPOCHS and is identical across arms -- `meta` is under-trained on the criterion's own
+# clock. Raising patience gives it the epochs back. On `extremes` this closed the deficit
+# monotonically (+0.0051 at 16, +0.0036 at 32, -0.0005 at 64).
+#
+# THE FAILURE THAT BLOCKED IT ON `extremes` CANNOT HAPPEN HERE. There, patience 32 crashed BOTH
+# arms on the window cap: longer training inflates `diff`, `diff` is irreducible by data, and
+# the growth gate `diff + err <= loss_precision` then became unsatisfiable within
+# `iteration_limit`. The FIXED procedure has no such gate -- a design stops on the
+# training-settled test alone and is ALWAYS scored, never capped -- so patience is free to
+# raise. It is applied to BOTH arms, because it is a shared training setting and the honest
+# control for it is the same cell at patience 16.
+
+# SCREEN config for the arm question: is there a cell where the `meta` arm (ContinualTrainer -- one
+# network carried across designs, half of every minibatch drawn from past designs) beats
+# `from_scratch` at MATCHED design count, scored against the closed-form `LinearDetector.bayes_risk`?
+#
+# FIXED-DATA procedure (scripts/bo_fixed.py), chosen deliberately over the growth procedure: the
+# measured mechanism by which `meta` LOSES is that replay halves its per-epoch gradient on the
+# current design, the settled test therefore fires earlier, and it exits the growth loop at a smaller
+# window -- 36864 against 65536 over 334 extremes exits. That is a confound between "trains
+# differently" and "is given less data". The fixed procedure hands every arm exactly `n_per_design`
+# calls at every design, so the confound is absent by construction and any remaining difference is a
+# difference in what the network learned.
+#
+# CELL d = 3, n_probes = 4, sigma 0.5 -- HARDER SEARCH. 12 design dimensions. The reason for it is measured in docs/linear-highdim.md section 3: the median BO residual is 42% of the range at 10 designs and 16% at 20, where the shipped d = 1 cell is at 0.0% by design 10. An arm difference in search can only be seen while a search is still running.
+#
+# n_per_design 8192 detector calls a design, budget 262144 = 32 x 8192, so the run ends after
+#   exactly 32 BO steps and the design count is IDENTICAL across arms -- no selection trap, and
+#   budget-matched and count-matched comparisons coincide.
+# loss_precision 2.0e-2 does NOT gate scoring under this procedure; it only sets the stillness
+#   threshold of the training-settled test, `P(train change over +patience < loss_precision/2) > 0.9`.
+# bo.gp.kernel.exchangeable 4 = n_probes: the design is field-major, one field per axis of width
+#   n_probes, and the probes are a SET.
+# The regressor, batch, warmup_epochs, patience, val_fraction and the whole optimiser and bo blocks
+#   are COPIED VERBATIM from config/linear_d2n3_fixed.yaml so that the cell is the only thing varying.
+
+detector: linear_d3n4
+
+regressor:
+  set-regressor:
+    features: [[32, 16], [16, 32]]
+    n_models: 4
+
+device: cuda
+plot_per_epoch: 8
+
+training:
+  n_per_design: 8192
+  batch: 128
+  eval_batch: 4096
+  warmup_epochs: 2
+  patience: 64
+  budget: 262144
+  val_fraction: 0.25
+  loss_precision: 2.0e-2
+  optimizer:
+    adamaxw:
+      learning_rate: 2.5e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-3
+
+bo:
+  n_init: 5
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds: [-2.0, 1.0]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+    kernel:
+      normalised-invariant-rbf:
+        exchangeable: 4
+  ei:
+    n_restarts: 32
+    n_steps: 100
+
+verify:
+  n_points: 10
+  epochs: 200
+  val_every_epochs: 10
+  budget: null
+  batch: null

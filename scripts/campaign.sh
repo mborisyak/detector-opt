@@ -58,6 +58,18 @@ PY=${PY:-/home/max/opt/pyenv/versions/3.11.9/envs/py3/bin/python}
 # jobs to share the node; SLURM queues what does not fit rather than oversubscribing.
 CPUS=${CPUS:-2}
 MEM_PER_CPU=${MEM_PER_CPU:-1500}
+# THE ACCELERATOR REQUEST, AND ITS DEFAULT WAS MISSING -- this line is the fix. The header above has
+# always documented "GRES (env, default `shard:1`)", but nothing ever assigned it, so an unset GRES
+# made `${GRES:+--gres=${GRES}}` expand to NOTHING and the job was submitted with no shard at all.
+# It still runs: jax finds no visible device, falls back to the host, and a campaign that was meant
+# to be on the GPU grinds through on CPU while `squeue -o %b` reports N/A. Nothing raises, so the
+# only symptom is a campaign that is inexplicably slow and whose numbers are not the ones intended.
+#
+# `${GRES-shard:1}` USES `-`, NOT `:-`, AND THE DIFFERENCE IS THE WHOLE CONTRACT. `:-` substitutes
+# for unset OR EMPTY, which would override the documented escape hatch for a `device: cpu` task
+# (`GRES= ./scripts/campaign.sh ...`, header line 34) and queue it behind a shard it never uses. `-`
+# substitutes only when GRES is UNSET, so an explicitly empty GRES stays empty.
+GRES=${GRES-shard:1}
 # Sized just ABOVE the measured run length -- see the --time comment at the sbatch call. Measured:
 # 0.8-1.2 h per run at budget 2097152 with per-epoch plotting off.
 TIME_LIMIT=${TIME_LIMIT:-01:45:00}
@@ -65,6 +77,15 @@ TIME_LIMIT=${TIME_LIMIT:-01:45:00}
 # Without this every campaign variant needs its own config file, which is how the rehearsal had to
 # work around it.
 OVERRIDES=${OVERRIDES:-}
+# THE JOB-NAME PREFIX, AND IT IS A CORRECTNESS SETTING, NOT COSMETICS. The duplicate guard below
+# recognises an in-flight run by the SLURM job name alone, which carries the arm and the seed but
+# not the task -- so two campaigns on DIFFERENT tasks sharing a seed and an arm look identical to
+# it, and the second one silently skips runs it never submitted. Give each campaign its own prefix
+# (`NAME_PREFIX=mm ./scripts/campaign.sh ...`) whenever another campaign may be on the queue.
+NAME_PREFIX=${NAME_PREFIX:-camp}
+
+# DRIVER (env, default `scripts/bo.py`) is the BO driver to run.
+DRIVER=${DRIVER:-scripts/bo.py}
 
 # Seeds are drawn from a fixed list rather than 0..N-1: these are the seeds the earlier enzyme
 # campaigns used, so a comparison against those runs is paired rather than accidental.
@@ -75,16 +96,29 @@ for ((i = 0; i < SEEDS; i++)); do
   seed=${ALL_SEEDS[$i]}
   for arm in "${ARMS[@]}"; do
     run="${OUT}/${seed}/${arm}"
-    # `results.json` EXISTS ONLY FOR A FINISHED RUN -- bo.py writes `partial.json` while in flight and
-    # renames at the end -- so its presence is the completion test, no field to read.
-    if [ -f "${run}/results.json" ]; then
+    # COMPLETION IS THE `completed` FIELD, NOT THE FILE'S EXISTENCE, and the difference silently cost
+    # a campaign cell before this was fixed. The comment here used to read "`results.json` EXISTS ONLY
+    # FOR A FINISHED RUN -- bo.py writes `partial.json` while in flight and renames at the end", and
+    # that has not been true since bo.py moved to one trajectory file: it now REWRITES `results.json`
+    # after every single design, carrying `completed: false` until the budget pool empties. So a run
+    # killed after one design leaves a `results.json` behind, the old test read it as finished, and
+    # the resubmission skipped a cell that had 1 design in it instead of the 32 it was meant to have.
+    # Nothing failed and nothing warned -- the campaign was simply one arm short.
+    #
+    # `bo.py` states this field is there "for readers that only have the file", which is exactly this
+    # reader. A missing or unreadable file is NOT complete, so a run with no results at all resubmits.
+    if [ "$("${PY}" -c "import json,sys
+try:
+  print(json.load(open(sys.argv[1])).get('completed') is True)
+except Exception:
+  print(False)" "${run}/results.json" 2>/dev/null)" = "True" ]; then
       echo "  skip  ${seed}/${arm} (already complete)"
       continue
     fi
     # DUPLICATE GUARD. Without it, re-invoking while a run is queued submits a SECOND job with the
     # same output directory: two `bo.py` processes writing one results.json and one orbax tree.
     # MEASURED in rehearsal -- a re-invocation duplicated all four in-flight runs.
-    if squeue -h -o "%j" -u "$USER" | grep -qx "camp-${arm}-${seed}"; then
+    if squeue -h -o "%j" -u "$USER" | grep -qx "${NAME_PREFIX}-${arm}-${seed}"; then
       echo "  skip  ${seed}/${arm} (already queued or running)"
       continue
     fi
@@ -111,10 +145,10 @@ for ((i = 0; i < SEEDS; i++)); do
     # those exhaust the node's 20 GB declaration and deadlock every other job on the box.
     id=$(sbatch --parsable ${GRES:+--gres=${GRES}} --cpus-per-task="${CPUS}" --mem-per-cpu="${MEM_PER_CPU}" \
       --time="${TIME_LIMIT}" \
-      -J "camp-${arm}-${seed}" -o "${run}/run.log" \
+      -J "${NAME_PREFIX}-${arm}-${seed}" -o "${run}/run.log" \
       --wrap="env XLA_PYTHON_CLIENT_PREALLOCATE=false OMP_NUM_THREADS=${CPUS} \
 OPENBLAS_NUM_THREADS=${CPUS} MKL_NUM_THREADS=${CPUS} NUMEXPR_NUM_THREADS=${CPUS} \
-${PY} -u scripts/bo.py =${CONFIG} output=${run} seed=${seed} nn_init_strategy=${arm} ${OVERRIDES}")
+${PY} -u ${DRIVER} =${CONFIG} output=${run} seed=${seed} nn_init_strategy=${arm} ${OVERRIDES}")
     echo "  job ${id}  ${seed}/${arm}"
   done
 done

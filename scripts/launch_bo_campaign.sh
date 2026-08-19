@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # Start (or RESTART) the cloud campaign on `bo`. Run ON bo.
 #
-#   scripts/launch_bo_campaign.sh <local_gpu K> [cores] [n_seeds] [task] [prefix]
+#   scripts/launch_bo_campaign.sh <local_gpu K> [cores] [n_seeds] [task] [prefix] [strategies]
 #   scripts/launch_bo_campaign.sh 8 24 5 enzyme_extremes output/cloud
+#   scripts/launch_bo_campaign.sh 12 36 5 enzyme_mm_sym_m3_p5e3 output/campaign-mm-p5e3 meta,from_scratch
+#
+# `strategies` is a comma-separated subset of the four arms and defaults to all of them. Pass it when
+# the campaign's own config documents a narrower comparison, or the run costs twice what that config
+# budgeted for. Arms are additive: relaunching later with a wider set scores only the missing ones.
 #
 # THE PREFIX GIVES THIS CAMPAIGN ITS OWN NAMESPACE, and costs nothing to use because the Snakefile
 # already reads a target path as `<prefix>/<config>/...` with the prefix being any path, however many
@@ -27,6 +32,15 @@
 #   3. RUN UNDER tmux, NOT nohup/setsid. A detached process that outlives its supervisor is an orphan
 #      nobody can stop; a tmux session is addressable, attachable and killable.
 #
+# ⛔️ `snakemake --unlock` RUNS FIRST, AND WITHOUT IT NO PREEMPTION IS EVER RECOVERABLE. Snakemake
+# locks its WORKING DIRECTORY and does not release that lock when its driver is killed -- which on a
+# preemptible box is how the driver normally dies. Every relaunch then fails at DAG build with
+# "LockException: Directory cannot be locked ... likely caused by a kill signal or a power loss",
+# having done nothing. It is safe to unlock here because it happens INSIDE the per-task `flock`, so
+# this launcher is provably the only one touching the directory: the flock, not the unlock, is what
+# prevents two drivers. Verified 2026-08-17, when a killed d2n3 driver left exactly this lock and the
+# relaunch reported success while starting nothing.
+#
 # `--rerun-triggers mtime` IS LOAD-BEARING ON A PREEMPTIBLE BOX, and it must sit BEFORE the `--`
 # separator: the flag takes multiple values, so placing it after the targets makes argparse swallow
 # them and the launch dies with "invalid choice: output/.../comparison.txt". Its job is to stop a
@@ -43,18 +57,28 @@
 # -- set cores >= 4*K or the local_gpu setting will not be what actually binds.
 set -euo pipefail
 
-K=${1:?usage: launch_bo_campaign.sh <local_gpu K> [cores] [n_seeds] [task] [prefix]}
+K=${1:?usage: launch_bo_campaign.sh <local_gpu K> [cores] [n_seeds] [task] [prefix] [strategies]}
 CORES=${2:-24}
 N_SEEDS=${3:-5}
 TASK=${4:-enzyme_extremes}
 PREFIX=${5:-output/cloud}
+STRATEGIES=${6:-from_scratch,continue,closest,meta}
 
-REPO=$HOME/detector-opt
+# THE REPO IS THIS SCRIPT'S OWN CHECKOUT, not a fixed path: a second checkout (e.g. one carrying new
+# code while an older campaign finishes in the original) must drive ITS OWN tree, not the other's.
+REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 VENV=$HOME/venv
-LOCK=$HOME/.detector-opt-campaign.lock
-SESSION=campaign
+# ONE LOCK PER TASK, not one globally. A single lock serialises every campaign on the box, which is
+# right when they share a tree and wrong when they do not -- two campaigns under different prefixes
+# are independent work and the GPU has room for both.
+LOCK=$HOME/.detector-opt-campaign-$TASK.lock
+SESSION=campaign-$TASK
 LOG=$REPO/logs/snakemake-$TASK.log
 CAMPAIGN=$PREFIX/$TASK
+# detopt is an editable install pointing at the ORIGINAL checkout, and `python scripts/x.py` puts
+# `scripts/` on sys.path rather than the cwd -- so without this a second checkout runs its new
+# scripts against the old library, silently.
+export PYTHONPATH=$REPO
 
 export CUDA_MPS_PIPE_DIRECTORY="$HOME/.mps"
 export CUDA_MPS_LOG_DIRECTORY="$HOME/.mps/log"
@@ -92,10 +116,11 @@ fi
 tmux new-session -d -s "$SESSION" -c "$REPO" "
   source $VENV/bin/activate
   export CUDA_MPS_PIPE_DIRECTORY=$CUDA_MPS_PIPE_DIRECTORY
-  flock -n $LOCK snakemake -s Snakefile.cloud \
-    -c$CORES --resources local_gpu=$K --config n_seeds=$N_SEEDS \
-    --rerun-triggers mtime \
-    -- $TARGETS >> $LOG 2>&1
+  export PYTHONPATH=$REPO
+  flock -n $LOCK bash -c \"
+    snakemake -s Snakefile.cloud --unlock >> $LOG 2>\&1 || true
+    snakemake -s Snakefile.cloud -c$CORES --resources local_gpu=$K --config n_seeds=$N_SEEDS strategies=$STRATEGIES --rerun-triggers mtime -- $TARGETS >> $LOG 2>\&1
+  \"
   echo \"driver exited \$? at \$(date -u +%FT%TZ)\" >> $LOG
   sleep 86400
 " 2>/dev/null || echo "tmux session '$SESSION' is already running a driver; not starting a second"

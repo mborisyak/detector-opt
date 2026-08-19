@@ -96,8 +96,21 @@ if ! finished_on_bo output/cloud enzyme_extremes; then
   exit 0
 fi
 
-launch enzyme_extremes_wide output/cloud-wide
 pull_full enzyme_extremes output/cloud
+
+# NOTHING IS LAUNCHED FROM HERE. The next campaign is the 1.5x-budget CONTINUATION of this one, and
+# it runs on a COPY of this tree under its own prefix -- which needs the new resume semantics
+# (results.json + done.txt) and the pool/index fixes pushed to bo first, a 24 GB tree copied there,
+# its markers migrated, and its verification markers removed. Those are consequential, ordered steps
+# on a finished campaign's only copy, so they are done deliberately rather than fired by a heartbeat.
+# The wide-network campaign follows the continuation.
+echo "chain: enzyme_extremes is COMPLETE and its full tree has been pulled."
+echo "chain: NEXT is the 1.5x-budget continuation on a copy -- set up deliberately, not from here."
+
+if finished_on_bo output/cloud-cont enzyme_extremes_cont; then
+  pull_full enzyme_extremes_cont output/cloud-cont
+  echo "chain: continuation COMPLETE and pulled."
+fi
 
 if finished_on_bo output/cloud-wide enzyme_extremes_wide; then
   pull_full enzyme_extremes_wide output/cloud-wide

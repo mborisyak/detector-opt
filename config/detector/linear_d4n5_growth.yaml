@@ -1,0 +1,35 @@
+# Detector for the growth-schedule `linear` campaign: (d = 4, n_probes = 5) at noise 0.5.
+#
+# A SEPARATE FILE from config/detector/linear_d4n5.yaml, which stays at noise 0.7. That file is what
+# the completed 5-seed campaign and the 16 tuning runs were measured under, and editing it in place
+# would retroactively change what those results mean.
+#
+# ⚠️ `noise` HAS NO INSTRUMENT TO CITE ON THIS TASK, and that is documented rather than overlooked:
+# docs/linear-highdim.md's verdict is that acceptance criterion 0 is unsatisfiable at any `d` because
+# "`linear` has no instrument, so `noise` has no provenance to cite", and docs/HANDOFF.md 4.1 says the
+# same and adds that "adjusted until the task screened well" is the tuning NO TRICKS voids.
+#
+# The 0.7 of the shipped config was reached exactly that way -- the campaign handoff records the cell
+# as "chosen over 53 other analytic cells because it leads on the acceptance criterion", and
+# docs/linear-highdim.md's sweep shows why: the baseline-to-optimum span peaks at sigma 0.7 in every
+# cell it tabulates. 0.5 is set here at the user's instruction (2026-08-17) as a less extreme
+# read-out. NEITHER value has provenance, so this campaign is a MACHINERY CHECK against the
+# closed-form `bayes_risk` -- which is what docs/linear-highdim.md recommends `linear` be kept for --
+# and NOT evidence about the acceptance gate.
+#
+# WHAT THE CHANGE DOES, computed from the closed form rather than estimated (200000 uniform designs,
+# best all-corner design by exhaustive search over sign patterns):
+#
+#   sigma   optimum   median random   span (median - optimum)
+#    0.5     0.0525       0.3045              0.2521
+#    0.7     0.0976       0.3881              0.2905
+#
+# So the LEVEL falls by 0.537 while the SPAN falls only to 0.868 of its old value -- the task keeps
+# nearly all of its dynamic range at a little over half the loss level. `loss_precision` follows the
+# level (see the run config).
+
+linear:
+  n_probes: 5
+  n_dimensions: 4
+  noise: 0.5
+  probe_bounds: [-1.0, 1.0]

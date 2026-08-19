@@ -53,11 +53,11 @@ detector: linear
 
 regressor:
   set-regressor:
-    features: [[16, 8], [8, 16]]
+    features: [[24, 32], [32, 24]]
     n_models: 4
 
 device: cuda
-plot_per_epoch: false
+plot_per_epoch: 8
 
 training:
   n0: 4096

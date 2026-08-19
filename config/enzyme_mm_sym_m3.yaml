@@ -1,0 +1,154 @@
+# CAMPAIGN CONFIG -- the tuned MM benchmark (detector: config/detector/enzyme_mm_sym_m3.yaml).
+#
+# It differs from `config/enzyme_mm_sym.yaml` in exactly four places, and every one of them is a
+# MEASUREMENT rather than a preference. Everything else -- the whole settled trainer block -- is that
+# file's, untouched.
+#
+# 1. detector: enzyme_mm_sym_m3. The batch is 3 experiments, not 4, because the target has 3
+#    identifiable parameters and `docs/task-mm-recovery.md` section 2 fixes `m ~ p` as this
+#    candidate's structural rule. MEASURED over 60 independent proxy BO runs per cell: m = 3 clears
+#    P(best-so-far at 2n < best-so-far at n) > 0.75 at the 10 -> 20 doubling, between INDEPENDENT
+#    runs, with the interval excluding 0.75; the shipped m = 4 clears only at 5 -> 10.
+#
+# 2. bo.gp.kernel.normalised-invariant-rbf.exchangeable: 3, NOT 4. This must equal `n_experiments`.
+#    Left at 4 against a 3-experiment batch the permutation group is wrong and the invariant kernel
+#    silently stops modelling the symmetry the design actually has.
+#
+# 3. training.loss_precision: 2.0e-3, was 1.0e-3. MEASURED on THIS task's neural objective, which is
+#    the only place the number means anything:
+#
+#      loss_precision   window at convergence   detector calls   wall clock   diff      err
+#      1.0e-3           172032 / 192512         229363 / 256668  1424 / 3168 s  0.0000 / 0.0002  0.0008 / 0.0007
+#      2.0e-3            36864                   49150            660 s         0.0001           0.0016
+#
+#    THE BINDING TERM ON THIS TASK IS `err`, NOT `diff`. The network does not overfit here -- the
+#    train/validation gap is 0.0001-0.0002, essentially nothing -- so the convergence bar is set
+#    entirely by the loss estimate's own standard error, which falls as `window^-0.5`. Measured
+#    constant: `err = 0.307 / sqrt(window)`, reproduced at both precisions. So `loss_precision`
+#    directly buys window, window directly buys detector calls, and 1.0e-3 costs 4.7x the calls and
+#    2.2-4.8x the wall clock of 2.0e-3 for a bar the task does not need. 1.0e-3 IS reachable -- both
+#    designs converged, neither capped -- it is simply not affordable: at 229-257k calls a design a
+#    run reaches only ~8 designs, which is fewer than the 2n = 20 the criterion needs.
+#
+#    2.0e-3 is reachable WITH MARGIN, not at the edge: the converged design reported diff + err =
+#    0.0017 against the 0.0020 bar, and the window it needed (36864) is 14x below `iteration_limit`.
+#
+# 4. training.budget: 2097152 (2^21), i.e. UNCHANGED from the parent. It was briefly set to 2^20 and
+#    that was WRONG, on an estimate that the first real design refuted. THE RUN LENGTH IS SET BY THE
+#    BUDGET -- bo.py stops when the shared pool empties -- so the budget decides how many designs a
+#    run reaches, and the campaign must reach 2n = 20 or the criterion it was tuned against cannot be
+#    evaluated on it at all.
+#
+#    The estimate used the m = 4 window, 36864, because that was the only neural measurement in hand;
+#    projected against 2^20 it gave 21.3 designs a run. MEASURED at m = 3, the window is 49152, not
+#    36864 -- three experiments carry less information per event than four, so the loss estimate needs
+#    more events to reach the same standard error. At 65533 calls a design that is
+#
+#        1048576 / 65533  =  16.0 designs a run   -- SHORT of 2n = 20,
+#        2097152 / 65533  =  32.0 designs a run   -- clears it with room.
+#
+#    The direction of the error is the one that matters: the cheaper-looking task needed the LARGER
+#    budget. Cost is not the constraint here -- a run is 32 x 418 s = 3.7 h and the four-run campaign
+#    is 7.4 h on two shards, inside the 8 h figure -- so nothing is bought by the smaller pool.
+#
+#    This also restores the parent file's 4:1 budget-to-iteration_limit ratio, so the judgement call
+#    the 2^20 version had to flag no longer arises. `iteration_limit` stays at 524288 throughout: it
+#    is the EPOCH LENGTH (`steps_per_epoch = iteration_limit // batch`), and `warmup_epochs`,
+#    `patience` and the convergence posterior are all written in units of it, so scaling it with the
+#    budget would silently retune the settled procedure -- the parent header records that
+#    `patience: 16` was chosen FOR 2048-step epochs. As a per-design data cap it never binds: 524288
+#    sits 10x above the 49152 a design actually needs.
+#
+# READ-OUTS: 16, the shipped value, NOT the 8 the tuning was done at. The XGBoost proxy flattens a
+# design into `n_experiments x n_measurements` columns and degrades in both speed and fidelity as that
+# widens (a 192-column sibling screen had to be abandoned), so the screen was run at 8 -- 24 columns.
+# The direction of that mismatch is FAVOURABLE and is on the record: `docs/decision-log.md` D34
+# measured more read-outs WIDENING the baseline-to-best span (0.2455 -> 0.3659), lowering dead volume
+# (12.1% -> 5.7%) and GROWING the 20 -> 40 doubling gain (+0.0868 -> +0.1584) on the sibling task. So
+# 8 is the conservative end and a candidate that clears the criterion there should clear it at 16.
+# That is an argument about read-out cadence, not a measurement on THIS task at 16, and no number in
+# this campaign may be quoted as though the screen had been run at 16.
+
+#
+# 2026-08-18 -- regressor.dropconnect SET TO 0.0. MEASURED on `linear`, 72 crossed cells (2 arms x
+# 4 doses x 3 designs x 3 seeds, paired within design and seed, `bo`): dropconnect adds BIAS THAT THE
+# CRITERION CANNOT SEE. Held-out excess against the closed-form floor rises monotonically to +0.00479
+# at dose 0.2 -- 48% of the bar -- while `gap`, the only overfitting signal the exit test has, FALLS
+# (-0.00041), and the exit window is UNCHANGED (ratio 1.00 at every dose in both arms). The procedure
+# therefore buys no extra data in compensation and reports a worse number at the same price. `meta` is
+# hurt about half as much as `from_scratch` (+0.00262 against +0.00479 at 0.2), so replay is partly
+# REDUNDANT with dropconnect rather than protected from it.
+
+#
+# 2026-08-18 (later) -- dropconnect 0.05, NOT null. Reverted from the `null` set earlier the same day.
+#
+# TURNING IT OFF REMOVED THE TERMINATION MECHANISM FROM BOTH PROCEDURES, which the bias measurement
+# did not anticipate:
+#   growth  -- the gap gate `gap + err <= loss_precision` needs the gap held down; unregularised the
+#              config's own record says designs cap (later shown to be an artefact of a 131072 cap,
+#              but the cost is real: 278512 calls/design against ~98281, i.e. 2.8x).
+#   fixed   -- stops on the TRAIN-SETTLED test alone, so the only thing that can end a design is the
+#              training curve flattening. MEASURED: with dropconnect 0.1, 394 of 394 designs
+#              terminated, median 109 s, max 271 s. With dropconnect null, median 476 s, max 2919 s,
+#              and designs still running past 3500 epochs with validation rising since epoch 600.
+#
+# 0.05 RATHER THAN 0.1 because that is where the bias is negligible. MEASURED on `linear`, 72 crossed
+# cells, held-out excess against the closed-form floor, paired within (design, seed):
+#     dose    from_scratch   meta
+#     0.05      +0.00007    +0.00001
+#     0.10      +0.00110    +0.00050
+#     0.20      +0.00479    +0.00262
+# and this task's own earlier record puts 0.05 at -0.0004 on the objective, i.e. free. 0.05 therefore
+# buys termination at a bias two orders of magnitude below the dose that motivated turning it off.
+
+detector: enzyme_mm_sym_m3
+
+regressor:
+  set-regressor:
+    features: [[24, 16], [16, 24]]
+    n_models: 4
+    dropconnect: 0.05
+device: cuda
+plot_per_epoch: 8
+
+training:
+  n0: 8192
+  n_increment: 4096
+  batch: 256
+  eval_batch: 2048
+  warmup_epochs: 2
+  patience: 16
+  budget: 2097152
+  iteration_limit: 524288
+  val_fraction: 0.25
+  loss_precision: 2.0e-3
+  param_mix: 0.25
+  optimizer:
+    adamaxw:
+      learning_rate: 2.5e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-3
+
+bo:
+  n_init: 5
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds: [-2.0, 1.0]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+    kernel:
+      normalised-invariant-rbf:
+        exchangeable: 3
+  ei:
+    n_restarts: 32
+    n_steps: 100
+
+verify:
+  n_points: 10
+  epochs: 200
+  val_every_epochs: 10
+  budget: null
+  batch: null

@@ -1,5 +1,7 @@
 detector: straw
 
+plot_per_epoch: 8
+
 regressor: deep-set-24
 discriminator: deep-set-24
 generator: deep-set-vae-64

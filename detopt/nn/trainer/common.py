@@ -519,11 +519,20 @@ class Trainer:
         raise ValueError(f"{source}: state was written at seed {int(data['seed'])}, this trainer is at "
                          f"{self.seed}; the seed fixes the train/val split and the event order")
       # THE LAYOUT COMES BACK FROM THE STATE, and a raised budget EXTENDS it rather than recutting it.
-      # A state written before generations existed is read as the single block it was.
+      #
+      # ⚠️ A STATE WRITTEN BEFORE `generations` EXISTED MUST BE READ AS THE BLOCK IT ACTUALLY WAS,
+      # which is the SAVED pools' capacity -- taken from the leading dimension of the saved arrays --
+      # NOT this trainer's configured capacity. Reading it as the configured one makes `extra` zero
+      # at any budget, so the single block silently takes the NEW sizes and the cut moves after all:
+      # precisely the train/val overlap generations exist to prevent, on precisely the trees that
+      # predate them, which are the only trees that will ever take this branch.
       if "generations" in data:
         stored = [(int(train), int(val)) for train, val in np.asarray(data["generations"]).reshape(-1, 2)]
       else:
-        stored = [(self.train_pool.capacity, self.val_pool.capacity)]
+        saved = tuple(int(np.shape(data[f"{name}_leaf_0"])[0]) for name in ("train", "val"))
+        stored = [saved]
+        print(f"[migrate] {source}: written before the event-index layout was recorded; reading it as one "
+              f"block of {saved[0]}+{saved[1]} events (the saved pools' own capacity).")
       spent_train = sum(train for train, _ in stored)
       spent_val = sum(val for _, val in stored)
       extra_train = self.train_pool.capacity - spent_train

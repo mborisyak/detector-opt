@@ -1,0 +1,85 @@
+# EXTREMES at 3.1M budget, bar TIGHTENED to 8.0e-3, under the CURRENT reported objective.
+#
+# Delta against `config/enzyme_extremes_cont.yaml`: `loss_precision` 1.0e-2 -> 8.0e-3. Nothing else
+# moves -- same detector, seeds, network (n_models 4, dropconnect 0.05), growth ladder (n0 8192,
+# n_increment 4096), patience 16, budget 3145728, iteration_limit 524288.
+#
+# NOT COMPARABLE TO THE PREVIOUS 3.1M RUN, and not because of the bar. `detopt/nn/trainer/design.py`
+# now reports the train/validation MIDPOINT with error `hypot(|val-train|/sqrt(12), err/2)` instead of
+# the validation value with error `|val-train| + err`. The EXIT GATE is untouched -- it is still
+# `diff + err <= loss_precision` -- but every reported loss and every GP noise value differs, so the
+# two campaigns must not be pooled.
+#
+# WHY 8.0e-3 AND NOT LOWER. The gate needs `diff + err <= bar`, and `diff` is a property of the fit
+# that no amount of data removes. MEASURED over 334 converged exits in the archived extremes logs:
+# `diff` median 0.00435, p10 0.00100, p90 0.00657, and `err = c/sqrt(window)` with c median 1.229.
+# A design whose `diff` already exceeds the bar can NEVER satisfy the gate at any window -- it burns
+# the whole iteration_limit and reports nothing. The fraction in that state by bar:
+#
+#     bar        dead    required window   designs per 3.1M run
+#     1.0e-2       0%              47300                   66
+#     9.0e-3       0%              69832                   45
+#     8.0e-3       1%             113338                   28   <- taken
+#     7.0e-3       7%             215016                   15
+#     6.0e-3      20%             554619                    6
+#     5.0e-3      43%            3573845                    1
+#
+# 8.0e-3 is the tightest bar that keeps the dead fraction ~1% and still buys enough designs per run to
+# be a trajectory. Below it the campaign stops measuring the optimiser and starts measuring the cap.
+#
+# ⚠️ WALL CLOCK WILL EXCEED THE 2.4-4.1 h/run of the 1.0e-2 campaign by MORE than the 2.4x window
+# growth suggests: the per-epoch eval pass scans the WHOLE window, so its cost is O(window) while the
+# training epoch is fixed at iteration_limit/batch. Larger windows make evaluation, not training, the
+# dominant per-epoch term.
+
+detector: enzyme_extremes
+
+regressor:
+  set-regressor:
+    features: [[24, 16], [16, 24]]
+    n_models: 4
+    dropconnect: 0.05
+device: cuda
+plot_per_epoch: 8
+
+training:
+  n0: 8192
+  n_increment: 4096
+  batch: 256
+  eval_batch: 2048
+  warmup_epochs: 2
+  patience: 16
+  budget: 3145728
+  iteration_limit: 524288
+  val_fraction: 0.25
+  loss_precision: 8.0e-3
+  param_mix: 0.25
+  optimizer:
+    adamaxw:
+      learning_rate: 2.5e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-3
+
+bo:
+  n_init: 5
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds: [-2.0, 1.0]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+    kernel:
+      normalised-invariant-rbf:
+        exchangeable: 4
+  ei:
+    n_restarts: 32
+    n_steps: 100
+
+verify:
+  n_points: 10
+  epochs: 200
+  val_every_epochs: 10
+  budget: null
+  batch: null

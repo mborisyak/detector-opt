@@ -83,6 +83,31 @@ def test_raising_the_budget_keeps_every_consumed_position_and_stays_disjoint():
   assert len(np.intersect1d(after_val[val0:], before_train)) < val0 // 100
 
 
+def test_a_legacy_state_is_read_as_the_block_it_actually_was():
+  """The tree that will actually be continued predates `generations`, so this branch is the one that
+  matters. Reading a legacy state as the CONFIGURED capacity rather than the SAVED one makes `extra`
+  zero at any budget, so the lone block silently adopts the new sizes and the cut moves after all --
+  reintroducing the whole overlap on exactly the trees that cannot defend themselves against it."""
+  saved_train, saved_val = 1572864, 524288
+  configured_train, configured_val = 2359296, 786432
+
+  # What the fixed code does: the block is what was SAVED, and the difference becomes a new block.
+  stored = [(saved_train, saved_val)]
+  extra = (configured_train - saved_train, configured_val - saved_val)
+  generations = stored + [extra]
+  assert generations == [(1572864, 524288), (786432, 262144)]
+
+  train, val = _layout(generations, None, 4321)
+  before_train, before_val = _layout(stored, None, 4321)
+  np.testing.assert_array_equal(train[:saved_train], before_train)
+  np.testing.assert_array_equal(val[:saved_val], before_val)
+  assert len(np.intersect1d(train[saved_train:], before_val)) < saved_val // 100
+
+  # What the buggy fallback did: one block at the CONFIGURED size, i.e. the moving cut.
+  buggy_train, buggy_val = _layout([(configured_train, configured_val)], None, 4321)
+  assert len(np.intersect1d(buggy_train[saved_train:], before_val)) > 0.99 * saved_val
+
+
 def test_the_moving_cut_layout_would_have_failed_this():
   """The bug, written as a test, so the fix is not mistaken for a no-op."""
   from detopt.utils.events import shuffled_event_index

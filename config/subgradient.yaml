@@ -37,6 +37,7 @@ regressor:
     n_models: 8   # ensemble of 8 (omit n_models for a single net)
 
 device: cuda
+plot_per_epoch: 8
 
 # Network (regressor) optimizer.
 training:

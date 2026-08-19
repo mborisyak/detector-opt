@@ -1,0 +1,5 @@
+linear:
+  n_probes: 3
+  n_dimensions: 2
+  noise: 0.5
+  probe_bounds: [-1.0, 1.0]

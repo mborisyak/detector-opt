@@ -1,0 +1,60 @@
+# MM-SYM at m = 3. DELTA-CONFIG: identical to `config/detector/enzyme_mm_sym.yaml` in every field
+# except `n_experiments`, and its gate is that file's gate, `output/screen/provenance-mm-sym.md`.
+#
+# WHY m = 3, AND IT IS NOT A TUNING CHOICE. `docs/task-mm-recovery.md` section 2 states the structural
+# rule this candidate was built on, before any number was measured: make the batch size equal the
+# number of identifiable target parameters, `m ~ p`, because a D-optimal design for p parameters puts
+# mass on ~p support points -- at m < p the target is underdetermined by construction, and at m > p
+# the batch is redundant, which is the melt benchmark's own failure (p = 1 against m = 4, its best
+# design being two useful probes plus junk). The target here is `[log_K_A, log_K_B, Q10_cat]`, so
+# p = 3, and the shipped `n_experiments: 4` is one MORE than the rule asks for. Gate 1.1 requires the
+# batch size to be "justified by the task's own structure and not chosen to make the search easy";
+# this is that justification, and it was written down in the plan long before this file existed.
+#
+# MEASURED, 60 independent proxy BO runs per cell at 8 read-outs (see the tuning report): m = 3 clears
+# P(best@2n < best@n) > 0.75 at the 10 -> 20 doubling with the interval excluding 0.75, where the
+# shipped m = 4 clears only at 5 -> 10. It is also the cheaper task -- 12 design dimensions against 16,
+# 24 flat proxy columns against 32, and one fewer progress curve to integrate per event.
+#
+# NOTHING ELSE MOVES. The read-out noise stays at the gated 0.05 mM; the priors, the concentration and
+# temperature boxes, the calibration constants, the integrator settings and the target are the parent
+# file's, unchanged. A noise variant scored higher on the criterion and was NOT taken: its own gate,
+# `output/screen/provenance-mm-n0.15.md`, declares 0.15 mM "a CONTROL on the model's shape, not a
+# candidate setting", and promoting a declared control after seeing that it won is the
+# threshold-after-the-result move `docs/benchmark-acceptance.md` bans.
+
+enzyme_mm:
+  n_experiments: 3
+  n_measurements: 16
+  concentration_E: 8.0e-5
+  duration: 1.0
+  measurement_noise: 0.05
+  concentration_A_bounds: [0.01, 10.0]
+  concentration_B_bounds: [0.01, 10.0]
+  enzyme_fraction_bounds: [0.01, 1.0]
+  temperature_bounds: [10.0, 35.0]
+  target_parameters: [log_K_A, log_K_B, Q10_cat]
+  calibration_concentration_A: 0.3162
+  calibration_concentration_B: 0.3162
+  calibration_fraction: 0.1
+  calibration_temperature: 25.0
+  half_time_bounds: [0.25, 2.0]
+  parameters:
+    log_K_A: [-2.3, 0.0]
+    Q10_A: [0.7, 2.0]
+    log_K_B: [-2.3, 0.0]
+    Q10_B: [0.7, 2.0]
+    log_Ki_C: [-3.91, -1.61]
+    Q10_C: [0.7, 2.0]
+    log_Ki_D: [-1.2, 1.1]
+    Q10_D: [0.7, 2.0]
+    Q10_cat: [1.8, 2.6]
+    delta_H: [1.2e5, 2.1e5]
+    delta_C: [2.5e3, 4.5e3]
+    T_melting: [40.0, 50.0]
+  min_folded_fraction: 0.98
+  n_quadrature: 33
+  n_steps_per_measurement: 160
+  n_stages: 5
+  damping: 0.153846
+  integration_tolerance: 0.0125

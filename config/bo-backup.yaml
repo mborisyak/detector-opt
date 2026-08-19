@@ -35,6 +35,7 @@ regressor:
     p_dropout: 0.1
 
 device: cuda
+plot_per_epoch: 8
 
 training:
   n0: 2048

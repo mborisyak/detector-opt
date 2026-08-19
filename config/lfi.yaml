@@ -21,6 +21,7 @@ discriminator:
     features: [[64, 32], [64, 32], [64, 32]]
 
 device: cuda
+plot_per_epoch: 8
 
 training:
   # Network (regressor) optimizer.
