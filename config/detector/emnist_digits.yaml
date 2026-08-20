@@ -1,0 +1,31 @@
+# Full default config for the `mnist` detector reading the EMNIST DIGITS split: EVERY __init__
+# parameter, at its default value except the two paths. Same task as config/detector/mnist.yaml --
+# digit classification through a rectangular VISIBLE WINDOW, the design being the window's two
+# opposite corners (x1, x2, y1, y2) on [0, 1]^4 -- on a 4x larger pool of digits.
+#
+# data_path / labels_path -- the raw IDX image/label pair, 240000 training frames of 28x28 over 10
+# classes, near-uniformly balanced at ~24000 per class. Supplying `labels_path` is what selects the
+# two-file IDX layout; leaving it null selects the single-file HuggingFace arrow layout that
+# config/detector/mnist.yaml uses. Nothing here downloads anything: the files were already on this
+# machine and were copied into data/emnist from another project's tree.
+#
+# ⚠️ EMNIST stores its frames column-major relative to MNIST, so the raw bytes decode to a digit
+# lying on its side and mirrored. `read_idx` transposes every image on the way out, which matters
+# here beyond appearance: the design IS a rectangle in image coordinates, so an uncorrected
+# transpose would swap the two axes and make `left`/`right` mean `top`/`bottom`. Verified by eye on
+# a chiral digit through the detector, not assumed.
+#
+# n_events -- how many leading records to read, or null for all 240000. It caps the event source and
+# therefore detector.size(), which is what decides when a run's shared event index starts REPEATING
+# digits; see the budget note in config/emnist.yaml.
+#
+# area_weight -- unchanged from MNIST and for the same reason: ln(10) = 2.302585092994046 is exactly
+# the cross-entropy of a uniform 10-class guess, so seeing the WHOLE image costs precisely as much as
+# knowing NOTHING, the two degenerate extremes are priced identically, and ln(10) is a reference line
+# on the reported total. It follows from the number of classes, which EMNIST digits shares with
+# MNIST, so it carries over without retuning.
+mnist:
+  data_path: /home/max/dev/data/emnist/emnist-digits-train-images-idx3-ubyte
+  labels_path: /home/max/dev/data/emnist/emnist-digits-train-labels-idx1-ubyte
+  n_events: null
+  area_weight: 2.302585092994046

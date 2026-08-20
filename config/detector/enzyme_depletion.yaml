@@ -1,0 +1,84 @@
+# Full default config for the `enzyme_depletion` detector (EnzymeDepletionDetector): EVERY __init__
+# parameter, at its default value. Single-substrate Michaelis-Menten depletion,
+#
+#     dA/dt = -q A / (A + K),   A(0) = A0
+#
+# with the initial concentrations A0 as the WHOLE design and the variant's own (ln q, ln K) as the
+# target. Concentrations are mM, times seconds, so q is mM/s and K is mM.
+#
+# EVERY NUMBER BELOW IS EITHER CALIBRATED HERE OR AN ESTIMATE STATED AS ONE. The calibration is
+# reproduced by `scripts/calibrate_enzyme_depletion.py --section all`.
+#
+# THE PRIORS ARE ESTIMATES, supplied as the anchor for "an unknown hexokinase variant" and marked as
+# such: hexokinase I-III Km for glucose ~0.02-0.13 mM, hexokinase IV/glucokinase ~5-10 mM, kcat
+# ~60-200 /s, enzyme at ~1-10 nM. The WIDTH is the point of the task, not the endpoints: a K prior
+# spanning three decades means no single initial concentration can be informative for all of it,
+# which is what makes the batch worth designing.
+enzyme_depletion:
+  # The designed batch: BO searches n_experiments dimensions, and the design is a SET (permuting the
+  # experiments names the same experiment), so the surrogate must be `sorting-rbf` with
+  # `exchangeable: n_experiments`. Companion configs enzyme_depletion_m2/_m4 run 2 and 4.
+  n_experiments: 1
+
+  # [A] read-outs per experiment, evenly spaced, the last at `duration`. A FIXED grid, identical for
+  # every experiment and every design -- sampling times are NOT a design coordinate.
+  # CALIBRATED so the knee is more-or-less resolved: at the prior medians (q = 3.162e-4 mM/s,
+  # K = 0.447 mM) and a semi-optimal A0 = 2.5 mM the substrate's half decay, 0.75 A0 -> 0.25 A0,
+  # spans 5507 s against a sampling interval of 2700 s -- 2.04 intervals, i.e. the transition covers
+  # about two measurements. Over A0 = 1.5 .. 3.5 mM the same calculation gives 6.1 .. 9.2.
+  n_measurements: 8
+
+  # One experiment lasts six hours. CALIBRATED, and it is the lever that sets the design box: the
+  # window must be long enough for the substrate to fall past K for most of the prior, and every
+  # hour of it costs integration steps. See `concentration_bounds`.
+  duration: 21600.0
+
+  # q = Vmax = kcat [E]. ESTIMATE: kcat 60-200 /s with enzyme at 1-10 nM gives 1e-4 .. 1e-3 mM/s.
+  # Log-uniform, one decade.
+  velocity_bounds: [1.0e-4, 1.0e-3]
+
+  # K = Km for the substrate. ESTIMATE spanning the low-Km isoforms (0.02-0.13 mM) and glucokinase
+  # (5-10 mM) with margin at both ends. Log-uniform, 3.3 decades, and this width IS the task.
+  michaelis_bounds: [0.01, 20.0]
+
+  # The design box. CALIBRATED from the requirement that for ANY design in it the knee A = K falls
+  # inside the time window with a 20% margin for at least 50% of prior draws. Measured over 2e5
+  # prior draws at `duration` 21600 s, that condition holds exactly on A0 in [0.45, 4.0] mM: the
+  # fraction is 0.500 at both ends and peaks at 0.658 near A0 = 1.5 mM. Below the box the substrate
+  # starts under K for too much of the prior (only q/K is then identifiable); above it the window is
+  # too short to deplete past K for too much of the prior (only q is).
+  concentration_bounds: [0.45, 4.0]
+
+  # Read-out noise: ABSOLUTE Gaussian on [A], sigma = measurement_noise, independent of the
+  # concentration being read. CALIBRATED so the task is neither trivial nor hopeless: over 96 Sobol
+  # designs it puts the MEDIAN loss at 0.0416 against the 0.3333 no-information level, with the box
+  # spanning 0.0163 to 0.1383 -- an 8.5-fold bowl for the surrogate to climb. It is raised with the
+  # batch size to hold that difficulty fixed (0.075 at 2 experiments, 0.138 at 4; the scaling is
+  # steeper than sqrt(m) because experiments at different A0 cover complementary parts of the K
+  # prior rather than repeating one measurement).
+  measurement_noise: 0.02
+
+  # RKC2. CALIBRATED on the cost frontier over a dense (A0, q, K) grid across the whole prior box,
+  # against the closed-form solution (`--section integrator`). The binding constraint is NOT linear
+  # stability: the rate has a pole at A = -K, so a step that overshoots a nearly depleted substrate
+  # past zero lands beyond the pole and the trajectory runs away -- 5 stages at 32 steps per
+  # measurement returns an error of 2.2e+01 mM. Past dt ~ 56 s the error is accuracy-bound and
+  # stage count buys almost nothing (at 48 steps: 1.21e-3 mM at 5 stages, 7.08e-4 at 13), so the
+  # cheapest setting that clears the tolerance is the fewest stages at the required dt.
+  # 5 stages / 64 steps costs 7680 rate evaluations per trajectory and holds 4.36e-4 mM.
+  n_stages: 5
+  steps_per_measurement: 64
+  # Verwer's standard damping, 2/13.
+  damping: 0.15384615384615385
+
+  # The dt-against-dt/2 bar, asserted host-side on EVERY call. MEASURED worst case over the dense
+  # grid at the settings above: true error 4.36e-4 mM against the closed form, monitor
+  # (max |fine - coarse| at the read-out times) 3.15e-4 mM. So the bar clears the measured worst
+  # monitor by 6.3x and sits at 10% of the read-out noise.
+  integration_tolerance: 2.0e-3
+
+  # The estimator grid: n_grid x n_grid points, even on (ln q, ln K) over the two priors. The
+  # instrument is the posterior mean on that grid. MEASURED resolution check: 41, 81 and 121 agree
+  # to 4 digits at every noise above 0.02 mM and differ by 8% at the sharpest posterior, so 65 is
+  # inside the plateau.
+  n_grid: 65

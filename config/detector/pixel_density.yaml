@@ -1,0 +1,71 @@
+# Full default config for the `pixel_density` detector (PixelDensityDetector): EVERY __init__
+# parameter, at its default value except the two paths. EMNIST digit classification from a 10x10
+# SAMPLING GRID whose point DENSITY is the design.
+#
+# The frame is treated as a continuous field -- a bicubic (Keys / Catmull-Rom cubic convolution)
+# interpolant through the pixel centres -- and read out at n_grid^2 points. With
+# u = linspace(0, 1, n_grid + 2)[1:-1] and the fixed quantiles z = Phi^-1(u), the sample positions are
+# x_i = Phi(sigma_x * z_i) and y_i = Phi(sigma_y * z_i), Phi being the standard normal CDF. Every
+# position is therefore inside the frame at every design -- the open interval in exact arithmetic,
+# and float32 saturates the widest designs onto 0 and 1, where the interpolant is still defined --
+# and sigma sets CONCENTRATION rather than extent: sigma = 1 reproduces the uniform grid x_i = u_i
+# exactly, below it the points crowd the middle, above it they pile onto the borders and leave the
+# middle coarse.
+#
+# ⚠️ The positions must NOT be renormalised to span [0, 1]: rescaling sigma * z so its min is 0 and
+# its max is 1 cancels sigma exactly, every design gives the identical grid, and the detector goes
+# silently design-blind. tests/test_pixel_density_detector.py pins that sigma bites.
+#
+# data_path + labels_path -- the raw IDX pair of the EMNIST digits training split: 240000 frames,
+# 28x28, 10 near-uniform classes. Supplying `labels_path` selects the two-file IDX layout over the
+# single-file arrow layout; `read_idx` reads it and TRANSPOSES every frame, because EMNIST stores its
+# images column-major relative to MNIST. Do not re-apply that transpose -- it is its own inverse.
+# Nothing here downloads anything.
+#
+# n_events -- how many leading records to read, or null for all 240000. It caps the event source and
+# therefore detector.size(), which is what decides when a run's shared event index starts REPEATING
+# frames; see the budget note in config/pixel_density.yaml. Tests set it small.
+#
+# n_grid -- points per axis, so the sample budget is n_grid^2 = 100 and it is FIXED. That is what
+# makes the task a design problem with no price attached: the design cannot buy resolution, only
+# spend it in one place rather than another, so design_penalty returns None (the absence of a price,
+# which is not the same as 0.0).
+#
+# sigma_min / sigma_max -- the design range, log-scaled (a factor is the natural step in a
+# concentration; SCALED 0.5 is sigma = 1, the uniform grid). CALIBRATED on the 28x28 EMNIST frame so
+# that BOTH ends fail, and fail for the two DIFFERENT reasons the task is made of. Measured by
+# scripts/probe_pixel_density.py over 8192 frames, with no estimator involved:
+#   * at sigma_min = 0.2 the ten positions span 5.9 pixels of 28 and sit 0.51 pixels apart. The grid
+#     oversamples a tiny central patch far below the pixel pitch, and only 11.1% of the dataset's ink
+#     lies inside the sampled box -- the extremities of the digit are never looked at, and the worst
+#     inked pixel is 11.4 pixels from the nearest sample;
+#   * at sigma_max = 5.0 the sampled box covers 100% of the ink, but the central spacing is 12.1
+#     pixels, so a stroke falls between two samples, and 96% of the hundred points land on frame that
+#     is essentially never inked. (One position per axis saturates onto the frame edge in float32
+#     here; the interpolant is defined there, reading the zero-padded half-weight value.)
+# The share of samples INSIDE the frame is 1 at every design and is not a symptom of anything -- the
+# density warp guarantees it -- which is why the large end is diagnosed by spacing and by ink instead.
+#
+# The range is symmetric in log about the uniform grid, which is a property of the parameterisation
+# and not a statement about where the optimum is. On the gradient-boosted proxy the isotropic profile
+# is a smooth bowl running 0.498 nats at sigma_min down to 0.130 at sigma = 0.79 and up to 0.759 at
+# sigma_max, against ln(10) = 2.303 for no information: an INTERIOR optimum, 34 and 55 proxy standard
+# errors clear of the two ends, at the sigma whose sampled span (19.8 pixels) matches the ~20-pixel
+# ink box of a size-normalised digit. Neither end is at the ceiling, so the box holds no dead
+# plateau. The basin is SHALLOW -- 0.130, 0.133, 0.138 nats at sigma = 0.79, 1.00, 1.26, against a
+# proxy standard error of 0.005 -- so which point inside it is best is the neural objective's
+# question, not the proxy's.
+#
+# The NEURAL objective, on the same range, is a wider bowl than the proxy's and confirms both ends
+# (output/pixel-density/precision.json, 2 seeds each): 0.115 nats at sigma = (1, 1), 0.69 at the
+# (0.2, 0.2) corner and 1.62 at the (5, 5) corner, all against ln(10) = 2.303 for no information. The
+# two ends therefore cost 6x and 14x the middle while remaining informative, which is the shape a
+# surrogate can climb; neither is a dead plateau at the ceiling. The profile is
+# output/pixel-density/profile.png and the grids it compares are output/pixel-density/grids.png.
+pixel_density:
+  data_path: /home/max/dev/data/emnist/emnist-digits-train-images-idx3-ubyte
+  labels_path: /home/max/dev/data/emnist/emnist-digits-train-labels-idx1-ubyte
+  n_events: null
+  n_grid: 10
+  sigma_min: 0.2
+  sigma_max: 5.0

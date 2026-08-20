@@ -1,0 +1,381 @@
+# Full default config for the `enzyme_depletion_bi` detector (EnzymeDepletionBiDetector): EVERY
+# __init__ parameter, at the value this task ships. TWO-substrate Michaelis-Menten depletion,
+#
+#     v = q [A] [B] / ((K_A + [A]) (K_B + [B])),      d[A]/dt = d[B]/dt = -v
+#
+# with the pair of initial concentrations (A0, B0) per experiment as the WHOLE design and the
+# variant's own (ln q, ln K_A, ln K_B) as the target. Concentrations are mM, times seconds, so q is
+# mM/s and both Michaelis constants are mM.
+#
+# EVERY NUMBER BELOW IS EITHER CALIBRATED HERE OR TAKEN FROM A NAMED SOURCE. The calibration is
+# reproduced by `scripts/calibrate_enzyme_depletion_bi.py --section all` and every decision has a
+# figure in `output/enzyme-depletion-bi/figures/` (see `scripts/plot_enzyme_depletion_bi.py`).
+#
+# ---------------------------------------------------------------------------------------------
+# THE RATE LAW: the PRODUCT form (rapid-equilibrium random binding), and why this one.
+#
+# Either substrate may bind first, the enzyme turns over only from the ternary complex, and the two
+# binding steps are independent. It carries EXACTLY the three parameters the target names -- one
+# maximum velocity and one Michaelis constant per substrate -- and NO INHIBITION TERM, none implied
+# and none to be added. Hexokinase forms a ternary complex, so this is also the right mechanism for
+# the enzyme whose priors this task borrows.
+#
+# ⚠️ CORRECTED. This task previously used the PING-PONG BI-BI law
+# `v = q A B / (K_A B + K_B A + A B)`, whose denominator is MISSING the constant term `K_A K_B`. The
+# correction did NOT add a parameter -- both laws have exactly `(q, K_A, K_B)` -- so the old
+# justification here, that the alternative "adds a fourth constant and makes the target
+# four-dimensional", was simply FALSE. Two measured consequences, not cosmetic ones:
+#   * ping-pong is singular at A = B = 0 and returned NaN on 184 of 400 diagonal designs. The product
+#     form's denominator is K_A K_B there, so it is finite everywhere and the reciprocal-form
+#     workaround is DELETED.
+#   * ping-pong made the diagonal an EXACT degeneracy in K_A + K_B. Under the product form that
+#     degeneracy DOES NOT EXIST, so the old reason to build the box away from the diagonal is gone.
+# Everything calibrated under the old law is quarantined in
+# `output/enzyme-depletion-bi/stale-ping-pong-law/`, with a README on why each file is invalid rather
+# than merely out of date.
+#
+# WHAT IS FAITHFUL AND WHAT IS A SIMPLIFICATION, stated plainly because the sibling
+# `config/detector/enzyme.yaml` sets that precedent for its own product-inhibition term:
+#   * FAITHFUL -- the reaction and its stoichiometry (glucose + ATP -> G6P + ADP, 1:1), the
+#     parameter priors and the assay scales, all taken from `config/detector/enzyme.yaml`, which
+#     models the same reaction and carries the provenance.
+#   * SIMPLIFICATION -- the DELIBERATE absence of every nuisance that file models: no temperature
+#     dependence, no product inhibition by G6P or ADP, no enzyme unfolding, no turnover calibration.
+#     The absence of nuisance is the point of this task, and it is why the target is the kinetics
+#     rather than a melting point.
+#
+# ---------------------------------------------------------------------------------------------
+# THE DESIGN PROBLEM, re-measured on the corrected law (`--section degeneracy`,
+# figures/degeneracy.png). Because the stoichiometry is 1:1, `[B] = [A] + (B0 - A0)` for all time.
+# Pushing B0 far above A0 saturates ATP and leaves single-substrate kinetics in glucose, which
+# identifies K_A and abandons K_B; the mirror design does the mirror thing (`--section profile`). A
+# batch therefore has to break the A/B symmetry, which is why m = 1 is only a control here.
+#
+# THE DIAGONAL IS WEAK BUT NOT DEGENERATE, and this is the claim the law correction overturned. Two
+# triples with the same q and the SAME K_A + K_B, separated in max|extent| (read-out noise 0.02 mM):
+#
+#     A0 = B0       0.1     0.3     1.0     3.0    10.0
+#     separation  0.0131  0.0222  0.0316  0.0351  0.0203  mM
+#     / noise      0.66    1.11    1.58    1.76    1.01
+#
+#     off-diagonal   (3, 3.6)  (3, 6)  (3, 15)  (10, 2)  (10, 1.2)
+#     separation      0.0888  0.1128   0.1624   0.0546    0.0439  mM
+#     / noise          4.44    5.64     8.12     2.73      2.20
+#
+# Under ping-pong the diagonal row was EXACTLY 0.000e+00; it is now 0.7-1.8x the read-out noise,
+# because the rate on the diagonal is `q a^2 / ((K_A + a)(K_B + a))`, which depends on the constants
+# through their PRODUCT as well as their sum. Off-diagonal separates 1.3-4.6x better than the BEST
+# diagonal design -- 4.6x at (3, 15) but only 1.3x at (10, 1.2) -- so symmetry breaking is still
+# worth designing for, and the diagonal is no longer a hole in the box.
+#
+# ⚠️ READ THE `/ noise` ROW, NOT A FRACTIONAL ONE. As a fraction of the extent the diagonal
+# separation grows monotonically as concentration falls (13.6% at A0 = 0.1 against 0.2% at A0 = 10),
+# which invites "the diagonal is most informative at low concentration". It is not: the read-out
+# noise is ABSOLUTE on the extent, so what is resolved is the separation in mM, and that peaks in the
+# MIDDLE of the box and falls at both ends. The fraction and the signal-to-noise disagree and only
+# the second is what the estimator sees.
+#
+# ⚠️ NOT YET RE-MEASURED ON THE CORRECTED LAW: the m = 2 per-batch table that stood here, and the
+# `profile` section it referred to, were computed under ping-pong. Their diagonal row in particular
+# asserted the exact degeneracy that no longer exists, so they are removed rather than left to be
+# read. `--section profile` must be re-run before anything is quoted from it.
+# ---------------------------------------------------------------------------------------------
+# ⚠️ THE LANDSCAPE TABLE BELOW IS FROM THE PING-PONG LAW AND HAS NOT BEEN RE-MEASURED. It is kept
+# only because `plateau = 0.000` was independently reproduced on the corrected law (48 Sobol designs
+# at m = 1: min 0.0969, median 0.1564, max 0.2108, plateau 0.0%, near-best 2.1%). Every other number
+# in it -- min, median, span, shape, quad, and the m = 4 saturation verdict -- must be re-run before
+# it is quoted. See `--section landscape`.
+#
+# THE LANDSCAPE, and why m = 2. 48 Sobol designs on the scaled cube, 1024 events, shipped lattice.
+# `span` is median - min, quoted against 5.0e-3 -- the objective's OWN reproducibility over
+# independent event blocks, which is the resolution floor that matters here (the trainer's
+# `loss_precision` belongs to the neural objective and is 2.5x larger). `plateau` is the fraction of
+# designs within 5% of the 1/3 no-information level; `near best` the fraction within one
+# `loss_precision` of the best.
+#
+#     m   noise      min   median     span   /5e-3   shape    quad   plateau   near best
+#     1   0.020   0.1163   0.1588   0.0425     8.5   0.417   0.305     0.000       0.167
+#     2   0.020   0.0295   0.0773   0.0478     9.6   0.283   0.455     0.000       0.021   <- shipped
+#     4   0.020   0.0128   0.0247   0.0119     2.4   0.220   0.495     0.000       0.521
+#     2   0.050   0.0715   0.1308   0.0594    11.9   0.401   0.455     0.000       0.042
+#
+# NO DEAD VOLUME ANYWHERE: `plateau` is 0.000 in every row measured, at every batch size and every
+# noise -- not one of 48 random designs scores the no-information value. That is what the
+# knee-visibility calibration of the design box buys, and it is the opposite of the sibling melt
+# task, whose own config records 65.6% of random designs sitting exactly at the target's variance.
+#
+# m = 4 IS SATURATED and is shipped only as a companion: 52% of random designs are already within one
+# `loss_precision` of the best, and the shape statistic 0.220 against a quadratic reference of 0.495
+# means the profile hugs the good end. With four experiments on an eight-dimensional box one almost
+# always lands in the K_A-informative region (B0 >> A0) and another in the K_B-informative one
+# (A0 >~ 2 B0), so a shotgun already covers both and there is little left to optimise. m = 1 is capped
+# the other way: one experiment cannot identify both constants, so its loss floors near 0.116.
+# m = 2 has the largest span-to-error ratio and by far the smallest near-best fraction (2.1%).
+enzyme_depletion_bi:
+  # The designed batch: BO searches 2 * n_experiments dimensions, and the design is a SET of PAIRS
+  # (permuting the experiments names the same batch, carrying each experiment's two concentrations
+  # together), so the surrogate must be `sorting-rbf` with `exchangeable: n_experiments`.
+  # Companion configs enzyme_depletion_bi.yaml and _m4 run 1 and 4.
+  n_experiments: 2
+
+  # Extent-of-reaction read-outs per experiment, evenly spaced, the last at `duration`. A FIXED
+  # grid, identical for every experiment and every design -- sampling times are NOT a design
+  # coordinate.
+  #
+  # CALIBRATED, and by arithmetic rather than by taste (`--section measurements`,
+  # figures/measurements.png). The knee time is EXACTLY t_knee = F(A0, B0, K_A, K_B) / q, so for a
+  # FIXED design the knee lands inside the sampled window [t_1, 0.8 T] only for q in a window of
+  # RATIO 0.8 * n_measurements. The velocity prior is log-uniform over a decade, so NO design can
+  # make a knee visible for more than log10(0.8 * n_measurements) of the prior:
+  #
+  #     n_measurements     8      9     10     12
+  #     ceiling         0.806  0.857  0.903  0.982
+  #     measured        0.806  0.857  0.903  0.978
+  #
+  # RE-MEASURED ON THE CORRECTED LAW AND UNCHANGED TO THREE DECIMALS, which is the point: the measured
+  # best sits ON the ceiling at every count, so this is ARITHMETIC and not a property of the rate law.
+  # 8 CANNOT reach the 0.90 visibility requirement and 10 is the smallest count that can. Narrowing
+  # the velocity prior instead was rejected: 30-300/s is the literature k_cat band quoted in
+  # config/detector/enzyme.yaml, and narrowing a PRIOR to pass an acceptance test changes the
+  # objective rather than the assay.
+  #
+  # ⚠️ AT n_measurements = 8 THE 0.90 REQUIREMENT IS UNREACHABLE (ceiling 0.806) AND THE TWO SETTINGS
+  # ARE IN DIRECT CONFLICT. No tuning removes it. What costs the difference is the 0.8 in the
+  # visibility definition: the knee must land in [t_1, 0.8 T] rather than [t_1, T], worth
+  # log10(1/0.8) = 0.097 of the prior. Allowing a knee in the final fifth of the window would put
+  # n = 8 at log10(8) = 0.903 and pass -- but a knee at the last read-out is not resolved by
+  # anything, so that is a WEAKER REQUIREMENT WEARING THE SAME NUMBER, not a cheaper way to meet this
+  # one. Reported rather than chosen: whoever owns the acceptance test has to give up n = 8 or give
+  # up "some design reaches 0.90", and this file ships 10 because the visibility requirement is the
+  # one with a measurement behind it.
+  n_measurements: 10
+
+  # One experiment lasts an hour. RE-MEASURED on the corrected law (`--section window`,
+  # figures/window.png), 40000 prior draws over a 31 x 31 design grid:
+  #
+  #     duration (s)    900   1800   2700   3600   5400   7200  14400
+  #     best f_A      0.903  0.902  0.902  0.903  0.903  0.902  0.904
+  #     best f_B      0.761  0.886  0.901  0.903  0.903  0.902  0.902
+  #     coverage      1.000  1.000  1.000  1.000  1.000  1.000  1.000
+  #
+  # Shorter windows lose the ATP knee first, because K_B is ~5x K_A so ATP must be depleted further
+  # before its knee appears.
+  #
+  # ⚠️ COVERAGE DOES NOT BIND and the old "SHORTEST window that passes" claim was wrong. Coverage is
+  # 1.000 at EVERY window tried, down to 900 s, so "long enough that the knee is reachable under some
+  # design" cannot choose between them. What binds is `best f_B` against 0.90 -- and 2700 s reaches
+  # 0.901, which is over the bar by less than the Monte-Carlo standard error of these draws
+  # (+-0.0015 at p ~ 0.9). So 2700 is a COIN FLIP against the bar and 3600 clears it by ~2 se. Nothing
+  # above 3600 buys anything: both knees are pinned at the arithmetic ceiling log10(0.8 n) = 0.903
+  # from 3600 s onward, so a longer window is pure cost. 3600 s is also exactly the `duration: 1.0`
+  # hour of config/detector/enzyme.yaml -- a check rather than a coincidence, since the same enzyme
+  # concentration and turnover band set the same timescale.
+  duration: 3600.0
+
+  # q = Vmax = k_cat [E]. FROM config/detector/enzyme.yaml: k_cat 30-300 /s (the literature band its
+  # `concentration_E` comment quotes) at the FIXED enzyme concentration 3.0e-5 mM of that file. The
+  # enzyme concentration is a fixed constant of the assay and is NOT a design coordinate. Only the
+  # PRODUCT k_cat * [E] enters the rate, so this is one number, and it is log-uniform over a decade.
+  velocity_bounds: [9.0e-4, 9.0e-3]
+
+  # K_M for glucose. FROM config/detector/enzyme.yaml `log_K0_A: [-3.91, -1.61]`, i.e. 0.02-0.2 mM,
+  # the approximate literature spread across hexokinase isoforms and species (HK I/II/III, yeast),
+  # NOT one isoform. Log-uniform, one decade. Glucokinase (HK IV, K_M ~5-10 mM) is deliberately
+  # EXCLUDED there and stays excluded here.
+  michaelis_a_bounds: [0.02, 0.2]
+
+  # K_M for ATP. FROM config/detector/enzyme.yaml `log_K0_B: [-2.30, 0.0]`, i.e. 0.1-1 mM.
+  # Log-uniform, one decade. The ~5x offset between the two priors is a FEATURE: the two knees sit
+  # at different concentration scales, so one experiment cannot bracket both.
+  michaelis_b_bounds: [0.1, 1.0]
+
+  # The design box, one per substrate because the two priors differ by ~5x and a shared box would
+  # put one substrate's informative window in a corner of the cube.
+  #
+  # CALIBRATED (`--section visibility`, figures/visibility.png) against three requirements, over
+  # 40000 prior draws on a 21 x 21 grid inside each candidate:
+  #   (1) every design in the box shows SOME knee for >= 25% of draws  (no dead experiments);
+  #   (2) the box contains designs reaching >= 90% for K_A AND designs reaching >= 90% for K_B;
+  #   (3) coverage ~ 1: every parameter draw has some design showing each knee.
+  #
+  #     A0 box        B0 box       worst design   best f_A   best f_B   coverage
+  #     [0.8, 10]     [1.0, 25]       0.374        0.903      0.902      1.000   <- shipped
+  #     [1.0, 8]      [1.5, 20]       0.460        0.903      0.902      1.000
+  #     [0.5, 15]     [0.8, 30]       0.212        0.902      0.903      1.000   <- fails (1)
+  #     [0.45, 4]     [0.45, 4]       0.059        0.901      0.901      1.000   <- fails (1)
+  #
+  # The last row is the SINGLE-SUBSTRATE task's box carried over unchanged, and it fails badly: it
+  # is the control showing the box had to be re-derived rather than inherited.
+  #
+  # ⚠️⚠️ VISIBILITY IS A FLOOR ON THE BOX, NOT A WAY TO CHOOSE ONE. Every reasonable candidate passes
+  # all three requirements, so they do not discriminate. Under the governing definition -- DEAD SPACE
+  # = PLATEAU (moving the design does not change the loss), TIGHT = the MAXIMAL box containing no
+  # plateau, found by EXPANDING each bound until the loss goes flat and then backing off -- the box
+  # is decided by `--section box`, not here. A too-SMALL box is a DEFECT, because it compresses the
+  # loss range and makes the task needle-like.
+  #
+  # WHAT THAT MEASUREMENT FOUND (`--section box`, figures/box.png, 8 line profiles at m = 1 swept to
+  # A0 = 100 and B0 = 200 mM), and it does NOT endorse this box:
+  #   * A0 LOW is a true dead zone -- loss sits AT the 1/3 prior below A0 ~ 0.09, alive by A0 ~ 0.25.
+  #     The shipped lower bound 0.8 is well inside the alive region (gradient -0.068 at 0.75), so on
+  #     this axis THE BOX IS TOO SMALL and could expand down to ~0.25.
+  #   * B0 LOW has NO plateau at all down to B0 = 0.1 (gradient still -0.045). The shipped 1.0 is
+  #     conservative by at least a decade.
+  #   * BOTH HIGH ENDS plateau, and the onset is set by the RATIO, not the concentration: flat once
+  #     `A0/B0 >~ 2-3` or `B0/A0 >~ 3-4`, because the substrate in excess saturates the enzyme and its
+  #     own constant stops being identifiable. Measured: A0 flat from 3.9 at B0 = 1.5, from 11 at
+  #     B0 = 5; B0 flat from 7.7 at A0 = 2.5, from 23 at A0 = 6, from 39 at A0 = 10.
+  #
+  # SO THE ALIVE REGION IS A BAND AROUND THE DIAGONAL, roughly 1/3 <~ A0/B0 <~ 3 with A0 >~ 0.2 --
+  # which INVERTS the original design. This box was built to AVOID the near-diagonal band because
+  # ping-pong made it an exact degeneracy; under the product form that band is exactly where the loss
+  # is ALIVE and the far-off-diagonal corners are the dead space. As a rectangle spanning ratios
+  # 0.032 to 10, this box necessarily contains two dead corners, (10, 1) and (0.8, 25).
+  #
+  # ⚠️ AND `plateau = 0.000` IN THE LANDSCAPE TABLE ABOVE IS NOT EVIDENCE AGAINST THIS. That statistic
+  # counts designs within 5% of the 1/3 no-information level; the plateaus found here sit at loss
+  # 0.14-0.23, far below 1/3, so it counts none of them. "No design scores no-information" and "no
+  # region is flat" are DIFFERENT CLAIMS and only the second decides whether iterations convert.
+  #
+  # NOT NOMINATED HERE. The face-gradient half of `--section box` (stepping each face inward under
+  # common random numbers) was cancelled to free memory for the GPU queue before it returned, so no
+  # replacement box is proposed. A rectangle cannot exclude the corners of a diagonal band, so the
+  # real options are a smaller near-square box, or reparameterising the design as (A0, B0/A0) --
+  # which is a change to the design space and is not made unasked.
+  #
+  # THE KNEES ARE SCORED SEPARATELY, and that is measured rather than preferred. Both knees appear
+  # in the SAME experiment only when -K_B <= A0 - B0 <= K_A, a narrow band around the diagonal -- and
+  # on the diagonal the two constants are EXACTLY degenerate. Requiring both knees per experiment
+  # would therefore select for the one configuration that cannot separate them. The requirement
+  # belongs at the BATCH level, where a batch spanning both sides of the diagonal covers both.
+  concentration_a_bounds: [0.8, 10.0]
+  concentration_b_bounds: [1.0, 25.0]
+
+  # Read-out noise: ABSOLUTE Gaussian on the extent of reaction, sigma = measurement_noise,
+  # independent of the value being read. Reading the extent rather than [A] costs nothing and hides
+  # nothing -- A0 is part of the design and therefore known exactly, so [A] = A0 - x is the same
+  # measurement up to a known constant -- but it treats the two substrates alike.
+  #
+  # CALIBRATED FROM IDENTIFIABILITY, LAST, and not from the appearance of the landscape
+  # (`--section identifiability`, figures/identifiability.png). The previous table here was a
+  # Cramer-Rao calculation on the PING-PONG Fisher information and is void; this one is the actual
+  # posterior risk of the shipped estimator, over 16 Sobol designs at m = 1, 1024 events each.
+  #
+  # WHY THIS IS SET LAST AND FROM THIS. A shape criterion -- span, plateau, near-best -- is computed
+  # on the AGGREGATE loss, which is a mean over three components, so a task can improve EVERY shape
+  # statistic by SHEDDING a target: raise the noise until K_A is no longer estimated and the
+  # landscape over (q, K_B) gets cleaner. That is the criterion being gamed, not the task being
+  # tuned. K_A binds, because K_M(glucose) is 0.02-0.2 mM against an A0 of order 1-10 mM, so the
+  # glucose knee sits at 98-99.8% depletion and is the last thing the curve reveals.
+  #
+  # `% recovered` is the fraction of that parameter's PRIOR VARIANCE removed, `1 - 3 * loss`:
+  #
+  #     noise (mM)   q       K_A      K_B    sd(ln K_A) avg   best design   worst per-parameter
+  #        0.005    98.1%   37.6%   46.1%       0.525          0.339           0.382  LATTICE FAILS
+  #        0.010    97.7%   33.8%   41.6%       0.541          0.380           0.333
+  #        0.020    97.2%   25.2%   35.2%       0.575          0.456           0.326   <- shipped
+  #        0.030    96.7%   19.4%   30.5%       0.597          0.505           0.326
+  #        0.050    95.7%   12.8%   23.6%       0.621          0.558           0.326   K_A ABANDONED
+  #        0.080    94.4%    8.5%   17.1%       0.636          0.600           0.326   K_A ABANDONED
+  #
+  # against a prior sd(ln K_A) of ln(10)/sqrt(12) = 0.665. AT 0.05 THE AVERAGE DESIGN REMOVES ONLY
+  # 12.8% OF THE K_A PRIOR VARIANCE and its posterior sd is 0.621, i.e. 93% of the prior -- a
+  # three-parameter task that is really estimating two, however well it scores. 0.02 keeps 25.2% and
+  # is the largest noise that does; that is why it is the shipped value.
+  #
+  # ⚠️ LOWER IS NOT FREE. At 0.005 the worst per-parameter loss is 0.382, ABOVE the 1/3 prior, which
+  # a Bayes estimator cannot be -- so that row is a LATTICE verdict, not a noise one: a sharper
+  # posterior needs a finer lattice to represent it. Re-running at (241, 21, 21) moves nothing at
+  # noise >= 0.01 (25.4% against 25.2% at 0.02) and still fails at 0.005, so the shipped
+  # (241, 15, 15) is NOT the limiting factor anywhere in the usable range.
+  #
+  # The inherited 0.05 mM of config/detector/enzyme.yaml belongs to an assay whose concentrations are
+  # ~0.5 mM rather than the 0.8-25 mM here; 0.02 mM is 0.08-2.5% of the extent across this box.
+  measurement_noise: 0.02
+
+  # RKC2. CALIBRATED on the cost frontier over a dense (A0, B0, q, K_A, K_B) grid -- 10800 points
+  # across the design box and the whole parameter prior -- against the closed-form solution
+  # (`--section integrator`, figures/integrator.png). Two DISTINCT failure modes, both measured:
+  #
+  #   * A STABILITY failure. The rate has poles just outside the physical range, reachable by a step
+  #     that overshoots a nearly exhausted substrate past zero, and past it the trajectory runs away
+  #     rather than merely losing accuracy: at 16 steps per measurement the error is 3.7e+01 mM.
+  #   * A SINGULARITY that NO LONGER EXISTS. Under the PING-PONG law the diagonal A0 == B0 was a
+  #     removable 0/0 -- both substrates exhaust together and numerator and denominator vanished
+  #     with them -- which hit 184 of 400 diagonal cases and survived refining from 64 to 512 steps
+  #     per measurement, because it was not a step-size problem. The PRODUCT form's denominator is
+  #     K_A K_B there, so it is finite, the count is ZERO, and the reciprocal rewrite that used to
+  #     live in `_integrate` is DELETED and must not be reintroduced. The scan grid still contains
+  #     A0 == B0 points on purpose (two independent geomspace axes share no value, so a product of
+  #     them never lands on the diagonal by accident) and so does the test suite.
+  #
+  #     stages   steps/meas   dt (s)   max|err|    monitor   NaN
+  #        5         16       22.50    3.69e+01   3.69e+01    0    stability failure
+  #        5         32       11.25    4.53e-03   3.83e-03    0
+  #        5         48        7.50    1.63e-03   1.28e-03    0
+  #        5         64        5.62    8.80e-04   6.84e-04    0    <- shipped
+  #        5         96        3.75    3.64e-04   2.80e-04    0
+  #        9         64        5.62    7.82e-04   6.07e-04    0    stages buy almost nothing
+  #
+  # Past the stability edge the error is accuracy-bound and stage count buys almost nothing (8.80e-4
+  # at 5 stages against 7.82e-4 at 9, for 1.8x the rate evaluations), so the cheapest setting that
+  # clears the tolerance is the fewest stages at the required dt.
+  n_stages: 5
+  steps_per_measurement: 64
+  # Verwer's standard damping, 2/13.
+  damping: 0.15384615384615385
+
+  # The dt-against-dt/2 bar, asserted host-side on EVERY call -- for the event batch AND for the
+  # estimator's model lattice. Taken from config/detector/enzyme.yaml. MEASURED at the shipped
+  # settings: true error against the closed form 8.80e-4 mM, monitor 6.84e-4 mM. So the bar clears
+  # the worst monitor by 7.3x, and the MONITOR TRACKS THE TRUE ERROR at 0.78x of it -- which is what
+  # makes the assert meaningful rather than decorative. It is 25% of the read-out noise.
+  integration_tolerance: 5.0e-3
+
+  # The estimator lattice: the posterior mean over the three log priors. ANISOTROPIC, and that is the
+  # whole design of it (`--section resolution`, figures/resolution.png).
+  #
+  # The velocity is determined an order of magnitude more sharply than either constant --
+  # sd(ln q) = 0.010 against sd(ln K_A) = 0.351 at the shipped noise -- so an ISOTROPIC lattice fine
+  # enough for the constants is far coarser than the posterior's ridge in q. The softmax then puts
+  # essentially all its weight on the one node nearest that ridge, the marginalisation over q is
+  # lost, and the estimate of the CONSTANTS becomes biased and over-confident: it scores ABOVE the
+  # prior, which a Bayes estimator CANNOT do. That is a sharp, self-contained test -- it needs no
+  # reference value and no convergence extrapolation. Worst PER-PARAMETER loss over four designs
+  # spanning the box, ceiling 1/3:
+  #
+  #     lattice (q, K_A, K_B)    nodes    noise 0.01   0.02   0.05   0.10
+  #        ( 21,  21,  21)        9261       1.137   1.067  0.928  0.725   TOO COARSE
+  #        ( 31,  31,  31)       29791       1.057   0.966  0.775  0.568   TOO COARSE
+  #        ( 41,  41,  41)       68921       0.823   0.726  0.591  0.433   TOO COARSE
+  #        (241,  21,  21)      106281       0.326   0.332  0.335  0.337   ok
+  #        (241,  31,  31)      231601       0.324   0.332  0.335  0.337   ok   <- shipped
+  #        (241,  41,  41)      405121       0.323   0.332  0.335  0.337   ok
+  #
+  # AND THE MICHAELIS AXES CAN BE CHEAP once q is resolved. Loss at 8 Sobol designs against the
+  # finest lattice, objective error 5.0e-3:
+  #
+  #     lattice          nodes   mean loss   max |diff vs (241,41,41)|   worst per-parameter
+  #     (241, 41, 41)   405121     0.0952            0.0000                    0.332
+  #     (241, 21, 21)   106281     0.0954            0.0003                    0.332
+  #     (241, 15, 15)    54225     0.0956            0.0007                    0.332   <- shipped
+  #     (241, 11, 11)    29161     0.0960            0.0012                    0.333
+  #     (241,  9,  9)    19521     0.0968            0.0030                    0.331
+  #
+  # 15 is converged to 0.0007, seven times inside the objective's own error, and is 7.5x cheaper than
+  # 31. THAT MATTERS: the estimator is the whole cost of a design evaluation, and at (241, 31, 31) it
+  # is 137 s per design on one CPU core, which makes a 5-seed 60-iteration criterion run a 25-hour
+  # job. At (241, 15, 15) it is about 18 s. 9 also passes the Bayes bound but its loss is drifting.
+  #
+  # IT IS NOT ABOUT NODE COUNT. The isotropic 41^3 at 68921 nodes FAILS while (241, 21, 21) at 106281
+  # nodes PASSES, and the three anisotropic rows agree to three decimals across a 3.8x range of node
+  # counts -- so the q axis is where the nodes have to go and 241 is enough. (241, 21, 21) would do
+  # and is 2.2x cheaper; 31 is kept for margin on the constants at 0.5 s per design evaluation.
+  # The isotropic lattice also inflates the MEAN loss: 0.2027 against 0.1643 at 41^3 / noise 0.02.
+  #
+  # ⚠️ A LOSS PLATEAU IS NOT EVIDENCE THAT THE LATTICE IS ADEQUATE. Refining the Michaelis axes at one
+  # design gives 0.0754 / 0.0746 / 0.0743 / 0.0742 at 13 / 21 / 31 / 41 -- a flat plateau from the
+  # coarsest size tried, at sizes this table rejects outright. A plateau says the value has stopped
+  # moving, which a quantised posterior does just as happily as a converged one.
+  n_grid: 15
+  n_grid_velocity: 241

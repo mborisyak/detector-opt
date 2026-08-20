@@ -1,0 +1,40 @@
+# Full default config for the `erasure` detector (ErasureDetector) on EMNIST DIGITS: every __init__
+# parameter, at the value this dataset is calibrated at. Digit classification through random PIXEL
+# ERASURE -- each pixel independently survives with probability p and is set to 0 otherwise, a
+# survivor showing its true intensity exactly.
+#
+# What makes the task hard is that an ERASED pixel and a BACKGROUND pixel are both 0 and cannot be
+# told apart, so raising p buys back a random share of the digit's ink with no clue as to which share
+# was missing. It is a subsampling problem, not a signal-to-noise one, and channel 0 stays inside
+# [0, 1] at every design -- no bound, no clip, no stabiliser is applied or needed.
+#
+# data_path + labels_path -- the raw IDX pair of the EMNIST digits training split: 240000 frames,
+# 28x28, 10 near-uniform classes. Supplying `labels_path` selects the two-file IDX layout over the
+# single-file arrow layout; the same `read_idx` the window detector uses reads it, and that loader
+# TRANSPOSES every frame because EMNIST stores its images column-major relative to MNIST. Do not
+# re-apply that transpose: it is its own inverse. Nothing here downloads anything.
+#
+# n_events -- how many leading records to read, or null for all 240000. Tests set it small.
+#
+# min_keep -- the bottom of the design range, the top being p = 1. ⚠️ PROVISIONAL: chosen from a
+# logistic-regression proxy and NOT yet confirmed with the real network. A clean frame carries about
+# 258 non-zero pixels, so p scales the surviving ink directly: p = 1e-3 leaves 0.8 of them, 3e-3
+# leaves 2.6, 1e-2 leaves 2.6, 1e-1 leaves 26. The proxy scored accuracy 0.141 at p = 0.003 against a
+# chance level of 0.1, and 0.239 at p = 0.01, so 3e-3 is the point at which a LINEAR model is
+# uninformative. A convolutional network does better than that proxy everywhere, so the floor that
+# is genuinely uninformative for it may be lower; the landscape probe sweeps down to 1e-3 to settle
+# it, and this value should be revisited against that measurement.
+#
+# keep_weight -- the price of keeping, in loss units per unit of keep probability, p on [0, 1]. Added
+# to the converged loss by scripts/bo.py; it NEVER reaches the trainer. Without it the best design is
+# trivially p = 1 and there is no design problem left. The default is ln(10) = 2.302585092994046,
+# exactly the cross-entropy of a uniform 10-class guess, which pins the top of the range: p = 1 pays
+# ln(10) in price and near-0 in cross-entropy, and any total below ln(10) is a design doing real
+# work. `null` removes the price entirely (design_penalty then returns None); 0.0 is a DIFFERENT
+# thing, a price that was measured and came out zero.
+erasure:
+  data_path: /home/max/dev/data/emnist/emnist-digits-train-images-idx3-ubyte
+  labels_path: /home/max/dev/data/emnist/emnist-digits-train-labels-idx1-ubyte
+  n_events: null
+  min_keep: 3.0e-3
+  keep_weight: 2.302585092994046

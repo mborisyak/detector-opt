@@ -1,0 +1,133 @@
+# RUN config for the `mnist` task: digit classification through an optimisable visible window.
+#
+# WHAT BO IS MINIMISING. The trained loss is the 10-class cross-entropy in nats alone -- that, and
+# only that, is what the convergence criterion judges. scripts/bo.py then ADDS the detector's
+# `design_penalty`, ln(10) times the window's area as a fraction of the image, so the objective is
+#
+#     cross_entropy + ln(10) * visible_area
+#
+# Both terms are bounded by ln(10) = 2.303 at their degenerate ends: a full-image window pays ln(10)
+# in area and ~0 in cross-entropy, a vanishing window pays ~0 in area and ln(10) in cross-entropy.
+# The optimum is a window just large enough to read the digit, and a total above ln(10) means the
+# design is worse than useless. results.json keeps `trained_loss` and `design_penalty` beside the
+# summed `loss`, so the two stay separable after the fact.
+#
+# regressor -- alpha-conv-regressor, a tiny residual CNN over the dense (28, 28, 2) image (the digit
+#   occluded by the window, beside the window mask). It is the network this task needs and none of
+#   the set/hit regressors is: those consume (B, M, F) elements and would have to flatten a 2-D image
+#   into an ordered vector, throwing away exactly the translation structure the window moves through.
+#   The stage widths (16, 32, 64) at 2 residual units each are ~122k parameters, small enough that a
+#   design costs seconds per epoch, which matters because BO must score many designs. The residual
+#   units carry a zero-initialised per-channel alpha, so depth is the identity at initialisation and
+#   costs nothing in conditioning -- and no BatchNorm has to be threaded through the functional
+#   train loop.
+#
+# training.budget -- 2^19 = 524288 shared detector calls, SIZED FROM THE MEASURED PER-DESIGN COST.
+#   A screen of 8 uniform designs at these settings spent a mean of 17749 calls each (median 16384,
+#   max 27306). A completed run at this budget then took 518829 calls over 34 DESIGNS, at a realised
+#   mean of 15260 and a MEDIAN of 10923 -- so if you want a given design count, budget from the
+#   median rather than the mean: the median design converges at n0 (8192 train + 2731 validation) and
+#   never grows at all, so per-design cost is set by n0, not by the growth schedule. 2^19 buys ~34
+#   designs; ~20 designs is nearer 320000, and halving n0 would roughly double the count.
+#
+#   The detector holds 60000 digits, so the run's event index OVERSAMPLES it by wrapping: the same
+#   digit is then seen under several DIFFERENT windows, which is a different training row, not a
+#   duplicated one. That is the intended behaviour here and the wrap warning it prints is expected.
+#
+# training.iteration_limit -- 32768, ALSO THE EPOCH LENGTH: steps_per_epoch = iteration_limit //
+#   batch, so this gives 256-step epochs. The coupling is definitional and must not be broken --
+#   warmup_epochs, patience and the convergence posterior are all in epoch units.
+#
+#   THE EPOCH LENGTH IS WHAT NEARLY KILLED THIS TASK, and it is worth writing down. An earlier
+#   rehearsal ran a 2048 iteration_limit at batch 64, i.e. 32 steps per epoch. The convergence
+#   procedure exits when the TRAIN loss has settled and the gap is small -- and a network that has
+#   not yet moved off the class prior satisfies BOTH trivially: train == val == ln(10) and the curve
+#   is flat because nothing has happened yet. Every design therefore "converged" at 2.30 and the
+#   objective was the area price alone, so BO drove the window to zero. 256 steps per epoch puts the
+#   first legal convergence test (warmup + 3 epochs) about 1280 steps in, which is well inside the
+#   learning phase, and the measured train losses at convergence run 0.34-1.97 rather than 2.30.
+#
+#   The DATA cap matters much less: the screened designs converged at windows of 8192-20480 against
+#   this cap of 32768, so no design was data-starved and there is headroom for one that is.
+#
+# training.loss_precision -- 1.0e-1, MEASURED. The exit gate is `diff + err <= loss_precision` with
+#   `diff = |val - train|`, and `diff` is not reducible by data, so a bar below the achievable slack
+#   makes designs unconvergeable and kills the run. This bar was set from a screen of 8 uniform
+#   designs plus 3 named ones at exactly these settings: every one of the 11 converged, and the
+#   WORST slack reached was 0.0867 (diff 0.0660 + err 0.0207), so 1.0e-1 clears the worst measured
+#   slack by 15%. The margin is thinner than one would like; the second line of defence is the data
+#   cap, which no design came near (20480 used against 32768 available), so a design that needs more
+#   than the screened designs did can still buy it.
+#
+#   AN EARLIER 5.0e-2 IN THIS FILE WAS INFEASIBLE and is recorded here because the error is easy to
+#   repeat: it sat BELOW the measured slack of every informative design, so those designs could
+#   never have converged whatever data they were given.
+#
+#   WHICH DESIGNS BIND is structural rather than measured. A cross-entropy classifier that has
+#   learned nothing predicts the uniform distribution and scores ln(10) on EVERY sample, so its
+#   per-sample variance collapses: the blind designs converge at the first window (measured diff
+#   0.0000, err 0.0008, 10923 calls) and are the CHEAP ones -- the opposite of a squared-error task.
+#   The binding designs are the informative mid-area windows, where the network genuinely fits.
+#
+# bo.gp.kernel -- independent-sorting-rbf with `exchangeable: 2`. The design is two UNORDERED PAIRS,
+#   `x = (x1, x2)` and `y = (y1, y2)`, and swapping the members of either names the SAME window: the
+#   objective is invariant under a group of order 4 and only a quarter of the cube is distinct. The
+#   kernel sorts each pair by its own values before the RBF, so the surrogate sees the canonical
+#   `(left, right, top, bottom)` and one lengthscale per EDGE -- quantities the loss is actually a
+#   function of, unlike the raw corners. `exchangeable: 2` selects the design_spec fields of width 2,
+#   which are exactly `x` and `y`. NOT `sorting-rbf`: that one orders every block by a single key
+#   block, tying the x-swap to the y-swap, which is the enzyme batch's symmetry and not this one.
+
+detector: mnist
+
+regressor:
+  alpha-conv-regressor:
+    channels: [16, 24, 32]
+    blocks: 2
+    kernel_size: 3
+    p_dropout: null
+
+device: cuda
+plot_per_epoch: 8
+
+training:
+  n0: 8192
+  n_increment: 4096
+  batch: 128
+  eval_batch: 2048
+  warmup_epochs: 2
+  patience: 8
+  budget: 1200000
+  iteration_limit: 60000
+  val_fraction: 0.25
+  loss_precision: 1.0e-1
+  param_mix: 0.25
+  optimizer:
+    adamaxw:
+      learning_rate: 5.0e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-3
+
+bo:
+  n_init: 5
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds: [-2.0, 1.0]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+    kernel:
+      independent-sorting-rbf:
+        exchangeable: 2
+  ei:
+    n_restarts: 32
+    n_steps: 100
+
+verify:
+  n_points: 10
+  epochs: 200
+  val_every_epochs: 10
+  budget: null
+  batch: null

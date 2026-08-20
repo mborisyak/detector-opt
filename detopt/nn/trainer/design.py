@@ -65,6 +65,11 @@ At a data addition the network is CARRIED by default -- same params, same optimi
 window. ``reinit_on_grow`` rebuilds it instead and ``param_mix`` interpolates toward the
 network the run started from (see ``__init__``); both default off. Neither is part of the procedure
 above and neither may alter it.
+
+``param_average_epochs`` (default 0, off) makes an exponential moving average of the parameters -- not
+the trained iterate -- the network that is scored, reported, checkpointed and carried to the next
+design; the gradient step itself is untouched. Its horizon is in epochs. See ``__init__``, and
+:mod:`.averaging` for the optax wrapper that carries the average.
 """
 
 from __future__ import annotations
@@ -79,7 +84,9 @@ import optax
 
 from ...utils.training import (bayesian_trend, masked_mean_sem,
                                probability_above, probability_change_below)
+from .averaging import decay_for_horizon, parameter_average, with_average, with_parameter_average
 from .common import (Trainer, TrainResult, _round_down, window_sample_indices, fresh_design_network,
+                     design_init_sequence,
                      )
 
 __all__ = ["DesignTrainer"]
@@ -130,6 +137,7 @@ class _DesignBase(Trainer):
         budget: int,
         reinit_on_grow: bool = False,
         param_mix: float = 0.0,
+        param_average_epochs: float = 0.0,
         val_fraction: float = 0.25,
         eval_batch: int | None = None,
         device=None,
@@ -181,6 +189,42 @@ class _DesignBase(Trainer):
         # land exactly on it (it also fixes the epoch length); the val cap mirrors the
         # train/val ratio. The base ``__init__`` then sizes the pools + builds kernels.
         iteration_limit = _round_down(self.n0, self.n_increment, int(iteration_limit))
+
+        # PARAMETER AVERAGING. DEFAULT OFF, and off means the optimiser is not wrapped, no buffer is
+        # allocated and nothing is read -- the trained iterate is scored, saved and carried exactly as
+        # a run without this knob does.
+        #
+        # WHAT IT IS FOR. `make_optimizer` gives a CONSTANT learning rate, because the convergence
+        # procedure decides the step count and a schedule needs a horizon it does not have. At a
+        # constant rate the iterate settles into a stationary DISTRIBUTION rather than a point, so
+        # train and val read at one snapshot differ by a fluctuation whose amplitude is set by the
+        # learning rate and the batch -- not by the window, which is the only thing the procedure can
+        # grow. `param_average_epochs > 0` scores an AVERAGE of the iterates instead, which is the
+        # only handle on that term that does not touch the optimiser.
+        #
+        # OPTIMISE ONE NETWORK, SCORE / REPORT / CARRY THE AVERAGE. The gradient step is taken at the
+        # raw iterate and is bit-for-bit the unwrapped one; the average is what `_eval_train` /
+        # `_eval_val` score, what the reported objective describes, what the per-design checkpoint
+        # holds (so verification re-scores it and the warm-started arms continue it), and what
+        # `_persist_network` hands to the next design. Exactly one network is visible outside the
+        # gradient step, so the reported number, the stored network and the continued network are the
+        # same object.
+        #
+        # THE HORIZON IS IN EPOCHS, not steps, because `steps_per_epoch = iteration_limit // batch` is
+        # task-dependent and because the procedure reads exactly one train/val pair per epoch: a
+        # horizon of one epoch averages the interval between two consecutive reported numbers.
+        #
+        # NO SEPARATE RESET AT A DATA ADDITION. `warmup_epochs` epochs of unconditional training follow
+        # every addition before any decision, so iterates from the smaller window are discounted by
+        # `exp(-warmup_epochs / horizon)` by the time anything is read. `param_mix` / `reinit_on_grow`
+        # re-initialise the optimiser state at the addition anyway, which reseeds the average on the
+        # network they leave behind.
+        self.param_average_epochs = float(param_average_epochs)
+        self.param_average_decay = None
+        if self.param_average_epochs > 0.0:
+            steps_per_epoch = max(1, int(iteration_limit) // int(batch))
+            self.param_average_decay = decay_for_horizon(steps_per_epoch * self.param_average_epochs)
+            optimizer = with_parameter_average(optimizer, self.param_average_decay)
         val_iteration_limit = max(int(batch), round(iteration_limit * val_fraction / (1.0 - val_fraction)))
         super().__init__(
             detector,
@@ -222,7 +266,8 @@ class _DesignBase(Trainer):
         design = detector.to_nominal(design_scaled)  # physical Design namedtuple (what the pools store)
         design_phys = np.asarray(detector.flatten_design(design), dtype=np.float32)  # flat, for the checkpoint tree
 
-        init_seq, training_seq = np.random.SeedSequence(int(seed)).spawn(2)
+        _, training_seq = np.random.SeedSequence(int(seed)).spawn(2)
+        init_seq = design_init_sequence(self.seed, int(step))
 
         # Network for this design (base: fresh / optionally warm-started; the
         # continual trainer keeps and continues the same one across designs).
@@ -272,10 +317,15 @@ class _DesignBase(Trainer):
                     tp.buffers(),
                 )
 
+                # THE NETWORK THAT IS SCORED: the trained iterate, or -- when the run asks for
+                # parameter averaging -- the running average of the iterates. `params` keeps taking
+                # gradient steps either way.
+                scored_params = params if self.param_average_decay is None else parameter_average(opt_state)
+
                 # Per-epoch losses: sequential masked passes over BOTH windows.
-                train_eval = self._eval_train(params, state, tp.buffers(), w0_train_j)
+                train_eval = self._eval_train(scored_params, state, tp.buffers(), w0_train_j)
                 train_mean, train_sem = masked_mean_sem(train_eval, train_count)
-                val_eval = self._eval_val(params, state, vp.buffers(), w0_val_j)
+                val_eval = self._eval_val(scored_params, state, vp.buffers(), w0_val_j)
                 val_mean, val_sem = masked_mean_sem(val_eval, val_count)
                 train_mean = float(train_mean)
                 train_sem = float(train_sem)
@@ -306,6 +356,25 @@ class _DesignBase(Trainer):
                 gap_signed = val_mean - train_mean  # val - train (signed)
                 err = float(np.hypot(train_sem, val_sem))  # combined SEM of val-train
                 diff = abs(gap_signed)
+
+                # THE SAME TWO WINDOWS AT THE RAW ITERATE, every epoch, whenever averaging is on. It is
+                # the PAIRED form of the whole measurement: both parameter points are scored on the
+                # same events at the same epoch of one trajectory, so the difference between their
+                # `gap`s is the evaluation point and nothing else -- no seed, no stopping point and no
+                # sampling offset in common. DIAGNOSTIC ONLY: nothing reads it back, no decision is
+                # taken from it, and it is printed rather than returned.
+                if self.param_average_decay is not None:
+                    raw_train, raw_train_sem = masked_mean_sem(
+                        self._eval_train(params, state, tp.buffers(), w0_train_j), train_count
+                    )
+                    raw_val, raw_val_sem = masked_mean_sem(self._eval_val(params, state, vp.buffers(), w0_val_j), val_count)
+                    raw_train, raw_val = float(raw_train), float(raw_val)
+                    print(
+                        f"  [average-vs-raw] epoch={len(train_loss_history)} window={train_count} "
+                        f"avg_train={train_mean:.6f} avg_val={val_mean:.6f} avg_diff={diff:.6f} avg_err={err:.6f} | "
+                        f"raw_train={raw_train:.6f} raw_val={raw_val:.6f} raw_diff={abs(raw_val - raw_train):.6f} "
+                        f"raw_err={float(np.hypot(raw_train_sem, raw_val_sem)):.6f}"
+                    )
 
                 # Warmup: unconditional training after every data addition.
                 if epoch_in_round <= self.warmup_epochs:
@@ -460,9 +529,26 @@ class _DesignBase(Trainer):
                     # THE OPTIMISER IS RESET with the rewind: Adam's moments describe the trajectory
                     # that reached the current parameters, and the rewind discards a fraction of that
                     # trajectory, so they no longer describe the network they would be stepping.
+                    #
+                    # THE AVERAGE IS REWOUND WITH THE NETWORK, by the same lambda toward the same
+                    # target, when averaging is on. It estimates where the network IS, so a known move
+                    # of the network is a known move of the estimate. Left alone it would keep
+                    # describing the pre-rewind trajectory; re-initialised it would throw away the
+                    # history the rewind did not throw away, since a partial rewind keeps `1 - lambda`
+                    # of the network and should keep `1 - lambda` of the average. The optimiser moments
+                    # still reset -- only the average is mixed rather than rebuilt.
                     mix = self.param_mix
-                    params = jax.tree.map(lambda p, q: q + (1.0 - mix) * (p - q), params, initial_params)
+
+                    def rewind(current, initial):
+                        return initial + (1.0 - mix) * (current - initial)
+
+                    average = None if self.param_average_decay is None else jax.tree.map(
+                        rewind, parameter_average(opt_state), initial_params
+                    )
+                    params = jax.tree.map(rewind, params, initial_params)
                     opt_state = self.optimizer.init(params)
+                    if average is not None:
+                        opt_state = with_average(opt_state, average)
                 round_start = len(train_loss_history)
                 epoch_in_round = 0
                 print(f"  [grow] window -> {tp.current - w0_train}, pool {tp.current}/{tp.capacity}")
@@ -477,7 +563,7 @@ class _DesignBase(Trainer):
             self._save_checkpoint(
                 manager,
                 len(train_loss_history),
-                params,
+                scored_params,
                 state,
                 design_tree,
                 train_mean,
@@ -485,10 +571,10 @@ class _DesignBase(Trainer):
             )
             if manager is not None:
                 manager.wait_until_finished()
-            self._persist_network(params, state, opt_state)  # continual: keep it
+            self._persist_network(scored_params, state, opt_state)  # continual: keep it
             objective_loss, objective_std = objective
             spent = (tp.current - w0_train) + (vp.current - w0_val)
-            return TrainResult(objective_loss, objective_std, spent, params)
+            return TrainResult(objective_loss, objective_std, spent, scored_params)
 
 
 class DesignTrainer(_DesignBase):

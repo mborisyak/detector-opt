@@ -1,0 +1,85 @@
+# RUN config for the BATCH-COMPOSITION comparison on `enzyme_depletion` at the HEXOKINASE prior
+# (config/detector/mm_hk_m2.yaml), 2 experiments. IDENTICAL to config/enzyme_depletion_hk_m2.yaml
+# except for `training.current_replay_ratio`, so the `continue` and `meta` arms run here exactly as
+# they do there -- `scripts/bo.py` drops a knob for every arm whose trainer does not own it, and
+# `current_replay_ratio` is owned by `meta_ratio` alone.
+#
+# `current_replay_ratio` is the CURRENT:REPLAY minibatch composition of the continual strategy: the
+# number of current-design rows per replay row, `batch // (1 + ratio)` of the batch being replay. 1.0
+# is `meta`'s 50/50 batch; 3.0 spends three quarters of every gradient on the window the reported
+# loss is actually measured on.
+#
+# RUN config for `enzyme_depletion` at the HEXOKINASE prior (config/detector/mm_hk_m2.yaml), 2
+# experiments, NEURAL arm -- the regressor is trained per design and `scripts/bo.py` drives it.
+#
+# The analytic arm of the same task needs no run config at all: the objective there is the detector's
+# own grid posterior and `scripts/enzyme_depletion_bo.py --detector-config` scores it directly.
+#
+# loss_of_a_guess = 1/3 in CLOSED FORM (both targets are log-uniform and the normalisation is affine
+# in the log), and every number is quoted against it.
+#
+# WHAT IS TUNED HERE AND WHY. The DATA SCHEDULE and `loss_precision` are one decision, not two: the
+# trainer stops a design when `|val - train| + err` falls under `loss_precision`, `err` is the loss
+# estimate's own standard error and falls like `1/sqrt(window)`, and the MEASURED law on this task is
+# `err ~ 0.035 * loss` at a 4096-event window (13 designs x 2 seeds spanning the landscape,
+# output/mm-tune/prec_m2_n0.075.json). So a bar far above that law converges EVERY design in the
+# first window and the per-design cost takes a single value -- which is what
+# `n0 = n_increment = 4096` at `loss_precision: 1.25e-2` did, and it makes the arm comparison void
+# because there is no cost for a warm start to convert.
+#
+# `iteration_limit` is BOTH the per-design window cap AND the epoch length
+# (`steps_per_epoch = iteration_limit // batch`), so `warmup_epochs` and `patience` are in units of
+# it and move with it.
+detector: mm_hk_m2
+regressor:
+  set-regressor:
+    features: [[24, 32], [32, 24]]
+    n_models: 4
+    dropconnect: 0.05
+device: cpu
+plot_per_epoch: 8
+training:
+  n0: 1024
+  n_increment: 512
+  batch: 128
+  eval_batch: 4096
+  warmup_epochs: 8
+  patience: 16
+  budget: 65536
+  iteration_limit: 32768
+  val_fraction: 0.25
+  loss_precision: 1.0e-2
+  param_mix: 0.25
+  replay_weight: 0.25
+  current_replay_ratio: 3.0
+  optimizer:
+    adamaxw:
+      learning_rate: 2.5e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-3
+verify:
+  n_points: 10
+  epochs: 200
+  val_every_epochs: 10
+  budget: null
+  batch: null
+bo:
+  n_init: 5
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds: [-2.0, 1.0]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+    kernel:
+      sorting-rbf:
+        exchangeable: 2
+  ei:
+    n_restarts: 16
+    n_steps: 60
+criterion:
+  checkpoints: [10, 20]
+  n_seeds: 256
+  n_events: 1024

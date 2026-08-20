@@ -87,9 +87,14 @@ NAME_PREFIX=${NAME_PREFIX:-camp}
 # DRIVER (env, default `scripts/bo.py`) is the BO driver to run.
 DRIVER=${DRIVER:-scripts/bo.py}
 
-# Seeds are drawn from a fixed list rather than 0..N-1: these are the seeds the earlier enzyme
-# campaigns used, so a comparison against those runs is paired rather than accidental.
-ALL_SEEDS=(1244111331 126382657 750143450 9577242 330924253 42 43 44 45 46)
+# Seeds are DERIVED, not listed: the same `random.Random(SUPER_SEED)` draw the Snakefile uses, so the
+# two drivers agree seed-for-seed and a comparison against earlier campaigns is paired rather than
+# accidental. Extending a campaign means asking for more seeds, which appends the next draws -- never
+# typing extra values in, because an invented seed looks identical to a paired one at the call site.
+SUPER_SEED=${SUPER_SEED:-123456}
+mapfile -t ALL_SEEDS < <(python3 -c 'import random, sys
+rng = random.Random(int(sys.argv[1]))
+print("\n".join(str(rng.randint(0, 2 ** 31 - 1)) for _ in range(int(sys.argv[2]))))' "$SUPER_SEED" "$SEEDS")
 
 echo "campaign: config=${CONFIG}  arms=${ARMS[*]}  seeds=${SEEDS}  -> ${OUT}"
 for ((i = 0; i < SEEDS; i++)); do

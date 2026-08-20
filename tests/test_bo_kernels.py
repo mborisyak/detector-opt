@@ -6,12 +6,14 @@ polish uses) are silent when wrong: a bad gradient gives a worse fit and a worse
 error.
 """
 
+from typing import NamedTuple
+
 import numpy as np
 import pytest
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel
 
-from detopt.bo import PermutationInvariantRBF, SortingRBF, __kernels__, kernel_from_config
+from detopt.bo import IndependentSortingRBF, PermutationInvariantRBF, SortingRBF, __kernels__, kernel_from_config
 
 BLOCKS = ((0, 1, 2, 3), (4, 5, 6, 7))  # the enzyme layout: fraction block + temperature block
 
@@ -20,8 +22,7 @@ def _kernel(blocks=BLOCKS, d=8, length_scale=None):
   n_groups = (len(blocks) + (d - sum(len(b) for b in blocks))) if blocks else d
   return PermutationInvariantRBF(
     d=d, blocks=blocks, constant_value=1.3, constant_value_bounds=(1e-3, 1e3),
-    length_scale=np.full(n_groups, 0.45) if length_scale is None else length_scale,
-    length_scale_bounds=(1e-2, 1e2)
+    length_scale=np.full(n_groups, 0.45) if length_scale is None else length_scale, length_scale_bounds=(1e-2, 1e2)
   )
 
 
@@ -33,10 +34,12 @@ def _permute(X, order, blocks=BLOCKS):
 
 
 def test_registry_names_and_config_entry():
-  """Four named modelling CHOICES: no symmetry, symmetry by group average, that average rescaled to
-  a constant diagonal, and symmetry by sorting."""
-  assert set(__kernels__) == {"ard-rbf", "permutation-invariant-rbf", "normalised-invariant-rbf",
-                              "sorting-rbf"}
+  """Five named modelling CHOICES: no symmetry, symmetry by group average, that average rescaled to
+  a constant diagonal, and symmetry by sorting -- the last in two flavours, one order shared across
+  blocks and one order per block."""
+  assert set(__kernels__) == {
+    "ard-rbf", "permutation-invariant-rbf", "normalised-invariant-rbf", "sorting-rbf", "independent-sorting-rbf"
+  }
 
 
 def test_lengthscale_count_is_per_group_not_per_coordinate():
@@ -45,7 +48,7 @@ def test_lengthscale_count_is_per_group_not_per_coordinate():
   assert _kernel().n_length_scales == 2
   assert _kernel(blocks=()).n_length_scales == 8  # no symmetry -> ordinary ARD
   # a free coordinate keeps its own
-  assert _kernel(blocks=((0, 1, 2, 3),), d=6, length_scale=np.full(3, 0.4)).n_length_scales == 3
+  assert _kernel(blocks=((0, 1, 2, 3), ), d=6, length_scale=np.full(3, 0.4)).n_length_scales == 3
 
 
 def test_kernel_is_invariant_under_permuting_either_argument():
@@ -178,8 +181,7 @@ def test_ryser_permanent_matches_the_definition():
   for m in (1, 2, 3, 4, 5):
     A = rng.random((3, m, m))
     brute = np.array([
-      sum(np.prod([a[k, order[k]] for k in range(m)]) for order in itertools.permutations(range(m)))
-      for a in A
+      sum(np.prod([a[k, order[k]] for k in range(m)]) for order in itertools.permutations(range(m))) for a in A
     ])
     np.testing.assert_allclose(PermutationInvariantRBF._permanent(A), brute, rtol=1e-10)
 
@@ -209,7 +211,7 @@ def _jax_kernel(theta, X, Y, blocks, free, n_blocks):
   factor = jnp.ones((X.shape[0], Y.shape[0]))
   for j, coordinate in enumerate(free):
     difference = X[:, coordinate][:, None] - Y[:, coordinate][None, :]
-    factor = factor * jnp.exp(-0.5 * difference**2 / length_scale[n_blocks + j] ** 2)
+    factor = factor * jnp.exp(-0.5 * difference**2 / length_scale[n_blocks + j]**2)
   if len(blocks) == 0:
     return amplitude * factor
 
@@ -220,10 +222,9 @@ def _jax_kernel(theta, X, Y, blocks, free, n_blocks):
     for b, block in enumerate(blocks):
       permuted = [block[k] for k in order]
       difference = X[:, list(block)][:, None, :] - Y[:, permuted][None, :, :]
-      exponent = exponent + jnp.sum(difference**2, axis=-1) / length_scale[b] ** 2
+      exponent = exponent + jnp.sum(difference**2, axis=-1) / length_scale[b]**2
     total = total + jnp.exp(-0.5 * exponent)
   return amplitude * factor * total / float(np.prod(np.arange(1, m + 1)))
-
 
 
 @pytest.fixture(autouse=True)
@@ -238,6 +239,7 @@ def _x64():
   yield
   jax.config.update("jax_enable_x64", previous)
 
+
 def test_value_matches_an_independent_jax_implementation():
   jax = pytest.importorskip("jax")
   jnp = pytest.importorskip("jax.numpy")
@@ -246,8 +248,10 @@ def test_value_matches_an_independent_jax_implementation():
   X, Y = rng.random((6, 8)), rng.random((5, 8))
   kernel = _kernel()
 
-  reference = _jax_kernel(jnp.asarray(kernel.theta, dtype=jnp.float64), jnp.asarray(X, dtype=jnp.float64),
-                          jnp.asarray(Y, dtype=jnp.float64), [list(b) for b in BLOCKS], [], len(BLOCKS))
+  reference = _jax_kernel(
+    jnp.asarray(kernel.theta, dtype=jnp.float64), jnp.asarray(X, dtype=jnp.float64), jnp.asarray(Y, dtype=jnp.float64),
+    [list(b) for b in BLOCKS], [], len(BLOCKS)
+  )
   np.testing.assert_allclose(kernel(X, Y), np.asarray(reference), rtol=1e-10, atol=1e-12)
 
 
@@ -298,9 +302,8 @@ def test_free_coordinates_also_match_autodiff():
 
   blocks, free, d = [(0, 1, 2), (3, 4, 5)], [6, 7], 8
   kernel = PermutationInvariantRBF(
-    d=d, blocks=tuple(tuple(b) for b in blocks), constant_value=0.9,
-    constant_value_bounds=(1e-3, 1e3), length_scale=np.array([0.4, 0.7, 0.3, 1.1]),
-    length_scale_bounds=(1e-2, 1e2)
+    d=d, blocks=tuple(tuple(b) for b in blocks), constant_value=0.9, constant_value_bounds=(1e-3, 1e3),
+    length_scale=np.array([0.4, 0.7, 0.3, 1.1]), length_scale_bounds=(1e-2, 1e2)
   )
   assert kernel.n_length_scales == 4  # 2 blocks + 2 free coordinates
 
@@ -316,7 +319,7 @@ def test_grad_diag_matches_finite_differences():
   """``diag`` is NOT constant for a group-averaged kernel, so the EI gradient needs its derivative.
   That term had no test at all, and it is the one the acquisition's polish is most sensitive to."""
   rng = np.random.default_rng(4)
-  for blocks, d in ((((0, 1, 2, 3), (4, 5, 6, 7)), 8), (((1, 2, 3, 4),), 5), (((0, 1), (2, 3)), 5), ((), 4)):
+  for blocks, d in ((((0, 1, 2, 3), (4, 5, 6, 7)), 8), (((1, 2, 3, 4), ), 5), (((0, 1), (2, 3)), 5), ((), 4)):
     kernel = PermutationInvariantRBF(d=d, blocks=blocks, constant_value=1.3, length_scale=0.6)
     x = rng.random(d)
     analytic = kernel.grad_diag(x)
@@ -344,8 +347,9 @@ def test_prior_variance_is_maximal_on_the_tied_diagonal():
   design of experiments there is. Pinned here so that a future normalisation (k/sqrt(k(x,x)k(y,y)))
   is a deliberate change with a failing test to update, rather than a silent one."""
   m = 4
-  kernel = PermutationInvariantRBF(d=2 * m, blocks=(tuple(range(m)), tuple(range(m, 2 * m))),
-                                   constant_value=1.0, length_scale=0.37)
+  kernel = PermutationInvariantRBF(
+    d=2 * m, blocks=(tuple(range(m)), tuple(range(m, 2 * m))), constant_value=1.0, length_scale=0.37
+  )
   rng = np.random.default_rng(1)
   tied = np.repeat(rng.random(2), m).reshape(1, -1)
   generic = rng.random((1, 2 * m))
@@ -354,9 +358,10 @@ def test_prior_variance_is_maximal_on_the_tied_diagonal():
 
 
 def _sorting(d=8, m=4, **kwargs):
-  return SortingRBF(d=d, sort_blocks=(tuple(range(m)), tuple(range(m, 2 * m))), key=-1,
-                    constant_value=1.3, length_scale=np.array([0.3, 0.5, 0.4, 0.6, 0.35, 0.45, 0.55, 0.25]),
-                    **kwargs)
+  return SortingRBF(
+    d=d, sort_blocks=(tuple(range(m)), tuple(range(m, 2 * m))), key=-1, constant_value=1.3,
+    length_scale=np.array([0.3, 0.5, 0.4, 0.6, 0.35, 0.45, 0.55, 0.25]), **kwargs
+  )
 
 
 def test_sorting_kernel_is_exactly_invariant():
@@ -513,3 +518,131 @@ def test_normalised_repr_reports_per_group_lengthscales():
   assert kernel.n_length_scales == 2
   assert repr(kernel).count(" ") < 20 and "blocks=2x4" in repr(kernel)
   assert len(np.atleast_1d(kernel._length_scales())) == kernel.n_length_scales
+
+
+# --------------------------------------------------------------------------- #
+# `independent-sorting-rbf`: sorting again, but each block by ITS OWN values. The MNIST window's
+# symmetry -- `(x1, x2)` and `(y1, y2)` are unordered pairs that swap INDEPENDENTLY -- which is a
+# product group, not the diagonal one `sorting-rbf` quotients.
+# --------------------------------------------------------------------------- #
+WINDOW_BLOCKS = ((0, 1), (2, 3))  # the MNIST layout: the x pair + the y pair
+
+
+def _independent(d=4, **kwargs):
+  return IndependentSortingRBF(
+    d=d, sort_blocks=WINDOW_BLOCKS, constant_value=1.3, length_scale=np.array([0.3, 0.5, 0.4, 0.6]), **kwargs
+  )
+
+
+def test_independent_sorting_is_invariant_under_the_FULL_product_group():
+  """All 4 relabellings of a window -- swap x, swap y, swap both, swap neither -- name the same
+  rectangle, so the kernel must not move by a single ulp under any of them."""
+  import itertools
+
+  kernel, rng = _independent(), np.random.default_rng(0)
+  X, x = rng.random((5, 4)), rng.random(4)
+  values = []
+  for flip_x, flip_y in itertools.product((False, True), repeat=2):
+    permuted = np.concatenate([x[:2][::-1] if flip_x else x[:2], x[2:][::-1] if flip_y else x[2:]])
+    values.append(kernel(permuted[None, :], X))
+  assert np.ptp(np.stack(values), axis=0).max() == 0.0
+
+
+def test_it_differs_from_sorting_rbf_on_exactly_the_designs_that_motivate_it():
+  """THE REASON THIS CLASS EXISTS, stated as a test. `sorting-rbf` orders every block by one KEY
+  block, so it is invariant only when both pairs are swapped TOGETHER; swapping x alone moves it.
+  These two designs name the same window, so a surrogate that scores them differently is wrong."""
+  x = np.array([0.2, 0.8, 0.3, 0.7])
+  swapped_x_only = np.array([0.8, 0.2, 0.3, 0.7])
+  X = np.random.default_rng(1).random((5, 4))
+
+  independent = _independent()
+  assert np.ptp(np.stack([independent(x[None, :], X), independent(swapped_x_only[None, :], X)]), axis=0).max() == 0.0
+
+  shared_key = SortingRBF(
+    d=4, sort_blocks=WINDOW_BLOCKS, key=-1, constant_value=1.3, length_scale=np.array([0.3, 0.5, 0.4, 0.6])
+  )
+  assert not np.allclose(shared_key(x[None, :], X), shared_key(swapped_x_only[None, :], X))
+
+
+def test_independent_sorting_has_a_constant_diagonal():
+  """Sorting leaves k(x, x) at the amplitude, so EI's exploration term is not inflated on the
+  degenerate zero-width windows the way the group average's would be."""
+  kernel = _independent()
+  degenerate = np.array([[0.4, 0.4, 0.7, 0.7]])
+  spread = np.array([[0.1, 0.9, 0.25, 0.75]])
+  assert np.isclose(kernel.diag(degenerate)[0], 1.3) and np.isclose(kernel.diag(spread)[0], 1.3)
+  assert np.all(kernel.grad_diag(spread[0]) == 0.0)
+
+
+def test_independent_sorting_gram_is_symmetric_and_psd():
+  kernel, rng = _independent(), np.random.default_rng(3)
+  gram = kernel(rng.random((12, 4)))
+  assert np.allclose(gram, gram.T)
+  assert np.min(np.linalg.eigvalsh(gram)) > -1e-8
+
+
+def test_independent_sorting_input_gradient_matches_finite_differences():
+  """``k_and_grad_x`` scatters the sorted-frame gradient back through the inverse permutation of
+  EACH block separately. Getting that wrong leaves the magnitudes right and the directions permuted,
+  which an optimiser cannot detect. Checked away from the tie locus, where it is differentiable."""
+  kernel, rng = _independent(), np.random.default_rng(2)
+  X = rng.random((6, 4))
+  for x in (np.array([0.20, 0.80, 0.35, 0.65]), np.array([0.80, 0.20, 0.65, 0.35]), np.array([0.80, 0.20, 0.35, 0.65])):
+    _, jac = kernel.k_and_grad_x(X, x)
+    numeric = np.zeros_like(jac)
+    for j in range(4):
+      step = np.zeros(4)
+      step[j] = 1e-6
+      numeric[:, j] = (kernel((x + step)[None, :], X)[0] - kernel((x - step)[None, :], X)[0]) / 2e-6
+    assert np.allclose(jac, numeric, atol=1e-7)
+
+
+def test_independent_sorting_without_blocks_is_exactly_an_ard_rbf():
+  rng = np.random.default_rng(5)
+  X, Y = rng.random((4, 4)), rng.random((3, 4))
+  length_scale = np.array([0.3, 0.5, 0.4, 0.6])
+  bare = IndependentSortingRBF(d=4, constant_value=1.3, length_scale=length_scale)
+  reference = ConstantKernel(1.3) * RBF(length_scale)
+  assert bare.is_stationary() and np.allclose(bare(X, Y), reference(X, Y))
+
+
+def test_independent_sorting_survives_sklearn_clone():
+  """sklearn re-clones the kernel from ``get_params`` on every fit, so every constructor argument
+  must be a named parameter; a ``**kwargs`` signature yields an empty ``theta`` silently."""
+  from sklearn.base import clone
+
+  kernel = _independent()
+  copy = clone(kernel)
+  assert np.allclose(copy.theta, kernel.theta) and copy.bounds.shape == kernel.bounds.shape
+  assert kernel.n_length_scales == 4  # one per EDGE: ARD acts on left, right, top, bottom
+  assert np.allclose(copy(np.array([[0.8, 0.2, 0.7, 0.3]])), kernel(np.array([[0.2, 0.8, 0.3, 0.7]])))
+
+
+def test_independent_sorting_is_built_from_the_window_design_spec():
+  """`exchangeable: 2` must find the design_spec fields of width 2 -- the x pair and the y pair --
+  and nothing else. Stubbed rather than built from `MNISTDetector`, which needs the arrow file."""
+  import jax
+
+  class WindowDesign(NamedTuple):
+    x: jax.Array
+    y: jax.Array
+
+  class Stub:
+
+    def design_spec(self):
+      pair = jax.ShapeDtypeStruct((2, ), np.float32)
+      return WindowDesign(x=pair, y=pair)
+
+    def design_dim(self):
+      return 4
+
+  gp = {"log_lengthscale_prior_bounds": [-2.0, 1.0], "log_amplitude_prior_bounds": [-6.0, 1.5]}
+  kernel = kernel_from_config({"independent-sorting-rbf": {"exchangeable": 2}}, Stub(), gp)
+  assert kernel.sort_blocks == ((0, 1), (2, 3))
+  assert kernel.d == 4 and kernel.n_length_scales == 4
+
+  with pytest.raises(ValueError, match="needs .exchangeable"):
+    kernel_from_config({"independent-sorting-rbf": {}}, Stub(), gp)
+  with pytest.raises(ValueError, match="no design field of length 3"):
+    kernel_from_config({"independent-sorting-rbf": {"exchangeable": 3}}, Stub(), gp)

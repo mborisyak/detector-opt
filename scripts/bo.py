@@ -19,6 +19,22 @@ The objective is the converged VALIDATION loss (BO minimises it directly); each
 observation's GP noise is that estimate's own uncertainty, ``|val - train| +
 hypot(sems)``.
 
+THE DESIGN PENALTY, when a detector prices one. ``detector.design_penalty(design)`` returns a scalar
+added to the trained loss, or ``None`` when the task has no such term -- and ``None`` is DROPPED
+rather than coerced to ``0.0``, so a task without a price never reports one. The term is
+deterministic in the design, so it moves the mean the GP sees and leaves ``noise`` alone. It is
+applied HERE and never inside the trainer: ``loss_precision`` and the settled test judge the
+NETWORK's fit, and a per-design constant added there would shift the reported loss without changing
+anything the criterion measures. ``results.json`` carries ``trained_loss`` and ``design_penalty``
+beside ``loss`` so the two stay separable after the fact.
+
+THE OBSERVATION-NOISE SCALE. ``bo.observation_noise_scale`` (default 1.0) multiplies the noise every
+observation is handed to the GP. The trainer reports the loss estimate's OWN standard error, which
+prices the estimator and not the run-to-run scatter of retraining the same design, so the GP can be
+told a noise well below the scatter it actually sees -- and a GP under-told its noise interpolates
+its observations instead of smoothing them. The knob exists to MEASURE that. At the default the
+trainer's value is passed through unchanged, so the default path is the one that was always run.
+
 SEEDS AND RESUME
 ----------------
 One :class:`numpy.random.SeedSequence` per run, split ONCE before any iteration into a network branch
@@ -49,18 +65,29 @@ import detopt
 import detopt.bo
 import detopt.utils.io
 from detopt.bo import BayesianOptimizer
-from detopt.nn.trainer import ContinualTrainer, DesignTrainer
+from detopt.nn.trainer import ContinualRatioTrainer, ContinualTrainer, DesignTrainer
 from detopt.utils.viz.bo import plot_iteration, plot_convergence
 
 # from_scratch / continue / closest all use DesignTrainer (a fresh per-design
 # network; "continue" and "closest" warm-start its weights from a previous design).
 # "meta" is the ContinualTrainer: one persistent network trained with current+history
-# replay. All are design-conditioned (combine sees each event's real scaled design).
-VALID_INIT_STRATEGIES = ("from_scratch", "continue", "closest", "meta")
+# replay. "meta_ratio" is the same continual strategy with the current:replay batch
+# composition as a knob (`training.current_replay_ratio`), of which "meta"'s 50/50
+# batch is the 1:1 case. All are design-conditioned (combine sees each event's real
+# scaled design).
+VALID_INIT_STRATEGIES = ("from_scratch", "continue", "closest", "meta", "meta_ratio")
 
-# THE TWO TRAINER CLASSES THIS DRIVER USES. "per_design" backs from_scratch / continue / closest
-# (they differ only in the warm start this driver passes), "meta" backs the continual strategy.
-TRAINERS = {"per_design": DesignTrainer, "meta": ContinualTrainer}
+# THE TRAINER CLASSES THIS DRIVER USES, KEYED BY STRATEGY. "per_design" backs from_scratch /
+# continue / closest (they differ only in the warm start this driver passes); every other strategy
+# names its own class here, so adding one is a line in this table rather than a branch below.
+TRAINERS = {"per_design": DesignTrainer, "meta": ContinualTrainer, "meta_ratio": ContinualRatioTrainer}
+
+# TRAINING KNOBS ONLY SOME TRAINERS ACCEPT, and which strategies own them. A run config written for a
+# multi-arm campaign has to carry every arm's knobs, but a trainer that does not take one raises
+# `TypeError: __init__() got an unexpected keyword argument` before the first design -- so a knob is
+# dropped for the arms that do not own it. Dropped LOUDLY: a setting that vanishes without a line in
+# the log is how a campaign ends up measuring something else.
+STRATEGY_KNOBS = {"replay_weight": ("meta", "meta_ratio"), "current_replay_ratio": ("meta_ratio", )}
 
 
 def bo(output, seed: int, force: bool = False, **config):
@@ -136,6 +163,12 @@ def bo(output, seed: int, force: bool = False, **config):
     # Initial random proposals: as many as the GP's CV folds, so the first GP
     # fit has enough points for k-fold cross-validation.
     n_init = int(bo_cfg.get("n_init", gp_cfg["n_folds"]))
+    # See "THE OBSERVATION-NOISE SCALE" in the module docstring. Announced only when it is off the
+    # default, so a run that uses one cannot be mistaken for a run that does not.
+    noise_scale = float(bo_cfg.get("observation_noise_scale", 1.0))
+    if noise_scale != 1.0:
+        print(f"[bo] observation_noise_scale={noise_scale!r}: the GP is told the trainer's reported "
+              f"standard error times {noise_scale!r}", flush=True)
 
     detector = detopt.detector.from_config(config["detector"])
     # BO searches the SCALED design cube [0, 1]^d -- the same space the subgradient and LFI methods
@@ -157,7 +190,16 @@ def bo(output, seed: int, force: bool = False, **config):
     # generator position to persist and no way for a resumed run to drift onto a different stream.
     network_seq, iteration_seq = np.random.SeedSequence(int(seed)).spawn(2)
 
-    trainer_cls = TRAINERS["meta"] if nn_init_strategy == "meta" else TRAINERS["per_design"]
+    trainer_cls = TRAINERS.get(nn_init_strategy, TRAINERS["per_design"])
+
+    # Drop every knob this arm's trainer does not accept (see STRATEGY_KNOBS above), one line per
+    # drop so the log says exactly which settings this cell did not use.
+    for knob, owners in STRATEGY_KNOBS.items():
+        if nn_init_strategy not in owners and knob in config.get("training", {}):
+            config = {**config, "training": {k: v for k, v in config["training"].items() if k != knob}}
+            print(f"[config] dropped `training.{knob}`: it applies to {'/'.join(owners)} only, "
+                  f"not `{nn_init_strategy}`", flush=True)
+
     trainer = trainer_cls.from_config(
         detector,
         config,
@@ -256,6 +298,15 @@ def bo(output, seed: int, force: bool = False, **config):
             "detector_calls_used": int(trainer.train_pool.current + trainer.val_pool.current),
             "method": "JAX-GP+EI",
             "completed": completed,
+            # THE CONFIG THIS TRAJECTORY WAS PRODUCED UNDER, recorded because without it a
+            # `results.json` is not self-describing and cross-campaign comparisons cannot be checked
+            # from the artefacts. MEASURED COST of its absence, 2026-08-20: two campaigns 2.67x apart
+            # in cold-start cost and 0.14 apart in loss level looked mutually comparable, and one was
+            # used to overturn a correct finding; recovering the truth needed four separate forensic
+            # signals (cold-start spend, loss level, a missing run.log, directory mtime) where one
+            # field settles it. `run.log` is not a fallback -- an older campaign here has none at all.
+            "config": config,
+            "nn_init_strategy": nn_init_strategy,
         }
         staged = results_path + ".new"
         with open(staged, "w") as f:
@@ -286,8 +337,16 @@ def bo(output, seed: int, force: bool = False, **config):
 
         design_phys = np.asarray(detector.flatten_design(detector.to_nominal(x_prop)), dtype=np.float32).tolist()
 
-        def _on_epoch(snapshot, _i=i, _d=design_phys):
+        # The LAST snapshot a design produced, kept so the final curve can be drawn once the design
+        # has exited. The stride alone renders every `plot_every`-th epoch, which leaves a short
+        # design showing one or two points and its exit epoch missing entirely -- the very shape one
+        # needs to see to tell "converged" from "never started", since a flat curve at the class
+        # prior passes the settled test more easily than a descending one.
+        last_snapshot = {}
+
+        def _on_epoch(snapshot, _i=i, _d=design_phys, _keep=last_snapshot):
             vlp = snapshot["val_loss_per_epoch"]
+            _keep["snapshot"], _keep["iteration"], _keep["design"] = snapshot, _i, _d
             # The snapshot's length IS the epoch count, so the stride gates here. The FIRST epoch and
             # every `plot_every`-th one are drawn: without the first, a design that converges inside
             # one stride would produce no plot at all.
@@ -296,6 +355,17 @@ def bo(output, seed: int, force: bool = False, **config):
                 return
             live = float(vlp[-1]) if vlp.size > 0 else float("nan")
             plot_iteration(snapshot, iteration=_i, design=_d, val_loss=live, plots_dir=plots_dir)
+
+        def _plot_final(_keep=last_snapshot):
+            """Render the design's LAST epoch, whatever the stride landed on."""
+            snapshot = _keep.get("snapshot")
+            if snapshot is None:
+                return
+            vlp = snapshot["val_loss_per_epoch"]
+            live = float(vlp[-1]) if vlp.size > 0 else float("nan")
+            plot_iteration(
+                snapshot, iteration=_keep["iteration"], design=_keep["design"], val_loss=live, plots_dir=plots_dir
+            )
 
         on_epoch = _on_epoch if plot_every > 0 else None
 
@@ -332,6 +402,8 @@ def bo(output, seed: int, force: bool = False, **config):
                 step=i,
             )
         except RuntimeError as error:
+            if plot_every > 0:
+                _plot_final()
             text = str(error).replace("\n", " ")
             if "did not reach precision within iteration_limit" not in text:
                 raise
@@ -339,12 +411,20 @@ def bo(output, seed: int, force: bool = False, **config):
             print(f"[failed] design {i} did not reach precision after {i} scored designs; "
                   f"partial.json holds those, and this design is re-proposed on resume")
             raise
+        if plot_every > 0:
+            _plot_final()
         if result is None:
             print(f"[budget] pool exhausted; finishing BO after {i} completed iterations.")
             break
-        loss = float(result.objective_loss)  # BO minimises the loss directly
+        trained_loss = float(result.objective_loss)
+        penalty = detector.design_penalty(design_phys)
+        penalty = None if penalty is None else float(penalty)
+        loss = trained_loss if penalty is None else trained_loss + penalty
 
-        bo_opt.append(x_prop, loss, noise=result.objective_std)
+        # At the default scale the trainer's own value is passed through -- not a product with 1.0,
+        # which would change its type and is not what earlier campaigns ran.
+        noise = result.objective_std if noise_scale == 1.0 else result.objective_std * noise_scale
+        bo_opt.append(x_prop, loss, noise=noise)
         proposed_scaled.append(x_prop)
 
         improved = loss < best_loss
@@ -353,8 +433,9 @@ def bo(output, seed: int, force: bool = False, **config):
 
         elapsed = time.time() - iter_start
         marker = " BEST" if improved else ""
+        priced = "" if penalty is None else f" (trained {trained_loss:.5f} + penalty {penalty:.5f})"
         print(
-            f"[iter {i+1}] loss={result.objective_loss:.5f}±{result.objective_std:.4f} "
+            f"[iter {i+1}] loss={loss:.5f}±{result.objective_std:.4f}{priced} "
             f"spent={result.spent} time={elapsed:.1f}s{marker}"
         )
 
@@ -363,7 +444,9 @@ def bo(output, seed: int, force: bool = False, **config):
                 "iteration": i,
                 "design": design_phys,
                 "x_scaled": x_prop.tolist(),
-                "loss": float(result.objective_loss),
+                "loss": loss,
+                "trained_loss": trained_loss,
+                "design_penalty": penalty,
                 "loss_std": float(result.objective_std),
                 "spent": int(result.spent),
                 "time_s": float(elapsed),

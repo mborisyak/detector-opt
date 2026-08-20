@@ -1,0 +1,99 @@
+# ⚠️ VARIANT of `config/emnist_drop.yaml`: `training.replay_weight` 2.0 (default 1.0). `meta` ONLY --
+# the other three arms never read it and `scripts/bo.py` drops it for them, printing a line saying so.
+# ⚠️ VARIANT of `config/emnist.yaml`: regressor `p_dropout` 0.1 (default `null`, i.e. OFF).
+# EVERYTHING ELSE IS IDENTICAL, so a cell here pairs directly against the corresponding cell from
+# `config/emnist.yaml` at the same seed and the difference is attributable to that one value.
+#
+# `training.optimizer.adamaxw.weight_decay` is ALREADY 1.0e-3 in the base config and is unchanged
+# here -- it was not a variable of this variant.
+#
+# The visible-window task on EMNIST DIGITS -- same detector as config/mnist.yaml, 4x the digits.
+# The design is the window's two opposite corners (x1, x2, y1, y2) on [0, 1]^4; the reported loss is
+# the converged cross-entropy PLUS `design_penalty`, ln(10) times the window's area as a fraction of
+# the image, so the objective is bounded below by neither degenerate extreme: the whole image costs
+# exactly ln(10), and so does seeing nothing.
+#
+# training.budget -- 240000, THE DATASET SIZE, and that identity is the point rather than a
+#   coincidence. The run's event stream is one seeded permutation of [0, size) consumed
+#   SEQUENTIALLY, and designs take disjoint consecutive slices of it, so at budget == size every
+#   design trains on digits no other design has seen and no digit is ever repeated. One call above
+#   this and `shuffled_event_index` wraps the permutation and starts re-issuing frames (it warns, and
+#   the MNIST run at budget 1200000 against 60000 digits did exactly that, 20x over). Verified rather
+#   than assumed: at 240000 the stream is 240000 distinct indices covering the dataset exactly once,
+#   with zero overlap between consecutive design slices; at 241000 it is 240000 distinct of 241000
+#   with a wrap warning.
+#
+#   What it buys: at the measured MNIST cost of 10923 calls for a design that converges at n0 (8192
+#   train + 2731 validation) this funds ~21 designs, of which `n_init` = 5 are the initial draws and
+#   the remaining ~16 are BO-guided. That is enough to compare two arms and NOT enough to call a
+#   campaign; size any campaign from a per-design cost measured on EMNIST, not on MNIST.
+#
+# ⚠️ WHAT IS CARRIED OVER FROM MNIST AND HAS *NOT* BEEN RE-MEASURED HERE. `n0`, `n_increment`,
+#   `iteration_limit`, `patience`, `warmup_epochs` and `loss_precision` are the MNIST values. EMNIST
+#   digits is a larger and more varied collection of writers, so the per-design cost and the
+#   convergence bar may both move; treat every number below as inherited until a screen on EMNIST
+#   says otherwise. `loss_precision` = 1.0e-1 is the one most worth re-checking: on MNIST the worst
+#   `diff + err` measured was 0.0318, so the bar had real slack, but a harder distribution eats it.
+#
+#   `iteration_limit` = 60000 is deliberately NOT rescaled to the new dataset size. It sets
+#   steps_per_epoch = iteration_limit // batch, so it decides what `patience` counts; changing it
+#   would silently redefine an epoch and break comparability with everything measured on MNIST.
+#
+# bo.gp.kernel -- independent-sorting-rbf with `exchangeable: 2`, exactly as in config/mnist.yaml:
+#   the design is two UNORDERED PAIRS and swapping the members of either names the SAME window, so
+#   the surrogate sees the canonical (left, right, top, bottom). See that file for the full note.
+
+detector: emnist_digits
+
+regressor:
+  alpha-conv-regressor:
+    channels: [16, 24, 32]
+    blocks: 2
+    kernel_size: 3
+    p_dropout: 0.1
+
+device: cuda
+plot_per_epoch: 8
+
+training:
+  n0: 8192
+  n_increment: 4096
+  batch: 128
+  eval_batch: 2048
+  warmup_epochs: 2
+  patience: 8
+  budget: 240000
+  iteration_limit: 60000
+  val_fraction: 0.25
+  loss_precision: 1.0e-1
+  replay_weight: 2.0
+  param_mix: 0.25
+  optimizer:
+    adamaxw:
+      learning_rate: 5.0e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-3
+
+bo:
+  n_init: 5
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds: [-2.0, 1.0]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+    kernel:
+      independent-sorting-rbf:
+        exchangeable: 2
+  ei:
+    n_restarts: 32
+    n_steps: 100
+
+verify:
+  n_points: 10
+  epochs: 200
+  val_every_epochs: 10
+  budget: null
+  batch: null

@@ -28,6 +28,21 @@ by averaging an equivariant base over the group. Two consequences worth being ex
 
 Not stationary (``k(x, x')`` is not a function of ``x - x'`` once the group is averaged over) and
 ``diag`` is not constant, so neither of sklearn's stationary mixins applies.
+
+PRIOR BOUNDS. Every production path supplies its own, from the config's ``gp.log_*_prior_bounds``
+through :func:`detopt.bo.kernel_from_config` or :class:`~detopt.bo.BayesianOptimizer`, and that is
+where a bound belongs: it is a statement about the TASK's scales, not about the kernel. The
+constructor defaults below serve only a kernel built by hand, and they are:
+
+* ``length_scale_bounds`` FROM THE BOX. These kernels are only ever evaluated on the scaled cube
+  ``[0, 1]^d``, so a coordinate's full range is 1 and both ends have a meaning. At the ceiling the
+  correlation across that whole range is ``exp(-1/(2 l^2))``, within half a percent of 1 -- the
+  coordinate is switched off, and a longer lengthscale is not distinguishable from it. At the floor
+  the lengthscale is a hundredth of the range, below the spacing any run of tens of designs has, so
+  the GP already interpolates its own observations and a shorter one buys nothing.
+* ``constant_value_bounds`` from NOTHING here. The amplitude is a prior variance in the OBJECTIVE's
+  units, which a kernel cannot know -- the driver centres ``y`` but never scales it -- so this
+  default is a bracket, not a derivation, and a task that cares must state its own.
 """
 
 import itertools
@@ -54,8 +69,9 @@ class ARDRBF(Kernel):
   cannot drift away from the library's own implementation of it.
   """
 
-  def __init__(self, d, constant_value=1.0, constant_value_bounds=(1e-5, 1e5),
-               length_scale=1.0, length_scale_bounds=(1e-5, 1e5)):
+  def __init__(
+    self, d, constant_value=1.0, constant_value_bounds=(1e-6, 1e2), length_scale=1.0, length_scale_bounds=(1e-2, 1e1)
+  ):
     self.d = d
     self.constant_value = constant_value
     self.constant_value_bounds = constant_value_bounds
@@ -91,8 +107,10 @@ class ARDRBF(Kernel):
     Built per call, not stored: sklearn tunes a kernel by ``clone_with_theta``, which assigns the
     attributes directly and never re-runs ``__init__``, so anything cached from the constructor
     would silently answer with the hyperparameters the fit started from."""
-    return (ConstantKernel(float(self.constant_value), self.constant_value_bounds)
-            * RBF(self.coordinate_length_scales(), self.length_scale_bounds))
+    return (
+      ConstantKernel(float(self.constant_value), self.constant_value_bounds) *
+      RBF(self.coordinate_length_scales(), self.length_scale_bounds)
+    )
 
   def coordinate_length_scales(self):
     """The lengthscale of each DESIGN COORDINATE, ``(d,)``. Same name and meaning as the invariant
@@ -121,17 +139,19 @@ class ARDRBF(Kernel):
     x = np.asarray(x, dtype=float).ravel()
     X_train = np.atleast_2d(np.asarray(X_train, dtype=float))
     length_scale = self.coordinate_length_scales()
-    difference = X_train - x[None, :]                                   # (n, d)
+    difference = X_train - x[None, :]  # (n, d)
     exponent = (difference * difference / (length_scale**2)[None, :]).sum(axis=1)
-    k = float(self.constant_value) * np.exp(-0.5 * exponent)            # (n,)
+    k = float(self.constant_value) * np.exp(-0.5 * exponent)  # (n,)
     return k, k[:, None] * difference / (length_scale**2)[None, :]
 
   def is_stationary(self):
     return True
 
   def __repr__(self):
-    return (f"{type(self).__name__}(d={self.d}, amplitude^2={float(self.constant_value):.3g}, "
-            f"l={np.round(self.coordinate_length_scales(), 3)})")
+    return (
+      f"{type(self).__name__}(d={self.d}, amplitude^2={float(self.constant_value):.3g}, "
+      f"l={np.round(self.coordinate_length_scales(), 3)})"
+    )
 
 
 class PermutationInvariantRBF(Kernel):
@@ -145,8 +165,10 @@ class PermutationInvariantRBF(Kernel):
   The lengthscale vector is laid out as ``[one per block] + [one per free coordinate]``.
   """
 
-  def __init__(self, d, blocks=(), constant_value=1.0, constant_value_bounds=(1e-5, 1e5),
-               length_scale=1.0, length_scale_bounds=(1e-5, 1e5)):
+  def __init__(
+    self, d, blocks=(), constant_value=1.0, constant_value_bounds=(1e-6, 1e2), length_scale=1.0,
+    length_scale_bounds=(1e-2, 1e1)
+  ):
     self.d = d
     self.blocks = blocks
     self.constant_value = constant_value
@@ -253,19 +275,19 @@ class PermutationInvariantRBF(Kernel):
       columns = [j for j in range(m) if (mask >> j) & 1]
       row_sums = A[..., :, columns].sum(axis=-1)  # R_i(S), (..., m)
       product = np.prod(row_sums, axis=-1)  # P(S)
-      sign = (-1.0) ** len(columns)
+      sign = (-1.0)**len(columns)
       total += sign * product
       if len(weights) == 0:
         continue
       # prod_{i' != i} R_i'(S), as (everything before i) * (everything after i).
-      ones = np.ones(A.shape[:-2] + (1,))
+      ones = np.ones(A.shape[:-2] + (1, ))
       prefix = np.concatenate([ones, np.cumprod(row_sums[..., :-1], axis=-1)], axis=-1)
       suffix = np.concatenate([np.cumprod(row_sums[..., :0:-1], axis=-1)[..., ::-1], ones], axis=-1)
       others = prefix * suffix
       for b, weight in enumerate(weights):
         row_derivative = (A[..., :, columns] * weight[..., :, columns]).sum(axis=-1)  # dR_i(S)
         derivatives[b] += sign * (row_derivative * others).sum(axis=-1)
-    parity = (-1.0) ** m
+    parity = (-1.0)**m
     return parity * total, [parity * d for d in derivatives]
 
   @staticmethod
@@ -282,8 +304,8 @@ class PermutationInvariantRBF(Kernel):
     for mask in range(1, 1 << m):
       columns = [j for j in range(m) if (mask >> j) & 1]
       row_sums = A[..., :, columns].sum(axis=-1)  # (..., m)
-      total += (-1.0) ** len(columns) * np.prod(row_sums, axis=-1)
-    return (-1.0) ** m * total
+      total += (-1.0)**len(columns) * np.prod(row_sums, axis=-1)
+    return (-1.0)**m * total
 
   def _pair_terms(self, X, Y):
     """The pieces every path needs, each computed ONCE per point pair.
@@ -305,7 +327,7 @@ class PermutationInvariantRBF(Kernel):
     free_factor = np.ones((X.shape[0], Y.shape[0]))
     for j, coordinate in enumerate(free):
       difference = X[:, coordinate][:, None] - Y[:, coordinate][None, :]
-      free_factor = free_factor * np.exp(-0.5 * difference * difference / length_scale[len(blocks) + j] ** 2)
+      free_factor = free_factor * np.exp(-0.5 * difference * difference / length_scale[len(blocks) + j]**2)
     if len(blocks) == 0:
       return free_factor, None, None
 
@@ -313,7 +335,7 @@ class PermutationInvariantRBF(Kernel):
     exponent = np.zeros((X.shape[0], Y.shape[0], blocks[0].size, blocks[0].size))
     for i, block in enumerate(blocks):
       difference = X[:, block][:, None, :, None] - Y[:, block][None, :, None, :]  # (nX, nY, m, m)
-      scaled = difference * difference / length_scale[i] ** 2
+      scaled = difference * difference / length_scale[i]**2
       block_distance.append(scaled)
       exponent = exponent + scaled
     return free_factor, np.exp(-0.5 * exponent), np.stack(block_distance)
@@ -352,7 +374,7 @@ class PermutationInvariantRBF(Kernel):
       for j, coordinate in enumerate(free):
         difference = X[:, coordinate][:, None] - Y[:, coordinate][None, :]
         column = len(blocks) + j
-        grad_length[:, :, column] = total * (difference * difference / length_scale[column] ** 2)
+        grad_length[:, :, column] = total * (difference * difference / length_scale[column]**2)
 
     if not eval_gradient:
       return total
@@ -390,10 +412,10 @@ class PermutationInvariantRBF(Kernel):
     total_k = np.zeros(X_train.shape[0])
     total_jac = np.zeros(X_train.shape)
     for order in self._permutations:
-      permuted = self._permuted(X_train, order)                       # (n, d)
-      difference = permuted - x[None, :]                              # (n, d)
+      permuted = self._permuted(X_train, order)  # (n, d)
+      difference = permuted - x[None, :]  # (n, d)
       exponent = (difference * difference / (per_coordinate**2)[None, :]).sum(axis=1)
-      term = amplitude * np.exp(-0.5 * exponent)                      # (n,)
+      term = amplitude * np.exp(-0.5 * exponent)  # (n,)
       total_k += term
       # d/dx_j exp(-|x - Xp|^2 / 2 l^2) = term * (Xp_j - x_j) / l_j^2
       total_jac += term[:, None] * difference / (per_coordinate**2)[None, :]
@@ -416,10 +438,10 @@ class PermutationInvariantRBF(Kernel):
       scaled = np.zeros(X.shape[0])
       for i, block in enumerate(blocks):
         difference = X[:, block] - permuted[:, block]
-        scaled += np.einsum("ij,ij->i", difference, difference) / length_scale[i] ** 2
+        scaled += np.einsum("ij,ij->i", difference, difference) / length_scale[i]**2
       for j, coordinate in enumerate(free):  # a free coordinate is never permuted -> contributes 0
         difference = X[:, coordinate] - permuted[:, coordinate]
-        scaled += difference * difference / length_scale[len(blocks) + j] ** 2
+        scaled += difference * difference / length_scale[len(blocks) + j]**2
       total += float(self.constant_value) * np.exp(-0.5 * scaled)
     return total / len(self._permutations)
 
@@ -448,14 +470,13 @@ class PermutationInvariantRBF(Kernel):
       exponent = 0.0
       for i, block in enumerate(blocks):
         difference = x[block] - permuted[block]
-        exponent += float(difference @ difference) / length_scale[i] ** 2
+        exponent += float(difference @ difference) / length_scale[i]**2
       for j, coordinate in enumerate(free):
         difference = x[coordinate] - permuted[coordinate]
-        exponent += float(difference * difference) / length_scale[len(blocks) + j] ** 2
+        exponent += float(difference * difference) / length_scale[len(blocks) + j]**2
       weight = float(self.constant_value) * np.exp(-0.5 * exponent)
       for i, block in enumerate(blocks):
-        gradient[block] -= weight * ((x[block] - permuted[block]) +
-                                     (x[block] - back[block])) / length_scale[i] ** 2
+        gradient[block] -= weight * ((x[block] - permuted[block]) + (x[block] - back[block])) / length_scale[i]**2
     return gradient / len(self._permutations)
 
   def is_stationary(self):
@@ -463,9 +484,11 @@ class PermutationInvariantRBF(Kernel):
 
   def __repr__(self):
     blocks, free = self._groups
-    return (f"{type(self).__name__}(d={self.d}, blocks={len(blocks)}x{blocks[0].size if blocks else 0}, "
-            f"free={free.size}, amplitude^2={float(self.constant_value):.3g}, "
-            f"l={np.round(self._length_scales(), 3)})")
+    return (
+      f"{type(self).__name__}(d={self.d}, blocks={len(blocks)}x{blocks[0].size if blocks else 0}, "
+      f"free={free.size}, amplitude^2={float(self.constant_value):.3g}, "
+      f"l={np.round(self._length_scales(), 3)})"
+    )
 
 
 class SortingRBF(ARDRBF):
@@ -503,14 +526,18 @@ class SortingRBF(ARDRBF):
   indistinguishable from the null (p = 0.42 and 0.79).
   """
 
-  def __init__(self, d, sort_blocks=(), key=-1, constant_value=1.0, constant_value_bounds=(1e-5, 1e5),
-               length_scale=1.0, length_scale_bounds=(1e-5, 1e5)):
+  def __init__(
+    self, d, sort_blocks=(), key=-1, constant_value=1.0, constant_value_bounds=(1e-6, 1e2), length_scale=1.0,
+    length_scale_bounds=(1e-2, 1e1)
+  ):
     # The parent is the PLAIN ARD-RBF: this kernel is a per-coordinate ARD in the sorted frame, so
     # every coordinate keeps its own lengthscale, and the invariance comes from the folding below
     # rather than from any group the parent averages over. `sort_blocks` describes only which
     # coordinates travel together under the sort.
-    super().__init__(d=d, constant_value=constant_value, constant_value_bounds=constant_value_bounds,
-                     length_scale=length_scale, length_scale_bounds=length_scale_bounds)
+    super().__init__(
+      d=d, constant_value=constant_value, constant_value_bounds=constant_value_bounds, length_scale=length_scale,
+      length_scale_bounds=length_scale_bounds
+    )
     self.sort_blocks = sort_blocks
     self.key = key
     # Every name in the signature must survive `get_params` -> `clone`, which sklearn calls on each
@@ -560,9 +587,101 @@ class SortingRBF(ARDRBF):
     return self._sort_index.size == 0
 
   def __repr__(self):
-    return (f"{type(self).__name__}(d={self.d}, sort_blocks={len(self.sort_blocks)}x"
-            f"{self._sort_index.shape[1] if self._sort_index.size else 0}, key={self.key}, "
-            f"amplitude^2={float(self.constant_value):.3g}, l={np.round(self.coordinate_length_scales(), 3)})")
+    return (
+      f"{type(self).__name__}(d={self.d}, sort_blocks={len(self.sort_blocks)}x"
+      f"{self._sort_index.shape[1] if self._sort_index.size else 0}, key={self.key}, "
+      f"amplitude^2={float(self.constant_value):.3g}, l={np.round(self.coordinate_length_scales(), 3)})"
+    )
+
+
+class IndependentSortingRBF(ARDRBF):
+  """An ARD-RBF that sorts each block by ITS OWN values, independently of every other block.
+
+  ``k(x, y) = k_ard(sigma x, sigma y)``, where ``sigma`` sorts block ``b`` into ascending order using
+  block ``b``'s own entries. The invariance realised is the PRODUCT group ``S_m x ... x S_m``, one
+  factor per block, rather than the single diagonal ``S_m`` of :class:`SortingRBF`.
+
+  That is the difference between the two, and it is the whole reason this class exists.
+  :class:`SortingRBF` orders by one designated KEY block and carries every other block along in that
+  same order, because for the enzyme batch experiment ``k`` IS the pair ``(fraction_k, temperature_k)``
+  and separating them would scramble the experiments. Here the blocks are not tied: the MNIST window
+  names two opposite corners, ``(x1, x2)`` and ``(y1, y2)``, and swapping ``x1`` with ``x2`` names the
+  same window whether or not ``y1`` and ``y2`` are also swapped. Sorting each pair on its own maps
+  every one of the 4 equivalent designs to the canonical ``(left, right, top, bottom)``, which is
+  exactly the surrogate the objective deserves: the loss is a function of the window, and a quarter
+  of the unit cube already contains every window there is.
+
+  It inherits SortingRBF's properties, for the same reasons:
+
+  * **Exactly invariant and PSD for free**, since composing a map with a PSD kernel preserves
+    positive-definiteness, and sorting is idempotent under the group.
+  * **Constant diagonal**, ``k(x, x) = amplitude``, so EI's exploration term is not inflated on the
+    tied stratum.
+  * **ARD acts on ORDER STATISTICS.** After sorting, the four coordinates are ``left``, ``right``,
+    ``top`` and ``bottom``, each with its own lengthscale -- and unlike the raw corners those are
+    quantities the loss is genuinely a function of.
+  * **A crease on the tie locus** (``x1 = x2``, the degenerate zero-width window), which has measure
+    zero and which L-BFGS-B tolerates.
+
+  ``sort_blocks`` lists the flat design indices of each block. They need not be the same length."""
+
+  def __init__(
+    self, d, sort_blocks=(), constant_value=1.0, constant_value_bounds=(1e-6, 1e2), length_scale=1.0,
+    length_scale_bounds=(1e-2, 1e1)
+  ):
+    # As in SortingRBF, the parent is the PLAIN ARD-RBF -- a per-coordinate ARD in the sorted frame.
+    # There is no `key` here: that argument names the block whose order the others follow, and the
+    # absence of such a block is precisely what distinguishes this kernel.
+    super().__init__(
+      d=d, constant_value=constant_value, constant_value_bounds=constant_value_bounds, length_scale=length_scale,
+      length_scale_bounds=length_scale_bounds
+    )
+    self.sort_blocks = sort_blocks
+    # Every name in the signature must survive `get_params` -> `clone`, which sklearn calls on each
+    # fit; a `**kwargs` signature silently yields an empty `theta` and an unfittable kernel.
+    self._blocks = tuple(np.asarray(b, dtype=int) for b in sort_blocks)
+
+  def _sorted(self, X):
+    """Each block ascending, in place, on a copy."""
+    X = np.atleast_2d(np.asarray(X, dtype=float))
+    if len(self._blocks) == 0:
+      return X
+    out = np.array(X, copy=True)
+    for block in self._blocks:
+      out[:, block] = np.sort(X[:, block], axis=1)
+    return out
+
+  def __call__(self, X, Y=None, eval_gradient=False):
+    return super().__call__(self._sorted(X), None if Y is None else self._sorted(Y), eval_gradient)
+
+  def diag(self, X):
+    return super().diag(self._sorted(X))
+
+  # `grad_diag` is the parent's, and its zero is right here: sorting leaves k(x, x) at the amplitude.
+
+  def k_and_grad_x(self, X_train, x):
+    """Chain rule through the sort. Its Jacobian is a permutation matrix almost everywhere -- a
+    BLOCK-DIAGONAL one, each block permuted by its own order -- so the gradient computed in the
+    sorted frame is scattered back to the coordinates it came from. Undefined on the tie locus
+    itself (measure zero), where the two one-sided values differ."""
+    x = np.asarray(x, dtype=float).ravel()
+    k, jac = super().k_and_grad_x(self._sorted(X_train), self._sorted(x))
+    if len(self._blocks) == 0:
+      return k, jac
+    scattered = np.array(jac, copy=True)
+    for block in self._blocks:
+      order = np.argsort(x[block])
+      scattered[:, block[order]] = jac[:, block]
+    return k, scattered
+
+  def is_stationary(self):
+    return len(self._blocks) == 0
+
+  def __repr__(self):
+    return (
+      f"{type(self).__name__}(d={self.d}, sort_blocks={[b.size for b in self._blocks]}, "
+      f"amplitude^2={float(self.constant_value):.3g}, l={np.round(self.coordinate_length_scales(), 3)})"
+    )
 
 
 class NormalisedInvariantRBF(PermutationInvariantRBF):
@@ -645,6 +764,8 @@ class NormalisedInvariantRBF(PermutationInvariantRBF):
     # has 2. This kernel's whole point is that a symmetric function cannot tell experiment 1 from
     # experiment 3, so a repr suggesting 8 free lengthscales asserts the opposite of what it is.
     blocks, free = self._groups
-    return (f"{type(self).__name__}(d={self.d}, blocks={len(blocks)}x"
-            f"{blocks[0].size if len(blocks) > 0 else 0}, free={free.size}, "
-            f"amplitude^2={float(self.constant_value):.3g}, l={np.round(self._length_scales(), 3)})")
+    return (
+      f"{type(self).__name__}(d={self.d}, blocks={len(blocks)}x"
+      f"{blocks[0].size if len(blocks) > 0 else 0}, free={free.size}, "
+      f"amplitude^2={float(self.constant_value):.3g}, l={np.round(self._length_scales(), 3)})"
+    )

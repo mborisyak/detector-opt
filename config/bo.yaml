@@ -10,22 +10,8 @@
 # 12.9% of the first design coordinate produced a blind station 0 (95 hits against 5507 at the
 # nominal design) -- a dead plateau the GP had to spend observations mapping. Revisit this bound
 # if data_dir changes: boundary_z is read from the event files, not from this config.
-# THE BAR IS 2.0e-2 AND THAT IS A THROUGHPUT CONSTRAINT, NOT A PRECISION PREFERENCE. This task's
-# pipeline runs at a MEASURED 30 detector calls/s and does NOT scale with concurrency: one process
-# alone delivers 30 calls/s (21841 calls in 728 s, a completed design) and twelve processes together
-# deliver the same ~30 aggregate, sampled over four multi-minute intervals with the GPU pinned at
-# 100% SM / 96% memory controller / 371 W. So the whole box makes a FIXED number of designs per day
-# and the only levers are the bar and the number of cells.
-#
-# The detector is NOT the constraint and speeding it up buys nothing: it is a CPU C extension running
-# at ~14000 events/s (measured, both machines), so simulating this entire 1048576-call budget takes
-# 1.2-1.5 MINUTES. The cost is the training loop re-reading those events across epochs.
-#
-# At 1.0e-2 a design costs ~87000 calls, i.e. ~9.7 h, giving 2-3 designs per cell in a 24 h limit --
-# fewer than n_init = 5, so every design produced is one of the shared random draws and ZERO are
-# BO-guided. That configuration cannot produce a trajectory at any budget the clock allows. At 2.0e-2
-# a design costs ~21841 calls, the box makes ~119 designs/24 h, and 12 cells get ~9.9 each: short,
-# but a real trajectory with ~5 BO-guided steps.
+# `loss_precision` is 2.0e-2; 1.0e-2 was rejected as too costly per design. If the bar is revisited,
+# derive the cost per design from `time_s` in a completed `results.json`.
 
 # n_models: null -- ONE network, not a 4-member ensemble, and this OVERRIDES a settled default.
 # `null` is not merely "ensemble of size 1": it takes the non-ensembled path, so kernels are

@@ -1,0 +1,123 @@
+# `extremes` RETUNED -- the binary inhibitor-mechanism task (`enzyme_inhib` with the two typed
+# classes), 2 experiment(s) per design. IDENTICAL to config/detector/extremes_tuned_m4.yaml except for
+# `n_experiments`; read that file for the rule behind every value. Not an edit of any shipped config.
+#
+# Every number below is either INHERITED from enzyme_extremes.yaml unchanged (its own header carries
+# the rule) or CALIBRATED here, in which case the measurement is quoted. All measurements were made
+# with the semi-analytic Bayes instrument (detopt/analytic/extremes.py) and the probes in
+# scripts/calibrate_extremes.py, on the simulator's own truth arrays. Concentrations mM, times hours,
+# temperatures Celsius.
+#
+# WHAT DECIDES THIS TASK, measured before anything was tuned. Swapping the two classes -- (k1, k2) ->
+# (k2, k1) -- is EXACTLY a reparameterisation of the enzyme at one inhibitor concentration:
+#
+#     K_B -> K_B r,  Ki_D -> Ki_D r,  k_cat -> k_cat r,   r = (1 + I k2) / (1 + I k1)
+#
+# checked against the detector's own integrator to 2.4e-7 mM, i.e. five orders below the read-out
+# noise. Two consequences run through every bound below. First, a batch at ONE inhibitor dose can only
+# separate the classes through the PRIOR's support, so the dose is the coordinate that must be
+# restricted and spread. Second, the achievable loss is PRIOR-limited rather than noise-limited: over
+# 24 Sobol designs the best loss moves 0.766 -> 0.756 -> 0.754 as the read-out noise falls 0.05 ->
+# 0.03 -> 0.02 mM, i.e. hardly at all, so the read-out noise is NOT the difficulty knob here and is
+# left at the inherited value.
+enzyme_inhib:
+  mechanism_classes: [mostly_competitive, mostly_uncompetitive]
+  n_experiments: 2
+  # CALIBRATED. The read-out cadence at a FIXED total integration step count, so the lever under test
+  # is resolution and not accuracy or cost. MEASURED at m=4, sigma=0.05, library 4096, on a spread
+  # design: 0.8568 (8 read-outs) -> 0.7926 (16) -> 0.7574 (32) -> 0.7593 (64). 32 is the knee -- 64 is
+  # within one standard error of it and no better -- and it is also where the instrument's own
+  # effective sample size is still healthy (106 at 32, 41 at 64). A degenerate design (every
+  # experiment identical) sits at 0.9985 at every cadence, so the cadence does not manufacture design
+  # dependence on its own.
+  n_measurements: 32
+
+  concentration_A: 0.5
+  concentration_B: 1.0
+  concentration_E: 3.0e-5
+  duration: 1.0
+  # INHERITED, and now MEASURED to be the right place to leave it. The plan permits lowering it as a
+  # stated instrument change; the measurement above says lowering it buys nothing (the best design
+  # improves by 0.012 of loss between 0.05 and 0.02) because what limits this task is the enzyme
+  # prior's ability to absorb the class swap, not the precision of the read-out.
+  measurement_noise: 0.05
+
+  # ------------------------------------------------------------------------------------------------
+  # DESIGN BOUNDS. Three of the four are RESTRICTED against enzyme_extremes.yaml; the rules are below.
+  # ------------------------------------------------------------------------------------------------
+  # CALIBRATED, restricted from [0.1, 0.9]. The top is INHERITED (0.9 keeps the fastest enzyme in the
+  # half-time prior from being finished at the first read-out). The FLOOR 0.4 is the rule that the
+  # experiment must actually turn over within the hour: the turnover is calibrated at
+  # `calibration_fraction` 0.5, so at f = 0.1 the slowest enzyme in the half-time prior needs
+  # 2 h x 0.5/0.1 = 10 h to half conversion, i.e. 7% conversion in the hour -- 0.035 mM against a
+  # 0.05 mM read-out noise, so nothing is measured at all. At f = 0.4 the same enzyme reaches 24%.
+  # MEASURED over 24 Sobol designs at m=4: raising the floor from 0.1 to 0.4 moves the MEDIAN loss
+  # 0.8765 -> 0.8352 and leaves the best design where it was (0.5935 -> 0.5865), i.e. it removes dead
+  # designs rather than making good ones better.
+  enzyme_fraction_bounds: [0.4, 0.9]
+  # CALIBRATED, floor restricted from 0.1; the CEILING IS KEPT AT 10.0 and the reason is a measurement
+  # that overturned the obvious argument.
+  #   FLOOR 0.3 mM -- total conversion is capped by min(A0, B0), so at the old floor 0.1 the entire
+  #   progress curve is 0.1 mM tall, 2 sigma, and the class contrast is a fraction of that. MEASURED
+  #   on the class-mirrored counterfactual (the same enzyme and the same compound with k1 and k2
+  #   swapped, i.e. the same event with the opposite label): at B0 = 0.1 the fraction of prior draws
+  #   whose read-out moves by at least one sigma is 0.000 at EVERY corner of the rest of the box.
+  #   CEILING 10.0 mM -- KEPT. The obvious argument says to cut it, because competitive inhibition is
+  #   outrun by substrate: with the enzyme held fixed and one branch switched on at a time, the
+  #   competitive branch falls 2.86 -> 2.43 -> 1.21 sigma over B0 = 1, 3, 10 while the uncompetitive
+  #   branch rises 3.92 -> 4.86 -> 5.22. But that ASYMMETRY IS THE CLASSIFICATION SIGNAL: at
+  #   saturation a competitive compound does nothing measurable and an uncompetitive one shuts the
+  #   reaction down by (1 + I k2), which is outside the factor-of-8 half-time prior. MEASURED over 24
+  #   Sobol designs at m=4: cutting the ceiling to 3.0 mM costs 0.20 of achievable loss (best design
+  #   0.5935 with the ceiling at 10.0, 0.7965 with it at 3.0) and shrinks the span from 0.383 to 0.228.
+  substrate_B_bounds: [0.3, 10.0]
+  # CALIBRATED, restricted from [1.0e-3, 1.0].
+  #   FLOOR 0.03 mM -- the dose is the coordinate the class degeneracy lives on. MEASURED as the
+  #   fraction of prior draws whose class-mirrored enzyme (K_B r, Ki_D r) stays INSIDE the enzyme
+  #   prior, i.e. is indistinguishable from one experiment: 0.797 at I = 0.003 mM, 0.463 at 0.03,
+  #   0.156 at 0.3, 0.053 at 1.0. At the old floor essentially the whole box was degenerate. The floor
+  #   still leaves 1.5 decades, so a batch can contrast doses -- which is what breaks the degeneracy
+  #   structurally rather than through the prior's edges.
+  #   CEILING 1.0 mM unchanged: solubility, and the top of the potency prior.
+  inhibitor_bounds: [0.03, 1.0]
+  # INHERITED [10, 35]: a bench range whose top sits ~7 C below the melting point of yeast
+  # hexokinase, so no experiment in the box is a denaturation probe.
+  temperature_bounds: [10.0, 35.0]
+
+  # ------------------------------------------------------------------------------------------------
+  # THE COMPOUND LIBRARY and THE ENZYME PRIOR -- INHERITED WHOLE from enzyme_extremes.yaml. They are
+  # the task, not a knob: narrowing either would change what is being asked rather than where it is
+  # asked. Note that `inhibitor_potency_bounds` is NO LONGER the same interval as
+  # `inhibitor_bounds` -- the shipped config tied them by a "the design must be able to bracket any
+  # compound" rule, and that rule is what put 80% of the box in the degenerate regime. The library is
+  # left alone and the DESIGN is restricted instead.
+  # ------------------------------------------------------------------------------------------------
+  inhibitor_potency_bounds: [1.0e-3, 1.0]
+  preference_bounds: [1.0, 2.5]
+  preference_bounds_noncompetitive: [0.0, 0.15]
+
+  calibration_fraction: 0.5
+  half_time_bounds: [0.25, 2.0]
+
+  parameters:
+    log_K0_A: [-3.91, -1.61]
+    Q10_A: [0.7, 2.0]
+    log_K0_B: [-2.30, 0.0]
+    Q10_B: [0.7, 2.0]
+    log_K0i_C: [-3.91, -1.61]
+    Q10_C: [0.7, 2.0]
+    log_K0i_D: [-1.20, 1.10]
+    Q10_D: [0.7, 2.0]
+    Q10_cat: [1.8, 2.6]
+
+  # ------------------------------------------------------------------------------------------------
+  # Numerics -- INHERITED. 32 read-outs x 40 steps = 1280 total RKC2 steps per experiment, the total
+  # the shipped config holds them at for campaign scale; the guard is 10% of the read-out noise and is
+  # asserted host-side on every call.
+  # ------------------------------------------------------------------------------------------------
+  n_temperature_steps: 20
+  n_quadrature: 33
+  n_steps_per_measurement: 40
+  n_stages: 5
+  damping: 0.153846
+  integration_tolerance: 5.0e-3

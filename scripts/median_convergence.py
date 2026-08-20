@@ -33,7 +33,7 @@ def _load(path):
     return json.load(f)
 
 
-def main(run_roots, output, strategies):
+def main(run_roots, output, strategies, statistic):
   runs = {}
   for strategy in strategies:
     seeds = {}
@@ -54,13 +54,15 @@ def main(run_roots, output, strategies):
   if len(runs) == 0:
     raise SystemExit(f"no results.json found under any of {run_roots}")
 
-  plot_median_convergence(runs, output, json_path=os.path.splitext(output)[0] + ".json")
+  plot_median_convergence(runs, output, json_path=os.path.splitext(output)[0] + ".json", statistic=statistic)
 
 
 if __name__ == "__main__":
   p = argparse.ArgumentParser()
   p.add_argument("--runs", nargs="+", required=True, help="per-seed run roots, each holding <strategy>/results.json")
   p.add_argument("--output", required=True, help="destination PNG; the plotted values go next to it as .json")
+  p.add_argument("--statistic", choices=("median", "mean"), default="median",
+                 help="pointwise reduction across seeds; median is typical-seed, mean is tail-sensitive")
   p.add_argument("--strategies", nargs="*", default=STRATEGIES)
   a = p.parse_args()
-  main(a.runs, a.output, a.strategies)
+  main(a.runs, a.output, a.strategies, a.statistic)

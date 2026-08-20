@@ -15,9 +15,8 @@
 #   t(K) ~ K * t(1)      exact equal sharing       -> aggregate FLAT; concurrency buys nothing
 #   t(K) >  K * t(1)     WORSE than equal sharing  -> aggregate FALLS; concurrency actively HURTS
 #
-# The third is the case worth ruling in or out, and nothing measured so far can: the earlier campaign
-# figure (~30 calls/s aggregate at both K=1 and K=12) is consistent with EXACT equal sharing and says
-# nothing about whether pushing further degrades it. Contention that is superlinear in K -- MPS context
+# The third is the case worth ruling in or out, and no campaign figure settles it: aggregate
+# throughput must be read from this script's own timings, not from a number quoted elsewhere. Contention that is superlinear in K -- MPS context
 # thrashing, memory-bandwidth saturation, host-side dispatch queueing -- would show as t(12)/t(1) > 12,
 # and the ratio t(K)/(K*t(1)) is printed for every level precisely so that is read off directly rather
 # than inferred.

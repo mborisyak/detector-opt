@@ -210,9 +210,18 @@ def run_config_for(
   `n0 = iteration_limit` removes the growth loop, so every design is scored at the SAME window, and
   holding the product fixed keeps the campaign's own definition of "trained out" while the
   convergence bar moves.
+
+  `replay_weight` is dropped for the same reason `scripts/bo.py` drops it off the `meta` arm: it is a
+  `ContinualTrainer` knob, this script always builds a `DesignTrainer`, and a 4-arm run config has to
+  carry it for the `meta` cell. Without the drop every cell dies on `TypeError: _DesignBase.__init__()
+  got an unexpected keyword argument 'replay_weight'` before the first design. Dropped LOUDLY, because
+  a setting that vanishes without a line in the log is how a probe ends up measuring something else.
   """
   run = json.loads(json.dumps(config))  # plain JSON-able yaml
   training = run["training"]
+  if "replay_weight" in training:
+    del training["replay_weight"]
+    print("[config] dropped `training.replay_weight`: it is a `meta` knob and this probe is per-design", flush=True)
   if iteration_limit is not None:
     training["iteration_limit"] = int(iteration_limit)
   if precision is not None:
@@ -589,11 +598,14 @@ def main():
             run["training"]["param_mix"] = float(arguments.param_mix)
           (optimizer_name, ), = (run["training"]["optimizer"].keys(), )
           (regressor_name, ), = (run["regressor"].keys(), )
-          # Either may be ABSENT from a config, in which case the regressor's own defaults apply (a
+          # Either may be ABSENT from a config -- or present and `null`, which the image-task configs
+          # write to mean the same thing -- in which case the regressor's own defaults apply (a
           # single net, no dropout); -1 records "not declared", distinctly from every real value.
           regressor = run["regressor"][regressor_name]
-          n_models_set = int(regressor.get("n_models", -1))
-          p_dropout_set = float(regressor.get("p_dropout", -1.0))
+          n_models_set = regressor.get("n_models", None)
+          n_models_set = -1 if n_models_set is None else int(n_models_set)
+          p_dropout_set = regressor.get("p_dropout", None)
+          p_dropout_set = -1.0 if p_dropout_set is None else float(p_dropout_set)
           cell = (
             design_name, int(seed), float(run["training"]["optimizer"][optimizer_name]["weight_decay"]),
             int(run["training"]["iteration_limit"]), int(plot), int(run["training"]["n0"]),

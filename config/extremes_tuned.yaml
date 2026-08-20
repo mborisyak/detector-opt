@@ -1,0 +1,70 @@
+# RUN CONFIG for the retuned `extremes` task -- the binary inhibitor-mechanism benchmark on
+# config/detector/extremes_tuned_m4.yaml. A NEW file: config/enzyme_extremes.yaml is load-bearing for
+# campaigns that have already run and is not edited.
+#
+# THE TASK CHANGED, THE TRAINER DID NOT. Everything under `regressor`, `training` and `verify` is
+# INHERITED from config/enzyme_extremes.yaml, whose header carries the measurement behind each value
+# (the architecture, dropconnect 0.05, param_mix 0.25, patience 16 at iteration_limit 524288, the
+# validation-loss-only objective). Only three things are set here rather than inherited:
+#
+#   detector        -- the retuned detector config: the design box restricted on two coordinates and
+#                      the read-out cadence set to its measured knee. See that file's header.
+#   training.budget -- sized to buy ~20 designs at the MEASURED per-design cost of this task, so a
+#                      run is a 20-step BO trajectory rather than 8 or 40. See below.
+#   loss_precision  -- MEASURED on this task, not inherited.
+#
+# bo.gp.kernel is `sorting-rbf`: the design is a SET of interchangeable experiments, so permuting them
+# names the same design, and `exchangeable: 4` is the number of experiments. Trust regions are banned
+# by the benchmark protocol and none is used.
+
+detector: extremes_tuned_m4
+
+regressor:
+  set-regressor:
+    features: [[24, 16], [16, 24]]
+    n_models: 4
+    dropconnect: 0.05
+device: cuda
+plot_per_epoch: 8
+
+training:
+  n0: 8192
+  n_increment: 4096
+  batch: 256
+  eval_batch: 2048
+  warmup_epochs: 2
+  patience: 16
+  budget: 2097152
+  iteration_limit: 524288
+  val_fraction: 0.25
+  loss_precision: 1.0e-2
+  param_mix: 0.25
+  optimizer:
+    adamaxw:
+      learning_rate: 2.5e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-3
+
+bo:
+  n_init: 5
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds: [-2.0, 1.0]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+    kernel:
+      sorting-rbf:
+        exchangeable: 4
+  ei:
+    n_restarts: 32
+    n_steps: 100
+
+verify:
+  n_points: 10
+  epochs: 200
+  val_every_epochs: 10
+  budget: null
+  batch: null

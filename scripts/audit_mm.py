@@ -26,6 +26,7 @@ import math
 import os
 import re
 
+import jax.nn
 import numpy as np
 
 CONVERGED = re.compile(

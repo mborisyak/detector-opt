@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from .common import design_init_sequence
 from .design import _DesignBase
 
 __all__ = ["ContinualTrainer"]
@@ -74,7 +75,7 @@ class ContinualTrainer(_DesignBase):
         # ONE persistent network, continued across every design (the continual strategy IS the warm
         # start). Built eagerly here -- never lazily on the first train() call -- so no jax array is
         # cached behind a None. _persist_network writes the continued net back after each design.
-        _, params, state = self._build_regressor(self.seed)
+        _, params, state = self._build_regressor(int(design_init_sequence(self.seed, 0).generate_state(1)[0]))
         d = self.device
         self._running = (jax.device_put(params, d), jax.device_put(state, d))
 

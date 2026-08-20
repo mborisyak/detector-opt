@@ -181,6 +181,25 @@ class Detector(object):
         (defined per detector)."""
         raise NotImplementedError()
 
+    def design_penalty(self, design):
+        """Additive price of the design ITSELF, in loss units, or ``None`` when the task prices nothing.
+
+        ``design`` is a physical design in any form :meth:`flatten_design` accepts. Returns a scalar to
+        be ADDED to the trained loss, or ``None`` -- the default -- meaning this detector has no such
+        term. Callers MUST test ``is not None`` and drop the term entirely when it is; a detector with
+        no cost must not be made to return ``0.0``, because ``0.0`` is a price that was measured and
+        ``None`` is the absence of one, and only the second may be omitted from a report.
+
+        IT IS DETERMINISTIC, SO IT CARRIES NO UNCERTAINTY. The value is a function of the design alone,
+        with no sampling in it: a caller adds it to the reported loss and leaves the reported ERROR
+        untouched.
+
+        IT MUST NEVER REACH THE TRAINER. ``loss_precision`` and the settled test are statements about
+        how well the NETWORK has fit its data; a per-design constant added there would move the
+        reported loss without changing anything the criterion is measuring, so the bar would stop
+        meaning what it says. The term belongs after convergence, where the design is priced once."""
+        return None
+
     def flatten_design(self, design):
         """``Design`` namedtuple / config ``Mapping`` / already-flat array -> flat physical
         ``(..., design_dim)`` (field order). Generic: packs the design pytree with

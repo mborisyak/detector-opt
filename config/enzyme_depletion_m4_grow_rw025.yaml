@@ -1,0 +1,173 @@
+# ⚠️ VARIANT of `config/enzyme_depletion_m4_grow.yaml`: `training.replay_weight` 0.25 (default 1.0).
+# EVERYTHING ELSE IS IDENTICAL, budget included, so a `meta` cell here pairs directly against the
+# completed grow pilot at the same seed and the difference is attributable to this one value.
+#
+# WHY. `ContinualTrainer`'s batch is half current-design rows and half replay rows, but the number it
+# must drive below `loss_precision`, and the number it hands to BO, is evaluated on the CURRENT
+# design's window ALONE. At `replay_weight = 1.0` half of every gradient is therefore spent on rows
+# that contribute to no measured quantity -- a fixed 2x dilution of the current design's signal from
+# the second design onward, however large the pool grows. The trainer's own header records the
+# measured consequence on a three-class campaign (designs 6/13/19, paired, 65536 held-out events):
+# the continual arm reports +0.0184 / +0.0214 / +0.0326 of loss above a fresh network on the same
+# design's data, 2.3-4.1x `loss_precision`, and it is a BIAS rather than a data shortage since
+# doubling every per-design count recovers only 0-41% of it.
+#
+# THAT BIAS IS LARGER THAN THE ARM GAPS BEING MEASURED HERE. On the m=2 grow pilot `meta` finished at
+# 0.0164 against `continue` 0.0178; on m=4 `continue` 0.0226 edged `meta` 0.0232 by 0.0006. A bias of
+# 0.018-0.033 against `meta` would swamp both, so the m=4 ordering in particular cannot be trusted
+# until this is measured on THIS task.
+#
+# ⚠️ NOT YET MEASURED ON MM. The numbers above are from another task; this config exists to measure
+# it here. 0.25 is taken from the existing precedent `config/linear_meta_d2n3_n8192_rw025.yaml`
+# rather than tuned, so it is a probe point and not a nomination.
+
+# MM depletion, m=4, WITH A LIVE GROWTH SCHEDULE. Derived from `config/enzyme_depletion_m4.yaml`;
+# only the growth knobs and `warmup_epochs` differ.
+#
+# WHY THIS EXISTS. At `n0 = n_increment = 4096` against `iteration_limit = 32768`, EVERY design
+# converged inside the first window, so per-design spend took a SINGLE value (5461 = 4096 / 0.75) at
+# m=2 and two values at m=4, and all four arms bought identical design counts. A per-design cost that
+# can only take one value cannot show a cost difference between arms even where one exists, which is
+# what voided the arm comparison on this task. The window was not measuring how much data a design
+# needs; it was quantising it away.
+#
+#   n0            4096 -> 1024     the first window no longer suffices, so growth actually runs
+#   n_increment   4096 ->  512     the resolution of the converged window, and so of per-design cost
+#   warmup_epochs    2 ->    8     user, 2026-08-20
+#
+# `iteration_limit` is DELIBERATELY UNCHANGED at 32768, because it is also the epoch length
+# (`steps_per_epoch = iteration_limit // batch`) and moving it would silently retune `warmup_epochs`,
+# `patience` and the convergence posterior at the same time as the growth schedule, confounding the
+# two changes.
+#
+# ⚠️ WHAT TO CHECK IN THE RESULT, and the reason to run it: the DISTRIBUTION of per-design spend, not
+# its mean. If it still takes one or two distinct values the resolution is still too coarse. The cost
+# of finer growth is more rounds, each re-training from the `param_mix` rewind, so whether it is a net
+# win in wall clock is UNMEASURED here.
+#
+# ⚠️ At a small window one epoch makes many passes over it (window 1024 against a 32768-sample epoch
+# is 32 passes), so early windows overfit fast. That is expected and is what drives growth; it is also
+# why the first converged window should be read as a lower bound on what the design needs.
+
+# RUN config for `enzyme_depletion`: single-substrate Michaelis-Menten depletion, dA/dt = -q A/(A+K),
+# with the initial concentrations as the whole design.
+#
+# THERE IS NO REGRESSOR IN THIS TASK. The objective is the parameter error of an ANALYTIC
+# instrument -- the posterior mean of (ln q, ln K) on an even grid over the prior box
+# (EnzymeDepletionDetector.estimate) -- evaluated directly, so a design costs milliseconds instead
+# of a training run and the campaign is driven by `scripts/enzyme_depletion_bo.py` rather than by
+# `scripts/bo.py`. There is consequently no `regressor` or `training` block here: adding one would
+# claim a network was involved.
+#
+# WHY THE ANALYTIC INSTRUMENT IS THE GRID AND NOT THE CLOSED FORM. The integrated Michaelis-Menten
+# equation is linear in the parameters -- (A0 - A) = q t + K ln(A/A0) -- so least squares returns
+# both in closed form, and that was implemented and measured FIRST. It fails: the same noisy reading
+# appears in the response and in the regressor, so the fit is biased, and the bias does not average
+# away. MEASURED at A0 = 1.7 mM, 8 measurements, no-information level 0.3333: at read-out noise 0.02
+# mM plain OLS scores 0.548 and generalised least squares with the correct residual variance 0.510,
+# both ABOVE the no-information level, and both get WORSE with 16 measurements rather than better.
+# The grid posterior scores 0.025. Re-substituting the fitted curve into the regressor did not
+# rescue it. Reproduce with `scripts/calibrate_enzyme_depletion.py --section estimator`.
+#
+# loss_of_a_guess = 1/3, in CLOSED FORM: both targets are log-uniform and the normalisation is
+# affine in the log, so the normalised target is exactly U[-1, 1] and the best constant prediction
+# scores its variance. Every number in this task is quoted against it.
+#
+# bo.gp.kernel -- `sorting-rbf` with `exchangeable: n_experiments`. The design is a SET: running
+# experiments at (1.9, 4.0) mM is the same experiment as running them at (4.0, 1.9), and the
+# invariant kernel is what says so. Trust regions are BANNED on this project and none is used.
+#
+# bo.gp.log_lengthscale_prior_bounds -- [-2, 1] against the SCALED cube [0, 1], i.e. lengthscales
+# from 0.135 to 2.72. The landscape is a single smooth bowl about a decade wide in A0, which after
+# the log-affine design map is O(1) in the cube, so the useful range sits in the middle of that box
+# and the ceiling is high enough for ARD to switch a coordinate off.
+
+detector: enzyme_depletion_m4
+
+
+# ---------------------------------------------------------------------------------------------
+# THE NEURAL CAMPAIGN. Everything above scores designs with the ANALYTIC instrument; the campaign
+# below scores them with a trained regressor instead, through `scripts/bo.py`, so the same task can
+# be run by `./scripts/campaign.sh`. The analytic driver is what TUNED these settings; it is not a
+# substitute for them.
+#
+# regressor -- a small MLP over the SET of experiments: one element per experiment, its features
+#   being that experiment's own read-out curve (n_measurements values as a fraction of its own A0)
+#   beside its scaled initial concentration, so the network is design-conditioned and permutation
+#   invariant in the experiments, which is the symmetry of the design.
+#
+# device: cpu -- the detector is a handful of RKC2 chains and the network is tiny, so this task has
+#   no use for a shard. `campaign.sh` must therefore be launched with GRES= (empty) so the runs sit
+#   beside the GPU work rather than queueing behind an accelerator they never touch.
+
+regressor:
+  set-regressor:
+    features: [[24, 32], [32, 24]]
+    n_models: 4
+    dropconnect: 0.05
+
+device: cpu
+plot_per_epoch: 8
+
+training:
+  n0: 1024
+  n_increment: 512
+  batch: 128
+  eval_batch: 4096
+  warmup_epochs: 8
+  patience: 16
+  # MEASURED per-design cost: every probe design settled at the first window and spent exactly 5461
+  # detector calls (n0 = 4096 train + 1365 validation at val_fraction 0.25). 2^17 = 131072 therefore
+  # buys 131072 / 5461 = 24 designs, which is the ~20 BO steps the campaign wants with a little room
+  # for a design that needs one increment.
+  budget: 131072
+  # ALSO THE EPOCH LENGTH: steps_per_epoch = iteration_limit // batch, so this gives 256-step epochs
+  # and leaves the window room to grow 8x above n0 before the procedure runs out of iterations.
+  iteration_limit: 32768
+  val_fraction: 0.25
+  # MEASURED, not inherited. Over the 8 designs of a probe run at `from_scratch` (5 Sobol init
+  # designs spanning the box plus 3 BO proposals, output/enzyme-depletion/neural-probe-m4) the worst
+  # `diff + err` the convergence procedure reported was 0.0065, at losses spanning 0.043 to 0.080.
+  # 1.25e-2 clears that worst case by 1.9x. Every one of those designs settled at the FIRST window,
+  # so the bar is not what sets the cost here -- n0 is.
+  loss_precision: 1.25e-2
+  replay_weight: 0.25
+  param_mix: 0.25
+  optimizer:
+    adamaxw:
+      learning_rate: 2.5e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-3
+
+verify:
+  n_points: 10
+  epochs: 200
+  val_every_epochs: 10
+  budget: null
+  batch: null
+
+bo:
+  n_init: 5
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds: [-2.0, 1.0]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+    kernel:
+      sorting-rbf:
+        exchangeable: 4
+  ei:
+    n_restarts: 16
+    n_steps: 60
+
+# The pre-registered figure of merit, reported for 1, 2 and 4 experiments:
+#     ( E[loss @ 10 designs] - E[loss @ 20 designs] ) / loss_of_a_guess
+# `loss @ n` is the incumbent design RE-EVALUATED on an independent block of events, not the best
+# value observed -- a running minimum over noisy evaluations is optimistically biased.
+criterion:
+  checkpoints: [10, 20]
+  n_seeds: 256
+  n_events: 1024

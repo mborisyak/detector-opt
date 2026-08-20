@@ -1,0 +1,37 @@
+# FOUR-EXPERIMENT variant of the `enzyme_depletion_bi` detector. EVERY number below except `n_experiments` is
+# identical to `config/detector/enzyme_depletion_bi_m2.yaml`, WHICH CARRIES THE FULL CALIBRATION
+# HEADER -- read that file for the evidence behind each one; duplicating it here would only let the
+# two copies drift apart.
+#
+# ⚠️⚠️ EVERY NUMBER IN THE PARAGRAPH BELOW WAS MEASURED UNDER THE PING-PONG RATE LAW AND HAS NOT BEEN
+# RE-MEASURED under the corrected product form. The saturation VERDICT may well survive -- it follows
+# from four experiments covering an eight-dimensional box, which is not a statement about the rate law
+# -- but the near-best fraction, the span and the shape statistic are all law-dependent and must be
+# re-run (`--section landscape`) before any of them is quoted. Kept only so the claim is visible and
+# checkable rather than silently dropped.
+#
+# ⚠️ m = 4 IS SATURATED AT THE SHIPPED NOISE and is a companion, not the candidate. MEASURED over 48
+# Sobol designs: 52% of them are already within one `loss_precision` of the best (against 2.1% at
+# m = 2), the span is only 2.4x the objective's own error (against 9.6x), and the shape statistic
+# is 0.220 against a quadratic reference of 0.495 -- the profile hugs the good end. With four
+# experiments on an eight-dimensional box one almost always lands in the K_A-informative region
+# and another in the K_B-informative one, so a shotgun already covers both. Raising the noise to
+# 0.05 moves it to near-best 0.208 and shape 0.333 without touching the prior, box or window --
+# but that leaves K_A unidentified (see `measurement_noise` in the m2 config), so it is a trade,
+# not a fix.
+enzyme_depletion_bi:
+  n_experiments: 4
+  n_measurements: 10
+  duration: 3600.0
+  velocity_bounds: [9.0e-4, 9.0e-3]
+  michaelis_a_bounds: [0.02, 0.2]
+  michaelis_b_bounds: [0.1, 1.0]
+  concentration_a_bounds: [0.8, 10.0]
+  concentration_b_bounds: [1.0, 25.0]
+  measurement_noise: 0.02
+  n_stages: 5
+  steps_per_measurement: 64
+  damping: 0.15384615384615385
+  integration_tolerance: 5.0e-3
+  n_grid: 15
+  n_grid_velocity: 241

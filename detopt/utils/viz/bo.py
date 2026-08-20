@@ -343,21 +343,27 @@ def plot_convergence_two_panel(runs, out_path, *, json_path=None, title="BO conv
   return out_path
 
 
-def _median_step(curves):
-    """Pointwise median of ``where="post"`` step functions, given as ``(x, y)`` pairs with x sorted.
+def _reduce_step(curves, reduce=np.median):
+    """Pointwise ``reduce`` over ``where="post"`` step functions, given as ``(x, y)`` pairs, x sorted.
 
     Evaluated on the union of the curves' x grids, starting at the first point every curve has
-    reached (before that the median is over fewer runs and would jump when one joins); beyond its
+    reached (before that the reduction is over fewer runs and would jump when one joins); beyond its
     last point a curve continues flat -- a best-so-far value persists once found.
+
+    ``reduce`` takes the stacked ``(n_curves, n_grid)`` array and an ``axis``. MEDIAN is the default
+    because a best-so-far curve is bounded below and heavily skewed -- one lucky seed drags a mean
+    down and never drags it back -- so the median says what a typical seed reached. MEAN answers a
+    different question, what a seed reached ON AVERAGE, and is the one to use when the tail matters
+    rather than the typical case. Neither is a summary of the other; report which was taken.
     """
     start = max(float(x[0]) for x, _ in curves)
     grid = np.unique(np.concatenate([x for x, _ in curves]))
     grid = grid[grid >= start]
     stack = np.stack([y[np.searchsorted(x, grid, side="right") - 1] for x, y in curves])
-    return grid, np.median(stack, axis=0)
+    return grid, reduce(stack, axis=0)
 
 
-def plot_median_convergence(runs, out_path, *, json_path=None, title="BO convergence: median best-so-far across seeds"):
+def plot_median_convergence(runs, out_path, *, json_path=None, statistic="median", title=None):
     """Two panels of per-strategy MEDIAN best-so-far (cummin) curves across seeds.
 
     ``runs`` maps a strategy label to ``{seed_label: {"results": [...], "verification": {...} | None}}``
@@ -367,8 +373,12 @@ def plot_median_convergence(runs, out_path, *, json_path=None, title="BO converg
     verified held-out test loss of the verified designs (solid). Per seed the best-so-far curve is
     a step function in cumulative detector calls; the median over seeds is taken pointwise via
     :func:`_median_step`. Everything drawn is written to ``json_path`` so the figure regenerates
-    without re-running anything.
+    without re-running anything. A panel with nothing to draw is annotated as empty rather than left
+    blank: a populated axis with no marks reads as data sitting at the bottom of the scale.
     """
+    reduce = {"median": np.median, "mean": np.mean}[statistic]
+    if title is None:
+        title = f"BO convergence: {statistic} best-so-far across seeds"
     from matplotlib.figure import Figure
 
     fig = Figure(figsize=(12, 5.5))
@@ -395,7 +405,7 @@ def plot_median_convergence(runs, out_path, *, json_path=None, title="BO converg
         for ax, curves, linestyle, key in panels:
             if len(curves) == 0:
                 continue
-            grid, median = _median_step(curves)
+            grid, median = _reduce_step(curves, reduce)
             suffix = "" if len(curves) == len(seeds) else f" (n={len(curves)})"
             ax.step(grid, median, where="post", lw=2.0, ls=linestyle, color=colour, alpha=0.9,
                     label=f"{label}{suffix}")
@@ -411,6 +421,10 @@ def plot_median_convergence(runs, out_path, *, json_path=None, title="BO converg
         ax.grid(True, alpha=0.25, lw=0.6)
         if len(ax.get_lines()) > 0:
             ax.legend(loc="upper right", fontsize=9)
+        else:
+            ax.annotate("no verification.json under any run\nnothing has been independently re-scored",
+                        xy=(0.5, 0.5), xycoords="axes fraction", ha="center", va="center",
+                        fontsize=10, color="#52514e")
     axes[0].set_ylabel("median best-so-far loss (normalised MSE)")
     fig.suptitle(title)
     fig.tight_layout()

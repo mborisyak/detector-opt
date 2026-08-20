@@ -103,6 +103,23 @@ def cosine_optimizer(optimizer_config, total_steps):
   return getattr(optax, name)(learning_rate=schedule, **arguments)
 
 
+def design_init_sequence(run_seed, step):
+  """Network-initialisation ``SeedSequence`` for design ``step``, rooted at the RUN-level seed.
+
+  ONE sequence per run, indexed by the BO iteration. The continual trainer and the warm-started arms
+  take element 0 and carry the network onward from there; the per-design trainer takes element
+  ``step``, so it still draws a fresh network every design. The point is that at step 0 EVERY arm
+  starts from the identical weights, which makes the first design a matched comparison instead of a
+  difference of initialisation -- previously the continual arm drew from the run seed while the
+  per-design arm drew from a sequence rooted at that design's own seed, and the two never agreed.
+
+  ``SeedSequence.spawn`` is deterministic on a fresh root, so ``spawn(step + 1)[step]`` is the
+  ``step``-th child however it is reached. A SEQUENCE is returned rather than an integer so that every
+  caller derives the network the same way -- ``generate_state`` on this object -- and so the rewind
+  path can still ``spawn`` further children from it."""
+  return np.random.SeedSequence(int(run_seed)).spawn(step + 1)[step]
+
+
 def fresh_design_network(trainer, init_seq, init_params):
   """A FRESH network per design (optionally warm-started), optimiser reset -- ``(params, state,
     opt_state)`` on the trainer's device. Warm-start carries PARAMS only; the non-param buffer

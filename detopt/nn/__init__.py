@@ -16,6 +16,8 @@ from .pair_set_regressor import PairSetRegressor
 from .induced import InducedSetRegressor
 from .predictive import PredictiveSetRegressor, PredictiveProbRegressor, PredictiveMixtureRegressor
 from .conv_regressor import ConvRegressor
+from .alpha_conv_regressor import AlphaConvRegressor
+from .plain_conv_regressor import PlainConvRegressor
 from .continuous_conv import ContinuousConvRegressor
 from .masked_set import MaskedSetRegressor
 from .hierarchical import DoubleSetRegressor, StructuredSetRegressor
@@ -34,6 +36,12 @@ __models__: dict[str, type[Model]] = {
     "predictive-prob-regressor": PredictiveProbRegressor,  # + next-layer per-straw hit-probability head
     "predictive-mixture-regressor": PredictiveMixtureRegressor,  # + next-layer Gaussian-mixture head
     "conv-regressor": ConvRegressor,  # hierarchical CNN; for stereo_image
+    # Tiny residual CNN over a DENSE channels-last image (zero-init per-channel alpha, no BatchNorm);
+    # for the mnist window detector, whose combine emits (rows, columns, 2).
+    "alpha-conv-regressor": AlphaConvRegressor,
+    # The same stack with the skip connection and the alpha gate REMOVED: the architecture control
+    # for the alpha-conv runs, identical in every other hyper-parameter and operator.
+    "plain-conv-regressor": PlainConvRegressor,
     "continuous-conv-regressor": ContinuousConvRegressor,  # kernel message-passing; for stereo_hits
     "masked-set-regressor": MaskedSetRegressor,  # set regressor + self-supervised flip-detection; stereo_layerwise
     "double-set-regressor": DoubleSetRegressor,  # hierarchical: straw->layer->global

@@ -1,0 +1,29 @@
+# Full default config for the `mnist` detector (MNISTDetector): EVERY __init__ parameter, at its
+# default value. MNIST digit classification through a rectangular VISIBLE WINDOW, the design being
+# where that window sits and how large it is -- (x, y, w, h) on [0, 1]^4, with w and h fractions of
+# the space REMAINING to the right of x and below y, so every point of the unit box is a window that
+# lies wholly inside the image and no proposal can be infeasible.
+#
+# data_path -- the HuggingFace arrow file the digits are read from, decoded ONCE at construction into
+# one dense uint8 array (the `image` column holds PNG bytes). The 60000-row training split; the test
+# split sits beside it as mnist-test.arrow. Nothing here downloads anything.
+#
+# n_events -- how many leading rows to read, or null for all of them. It caps the event source, so it
+# also caps detector.size() and therefore how many distinct digits a run can draw before the shared
+# event index wraps. Tests set it small so construction does not decode 60000 PNGs.
+#
+# area_weight -- the price of LOOKING, in loss units per unit of visible area, with the area a
+# fraction of the image on [0, 1]. It is added to the converged loss by scripts/bo.py and NEVER
+# reaches the trainer. Without it the best window is trivially the whole image and there is no design
+# problem left. The default is ln(10) = 2.302585092994046, which is exactly the cross-entropy of a
+# uniform 10-class guess: at that weight seeing the WHOLE image costs precisely as much as knowing
+# NOTHING about the digit, the two degenerate extremes are priced identically, and ln(10) becomes a
+# reference line on the reported total -- above it, the design is worse than useless. The value
+# follows from the number of classes rather than from tuning, and it stays configurable so the
+# trade-off can be moved. `null` removes the price entirely (design_penalty then returns None, the
+# pure-classification debugging mode); 0.0 is a DIFFERENT thing, a price that was measured and came
+# out zero.
+mnist:
+  data_path: /home/max/dev/data/mnist/mnist-train.arrow
+  n_events: null
+  area_weight: 2.302585092994046

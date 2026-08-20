@@ -1,0 +1,26 @@
+# SINGLE-EXPERIMENT control of the `enzyme_depletion_bi` detector. EVERY number below except `n_experiments` is
+# identical to `config/detector/enzyme_depletion_bi_m2.yaml`, WHICH CARRIES THE FULL CALIBRATION
+# HEADER -- read that file for the evidence behind each one; duplicating it here would only let the
+# two copies drift apart.
+#
+# m = 1 IS A CONTROL, NOT A CANDIDATE. A single experiment cannot identify both Michaelis
+# constants: B0 >> A0 identifies K_A and abandons K_B, A0 >> B0 the mirror, and the diagonal
+# neither (`--section profile`). Its loss therefore floors near 1/3 of the no-information level --
+# the value of leaving exactly one of three normalised targets at the prior -- and it is shipped
+# so that floor can be MEASURED rather than assumed.
+enzyme_depletion_bi:
+  n_experiments: 1
+  n_measurements: 10
+  duration: 3600.0
+  velocity_bounds: [9.0e-4, 9.0e-3]
+  michaelis_a_bounds: [0.02, 0.2]
+  michaelis_b_bounds: [0.1, 1.0]
+  concentration_a_bounds: [0.8, 10.0]
+  concentration_b_bounds: [1.0, 25.0]
+  measurement_noise: 0.02
+  n_stages: 5
+  steps_per_measurement: 64
+  damping: 0.15384615384615385
+  integration_tolerance: 5.0e-3
+  n_grid: 15
+  n_grid_velocity: 241
