@@ -87,6 +87,7 @@ regressor:
     features: [[36, 48], [48, 36]]
     n_models: null
     p_dropout: null
+    activation: celu
 
 device: cuda
 plot_per_epoch: 8

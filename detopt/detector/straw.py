@@ -19,7 +19,7 @@ from .propagation import RealisticEngine, SimplifiedEngine
 from ..utils.det_random import det_uniforms, box_muller
 
 __all__ = ["StrawDetector", "StrawEvent", "HNLTarget", "DaughterTarget", "StrawGroundTruth", "Pool",
-           "MATERIALS", "material_constants", "four_feature_combine", "four_feature_shape"]
+           "MATERIALS", "material_constants", "four_feature_combine", "four_feature_shape", "address_combine", "address_shape"]
 
 
 class Pool(NamedTuple):
@@ -932,8 +932,10 @@ class StrawDetector(Detector):
     # ------------------------------------------------------------------ #
     # Combine: ABSTRACT here (Detector declares combine_scaled/combined_event_shape/element_mask). Each
     # combine LEAF builds its own per-hit/-layer features; the shared 4-feature logic is the module
-    # function `four_feature_combine` below. The TDC standardisation constants live here (event
-    # normalisation is straw-wide, used by that function).
+    # function `four_feature_combine` below, and its DESIGN-FREE counterpart -- what a straw detector
+    # can report when the design is withheld -- is `address_combine`. A straw measurement does not
+    # depend on the design, so `design_scaled=None` is honoured rather than refused. The TDC
+    # standardisation constants live here (event normalisation is straw-wide, used by both functions).
     # ------------------------------------------------------------------ #
     _TDC_MEAN = 440.0
     _TDC_STD = 80.0
@@ -962,7 +964,7 @@ def four_feature_combine(det, event, design_scaled, mask=None):
     ``[TDC, norm(layer z), wire_y_left, wire_y_right]``. Geometry-AGNOSTIC: it gathers each hit's own layer
     geometry through ``det._scaled_to_layer_geometry`` (the design subclass owns that map), so every
     4-feature combine leaf (``FreeStrawDetector``, ``Stereo4Feature``, incl. its ``engine='relay'`` mode) calls this.
-    ``mask`` is accepted for the uniform signature but ignored (the element axis IS the hit axis; padded
+    ``mask`` is accepted for the uniform signature but ignored (the element axis IS the hit axis; masked
     hits are zeroed downstream by the regressor mask).
 
     The sense wire is encoded as its two y-endpoints at the FIXED x-ends of the parallelogram (the sheared
@@ -1011,3 +1013,40 @@ def four_feature_combine(det, event, design_scaled, mask=None):
 def four_feature_shape(det):
     """The 4-feature combine's ``combined_event_shape``: one element per hit, 4 features."""
     return (det.max_hits_per_event, 4)
+
+
+N_ADDRESS_FEATURES = 5
+
+
+def address_combine(det, event, mask=None):
+    """The DESIGN-FREE combine shared by every straw leaf: per-hit features
+    ``[TDC, station, view, layer-in-view, straw]``, the four indices each normalised to ``[0, 1]``.
+
+    THIS IS WHAT A STRAW DETECTOR CAN SAY WITHOUT THE DESIGN. ``four_feature_combine`` resolves the
+    design into each hit's own geometry -- ``norm_z`` is the hit's layer z, ``wire_y_left/right`` its
+    wire endpoints -- so with no design there is no z and no wire position to report, only WHICH straw
+    fired and WHEN. The network must then work the geometry out for itself, which makes this a harder
+    task and not a re-encoding of the same one; losses are not comparable across the two.
+
+    ``TDC`` is standardised exactly as in ``four_feature_combine``, so the time feature is the same
+    number in both. A count of 1 would divide by zero and is guarded. ``mask`` is accepted for the
+    uniform signature and ignored: the element axis IS the hit axis and masked hits are zeroed
+    downstream by the regressor mask."""
+    import jax.numpy as jnp
+
+    def normed(values, count):
+        return jnp.asarray(values, jnp.float32) / float(max(int(count) - 1, 1))
+
+    tdc = (jnp.asarray(event.tdc, jnp.float32) - det._TDC_MEAN) / det._TDC_STD
+    return jnp.stack([
+        tdc,
+        normed(event.station, det.n_stations),
+        normed(event.view, det.n_views_per_station),
+        normed(event.layer, det.n_layers_per_view),
+        normed(event.straw, det.n_straws),
+    ], axis=-1)
+
+
+def address_shape(det):
+    """The design-free combine's ``combined_event_shape``: one element per hit, 5 features."""
+    return (det.max_hits_per_event, N_ADDRESS_FEATURES)

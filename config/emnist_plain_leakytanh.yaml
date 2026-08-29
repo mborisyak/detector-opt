@@ -1,0 +1,74 @@
+# `config/emnist_plain.yaml` with ONE value changed: the plain CNN's `activation`, celu ->
+# leaky-tanh. leaky-tanh carries two LEARNED gains per feature at every activation site (+496
+# parameters, 20 extra parameter leaves, measured), which is a fast re-gating channel; celu is
+# parameter-free and removes it. Everything else -- detector, budget, convergence knobs,
+# optimizer, BO settings -- is byte-identical, which `scripts/probe_semi_hyper.py` asserts.
+# The ARCHITECTURE CONTROL for config/emnist.yaml: the same visible-window task on EMNIST DIGITS with
+# the residual, alpha-gated CNN swapped for the PLAIN one (`plain-conv-regressor`, no skip
+# connection and no zero-initialised gate). Every other field below is copied from config/emnist.yaml
+# verbatim -- same detector, same budget and window schedule, same optimizer, same convergence bar,
+# same surrogate -- so a difference between the two campaigns is attributable to the architecture and
+# to nothing else. Read that file for what each number means and for which of them are inherited from
+# MNIST rather than measured on EMNIST; do not retune anything here without retuning it there.
+#
+# WHAT THIS IS FOR. On EMNIST the continual arms show no benefit: `meta`'s mean per-design `spent` in
+# the last third of the trajectory divided by the first third sits at ~1, i.e. the carried network
+# makes later designs no cheaper, where on the SHiP task the same ratio drops well below 1. The
+# hypothesis under test is that the alpha gate is responsible -- a network whose residual branches
+# start switched off may re-learn from near-identity whatever it is handed. This config is the arm
+# that answers it; the ratio, not the final loss, is the measurement.
+
+detector: emnist_digits
+
+regressor:
+  plain-conv-regressor:
+    channels: [16, 24, 32]
+    blocks: 2
+    kernel_size: 3
+    p_dropout: null
+    activation: leaky-tanh
+
+device: cuda
+plot_per_epoch: 8
+
+training:
+  n0: 8192
+  n_increment: 4096
+  batch: 128
+  eval_batch: 2048
+  warmup_epochs: 2
+  patience: 8
+  budget: 240000
+  iteration_limit: 60000
+  val_fraction: 0.25
+  loss_precision: 1.0e-1
+  param_mix: 0.25
+  optimizer:
+    adamaxw:
+      learning_rate: 5.0e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-3
+
+bo:
+  n_init: 5
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds: [-2.0, 1.0]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+    kernel:
+      independent-sorting-rbf:
+        exchangeable: 2
+  ei:
+    n_restarts: 32
+    n_steps: 100
+
+verify:
+  n_points: 10
+  epochs: 200
+  val_every_epochs: 10
+  budget: null
+  batch: null

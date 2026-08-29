@@ -145,11 +145,14 @@ def test_combine(detector):
   design = nominal(detector, [0.6, 3.0])
   _, event, mask, _ = detector(design, np.arange(32))
   features = detector.combine(event, design)
+  blind = detector.combine(event, design, reveal_design=False)
+  assert blind.shape == (32, 2, detector.n_measurements)
+  assert np.allclose(np.asarray(blind), np.asarray(features[..., :-1]))
   assert features.shape == (32, 2, detector.n_measurements + 1)
   # last channel is the SCALED design, broadcast over the batch
   assert np.allclose(np.asarray(features[:, :, -1]), np.asarray(detector.to_scaled(design))[None, :], atol=1e-6)
-  # readings are fractions of each experiment's OWN initial concentration
-  assert np.all(np.asarray(features[:, :, :-1]) < 1.5)
+  # readings are RAW concentrations -- no normalisation, so they are bounded by the design box top
+  assert np.all(np.asarray(features[:, :, :-1]) < 1.5 * detector.concentration_bounds[1])
   assert np.allclose(np.asarray(detector.element_mask(event, mask)), np.asarray(mask))
 
 

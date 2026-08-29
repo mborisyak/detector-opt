@@ -396,9 +396,10 @@ class EnzymeInhibitorDetector(Detector):
       'inhibitor': self.inhibitor_bounds, 'temperature': self.temperature_bounds
     }
 
-  def combined_event_shape(self):
-    # element == experiment; its features are its own measurements + its own 4 design coordinates
-    return (self.n_experiments, self.n_measurements + 4)
+  def combined_event_shape(self, design: bool = True):
+    # element == experiment; its features are its own measurements + either its own 4 design
+    # coordinates or a one-hot of its own index (see `combine_scaled`).
+    return (self.n_experiments, self.n_measurements + (4 if design else self.n_experiments))
 
   def size(self):
     return None  # an analytic source: every index is a fresh (enzyme, compound) pair
@@ -429,19 +430,40 @@ class EnzymeInhibitorDetector(Detector):
   # ------------------------------------------------------------------ #
   # Combine + normalisation
   # ------------------------------------------------------------------ #
-  def combine_scaled(self, event, design_scaled, mask=None):
+  def combine_scaled(self, event, design_scaled=None, mask=None, reveal_design: bool = True):
     """``features (..., n_experiments, n_measurements + 4)``: each experiment's [A] samples followed
     by its own four design values, taken STRAIGHT from the scaled design -- already each coordinate
     on its own range in [0, 1] (log-scaled for the two concentrations), which is what the network
     wants. The MEASUREMENTS stay LINEAR: the read-out noise is additive and homoscedastic in linear
     space, and a noisy [A] near zero can be negative, where a log is undefined. ``mask`` is unused:
-    every experiment of the batch is real (the element axis is the design's, not a hit count)."""
+    every experiment of the batch is real (the element axis is the design's, not a hit count).
+
+    WITH THE DESIGN WITHHELD -- ``reveal_design=False`` or ``design_scaled=None``, treated alike since
+    an experiment is run before it is combined -- the four design columns are replaced by a ONE-HOT OF
+    THE EXPERIMENT'S OWN INDEX, ``(..., n_experiments, n_measurements + n_experiments)``. The
+    measurements are unchanged, because they already use the FIXED glucose stock as their reference
+    rather than the experiment's own design and so nothing leaks back. The network is told WHAT was
+    read and WHICH experiment read it, never UNDER WHICH conditions.
+
+    ⚠️ WHY NOT THE MEASUREMENTS ALONE. The set regressor is permutation-INVARIANT over the element
+    axis, so a bare measurement block is an unordered MULTISET of four progress curves. This design is
+    a 2x2 FACTORIAL -- (B0 low / B0 saturating) x (I weak / I ~ 1/k) -- and neither arm can be read
+    without knowing which cell it came from, so a withheld arm would plateau because the problem is
+    underdetermined, which is a statement about the regressor's symmetry and not about the design. The
+    one-hot restores each experiment's IDENTITY without restoring its CONDITIONS, so the two are
+    separable: an arm that recovers with it was limited by exchangeability, an arm that does not was
+    limited by the design information itself. Same construction, same reason, as
+    :meth:`detopt.detector.linear.LinearDetector.combine_scaled`."""
+    measurements = jnp.asarray(event.measurements, jnp.float32)
+    if design_scaled is None or not reveal_design:
+      identity = jnp.broadcast_to(
+        jnp.eye(self.n_experiments, dtype=jnp.float32), measurements.shape[:-1] + (self.n_experiments, )
+      )
+      return jnp.concatenate([measurements, identity], axis=-1)
     design_scaled = jnp.asarray(design_scaled, jnp.float32)
     if design_scaled.ndim == 1:  # one design for the whole event batch
       design_scaled = jnp.broadcast_to(design_scaled[None, :], event.measurements.shape[:-2] + design_scaled.shape)
     n = self.n_experiments
-    # [A] runs from the (fixed, saturating) glucose stock down to zero.
-    measurements = self._to_unit(event.measurements, (0.0, self.concentration_A))
     return jnp.concatenate([
       measurements,
       design_scaled[..., :n, None], design_scaled[..., n:2 * n, None],

@@ -170,6 +170,7 @@ _FIXED_ACTIVATIONS = {
   "tanh": jax.nn.tanh,  # BOUNDED (|f| <= 1) and slope 1 at the origin: the least expressive option
   "relu": jax.nn.relu,  # unbounded, piecewise linear
   "gelu": jax.nn.gelu,  # unbounded, smooth
+  "celu": jax.nn.celu,
 }
 
 

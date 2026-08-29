@@ -297,8 +297,12 @@ def test_combine(detector):
   scaled = np.asarray(detector.to_scaled(design))
   assert np.allclose(np.asarray(features[:, :, -2]), scaled[None, :2], atol=1e-6)
   assert np.allclose(np.asarray(features[:, :, -1]), scaled[None, 2:], atol=1e-6)
-  # readings are fractions of each experiment's OWN maximum extent min(A0, B0)
-  assert np.all(np.asarray(features[:, :, :-2]) < 1.5)
+  # readings are the RAW extent -- no normalisation, so they are bounded by the box, not by 1
+  ceiling = min(detector.concentration_a_bounds[1], detector.concentration_b_bounds[1])
+  assert np.all(np.asarray(features[:, :, :-2]) < 1.5 * ceiling)
+  blind = detector.combine(event, design, reveal_design=False)
+  assert blind.shape == (32, 2, detector.n_measurements)
+  assert np.allclose(np.asarray(blind), np.asarray(features[..., :-2]))
   assert np.allclose(np.asarray(detector.element_mask(event, mask)), np.asarray(mask))
 
 

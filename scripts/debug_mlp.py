@@ -34,7 +34,7 @@ def main(buffer=32768, val_buffer=8192, eps=0.1, train_steps=6000, batch=512, co
     det = detopt.detector.from_config(cfg["detector"])
     dd = int(det.design_dim())
     M = det.max_hits_per_event
-    F = det.combined_feature_dim
+    F = det.combined_feature_dim()
     labels = [f"y{i}" for i in range(int(det.target_dim()))]  # per-axis target components (net outputs)
     nd = cfg["nominal_design"]
     theta0 = jnp.asarray(det.to_scaled(nd), jnp.float32)

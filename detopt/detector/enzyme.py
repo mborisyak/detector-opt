@@ -470,9 +470,9 @@ class EnzymeDetector(Detector):
   def design_bounds(self):
     return {'enzyme_fraction': self.enzyme_fraction_bounds, 'temperature': self.temperature_bounds}
 
-  def combined_event_shape(self):
+  def combined_event_shape(self, design: bool = True):
     # element == experiment; its features are its own measurements + its own (E0, temperature)
-    return (self.n_experiments, self.n_measurements + 2)
+    return (self.n_experiments, self.n_measurements + (2 if design else 0))
 
   def size(self):
     return None  # an analytic source: every index is a fresh enzyme
@@ -499,12 +499,21 @@ class EnzymeDetector(Detector):
   # ------------------------------------------------------------------ #
   # Combine + normalisation
   # ------------------------------------------------------------------ #
-  def combine_scaled(self, event, design_scaled, mask=None):
+  def combine_scaled(self, event, design_scaled=None, mask=None, reveal_design: bool = True):
     """``features (..., n_experiments, n_measurements + 2)``: each experiment's [A] samples followed
     by its own two design values, taken STRAIGHT from the scaled design -- it is already each
     coordinate affinely on its own range in [0, 1], which is what the network wants. ``mask`` is
     unused: every experiment of the batch is real (the element axis is the design's, not a hit
-    count)."""
+    count).
+
+    WITH THE DESIGN WITHHELD -- ``reveal_design=False`` or ``design_scaled=None``, treated alike since
+    an experiment is run before it is combined -- the trailing design columns are simply absent and
+    the measurements are unchanged: they are scaled by the FIXED A stock, not by anything the design
+    sets, so nothing leaks back. The network is told WHAT was read and not UNDER WHICH conditions.
+    The features are narrower, not corrupted."""
+    measurements = jnp.asarray(event.measurements, jnp.float32)
+    if design_scaled is None or not reveal_design:
+      return measurements
     design_scaled = jnp.asarray(design_scaled, jnp.float32)
     if design_scaled.ndim == 1:  # one design for the whole event batch
       design_scaled = jnp.broadcast_to(design_scaled[None, :], event.measurements.shape[:-2] + design_scaled.shape)
@@ -513,8 +522,6 @@ class EnzymeDetector(Detector):
     # concentration.
     enzyme = design_scaled[..., :n]
     heat = design_scaled[..., n:2 * n]
-    # [A] never exceeds half the A stock (the other half of the non-enzyme volume is B).
-    measurements = self._to_unit(event.measurements, (0.0, 0.5 * self.concentration_A))
     return jnp.concatenate([measurements, enzyme[..., None], heat[..., None]], axis=-1)
 
   def element_mask(self, event, mask):

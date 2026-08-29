@@ -173,8 +173,8 @@ class EnzymeDepletionDetector(Detector):
   def design_bounds(self):
     return {'initial_concentration': self.concentration_bounds}
 
-  def combined_event_shape(self):
-    return (self.n_experiments, self.n_measurements + 1)
+  def combined_event_shape(self, design: bool = True):
+    return (self.n_experiments, self.n_measurements + (1 if design else 0))
 
   def size(self):
     return None  # an analytic source: every index is a fresh variant
@@ -195,19 +195,31 @@ class EnzymeDepletionDetector(Detector):
   # ------------------------------------------------------------------ #
   # Combine + normalisation
   # ------------------------------------------------------------------ #
-  def combine_scaled(self, event, design_scaled, mask=None):
-    """``features (..., n_experiments, n_measurements + 1)``: each experiment's readings as a
-    fraction of its OWN initial concentration, followed by that concentration on the scaled cube.
+  def combine_scaled(self, event, design_scaled=None, mask=None, reveal_design: bool = True):
+    """``features (..., n_experiments, n_measurements + 1)``: each experiment's readings on a FIXED
+    scale, followed by its own initial concentration on the scaled cube.
+    ⚠️ THE READINGS ARE SCALED BY A FIXED REFERENCE -- the TOP OF THE DESIGN BOX -- and NOT by each
+    experiment's own initial concentration. Dividing by the experiment's own value was the old rule
+    and it is refuted: the read-out noise is ABSOLUTE (a standard deviation in concentration units,
+    added to the clean signal), so dividing by the design multiplies that noise by its reciprocal and
+    the FEATURE noise then varies across the design box by the box's own ratio. The information is not
+    lost -- the initial concentration is appended as its own feature -- but the conditioning is, and a
+    design at the bottom of the box arrives with the noisiest features for no physical reason. This is
+    the same rule, and the same reason, as :mod:`detopt.detector.enzyme_mm`.
+
+    Withholding the design drops the trailing column and nothing else: the readings never depended on
+    it.
 
     ``mask`` is unused -- every experiment of the design is real (the element axis is the design's,
     not a hit count)."""
-    design_scaled = jnp.asarray(design_scaled, jnp.float32)
-    initial = self._to_nominal_flat(design_scaled)
     concentration = jnp.asarray(event.concentration, jnp.float32)
-    if initial.ndim == 1:  # one design for the whole event batch
-      initial = jnp.broadcast_to(initial, concentration.shape[:-2] + initial.shape)
+    readings = concentration
+    if design_scaled is None or not reveal_design:
+      return readings
+    design_scaled = jnp.asarray(design_scaled, jnp.float32)
+    if design_scaled.ndim == 1:  # one design for the whole event batch
       design_scaled = jnp.broadcast_to(design_scaled, concentration.shape[:-2] + design_scaled.shape)
-    return jnp.concatenate([concentration / initial[..., None], design_scaled[..., None]], axis=-1)
+    return jnp.concatenate([readings, design_scaled[..., None]], axis=-1)
 
   def element_mask(self, event, mask):
     return mask  # element == experiment

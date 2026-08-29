@@ -289,9 +289,9 @@ class GrowthDetector(Detector):
       'temperature': self.temperature_bounds, 'inoculum': self.inoculum_bounds, 'substrate': self.substrate_bounds
     }
 
-  def combined_event_shape(self):
+  def combined_event_shape(self, design: bool = True):
     # element == culture; its features are its own OD samples + its own (T, N0, S0)
-    return (self.n_experiments, self.n_measurements + 3)
+    return (self.n_experiments, self.n_measurements + (3 if design else 0))
 
   def size(self):
     return None  # an analytic source: every index is a fresh strain
@@ -322,7 +322,7 @@ class GrowthDetector(Detector):
   # ------------------------------------------------------------------ #
   # Combine + normalisation
   # ------------------------------------------------------------------ #
-  def combine_scaled(self, event, design_scaled, mask=None):
+  def combine_scaled(self, event, design_scaled=None, mask=None, reveal_design: bool = True):
     """``features (..., n_experiments, n_measurements + 3)``: each culture's OD samples followed by its
     own three design values, taken STRAIGHT from the scaled design -- already each coordinate on its
     own range in [0, 1], which is what the network wants.
@@ -330,13 +330,21 @@ class GrowthDetector(Detector):
     The OD samples go in on a LOG axis: growth curves are exponential, the quantity a rate estimate is
     the slope of, and the read-out is censored at the detection limit, so the log is bounded below by
     construction. ``mask`` is unused -- every culture of the batch is real (the element axis is the
-    design's, not a hit count)."""
+    design's, not a hit count).
+
+    WITH THE DESIGN WITHHELD -- ``reveal_design=False`` or ``design_scaled=None``, treated alike since
+    a culture is grown before it is combined -- the trailing three columns are simply absent and the
+    OD samples are unchanged: they are scaled by the FIXED detection-limit-to-ceiling range, not by
+    anything the design sets, so nothing leaks back. The network is told WHAT was read and not UNDER
+    WHICH conditions. The features are narrower, not corrupted."""
+    logarithm = jnp.log(jnp.maximum(event.measurements, self.detection_limit))
+    measurements = self._to_unit(logarithm, (math.log(self.detection_limit), math.log(self.od_ceiling)))
+    if design_scaled is None or not reveal_design:
+      return measurements
     design_scaled = jnp.asarray(design_scaled, jnp.float32)
     if design_scaled.ndim == 1:  # one design for the whole event batch
       design_scaled = jnp.broadcast_to(design_scaled[None, :], event.measurements.shape[:-2] + design_scaled.shape)
     n = self.n_experiments
-    logarithm = jnp.log(jnp.maximum(event.measurements, self.detection_limit))
-    measurements = self._to_unit(logarithm, (math.log(self.detection_limit), math.log(self.od_ceiling)))
     return jnp.concatenate([
       measurements, design_scaled[..., :n, None], design_scaled[..., n:2 * n, None], design_scaled[..., 2 * n:3 * n, None]
     ], axis=-1)

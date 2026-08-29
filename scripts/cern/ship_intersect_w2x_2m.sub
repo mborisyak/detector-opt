@@ -1,0 +1,34 @@
+universe       = vanilla
+executable     = geom_cell.sh
+arguments      = ship_intersect_prec1e2_w2x_2m $(seed) $(arm) $(reveal) /afs/cern.ch/work/m/maborisy/ship-intersect-w2x-2m/$(seed)/$(arm)
+output         = logs/isect2m_$(seed)_$(arm).$(ClusterId).$(ProcId).out
+error          = logs/isect2m_$(seed)_$(arm).$(ClusterId).$(ProcId).err
+log            = logs/isect2m.$(ClusterId).log
+request_gpus   = 1
+request_cpus   = 2
+request_memory = 12000
+requirements   = TARGET.GPUs_GlobalMemoryMb >= 20000
++MaxRuntime    = 172800
++JobBatchName  = "ship-intersect-w2x-2m"
+queue seed,arm,reveal from (
+  1244111331, from_scratch, none
+  1244111331, continue, none
+  1244111331, closest, none
+  1244111331, meta, design
+  126382657, from_scratch, none
+  126382657, continue, none
+  126382657, closest, none
+  126382657, meta, design
+  750143450, from_scratch, none
+  750143450, continue, none
+  750143450, closest, none
+  750143450, meta, design
+  9577242, from_scratch, none
+  9577242, continue, none
+  9577242, closest, none
+  9577242, meta, design
+  330924253, from_scratch, none
+  330924253, continue, none
+  330924253, closest, none
+  330924253, meta, design
+)

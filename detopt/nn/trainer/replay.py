@@ -86,3 +86,30 @@ def load_carried_network_state(running, data, device):
     loaded = [_like(leaf, data[f"net_{name}_{index}"]) for index, leaf in enumerate(leaves)]
     restored.append(jax.device_put(jax.tree.unflatten(structure, loaded), device))
   return (restored[0], restored[1])
+
+
+def replay_carried_network(trainer, rows):
+  """The persistent network, read back from the LAST replayed design's checkpoint.
+
+  The continual strategies carry one network across designs and it is already saved per design, so a
+  replayed run recovers it from that checkpoint rather than from a state file. The restored trees come
+  back as PURE DICTS; they are poured into the live network's own structure so leaf types, dtypes and
+  device placement are the running network's, not the checkpoint's."""
+  from ...utils import io
+
+  if len(rows) == 0:
+    return trainer._running
+  manager = trainer._checkpoint_manager(len(rows) - 1)
+  if manager is None:
+    raise ValueError(
+      "a continual strategy cannot be replayed without checkpoints: the persistent "
+      "network crosses design boundaries and is not derivable from the trajectory"
+    )
+  params, state = trainer._running
+  restored_params, restored_state, _design, _aux = io.restore_training_checkpoint(manager, regressor=(params, state))
+  manager.close()
+  recovered = []
+  for live, loaded in ((params, restored_params), (state, restored_state)):
+    leaves, structure = jax.tree.flatten(live)
+    recovered.append(jax.device_put(jax.tree.unflatten(structure, jax.tree.leaves(loaded)), trainer.device))
+  return recovered[0], recovered[1]

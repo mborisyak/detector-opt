@@ -1,0 +1,32 @@
+# CONTROL for the `ship-angle-w2x-3m` arm comparison: `continue` at reveal=design.
+#
+# WHAT IT SEPARATES. In that campaign `meta` runs at reveal=design and the three per-design arms
+# (from_scratch / continue / closest) run at reveal=none, so meta's win confounds TWO changes: the
+# continual+replay training AND the input representation. Those are not two encodings of one task --
+# `address_combine` (5 features: TDC + station/view/layer/straw indices) reports only WHICH straw
+# fired and WHEN, while `four_feature_combine` (4 features: TDC, norm z, wire_y_left, wire_y_right)
+# resolves the design into each hit's own geometry, and `straw.py:address_combine` states outright
+# that the network must otherwise work the geometry out for itself, so losses are NOT comparable
+# across the two. This cell makes one per-design arm comparable to meta.
+#
+# ONE SEED, draw 1 of the campaign generator `random.Random(123456).randint(0, 2**31-1)` =
+# 1244111331, so it pairs cell-for-cell with the banked reveal=none `continue` at the same seed.
+#
+# Its own tree (`-reveal`), NOT a fifth arm inside `ship-angle-w2x-3m`: the campaign's per-seed
+# directory holds exactly the four arm names and a plot over that tree would silently pool a cell
+# that is not on the same task as its siblings.
+universe       = vanilla
+executable     = geom_cell.sh
+arguments      = ship_angle_prec1e2_w2x_3m $(seed) $(arm) $(reveal) /afs/cern.ch/work/m/maborisy/ship-angle-w2x-3m-reveal/$(seed)/$(arm)
+output         = logs/angle3mrev_$(seed)_$(arm).$(ClusterId).$(ProcId).out
+error          = logs/angle3mrev_$(seed)_$(arm).$(ClusterId).$(ProcId).err
+log            = logs/angle3mrev.$(ClusterId).log
+request_gpus   = 1
+request_cpus   = 2
+request_memory = 12000
+requirements   = TARGET.GPUs_GlobalMemoryMb >= 20000
++MaxRuntime    = 259200
++JobBatchName  = "ship-angle-w2x-3m-reveal"
+queue seed,arm,reveal from (
+  1244111331, continue, design
+)

@@ -11,9 +11,20 @@ three schedules (constant / SGDR seesaw / smooth cyclical) on a DIFFERENT task (
 and compared DATA-TO-CONVERGENCE and EPOCHS; it found them identical and concluded "stopping is
 data-bound, not optimization-bound". It never separated the two terms of the stopping rule. The
 trainer stops when ``diff + err < loss_precision`` with ``err`` the standard error (falls like
-1/sqrt(window): data fixes it) and ``diff = |train - val|`` an OVERFITTING BIAS that does not fall
-with data on an uninformative design. This probe targets ``diff`` specifically, on the real
+1/sqrt(window): data fixes it) and ``diff = |train - val|`` the finite-sample overfitting gap, which
+falls with data too -- both splits are IID from one stream and the network is fixed-capacity, so both
+empirical risks converge to the same population risk. What bites is the PRE-ASYMPTOTIC regime at an
+affordable window. This probe targets ``diff`` specifically, on the real
 ``enzyme_inhib`` task, at the designs a real BO run actually visited.
+
+⚠️ NOT MONOTONE, and the sign is design-dependent. Uniform convergence gives `diff -> 0`
+ASYMPTOTICALLY; it says nothing about the path. At small `n` an underfitting network holds train
+and val both high and close, so `diff` is small; as `n` grows and the network starts to fit, train
+falls faster than val and `diff` RISES; only later does val catch up and `diff` fall. Measured on
+SHiP: median slope `dlog(diff)/dlog(window) = -1.38` over 9 designs, but `+0.428` on one design
+that was still rising at window 262,144 (`err` on that same design fell at -0.495, matching
+`n^-1/2` to three digits, so the measurement is sound and it is `diff` alone that is unruly).
+Do NOT assume a sign for the affordable range.
 
 THE CENSORING PROBLEM, and what is therefore reported. The loop EXITS the moment ``diff + err``
 first dips below ``loss_precision``, so the ``diff`` of a converged run is truncated by construction
@@ -59,7 +70,6 @@ from detopt.nn.trainer import DesignTrainer
 from detopt.utils.config import resolve_device, split
 from detopt.utils.training import masked_mean_sem
 
-
 class _Tee:
   """stdout pass-through that also keeps the lines, so the trainer's own ``[converged]`` line (the
   only place ``diff`` and ``err`` are reported SEPARATELY) can be read back out."""
@@ -75,7 +85,6 @@ class _Tee:
   def flush(self):
     self.stream.flush()
 
-
 def parse_setting(text):
   """``"lr=1e-4,wd=1.0e-2"`` -> ``{"lr": 1e-4, "wd": 1.0e-2}``; ``"baseline"`` -> ``{}``."""
   if text == "baseline":
@@ -90,7 +99,6 @@ def parse_setting(text):
       raise ValueError(f"unknown setting key {key!r}; known: {sorted(keys)}")
     out[key] = value if key == "sched" else float(value)
   return out
-
 
 def build_optimizer(base_config, setting, steps_per_epoch):
   """The run's optimiser with this setting's overrides applied. Returns ``(transformation, label)``.
@@ -131,7 +139,6 @@ def build_optimizer(base_config, setting, steps_per_epoch):
   label = ",".join(f"{k}={v}" for k, v in sorted(setting.items())) if len(setting) > 0 else "baseline"
   return getattr(optax, name)(**arguments), label
 
-
 def parse_converged(lines):
   """``diff`` / ``err`` / ``window`` off the trainer's last ``[converged]`` line."""
   for line in reversed(lines):
@@ -150,7 +157,6 @@ def parse_converged(lines):
       }
   return {}
 
-
 def parse_failure(message):
   """``diff`` / ``err`` / ``window`` off the ``did not reach precision`` RuntimeError."""
   text = message.replace("\n", " ").replace("(", " ").replace(")", " ").replace(";", " ")
@@ -167,7 +173,6 @@ def parse_failure(message):
       except ValueError:
         pass
   return out
-
 
 def run_fixed_window(trainer, x_scaled, seed, window, epochs):
   """Train ONE fixed window for a FIXED number of epochs and return the per-epoch loss curves.
@@ -206,7 +211,6 @@ def run_fixed_window(trainer, x_scaled, seed, window, epochs):
     curves["val_sem"].append(float(val_sem))
   return curves, train_count, val_count
 
-
 def summarise_fixed_window(curves, tail=25):
   """Headline numbers from a fixed-window curve. The TAIL means are what to compare: a single final
   epoch is one noisy draw, and the quantity of interest is where the pair of curves settled."""
@@ -228,7 +232,6 @@ def summarise_fixed_window(curves, tail=25):
     "val_min_epoch": int(val.argmin()),
     "diff_final": float(abs(val[-1] - train[-1])),
   }
-
 
 def main():
   parser = argparse.ArgumentParser()
@@ -360,7 +363,6 @@ def main():
     "READ IT AS: a converged `diff` is CENSORED by the stopping rule -- compare SPEND at rank 0 "
     "(does the gap resist?) against LEVEL at the good rank (did it just under-fit?)."
   )
-
 
 if __name__ == "__main__":
   main()

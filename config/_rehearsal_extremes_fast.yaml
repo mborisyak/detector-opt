@@ -29,6 +29,7 @@ plot_per_epoch: 8
 training:
   n0: 2048
   n_increment: 1024
+  param_mix: 0.25
   batch: 256
   eval_batch: 2048
   warmup_epochs: 4               # A SAFEGUARD, not a tuning knob: it only stops the procedure

@@ -12,8 +12,9 @@ detector: enzyme_inhib
 
 regressor:
   # A deep set over the batch: one ELEMENT per experiment, its features being that experiment's
-  # read-outs followed by its own design coordinates, so the network is design-conditioned and the
-  # inference is permutation-invariant in the experiments -- the symmetry of the problem.
+  # read-outs followed by its own design coordinates. Those columns reach the network only in the
+  # arms that REVEAL the design (`Trainer.reveals_design`); the inference is permutation-invariant
+  # in the experiments either way -- the symmetry of the problem.
   set-regressor:
     features: [[24, 16], [16, 24]]
     n_models: 4      # ensemble: independent members, averaged at evaluation
@@ -25,6 +26,7 @@ plot_per_epoch: 8
 training:
   n0: 2048
   n_increment: 1024
+  param_mix: 0.25
   batch: 256
   eval_batch: 2048
   warmup_epochs: 4              # A SAFEGUARD, not a tuning knob: it only stops the procedure

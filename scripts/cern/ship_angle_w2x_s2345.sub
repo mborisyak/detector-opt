@@ -1,0 +1,30 @@
+universe       = vanilla
+executable     = geom_cell.sh
+arguments      = ship_angle_prec1e2_w2x $(seed) $(arm) $(reveal) /afs/cern.ch/work/m/maborisy/ship-angle-w2x/$(seed)/$(arm)
+output         = logs/angle_$(seed)_$(arm).$(ClusterId).$(ProcId).out
+error          = logs/angle_$(seed)_$(arm).$(ClusterId).$(ProcId).err
+log            = logs/angle.$(ClusterId).log
+request_gpus   = 1
+request_cpus   = 2
+request_memory = 12000
+requirements   = TARGET.GPUs_GlobalMemoryMb >= 20000
++MaxRuntime    = 172800
++JobBatchName  = "ship-angle-w2x"
+queue seed,arm,reveal from (
+  126382657, from_scratch, none
+  126382657, continue, none
+  126382657, closest, none
+  126382657, meta, design
+  750143450, from_scratch, none
+  750143450, continue, none
+  750143450, closest, none
+  750143450, meta, design
+  9577242, from_scratch, none
+  9577242, continue, none
+  9577242, closest, none
+  9577242, meta, design
+  330924253, from_scratch, none
+  330924253, continue, none
+  330924253, closest, none
+  330924253, meta, design
+)

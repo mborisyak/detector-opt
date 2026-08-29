@@ -30,7 +30,7 @@ FEATURE_LABELS = ("tdc", "norm_z", "wire_y_left", "wire_y_right")
 
 def measure(seed=0, n_events=2048, **config):
     detector = detopt.detector.from_config(config["detector"])
-    F = detector.combined_feature_dim
+    F = detector.combined_feature_dim()
     M = detector.max_hits_per_event
 
     theta = jnp.asarray(detector.to_scaled(config["design"]), jnp.float32)  # the design we train at

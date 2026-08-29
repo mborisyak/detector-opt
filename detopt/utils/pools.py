@@ -77,8 +77,9 @@ class Pool(Buffered):
   read the fixed-shape buffers gated on ``n_current``, so one compiled kernel handles a
   growing pool. The pool never calls the detector -- scripts sample events explicitly (so the
   detector calls stay visible) and append them here. Storing the raw physical design per event
-  lets one pool span many designs (it accumulates across BO iterations) and lets the network's
-  ``combine`` be design-conditioned -- each event is combined with its own design.
+  lets one pool span many designs (it accumulates across BO iterations) and lets ``combine`` be
+  given each event's OWN design -- whether that design then reaches the network is the trainer's
+  call (``Trainer.reveals_design``), and either way the pool holds the same raw records.
   """
 
   def __init__(self, capacity, specs, device=None, buffers=None):

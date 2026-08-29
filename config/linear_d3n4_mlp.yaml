@@ -1,0 +1,93 @@
+# ⚠️ VARIANT of `config/linear_d3n4.yaml`: the `regressor` block and NOTHING ELSE.
+#
+# WHY AN MLP. `set-regressor` is permutation-INVARIANT over the element axis, so with the design
+# withheld one event is an unordered multiset of `n_probes` readings and `w` is not identifiable from
+# it -- the withheld arms plateau because the problem is underdetermined, not because they are slow.
+# `mlp-regressor` FLATTENS the element set instead, giving every (probe, feature) slot its own weight,
+# so probe 0 and probe 3 are distinguishable by POSITION IN THE INPUT VECTOR even when their design
+# columns are gone. If the plateau is a symmetry artefact it should lift here; if it does not, the
+# cost is the information itself.
+#
+# WIDTH 137 IS CHOSEN TO MATCH THE PARAMETER COUNT, not for its own sake: 22,335 against the
+# set-regressor's 22,384 in the design-revealed layout, the closest any [w, w] reaches. ⚠️ The counts
+# CANNOT match across reveal conditions -- the flattened input is `n_probes * F`, and F differs
+# between the revealed and withheld layouts -- so the withheld MLP has 20,691. That difference is a
+# property of the comparison and is reported rather than hidden.
+
+# LINEAR at d = 3 with n_probes = 4, GROWTH procedure, short run.
+#
+# Delta against `config/linear.yaml`: `detector` -> `linear_d3n4` (3 dimensions, 4 probes, noise 0.5,
+# 12 design coordinates) and `budget` 1048576 -> 131072. Nothing else moves.
+#
+# WHY 131072. At the shipped bar of 2.0e-2 a `linear` design costs a MEASURED median 6512 detector
+# calls over 8 runs, so 131072 buys roughly 20 designs -- the run length asked for. The count is a
+# consequence of the bar, not a setting: this procedure grows each design's window until
+# `diff + err <= loss_precision` and stops when the shared budget is spent.
+#
+# n_probes = n_dimensions + 1 is the structural rule for this family, and `config/detector/
+# linear_d3n4.yaml` follows it. The design is 12-dimensional, so BO has a real search here, unlike
+# the shipped d = 1 cell where every arm reaches the exact closed-form optimum by design 20 and sits
+# there.
+#
+# `exchangeable: 4`, NOT the parent's 2. The design is a SET of probes and the invariant kernel
+# quotients the permutation symmetry, so the value must equal `n_probes` -- 4 here. Inheriting the
+# parent's 2 raises `no design field of length 2 to permute` at the first GP fit.
+#
+# THE POINT OF THIS RUN is the step-0 initialisation change: `design_init_sequence` now roots every
+# arm's first network in ONE sequence off the run seed, so `from_scratch`, `continue`, `closest` and
+# `meta` begin design 0 from bit-identical weights (verified: max|diff| 0.0 over 21992 parameters).
+# Design 0 was already the one design where the continual arm's replay is inert -- at `start == 0`
+# both halves of its batch come from the current window -- so with initialisation matched too, the
+# first design is now a genuinely matched comparison across all four arms.
+
+detector: linear_d3n4
+
+regressor:
+  mlp-regressor:
+    features: [137, 137]
+    n_models: 4
+
+device: cuda
+plot_per_epoch: 8
+
+training:
+  n0: 4096
+  n_increment: 4096
+  batch: 128
+  eval_batch: 4096
+  warmup_epochs: 2
+  patience: 16
+  budget: 131072
+  iteration_limit: 65536
+  val_fraction: 0.25
+  loss_precision: 2.0e-2
+  param_mix: 0.25
+  optimizer:
+    adamaxw:
+      learning_rate: 2.5e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-3
+
+bo:
+  n_init: 5
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds: [-2.0, 1.0]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+    kernel:
+      normalised-invariant-rbf:
+        exchangeable: 4
+  ei:
+    n_restarts: 32
+    n_steps: 100
+
+verify:
+  n_points: 10
+  epochs: 200
+  val_every_epochs: 10
+  budget: null
+  batch: null

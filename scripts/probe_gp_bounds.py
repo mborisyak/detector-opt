@@ -23,6 +23,9 @@ distance of each hyperparameter to its prior bound in log units. Pinning is then
 asserted; the iteration-to-iteration jump in log-lengthscale is recorded beside it, because a fit
 that swings without ever touching a bound is unstable too.
 
+`resolution` fixes a design and varies only the event block, so its spread is the instrument's own
+Monte-Carlo scatter -- the bar any difference measured with it has to clear.
+
 The searched frame is the kernel's, not the cube's: `sorting-rbf` compares designs after sorting the
 exchangeable block, so every distance here is measured after the same sort.
 """
@@ -158,6 +161,37 @@ def run_scales(arguments):
   return payload
 
 
+def run_resolution(arguments):
+  """What the instrument can resolve: the objective's scatter at a FIXED design.
+
+  One design, many INDEPENDENT event blocks, so the spread is the read-out's own Monte-Carlo
+  scatter and nothing else -- the number every difference in this study has to beat."""
+  rng = np.random.default_rng(arguments.seed)
+  detector = build_detector(arguments.detector_config, arguments.n_experiments)
+  designs = rng.random((arguments.n_designs, detector.design_dim()))
+  rows = []
+  for design in designs:
+    values = []
+    for replicate in range(arguments.n_blocks):
+      index = np.arange(replicate * arguments.n_events, (replicate + 1) * arguments.n_events)
+      values.append(objective(detector, design, index))
+    values = np.asarray(values)
+    rows.append({
+      'design': design.tolist(),
+      'mean': float(values.mean()),
+      'std': float(values.std(ddof=1)),
+      'values': values.tolist(),
+    })
+  return {
+    'mode': 'resolution',
+    'n_experiments': int(detector.n_experiments),
+    'design_dim': int(detector.design_dim()),
+    'n_events': arguments.n_events,
+    'n_blocks': arguments.n_blocks,
+    'designs': rows,
+  }
+
+
 def run_fits(arguments):
   detector = build_detector(arguments.detector_config, arguments.n_experiments)
   d = detector.design_dim()
@@ -213,7 +247,7 @@ def run_fits(arguments):
 
 def main():
   parser = argparse.ArgumentParser()
-  parser.add_argument('--mode', choices=('scales', 'fits'), required=True)
+  parser.add_argument('--mode', choices=('scales', 'fits', 'resolution'), required=True)
   parser.add_argument('--detector-config', default='config/detector/mm_hk_m2.yaml')
   parser.add_argument('--n-experiments', type=int, default=None)
   parser.add_argument('--kernel', default='sorting-rbf')
@@ -239,7 +273,7 @@ def main():
   arguments = parser.parse_args()
 
   warnings.simplefilter('ignore')
-  payload = run_scales(arguments) if arguments.mode == 'scales' else run_fits(arguments)
+  payload = {'scales': run_scales, 'fits': run_fits, 'resolution': run_resolution}[arguments.mode](arguments)
   os.makedirs(os.path.dirname(arguments.output) or '.', exist_ok=True)
   with open(arguments.output, 'w') as handle:
     json.dump(payload, handle)

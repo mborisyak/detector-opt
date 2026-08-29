@@ -1,0 +1,26 @@
+universe       = vanilla
+executable     = campaign_cell.sh
+arguments      = ship_addr_prec1e2 $(seed) $(arm) $(reveal) /afs/cern.ch/work/m/maborisy/ship-addr-prec1e2/$(seed)/$(arm)
+output         = logs/addr1e2s678_$(seed)_$(arm).$(ClusterId).$(ProcId).out
+error          = logs/addr1e2s678_$(seed)_$(arm).$(ClusterId).$(ProcId).err
+log            = logs/addr1e2s678.$(ClusterId).log
+request_gpus   = 1
+request_cpus   = 2
+request_memory = 12000
+requirements   = TARGET.GPUs_GlobalMemoryMb >= 20000
++MaxRuntime    = 172800
++JobBatchName  = "ship-addr-prec1e2-s678"
+queue seed,arm,reveal from (
+  219094734, from_scratch, none
+  219094734, continue, none
+  219094734, closest, none
+  219094734, meta, design
+  1153299222, from_scratch, none
+  1153299222, continue, none
+  1153299222, closest, none
+  1153299222, meta, design
+  122012491, from_scratch, none
+  122012491, continue, none
+  122012491, closest, none
+  122012491, meta, design
+)

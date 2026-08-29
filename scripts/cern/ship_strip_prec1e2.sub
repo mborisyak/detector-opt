@@ -1,0 +1,26 @@
+universe       = vanilla
+executable     = campaign_cell.sh
+arguments      = ship_strip_prec1e2 $(seed) $(arm) $(reveal) /afs/cern.ch/work/m/maborisy/ship-strip-prec1e2/$(seed)/$(arm)
+output         = logs/strip1e2_$(seed)_$(arm).$(ClusterId).$(ProcId).out
+error          = logs/strip1e2_$(seed)_$(arm).$(ClusterId).$(ProcId).err
+log            = logs/strip1e2_$(seed).$(ClusterId).log
+request_gpus   = 1
+request_cpus   = 1
+request_memory = 16000
+requirements   = TARGET.GPUs_GlobalMemoryMb >= 20000 && (TARGET.GPUs_Capability =?= undefined || TARGET.GPUs_Capability >= 8.0)
++MaxRuntime    = 72000
++JobBatchName  = "ship-strip-prec1e2"
+queue seed,arm,reveal from (
+  1244111331, from_scratch, none
+  1244111331, continue, none
+  1244111331, closest, none
+  1244111331, meta, design
+  126382657, from_scratch, none
+  126382657, continue, none
+  126382657, closest, none
+  126382657, meta, design
+  750143450, from_scratch, none
+  750143450, continue, none
+  750143450, closest, none
+  750143450, meta, design
+)

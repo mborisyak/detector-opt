@@ -36,6 +36,7 @@ import jax.numpy as jnp
 from flax import nnx
 
 from .common import Model, Shape
+from .set_regressor import make_activation
 
 __all__ = ['PlainConvRegressor', 'PlainConvUnit', 'PlainConvStage']
 
@@ -44,8 +45,9 @@ class PlainConvUnit(nnx.Module):
   """One plain unit ``h -> Conv(celu(Dropout(h)))``. Resolution and width are unchanged (``SAME``
   padding, unit stride)."""
 
-  def __init__(self, channels: int, kernel_size: int, p_dropout: float | None, *, rngs: nnx.Rngs):
+  def __init__(self, channels: int, kernel_size: int, p_dropout: float | None, activation: str = 'celu', *, rngs: nnx.Rngs):
     self.channels = int(channels)
+    self.activation = make_activation(activation, None, self.channels)
     kernel = (int(kernel_size), int(kernel_size))
     self.conv = nnx.Conv(self.channels, self.channels, kernel_size=kernel, padding='SAME', rngs=rngs)
     has_dropout = p_dropout is not None and p_dropout > 0
@@ -54,7 +56,7 @@ class PlainConvUnit(nnx.Module):
   def __call__(self, h, *, deterministic: bool = True, rngs=None):
     if self.dropout is not None:
       h = self.dropout(h, deterministic=deterministic, rngs=rngs)
-    return self.conv(jax.nn.celu(h))
+    return self.conv(self.activation(h))
 
 
 class PlainConvStage(nnx.Module):
@@ -64,12 +66,13 @@ class PlainConvStage(nnx.Module):
 
   def __init__(
     self, channels: int, out_channels: int | None, blocks: int, kernel_size: int, p_dropout: float | None,
-    *, rngs: nnx.Rngs
+    activation: str = 'celu', *, rngs: nnx.Rngs
   ):
     if blocks < 1:
       raise ValueError(f'blocks must be at least 1, got {blocks}')
     kernel = (int(kernel_size), int(kernel_size))
-    self.units = nnx.List([PlainConvUnit(channels, kernel_size, p_dropout, rngs=rngs) for _ in range(int(blocks))])
+    self.units = nnx.List([PlainConvUnit(channels, kernel_size, p_dropout, activation, rngs=rngs) for _ in range(int(blocks))])
+    self.down_activation = make_activation(activation, None, int(channels))
     down = out_channels is not None
     self.downsample = nnx.data(
       nnx.Conv(int(channels), int(out_channels), kernel_size=kernel, strides=(2, 2), padding='SAME', rngs=rngs)
@@ -79,7 +82,7 @@ class PlainConvStage(nnx.Module):
     for unit in self.units:
       h = unit(h, deterministic=deterministic, rngs=rngs)
     if self.downsample is not None:
-      h = self.downsample(jax.nn.celu(h))
+      h = self.downsample(self.down_activation(h))
     return h
 
 
@@ -94,11 +97,14 @@ class PlainConvRegressor(Model):
   kernel_size : side of every square kernel.
   p_dropout : dropout before each unit's convolution, live from the first step (see the module
       docstring).
+  activation : ``celu`` (parameter-free) or ``leaky-tanh`` (two LEARNED gains per feature, per site),
+      resolved through ``set_regressor.make_activation`` so the CNN and the set regressor name the
+      same activations. Every site owns its own module, since the gains are per-feature.
   """
 
   def __init__(
     self, input_shape: Shape, target_shape: Shape, ground_truth_shape: Shape, channels: Sequence[int] = (16, 32, 64),
-    blocks: int = 2, kernel_size: int = 3, p_dropout: float | None = None, *, rngs: nnx.Rngs
+    blocks: int = 2, kernel_size: int = 3, p_dropout: float | None = None, activation: str = 'celu', *, rngs: nnx.Rngs
   ):
     if len(input_shape) != 3:
       raise ValueError(f'expected a channels-last image shape (rows, columns, channels), got {tuple(input_shape)}')
@@ -113,9 +119,11 @@ class PlainConvRegressor(Model):
     )
     self.stages = nnx.List([
       PlainConvStage(
-        widths[i], widths[i + 1] if i + 1 < len(widths) else None, int(blocks), int(kernel_size), p_dropout, rngs=rngs
+        widths[i], widths[i + 1] if i + 1 < len(widths) else None, int(blocks), int(kernel_size), p_dropout, activation,
+        rngs=rngs
       ) for i in range(len(widths))
     ])
+    self.head_activation = make_activation(activation, None, widths[-1])
     self.output = nnx.Linear(widths[-1], self.target_dim, rngs=rngs)
 
   def ensemble(self) -> int | None:
@@ -128,4 +136,4 @@ class PlainConvRegressor(Model):
     h = self.stem(features)
     for stage in self.stages:
       h = stage(h, deterministic=deterministic, rngs=rngs)
-    return self.output(jnp.mean(jax.nn.celu(h), axis=(-3, -2)))
+    return self.output(jnp.mean(self.head_activation(h), axis=(-3, -2)))

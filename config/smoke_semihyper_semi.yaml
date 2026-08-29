@@ -1,0 +1,59 @@
+# TEMPORARY smoke config for scripts/probe_semi_hyper.py -- a few hundred events per design on the
+# CPU so the plumbing (config check, gearup binding, trainer construction, both arms) is exercised
+# without a GPU shard. NOT a measurement: the window, the precision bar and the patience are all far
+# below anything the campaign uses.
+detector: emnist_digits
+
+regressor:
+  semi-hyper-conv-regressor:
+    channels: [16, 24, 32]
+    blocks: 2
+    kernel_size: 3
+    p_dropout: null
+    embedding_channels: 8
+    embedding_features: 32
+
+device: cpu
+plot_per_epoch: 0
+
+training:
+  n0: 512
+  n_increment: 256
+  batch: 64
+  eval_batch: 512
+  warmup_epochs: 1
+  patience: 2
+  budget: 8192
+  iteration_limit: 2048
+  val_fraction: 0.25
+  loss_precision: 5.0e-1
+  param_mix: 0.25
+  optimizer:
+    adamaxw:
+      learning_rate: 5.0e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-3
+
+bo:
+  n_init: 5
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds: [-2.0, 1.0]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+    kernel:
+      independent-sorting-rbf:
+        exchangeable: 2
+  ei:
+    n_restarts: 32
+    n_steps: 100
+
+verify:
+  n_points: 10
+  epochs: 200
+  val_every_epochs: 10
+  budget: null
+  batch: null

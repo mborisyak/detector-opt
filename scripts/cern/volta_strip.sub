@@ -1,0 +1,12 @@
+universe       = vanilla
+executable     = volta_strip_cell.sh
+output         = logs/voltastrip.$(ClusterId).out
+error          = logs/voltastrip.$(ClusterId).err
+log            = logs/voltastrip.$(ClusterId).log
+request_gpus   = 1
+request_cpus   = 2
+request_memory = 12000
+requirements   = TARGET.GPUs_GlobalMemoryMb >= 20000 && TARGET.GPUs_Capability >= 7.0 && TARGET.GPUs_Capability < 8.0
++MaxRuntime    = 3600
++JobBatchName  = "volta-strip-test"
+queue 1

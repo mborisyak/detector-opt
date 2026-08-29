@@ -1,0 +1,23 @@
+universe       = vanilla
+executable     = head2_cell.sh
+arguments      = $(seed) $(pair) $(repr) $(reveal) /afs/cern.ch/work/m/maborisy/ship-headonly/$(repr)-$(reveal)/$(seed)/pair$(pair)
+output         = logs/head2_$(seed)_$(pair).$(ClusterId).$(ProcId).out
+error          = logs/head2_$(seed)_$(pair).$(ClusterId).$(ProcId).err
+log            = logs/head2.$(ClusterId).log
+request_gpus   = 1
+request_cpus   = 2
+request_memory = 12000
+requirements   = TARGET.GPUs_GlobalMemoryMb >= 20000 && TARGET.GPUs_Capability >= 8.0
++MaxRuntime    = 72000
++JobBatchName  = "ship-headonly"
+queue seed,pair,repr,reveal from (
+  1244111331, 9, address, none
+  1244111331, 9, strip, none
+  1244111331, 9, layerset, none
+  126382657, 10, address, none
+  126382657, 10, strip, none
+  126382657, 10, layerset, none
+  330924253, 11, address, none
+  330924253, 11, strip, none
+  330924253, 11, layerset, none
+)

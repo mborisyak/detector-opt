@@ -31,7 +31,7 @@ import jax.numpy as jnp
 
 from .common import design_init_sequence
 from .design import _DesignBase
-from .replay import carried_network_state, load_carried_network_state, persistent_network
+from .replay import carried_network_state, load_carried_network_state, persistent_network, replay_carried_network
 
 __all__ = ["ContinualRatioTrainer"]
 
@@ -43,6 +43,19 @@ class ContinualRatioTrainer(_DesignBase):
   the same growth procedure, the same persistent network with the optimiser restarted at every design
   boundary, and the same exact-resume payload.
   """
+
+  def spent_calls(self):
+    """Reserves nothing, so the pools' fill IS the spend."""
+
+    return self.train_pool.current + self.val_pool.current
+
+  def _round_extra(self, n_train):
+    """Trains on the proposed designs alone, so a round costs exactly what it asked for."""
+
+  def default_reveal(self):
+    """A continual strategy: the batch mixes the current design with replay at
+    ``current_replay_ratio``, so the design is what tells those rows apart."""
+    return 'design'
 
   def __init__(self, *args, replay_weight: float = 1.0, current_replay_ratio: float = 1.0, **kwargs):
     self.replay_weight = float(replay_weight)
@@ -104,3 +117,6 @@ class ContinualRatioTrainer(_DesignBase):
 
   def _load_carried_state(self, data):
     self._running = load_carried_network_state(self._running, data, self.device)
+
+  def _replay_carried_state(self, rows):
+    self._running = replay_carried_network(self, rows)

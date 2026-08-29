@@ -13,9 +13,10 @@ detector: enzyme
 regressor:
   # The meta-regressor: a deep set over the batch of experiments -> optimal temperature. One set
   # ELEMENT per experiment, its features being that experiment's 8 measurements followed by its own
-  # two design values (combine_scaled), so the network is design-conditioned and reads each readout
-  # together with the condition that produced it. Aggregating over the element axis makes the
-  # inference permutation-invariant in the experiments, which is exactly the symmetry of the problem:
+  # two design values (combine_scaled). Those columns reach the network only in the arms that REVEAL
+  # the design (`Trainer.reveals_design`), which then read each readout together with the condition
+  # that produced it; a per-design arm gets the readouts alone. Aggregating over the element axis
+  # makes the inference permutation-invariant in the experiments -- exactly the symmetry of the problem:
   # T* is a property of the enzyme and the batch is an unordered set of (condition, readout) pairs.
   # Each block is [hidden..., out]; the next block sees 2 * out (own value + aggregated batch).
   # `mlp-regressor: {features: [128, 128], ...}` is the order-dependent flat-MLP ablation.
@@ -30,6 +31,7 @@ plot_per_epoch: 8
 training:
   n0: 2048
   n_increment: 1024
+  param_mix: 0.25
   batch: 256
   # Gradient-free evaluation batch for the sequential train+val loss passes.
   eval_batch: 2048

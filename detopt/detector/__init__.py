@@ -14,15 +14,18 @@ from .enzyme_depletion_bi import EnzymeDepletionBiDetector
 from .growth import GrowthDetector
 from .linear import LinearDetector
 from .mnist import MNISTDetector
-from .erasure import ErasureDetector
-from .pixel_density import PixelDensityDetector
 from .straw import StrawDetector  # abstract base (no design scheme)
 from .free_straw import FreeStrawDetector, free_design_array
 from .stereo_straw import StereoStrawDetector
 from .stereo_tracking import Stereo4Feature, StereoTrackerTruth
+from .stereo_tracking_layerset import StereoLayerSet
 from .stereo_tracking_layerwise import StereoLayerWise
 from .stereo_tracking_image import StereoImage
+from .stereo_tracking_strip import StereoStrip
 from .stereo_tracking_hits import StereoHits
+from .stereo_tracking_address_design import StereoAddressDesign
+from .stereo_intersection import StereoIntersectionPenalty
+from .stereo_angle_only import StereoAngleOnly
 
 __detectors__: dict[str, type[Detector]] = {
     # GEOMETRY bases (StrawDetector / StereoStrawDetector) are abstract-combine and NOT registered as
@@ -61,24 +64,39 @@ __detectors__: dict[str, type[Detector]] = {
     # WINDOW, the design being where that window sits and how big it is. A dense image task -- the
     # only one here whose combine emits a 2-D image with a channel axis rather than a set of
     # elements -- and the one that prices its design (`design_penalty` charges the visible area).
+    # The aperture IS the measurement, so `combine` still applies it under `reveal_design=False` (the
+    # window CHANNEL goes, 2 -> 1) and REFUSES `design=None` outright.
     "mnist": MNISTDetector,
-    # The same digits and the same ln(10) price, but the design is HOW MUCH OF THE FRAME SURVIVES:
-    # one keep probability, each pixel independently erased to 0. An erased pixel and a background
-    # pixel are indistinguishable, so the design costs a random share of the ink with no way to tell
-    # which share -- a subsampling problem, not a signal-to-noise one.
-    "erasure": ErasureDetector,
-    # The same digits again, but the frame is a CONTINUOUS field (a bicubic interpolant) read out on
-    # an n_grid x n_grid grid whose point DENSITY is the design: x_i = Phi(sigma_x * z_i) over fixed
-    # normal quantiles z, so sigma = 1 is the uniform grid, below it the points crowd the centre and
-    # above it the borders. The sample budget is fixed by the grid, so the trade-off is intrinsic and
-    # `design_penalty` returns None -- the only image task here that prices nothing.
-    "pixel_density": PixelDensityDetector,
+    # The straw family. Every shape below is the DESIGN-REVEALED one, and each combine has a narrower
+    # design-free form that drops exactly the design: the 4-feature combines fall back to the 5-feature
+    # address `[TDC, station, view, layer, straw]` (`straw.address_combine`), `stereo_hits` goes 7 -> 5
+    # features, the layer-wise rows 5 + n_straws -> 3 + n_straws and the image 6 -> 4 channels, the last
+    # three all losing station_z and the stereo angle. A straw measurement does not depend on the
+    # design, so `design=None` is honoured throughout rather than refused.
     "straw": FreeStrawDetector,  # free per-layer geometry + 4-feature combine
     "stereo_tracking": Stereo4Feature,  # stereo geometry + 4-feature combine (the default stereo detector)
     "stereo_tracker_truth": StereoTrackerTruth,  # + per-hit (x,y)/drift_r/tdc TRUTH for tracker experiments
     "stereo_layerwise": StereoLayerWise,  # set element = layer (TDC grid per layer)
     "stereo_image": StereoImage,  # (n_layers, n_straws, 6) image for the CNN regressor
+    # 1-D image along the STRAW axis with the LAYERS as channels: (n_straws, n_layers [+ D]).
+    # Same TDC grid as `stereo_image`, transposed and with the per-layer geometry channels
+    # gone -- they cannot exist when the layers are the channels. For a depthwise-separable
+    # 1-D stack; the design, when revealed, is D whole-image constants.
+    "stereo_layer_set": StereoLayerSet,  # set element = layer, identified one-hot (blind) or by (z, angle)
+    "stereo_strip": StereoStrip,
+    # The design as trailing COLUMNS beside the raw hit address, so withholding is a clean column
+    # drop and the measurement representation does not change with it.
+    "stereo_address_design": StereoAddressDesign,
     "stereo_hits": StereoHits,  # per-hit (M, 7) features for the continuous-conv regressor
+    # Same 4-feature combine as `stereo_tracking`, with the STATION PLACEMENT re-parametrized. The
+    # sequential coupled window is replaced by one FIXED window per side of the magnet, so stations
+    # may reorder and overlap; an overlap is then PRICED by `design_penalty` (overlap_weight times
+    # the total pairwise footprint intersection, in cm) rather than forbidden by the encoding.
+    "intersection_penalty": StereoIntersectionPenalty,
+    # The 4-feature combine at a FIXED station placement, leaving the stereo angle as the only dof
+    # and letting it take either sign. `fixed_stations` is required from the config -- it is
+    # geometry here, not a design.
+    "angle_only": StereoAngleOnly,
     "ship_relay_4feat": Stereo4Feature,  # replay FairShip digi hits (engine: relay): 4-feature combine
     "ship_relay_layerwise": StereoLayerWise,  # replay FairShip digi hits (engine: relay): layer-wise combine
 }

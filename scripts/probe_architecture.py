@@ -8,11 +8,22 @@
 
 THE PROBLEM. `detopt/nn/trainer/design.py` stops a design when `diff + err < loss_precision`, where
 `err` is the loss estimate's standard error (falls like `1/sqrt(window)`, so data always fixes it) and
-`diff = |train - val|` is an OVERFITTING BIAS that does not fall with data. Measured on the campaign's
+`diff = |train - val|` is the finite-sample overfitting gap, and it falls with data too -- both
+splits are IID from one stream and the network is fixed-capacity, so both empirical risks converge
+to the same population risk. What bites is the PRE-ASYMPTOTIC regime at an affordable window. Measured there, on the campaign's
 own worst design, `diff` alone is 0.0055 with the shipped set regressor, which is why `loss_precision`
 had to be raised to 8.0e-3 -- and that puts criterion (d)'s bar (`10 x loss_precision`) at 0.080
 against a baseline-to-best span of ~0.24. The benchmark's resolution is then set by the REGRESSOR's
 overfitting, not by the search.
+
+⚠️ NOT MONOTONE, and the sign is design-dependent. Uniform convergence gives `diff -> 0`
+ASYMPTOTICALLY; it says nothing about the path. At small `n` an underfitting network holds train
+and val both high and close, so `diff` is small; as `n` grows and the network starts to fit, train
+falls faster than val and `diff` RISES; only later does val catch up and `diff` fall. Measured on
+SHiP: median slope `dlog(diff)/dlog(window) = -1.38` over 9 designs, but `+0.428` on one design
+that was still rising at window 262,144 (`err` on that same design fell at -0.495, matching
+`n^-1/2` to three digits, so the measurement is sound and it is `diff` alone that is unruly).
+Do NOT assume a sign for the affordable range.
 
 WHAT THIS PROBE MUST SEPARATE, stated before running it. A `diff` floor of ~0.005 (the shipped
 architecture, which cannot converge at a tighter precision) from a floor of ~0.001-0.0015 (which
@@ -244,7 +255,6 @@ ARCHITECTURES = {
   },
 }
 
-
 def load_run_config(name):
   with open(f"config/{name}.yaml") as f:
     config = yaml.safe_load(f)
@@ -256,7 +266,6 @@ def load_run_config(name):
       detector_config = yaml.safe_load(f)
   return config, detector_config
 
-
 def count_parameters(detector, regressor_config):
   from flax import nnx
 
@@ -265,7 +274,6 @@ def count_parameters(detector, regressor_config):
   model = regressor_from_config(detector, config=regressor_config, rngs=nnx.Rngs(0))
   _, params, _ = nnx.split(model, nnx.Param, nnx.Variable)
   return int(sum(int(np.asarray(leaf).size) for leaf in jax.tree.leaves(params)))
-
 
 def main():
   parser = argparse.ArgumentParser()
@@ -379,7 +387,6 @@ def main():
   print(f"\nwrote {arguments.output} ({len(rows)} rows) and per-epoch histories to {history_dir}/", flush=True)
   print("READ IT AS: a row that CONVERGED permits this loss_precision at that spend; a row that hit the")
   print("cap does not, and its diff+err is the tightest precision that architecture could ever permit.")
-
 
 if __name__ == "__main__":
   main()

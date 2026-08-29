@@ -71,7 +71,7 @@ def test_specs():
   assert detector.ground_truth_dim() == len(PARAMETER_NAMES) + 1  # + half_time
   assert detector.design_dim() == 2 * n
   assert detector.combined_event_shape() == (n, m + 2)
-  assert detector.combined_feature_dim == m + 2
+  assert detector.combined_feature_dim() == m + 2
   assert detector.size() is None  # analytic source
 
 

@@ -76,7 +76,7 @@ def test_set_regressor_factory_from_detector(seed):
     )
     assert isinstance(reg, detopt.nn.SetRegressor)
 
-    B, M, F = 3, detector.max_hits_per_event, detector.combined_feature_dim
+    B, M, F = 3, detector.max_hits_per_event, detector.combined_feature_dim()
     features = jnp.zeros((B, M, F), dtype=jnp.float32)
     mask = jnp.ones((B, M), dtype=jnp.int32)
     pred = reg(features, mask, deterministic=True)

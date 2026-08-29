@@ -1,0 +1,185 @@
+# PROBE VARIANT of `config/bo_rw025.yaml`: `training.loss_precision` 5.0e-3 instead of 2.0e-2,
+# FOUR TIMES TIGHTER. Exactly one key differs. Used only by `scripts/probe_batch_mix.py` to score
+# mid-trajectory designs of an existing rw=0.25 run; the replay follows the run's RECORDED spend,
+# so the tighter bar reaches only the measured design and cannot alter the state it is measured
+# from. A design whose gap has not fallen under the bar when the window cap is reached is
+# reported CAPPED, which is the uncensored reading the 2.0e-2 runs cannot give.
+# ⚠️ VARIANT of `config/bo.yaml`: `training.replay_weight` 0.25 (default 1.0). SHiP `stereo_tracking`.
+# EVERYTHING ELSE IS IDENTICAL, so a `meta` cell here pairs directly against the corresponding cell
+# run from `config/bo.yaml` at the same seed, and the difference is attributable to this one value.
+#
+# `replay_weight` ONLY AFFECTS `meta` (`ContinualTrainer`); the other three arms never see it, which
+# is why only the `meta` arm is run from this config.
+#
+# WHY. The continual batch is half current-design rows and half replay rows, but the quantity driven
+# below `loss_precision` -- and handed to BO -- is evaluated on the CURRENT design's window alone. At
+# `replay_weight = 1.0` half of every gradient is therefore spent on rows contributing to no measured
+# quantity: a fixed 2x dilution of the current design's signal from the second design onward. The
+# trainer's own header records +0.0184 / +0.0214 / +0.0326 of reported loss above a fresh network on
+# the same design's data on another task, a BIAS rather than a data shortage.
+#
+# ⚠️ 0.25 is the existing precedent from `config/linear_meta_d2n3_n8192_rw025.yaml`, NOT a tuned
+# value, so this is a probe point and not a nomination.
+
+# Extended-budget BO run on the stereo straw detector over the FairShip ship2numpy
+# events, warm-starting each design's network from the nearest previously trained one.
+#
+# layer_bounds[0] IS TIED TO THE DATA. The ship2numpy pool injects every particle at
+# boundary_z = 8312.0 cm moving forward and the solver never propagates backward, so a station
+# placed upstream of that plane records nothing. Station 0's centre range starts at
+# layer_bounds[0] + station_width/2 and its layers span the centre +- 8.366 cm, which makes
+# 8312.0 + 8.366 - 50 = 8270.37 the lowest bound whose whole footprint is downstream of the
+# injection plane; 8275.0 takes that with 4.6 cm of margin. At the previous 8200.0 the lowest
+# 12.9% of the first design coordinate produced a blind station 0 (95 hits against 5507 at the
+# nominal design) -- a dead plateau the GP had to spend observations mapping. Revisit this bound
+# if data_dir changes: boundary_z is read from the event files, not from this config.
+# `loss_precision` is 2.0e-2; 1.0e-2 was rejected as too costly per design. If the bar is revisited,
+# derive the cost per design from `time_s` in a completed `results.json`.
+
+# n_models: null -- ONE network, not a 4-member ensemble, and this OVERRIDES a settled default.
+# `null` is not merely "ensemble of size 1": it takes the non-ensembled path, so kernels are
+# (in, out) rather than (1, in, out) and the eval calls the MODEL's own `loss`. For `set-regressor`
+# that is numerically the same thing -- it does not override `Model.loss`, which is just
+# `loss_fn(self(features, mask), target)` -- but it would NOT be equivalent for `masked-set`,
+# `predictive` or `hierarchical`, which do override it.
+#
+# WHY: MEASURED, `scripts/probe_epoch_cost.py` on this exact config at fixed steps per epoch --
+# n_models 1 costs 0.815 s/epoch (0.80 ms/step, eval 0.234 s) against n_models 4 at 3.448 s/epoch
+# (3.37 ms/step, eval 0.899 s). That is 4.23x for 4x the members: the loop is ARITHMETIC-bound in the
+# capacity dimension, so dropping the ensemble is a ~4x cut to per-epoch cost, by far the largest
+# lever measured on this task. The detector is not a lever at all (14000 events/s, 0.2% of wall).
+#
+# WHAT IT COSTS: the ensemble was a settled default and its averaging is what damped the reported
+# loss's variance. Expect a NOISIER per-design estimate, which the criterion sees through `err` and
+# pays for by buying a larger window -- so the 4x is an upper bound on the real speedup, not a
+# guarantee. If windows grow sharply against the previous leg, that is the ensemble's variance
+# reduction being bought back as data.
+
+detector:
+  stereo_tracking:
+    n_stations_upstream: 2    # stations upstream of the magnet (z < z0)
+    n_stations_downstream: 2  # stations downstream of the magnet (z > z0)
+    n_layers_per_view: 2
+    n_straws_per_layer: 316  # FairShip SST V2023 straws per layer (digi_straw index 1..316); 2 cm pitch -> |y| <= 316 cm
+    straw_length: 400.0
+    straw_pitch: 2.0
+    layer_z_gap: 1.732
+    view_z_gap: 5.0
+    magnet_half_cm: 140.0  # exclude the spectrometer magnet (FairShip YokeDepth 1.4 m) from station bounds
+    field_integral: -1.071 # T.m, int Bx dz (FairShip MainSpectrometerField, negative polarity; -0.151 T peak derived w/ B_sigma=283)
+    z0: 8957.0             # magnet centre (FairShip c.z = 89.57 m, map z_local=0)
+    B_sigma: 283.0         # cm; proper-Gaussian std-dev matched to MainSpectrometerField on-axis Bx(z) (int Bx dz ~ -1.07 T.m)
+    layer_bounds: [8275.0, 9750.0]
+    max_particles: 1024    # DEBUG-only now (trajectory/tree slots); does not gate hits or input
+    max_hits_per_event: 128  # NN-facing per-event hit cap (solver emits the M earliest-TDC straws)
+    max_dt: 1.0
+    max_time: 300.0
+    material: kapton
+    data_dir: "data/mc/numpy_newFS"  # ~4.31M events across 996 files (verified 2026-08-18); boundary crossings are upstream of the magnet (magnet-independent)
+
+# Nominal (initial/baseline) design -- NOT detector state. A named physical-design dict the
+# detector scales via to_scaled (BO itself seeds from random proposals).
+nominal_design:
+  stations: [8407.0, 8607.0, 9307.0, 9507.0]
+  view_angle: 0.0798
+
+regressor:
+  set-regressor:
+    features: [[16, 24], [24, 16]]
+    n_models: null
+    p_dropout: null
+    activation: celu
+
+device: cuda
+plot_per_epoch: 8
+
+### target 10+ steps
+training:
+  n0: 2048
+  n_increment: 1024
+  batch: 256
+  # Gradient-free evaluation batch for the sequential train+val loss passes
+  # (no backprop, so it can exceed the training batch).
+  eval_batch: 2048
+  # Mandatory unconditional epochs after every data addition.
+  warmup_epochs: 4               # A SAFEGUARD, not a tuning knob: it only stops the procedure
+                                # acting before there is anything to act on. Small on purpose --
+                                # the settled-test is a POSTERIOR, so an unsettled early curve
+                                # already fails it through its own width. 2-4.
+  # Extended shared detector-call budget for the whole BO run.
+  budget: 1048576
+  # Per-design upper limit on data (also sets epoch = iteration_limit / batch).
+  iteration_limit: 262144
+
+  val_fraction: 0.25
+  # Convergence: per-epoch-slope flatness tol, target loss precision, plateau window.
+  loss_precision: 5.0e-3
+  patience: 32                  # The horizon over which the loss must be STILL. Requiring N
+                                # epochs of stillness IS how the procedure waits for the
+                                # regressor's BIAS to disappear, so it must be long enough that
+                                # "still" means "the bias has finished moving" and not merely
+                                # "the noise was quiet". 16-32, scaling with `iteration_limit`,
+                                # which sets how much optimisation one epoch contains.
+  replay_weight: 0.25
+  param_mix: 0.1
+  optimizer:
+    adamaxw:
+      learning_rate: 2.0e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-3
+# Independent trajectory verification (scripts/verify_trajectory.py): re-score <= n_points designs
+# of a finished run's results.json (uniform in cumulative detector calls, always the last) on a
+# 6:2:2 train/val/test split; best-val network scored once on the held-out test buffer.
+verify:
+  n_points: 1
+  epochs: 64
+  val_every_epochs: 1
+  eval_batch: 1024
+  sample_batch: 1024
+
+bo:
+  # No fixed iteration count -- the run continues until the shared detector-call
+  # `budget` is exhausted. Initial random proposals = gp.n_folds (set in bo.py).
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    # Lengthscales are read against the UNIT cube, so l = 1 already spans the whole
+    # domain. The old ceiling of 1.5 (l = 4.5) was calibrated when the searched box
+    # was the encoded [-3, 3]^d; on the scaled cube it pins uninformative dimensions
+    # at the bound instead of letting ARD switch them OFF (which needs l >> 1).
+    # 4.0 gives l = 54.6 -- effectively inert -- while the floor still forbids a
+    # degenerate white-noise fit. Matches config/enzyme.yaml.
+    log_lengthscale_prior_bounds: [-6.0, 4.0]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+    # Ordinary per-coordinate ARD: this design has NO exchangeable element. A layer's wire stagger
+    # is keyed to its index parity, so permuting layers is a different detector; and the stereo
+    # stations are already ordered by their coupled sequential window, so the relabelling symmetry
+    # is removed by the parameterisation rather than left for the kernel.
+    #
+    # AN INVARIANT KERNEL IS NOT AN OPTION HERE, and the reason is worth writing down because
+    # `config/enzyme.yaml` selects one and the two designs look superficially alike. Both invariant
+    # families (sorting, group average) would have to act on the SCALED coordinates the GP sees, and
+    # `_to_nominal_flat` (stereo_straw.py:263) makes those conditional: u_k is the fraction of the
+    # window REMAINING after station k-1, with the window reset at the magnet, so u_1 and u_2 are not
+    # commensurable quantities and slots 0-1 live upstream of the magnet while 2-3 live downstream.
+    # Measured on 2000 uniform draws at this config: the nominal stations come out strictly
+    # increasing in EVERY draw (slot ranges [8250, 8667], [8374, 8767], [9147, 9600], [9259, 9700]),
+    # and sorting the u's moves the physical design by a median 175 cm, max 437 cm, leaving it
+    # unchanged in 64/2000. So sorting is the IDENTITY in the space where it would mean something
+    # (the nominal z's, already ordered) and asserts a false equality in the space it would act on.
+    # A genuine set symmetry here needs the map to change first -- independent per-station z on a
+    # global range, ordering left to the solver, as `free_straw` does with its 32 `layer_z` (the C
+    # solver sorts layers by z before propagating, straw_detector.c:589, so a 32! redundancy IS
+    # unmodelled there and an invariant kernel would have something real to quotient).
+    kernel:
+      ard-rbf: {}
+
+  ei:
+    n_restarts: 32
+    n_steps: 100
+
+# Warm-start each network from the nearest previously trained design.
+nn_init_strategy: closest

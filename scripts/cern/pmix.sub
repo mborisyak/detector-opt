@@ -1,0 +1,23 @@
+universe       = vanilla
+executable     = pmix_cell.sh
+arguments      = $(seed) $(design) $(pmix) $(trial) /afs/cern.ch/work/m/maborisy/ship-pmix/mix$(pmix)/trial$(trial)
+output         = logs/pmix_$(pmix)_$(trial).$(ClusterId).$(ProcId).out
+error          = logs/pmix_$(pmix)_$(trial).$(ClusterId).$(ProcId).err
+log            = logs/pmix.$(ClusterId).log
+request_gpus   = 1
+request_cpus   = 2
+request_memory = 12000
+requirements   = TARGET.GPUs_GlobalMemoryMb >= 20000 && TARGET.GPUs_Capability >= 8.0
++MaxRuntime    = 72000
++JobBatchName  = "ship-param-mix"
+queue seed,design,pmix,trial from (
+  1244111331, 4, 0.0, 0
+  1244111331, 4, 0.0, 1
+  1244111331, 4, 0.0, 2
+  1244111331, 4, 0.1, 0
+  1244111331, 4, 0.1, 1
+  1244111331, 4, 0.1, 2
+  1244111331, 4, 0.25, 0
+  1244111331, 4, 0.25, 1
+  1244111331, 4, 0.25, 2
+)

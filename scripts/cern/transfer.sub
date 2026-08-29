@@ -1,0 +1,39 @@
+universe       = vanilla
+executable     = transfer_cell.sh
+arguments      = $(seed) $(first) $(last) /afs/cern.ch/work/m/maborisy/ship-transfer/$(seed)/i$(first)-$(last)
+output         = logs/transfer_$(seed)_$(first).$(ClusterId).$(ProcId).out
+error          = logs/transfer_$(seed)_$(first).$(ClusterId).$(ProcId).err
+log            = logs/transfer.$(ClusterId).log
+request_gpus   = 1
+request_cpus   = 2
+request_memory = 12000
+requirements   = TARGET.GPUs_GlobalMemoryMb >= 20000
++MaxRuntime    = 21600
++JobBatchName  = "ship-continue-transfer"
+queue seed,first,last from (
+  1244111331, 0, 2
+  1244111331, 3, 5
+  1244111331, 6, 9
+  1244111331, 10, 12
+  1244111331, 13, 15
+  126382657, 0, 2
+  126382657, 3, 6
+  126382657, 7, 9
+  126382657, 10, 13
+  126382657, 14, 16
+  330924253, 0, 3
+  330924253, 4, 7
+  330924253, 8, 11
+  330924253, 12, 15
+  330924253, 16, 19
+  750143450, 0, 2
+  750143450, 3, 6
+  750143450, 7, 9
+  750143450, 10, 13
+  750143450, 14, 16
+  9577242, 0, 2
+  9577242, 3, 5
+  9577242, 6, 8
+  9577242, 9, 11
+  9577242, 12, 14
+)

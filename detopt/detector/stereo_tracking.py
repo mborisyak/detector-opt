@@ -5,25 +5,34 @@ A combine LEAF: stereo geometry (``StereoStrawDetector``) + the unified daughter
 with ``FreeStrawDetector`` through the module function :func:`four_feature_combine`. Its siblings under
 ``StereoStrawDetector`` (``StereoLayerWise`` / ``Image`` / ``Hits``) only differ in the combine.
 
+WITH THE DESIGN WITHHELD it emits the 5-feature ADDRESS instead, ``[TDC, station, view, layer, straw]``
+(:func:`straw.address_combine`): ``norm z`` and the wire endpoints ARE the design resolved per hit, so
+with it gone there is no z and no wire position to report -- only which straw fired and when. A straw
+measurement does not depend on the design, so ``design=None`` is honoured here and behaves exactly like
+``reveal_design=False``.
+
 ``StereoTrackerTruth`` extends it with per-hit TRUTH measurements for tracker experiments.
 """
 
 import numpy as np
 
 from .stereo_straw import StereoStrawDetector
-from .straw import StrawEvent, DaughterTarget, four_feature_combine, four_feature_shape
+from .straw import StrawEvent, DaughterTarget, four_feature_combine, four_feature_shape, address_combine, address_shape
 
 __all__ = ["Stereo4Feature", "DaughterTarget", "StereoTrackerTruth"]
 
 
 class Stereo4Feature(StereoStrawDetector):
-    """Stereo geometry + the 4-feature per-hit combine (the default stereo detector)."""
+    """Stereo geometry + the 4-feature per-hit combine (the default stereo detector), falling back to
+    the 5-feature address combine when the design is withheld."""
 
-    def combine_scaled(self, event, design_scaled, mask=None):
+    def combine_scaled(self, event, design_scaled=None, mask=None, reveal_design: bool = True):
+        if design_scaled is None or not reveal_design:
+            return address_combine(self, event, mask=mask)
         return four_feature_combine(self, event, design_scaled, mask=mask)
 
-    def combined_event_shape(self):
-        return four_feature_shape(self)
+    def combined_event_shape(self, design: bool = True):
+        return four_feature_shape(self) if design else address_shape(self)
 
     def element_mask(self, event, mask):
         return mask  # element == hit (padded hits are gated by the regressor's hit mask)

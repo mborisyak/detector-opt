@@ -1,0 +1,21 @@
+# The `linear` detector at 1 dimension with 2 probes, sigma 0.5 -- the SMALLEST cell of the family,
+# 2 design coordinates. `n_probes = n_dimensions + 1`, the structural rule this family follows, so no
+# design is rank deficient and the structural floor is 0.0.
+#
+# MEASURED in docs/linear-highdim.md, closed form over 200000 uniform designs at this sigma: optimum
+# 0.1111, median random 0.3637, ceiling 0.5556, span (median - optimum) 0.2526. The optimum is the
+# pair of box CORNERS {-1, +1}, in either order, since the design is a set.
+#
+# ⚠️ THIS CELL IS SOLVED BEFORE THE RUN ENDS. Section 3.2 of that document measures the repo's own BO
+# driver against the closed form over 10 seeds: the residual is 0.1%-8% of the range at n = 20, and
+# the live 1-dimensional neural campaign reads 0%-6% at n = 10. An ARM comparison here therefore has
+# little room to separate anything -- every arm is expected at or near the optimum. It is run as the
+# small end of a dimension ladder (2 / 6 / 12 design coordinates), not as a search comparison.
+#
+# `noise` 0.5 follows config/detector/linear_d2n3.yaml and config/detector/linear_d3n4.yaml so the
+# three cells differ in dimension alone.
+linear:
+  n_probes: 2
+  n_dimensions: 1
+  noise: 0.5
+  probe_bounds: [-1.0, 1.0]

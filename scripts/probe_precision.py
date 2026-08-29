@@ -11,10 +11,19 @@ sibling task's floor ran 0.0055 to 0.0083 across designs and the BINDING design 
 
 WHAT IS MEASURED. `detopt/nn/trainer/design.py` calls a design converged when `diff + err` falls under
 `loss_precision`, where `err = hypot(train_sem, val_sem)` is the loss estimate's standard error and
-`diff = |val - train|` is the train/validation gap. `err` falls like `1/sqrt(window)`, so more data
-always fixes it; `diff` is an OVERFITTING BIAS and need not fall at all. A design whose persistent gap
-exceeds the requested precision can NEVER converge, grows its window to `iteration_limit`, and
-`scripts/bo.py` raises -- deterministically per seed, so a resubmission reproduces it.
+`diff = |val - train|` is the train/validation gap. `err` falls like `1/sqrt(window)`, so more data always fixes it; obviously, diff falls with data too,
+for the same reason. But at the windows a run can AFFORD, a design whose gap still exceeds the
+requested precision grows its window to `iteration_limit` and `scripts/bo.py` raises --
+deterministically per seed, so a resubmission reproduces it.
+
+⚠️ NOT MONOTONE, and the sign is design-dependent. Uniform convergence gives `diff -> 0`
+ASYMPTOTICALLY; it says nothing about the path. At small `n` an underfitting network holds train
+and val both high and close, so `diff` is small; as `n` grows and the network starts to fit, train
+falls faster than val and `diff` RISES; only later does val catch up and `diff` fall. Measured on
+SHiP: median slope `dlog(diff)/dlog(window) = -1.38` over 9 designs, but `+0.428` on one design
+that was still rising at window 262,144 (`err` on that same design fell at -0.495, matching
+`n^-1/2` to three digits, so the measurement is sound and it is `diff` alone that is unruly).
+Do NOT assume a sign for the affordable range.
 
 WHICH DESIGNS, and this is the trap the protocol exists to avoid: **the binding designs are the
 INFORMATIVE ones**. On this classification task an uninformative design leaves both train and val at
@@ -75,7 +84,6 @@ from detopt.utils.viz.bo import plot_iteration
 # stopping epoch's `diff` understates the gap -- reuse it rather than keep a second copy.
 from probe_dropout import _per_window
 from validate_inhibitor import named_designs
-
 
 def design_set(detector, landscape, names=None, replay=(), extra_ranks=(), unranked=0):
   """The designs to score, as SCALED `[0, 1]^d` vectors, keyed by name.
@@ -155,7 +163,6 @@ def design_set(detector, landscape, names=None, replay=(), extra_ranks=(), unran
     chosen = {name: chosen[name] for name in names}
   return chosen
 
-
 def replay_design(detector, config, results_path, seed):
   """The design a crashed `scripts/bo.py` run would have scored NEXT -- i.e. the one that killed it.
 
@@ -193,7 +200,6 @@ def replay_design(detector, config, results_path, seed):
     optimiser.append(x, float(entry["loss"]), noise=float(entry["loss_std"]))
   next_seed = int(iteration_seq.spawn(1)[0].generate_state(1)[0])
   return np.asarray(optimiser.propose(next_seed), np.float32), len(recorded), mismatch
-
 
 def run_config_for(
   config, *, weight_decay, iteration_limit, precision, device, n0=None, n_increment=None, warmup_epochs=None, patience=None,
@@ -283,7 +289,6 @@ def run_config_for(
   # `None` is a strict no-op (no mask, no key drawn) while a rate of 0 is a code path.
   return run
 
-
 def init_signature(trainer, seed):
   """A checksum of the INITIAL network, before a single training step.
 
@@ -307,7 +312,6 @@ def init_signature(trainer, seed):
   leaves = jax.tree.leaves(params)
   checksum = float(sum(float(jnp.sum(jnp.abs(leaf))) for leaf in leaves))
   return checksum, int(sum(int(leaf.size) for leaf in leaves))
-
 
 def measure(detector, run, x_scaled, seed, *, plot_dir=None):
   """Score ONE (design, seed, setting) through the trainer and return what it achieved.
@@ -395,10 +399,18 @@ def measure(detector, run, x_scaled, seed, *, plot_dir=None):
     row["per_window"] = per_window
   return row
 
-
 def main():
   parser = argparse.ArgumentParser()
   parser.add_argument("config", help="gearup root token of a RUN config, e.g. =enzyme_extremes")
+  parser.add_argument(
+    "--trajectory", default=None,
+    help="a bo.py `results.json`; the designs it actually visited are added as `mid-<index>`, so the "
+    "precision floor is measured where BO goes rather than at Sobol draws"
+  )
+  parser.add_argument(
+    "--trajectory-designs", nargs="*", type=int, default=None, metavar="I",
+    help="which `--trajectory` indices to take (default: all of them)"
+  )
   parser.add_argument(
     "--landscape", default="output/screen/extremes_m4.npz",
     help="a screen_task.py `_m<m>.npz` (designs + proxy losses), used ONLY to pick "
@@ -558,6 +570,16 @@ def main():
       print(f"[warning] dropping {dropped}: their replay produced no design", flush=True)
       requested = [n for n in requested if n not in dropped]
 
+  if arguments.trajectory is not None:
+    with open(arguments.trajectory) as handle:
+      visited = json.load(handle)["results"]
+    wanted = arguments.trajectory_designs if arguments.trajectory_designs is not None else range(len(visited))
+    for index in wanted:
+      if index < 0 or index >= len(visited):
+        raise SystemExit(f"probe_precision: --trajectory has {len(visited)} designs, no index {index}")
+      replay.append((f"mid-{index}", np.asarray(visited[index]["x_scaled"], np.float32)))
+    print(f"trajectory {arguments.trajectory}: added {len(list(wanted))} visited designs", flush=True)
+
   designs = design_set(detector, arguments.landscape, requested, replay, arguments.extra_ranks, arguments.unranked)
   rows, done = [], set()
   if arguments.resume and os.path.isfile(arguments.output):
@@ -679,7 +701,6 @@ def main():
     "reach that value, not what its floor is. Only a CAPPED cell reports an uncensored slack, and "
     "the smallest precision the task can be run at is above the largest of those."
   )
-
 
 if __name__ == "__main__":
   main()

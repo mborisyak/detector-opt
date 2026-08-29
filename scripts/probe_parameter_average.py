@@ -123,6 +123,12 @@ def _rewind(trainer, snapshot):
     trainer._running = running
 
 
+def _dump(output, run, arm, index, record):
+  """Publish everything measured so far."""
+  with open(os.path.join(output, "probe.json"), "w") as f:
+    json.dump({"run": run, "arm": arm, "index": index, "runs": record}, f, indent=2)
+
+
 def probe(output, run, run_seed: int, index: int, arm: str, repeats: int = 3, horizon: float = 1.0, **config):
   os.makedirs(output, exist_ok=True)
   index, repeats = int(index), int(repeats)
@@ -175,8 +181,11 @@ def probe(output, run, run_seed: int, index: int, arm: str, repeats: int = 3, ho
         f"[run] horizon={horizon} repeat={repeat} loss={result.objective_loss:.6f} "
         f"std={result.objective_std:.6f} spent={result.spent} epochs={epochs}", flush=True
       )
-  with open(os.path.join(output, "probe.json"), "w") as f:
-    json.dump({"run": run, "arm": arm, "index": index, "runs": record}, f, indent=2)
+      # WRITTEN AFTER EVERY TRAINING, not once at the end: a cell killed by its SLURM time limit
+      # otherwise loses every per-epoch trace it had already paid for, and the traces are what the
+      # fluctuation estimate is computed from.
+      _dump(output, run, arm, index, record)
+  _dump(output, run, arm, index, record)
   print(f"\n[probe] wrote {os.path.join(output, 'probe.json')}", flush=True)
 
 

@@ -15,7 +15,8 @@ from typing import NamedTuple
 import jax
 import numpy as np
 
-from .straw import StrawDetector, four_feature_combine, four_feature_shape, scale, unscale
+from .straw import (StrawDetector, four_feature_combine, four_feature_shape, address_combine, address_shape,
+                    scale, unscale)
 
 __all__ = ["FreeStrawDetector", "FreeDesign", "free_design_array"]
 
@@ -126,11 +127,13 @@ class FreeStrawDetector(StrawDetector):
     # ------------------------------------------------------------------ #
     # Combine: the shared 4-feature per-hit combine (element == hit).
     # ------------------------------------------------------------------ #
-    def combine_scaled(self, event, design_scaled, mask=None):
+    def combine_scaled(self, event, design_scaled=None, mask=None, reveal_design: bool = True):
+        if design_scaled is None or not reveal_design:
+            return address_combine(self, event, mask=mask)
         return four_feature_combine(self, event, design_scaled, mask=mask)
 
-    def combined_event_shape(self):
-        return four_feature_shape(self)
+    def combined_event_shape(self, design: bool = True):
+        return four_feature_shape(self) if design else address_shape(self)
 
     def element_mask(self, event, mask):
         return mask  # element == hit (padded hits are gated by the regressor's hit mask)

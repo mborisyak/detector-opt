@@ -28,10 +28,10 @@ detector: enzyme_depletion_bi_m2
 
 # ---------------------------------------------------------------------------------------------
 # regressor -- a small MLP over the SET of experiments: one element per experiment, its features
-#   being that experiment's own extent curve (n_measurements values as a fraction of its own maximum
-#   possible extent min(A0, B0)) beside its two scaled initial concentrations, so the network is
-#   design-conditioned and permutation invariant in the experiments, which is the symmetry of the
-#   design.
+#   being that experiment's own extent curve (n_measurements values on a FIXED scale -- the top of the
+#   box, not its own maximum possible extent min(A0, B0)) beside its two scaled initial concentrations. Those columns reach
+#   the network only in the arms that REVEAL the design (`Trainer.reveals_design`); the inference is
+#   permutation invariant in the experiments either way, which is the symmetry of the design.
 #
 # device: cpu -- the detector is a handful of RKC2 chains and the network is tiny, so this task has
 #   no use for a shard. `campaign.sh` must therefore be launched with GRES= (empty) so the runs sit

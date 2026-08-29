@@ -24,6 +24,11 @@ aperture sits and how big it is; the network must name the digit from what the a
   network, and it is needed even though the image is already occluded: without it a black pixel
   INSIDE the window is indistinguishable from a pixel outside it, so the network could not tell a
   small window from a large one over blank paper.
+  ⛔️ THE APERTURE IS THE MEASUREMENT, so this detector needs the design even when the network is not
+  told it. ``reveal_design=False`` still occludes and drops only the second channel, giving
+  ``(28, 28, 1)``; ``design=None`` is REFUSED, because there is no honest image to return without a
+  window. Returning the intact image to a blind arm would hand it pixels the detector never collected
+  and make the reported loss independent of the design.
 * **target** -- the digit, one-hot over 10 classes.
 * **loss** -- softmax cross-entropy in NATS, undivided. Uniform guessing scores ``ln 10 = 2.303``.
 
@@ -59,7 +64,7 @@ import numpy as np
 from .common import Detector
 from ..utils import tensor
 
-__all__ = ['MNISTDetector', 'MNISTDesign', 'MNISTEvent', 'MNISTTarget', 'MNISTGroundTruth', 'N_CLASSES', 'read_arrow', 'read_idx']
+__all__ = ['MNISTBase', 'MNISTDetector', 'MNISTDesign', 'MNISTEvent', 'MNISTTarget', 'MNISTGroundTruth', 'N_CLASSES', 'read_arrow', 'read_idx']
 
 N_CLASSES = 10
 
@@ -148,7 +153,7 @@ def read_idx(images_path, labels_path, n_events):
   return np.ascontiguousarray(images), label_bytes.astype(np.int32)
 
 
-class MNISTDetector(Detector):
+class MNISTBase(Detector):
   """A rectangular visible window over an MNIST digit (see the module docstring).
 
   Every constant is a constructor argument, i.e. lives in the yaml config: which file the digits come
@@ -212,9 +217,6 @@ class MNISTDetector(Detector):
   def design_bounds(self):
     return {name: (0.0, 1.0) for name in MNISTDesign._fields}
 
-  def combined_event_shape(self):
-    return (self.n_rows, self.n_columns, 2)
-
   def size(self):
     return int(self.images.shape[0])
 
@@ -260,29 +262,6 @@ class MNISTDetector(Detector):
   # ------------------------------------------------------------------ #
   # Combine + normalisation
   # ------------------------------------------------------------------ #
-  def combine_scaled(self, event, design_scaled, mask=None):
-    """Raw ``MNISTEvent`` + SCALED design -> ``features (..., n_rows, n_columns, 2)``, channels-last.
-
-    Channel 0 is the image on ``[0, 1]`` MULTIPLIED by the window, so nothing outside the aperture
-    reaches the network; channel 1 is the binary window itself, which is how the design enters and
-    what separates "dark inside the window" from "outside it". A pixel is inside when its CENTRE is,
-    on the half-open extent, so ``w = 0`` or ``h = 0`` shows nothing at all. ``mask`` is unused:
-    every row of a dense image is a real element."""
-    design_scaled = jnp.asarray(design_scaled, jnp.float32)
-    image = jnp.asarray(event.image, jnp.float32) / 255.0
-    if design_scaled.ndim == 1:
-      design_scaled = jnp.broadcast_to(design_scaled, image.shape[:-2] + design_scaled.shape)
-    x0, x1, y0, y1 = self.window(design_scaled)
-    in_columns = (self.column_centres >= x0[..., None]) & (self.column_centres < x1[..., None])
-    in_rows = (self.row_centres >= y0[..., None]) & (self.row_centres < y1[..., None])
-    window = (in_rows[..., :, None] & in_columns[..., None, :]).astype(jnp.float32)
-    return jnp.stack([image * window, window], axis=-1)
-
-  def element_mask(self, event, mask):
-    """Every image ROW is a valid element -- the combine's element axis is the row axis and a dense
-    image has nothing to mask out."""
-    return jnp.ones(jnp.asarray(event.image).shape[:-1], jnp.int32)
-
   def normalize_target(self, target):
     """IDENTITY on the one-hot label: there is no scale to remove. The normalisation lives in the
     LOSS, which reads in nats against the fixed reference ``ln(n_classes)``."""
@@ -339,3 +318,48 @@ class MNISTDetector(Detector):
     event = MNISTEvent(image=jnp.asarray(self.images[rows]))
     mask = jnp.ones((event_index.shape[0], self.n_rows), jnp.int32)
     return MNISTGroundTruth(digit=digit), event, mask, MNISTTarget(digit=digit)
+
+
+class MNISTDetector(MNISTBase):
+  """The VISIBLE-WINDOW leaf: the design's box is an aperture that occludes everything outside it."""
+
+  def combined_event_shape(self, design: bool = True):
+    return (self.n_rows, self.n_columns, 2 if design else 1)
+
+  def combine_scaled(self, event, design_scaled=None, mask=None, reveal_design: bool = True):
+    """Raw ``MNISTEvent`` + SCALED design -> ``features (..., n_rows, n_columns, 2)``, channels-last.
+
+    Channel 0 is the image on ``[0, 1]`` MULTIPLIED by the window, so nothing outside the aperture
+    reaches the network; channel 1 is the binary window itself, which is how the design enters and
+    what separates "dark inside the window" from "outside it". A pixel is inside when its CENTRE is,
+    on the half-open extent, so ``w = 0`` or ``h = 0`` shows nothing at all. ``mask`` is unused:
+    every row of a dense image is a real element.
+
+    ⛔️ THE APERTURE IS THE MEASUREMENT, so this detector needs the design EVEN WHEN THE NETWORK IS
+    NOT TOLD IT, and ``design_scaled=None`` is refused rather than silently answered. Under
+    ``reveal_design=False`` the window is still applied -- the network sees exactly the pixels the
+    detector captured -- and only the second channel, which announces WHERE the window was, is
+    dropped: ``(..., n_rows, n_columns, 1)``. Returning the WHOLE image instead would hand a blind arm
+    pixels the detector never collected, make the reported loss independent of the design, and leave BO
+    with no signal at all."""
+    if design_scaled is None:
+      raise ValueError(
+        'the visible-window aperture IS the measurement, so this detector cannot combine without a '
+        'design; pass the true design with reveal_design=False to withhold it from the network'
+      )
+    image = jnp.asarray(event.image, jnp.float32) / 255.0
+    design_scaled = jnp.asarray(design_scaled, jnp.float32)
+    if design_scaled.ndim == 1:
+      design_scaled = jnp.broadcast_to(design_scaled, image.shape[:-2] + design_scaled.shape)
+    x0, x1, y0, y1 = self.window(design_scaled)
+    in_columns = (self.column_centres >= x0[..., None]) & (self.column_centres < x1[..., None])
+    in_rows = (self.row_centres >= y0[..., None]) & (self.row_centres < y1[..., None])
+    window = (in_rows[..., :, None] & in_columns[..., None, :]).astype(jnp.float32)
+    if not reveal_design:
+      return (image * window)[..., None]
+    return jnp.stack([image * window, window], axis=-1)
+
+  def element_mask(self, event, mask):
+    """Every image ROW is a valid element -- the combine's element axis is the row axis and a dense
+    image has nothing to mask out."""
+    return jnp.ones(jnp.asarray(event.image).shape[:-1], jnp.int32)

@@ -1,0 +1,17 @@
+universe       = vanilla
+executable     = strip_width_cell.sh
+arguments      = $(tag) /afs/cern.ch/work/m/maborisy/ship-strip-width/w$(tag)
+output         = logs/stripw_$(tag).$(ClusterId).$(ProcId).out
+error          = logs/stripw_$(tag).$(ClusterId).$(ProcId).err
+log            = logs/stripw.$(ClusterId).log
+request_gpus   = 1
+request_cpus   = 1
+request_memory = 4000
+requirements   = TARGET.GPUs_GlobalMemoryMb >= 16000 && (TARGET.GPUs_Capability =?= undefined || TARGET.GPUs_Capability >= 8.0)
++MaxRuntime    = 72000
++JobBatchName  = "ship-strip-width"
+queue tag from (
+  32-24-16-12
+  24-24-16-16-12
+  16-16-16-16-16
+)

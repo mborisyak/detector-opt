@@ -134,8 +134,10 @@ class LinearDetector(Detector):
     axes = jnp.reshape(flat, flat.shape[:-1] + (self.n_dimensions, self.n_probes))
     return jnp.swapaxes(axes, -1, -2)
 
-  def combined_event_shape(self):
-    return (self.n_probes, 1 + self.n_dimensions)  # element == probe: its reading and its position
+  def combined_event_shape(self, design: bool = True):
+    # element == probe: its reading, and either its POSITION (design revealed) or a one-hot of its
+    # own INDEX (design withheld) -- see `combine_scaled` for why the withheld case is not empty
+    return (self.n_probes, 1 + (self.n_dimensions if design else self.n_probes))
 
   def size(self):
     return None  # an analytic source: every index is a fresh response
@@ -154,20 +156,35 @@ class LinearDetector(Detector):
   # ------------------------------------------------------------------ #
   # Combine + normalisation
   # ------------------------------------------------------------------ #
-  def combine_scaled(self, event, design_scaled, mask=None):
-    """``features (..., n_probes, 2)``: each probe's reading beside its own position.
+  def combine_scaled(self, event, design_scaled=None, mask=None, reveal_design: bool = True):
+    """``features (..., n_probes, 1 + n_dimensions)``: each probe's RAW reading beside its own position.
 
-    The reading is divided by the prior standard deviation of the response at the box edge, so the
-    input is O(1) whatever the box is; the position comes STRAIGHT from the scaled design, already on
-    ``[0, 1]``. ``mask`` is unused -- every probe of the design is real (the element axis is the
-    design's, not a hit count)."""
+    The reading is passed through UNCHANGED -- there is no rescaling. The position comes STRAIGHT from
+    the scaled design, already on ``[0, 1]``. ``mask`` is unused -- every probe of the design is real
+    (the element axis is the design's, not a hit count).
+
+    WITH THE DESIGN WITHHELD -- ``reveal_design=False`` or ``design_scaled=None`` -- the position
+    columns are replaced by a ONE-HOT OF THE PROBE'S OWN INDEX, ``(..., n_probes, 1 + n_probes)``. The
+    reading is unchanged: the response is drawn from ``event_index`` alone and read out at the true
+    probe positions either way, so withholding costs the knowledge of WHERE each reading was taken,
+    never the reading.
+
+    ⚠️ WHY THE WITHHELD CASE IS NOT SIMPLY THE READING ALONE. The set regressor is permutation-
+    INVARIANT over the element axis, so a bare column of readings is an unordered MULTISET of
+    ``w . x_i + b`` and ``w`` is not identifiable from it -- a withheld arm would plateau because the
+    problem is underdetermined, which is a statement about the regressor's symmetry and not about the
+    design. The one-hot restores each probe's IDENTITY without restoring its POSITION, so the two are
+    separable: an arm that recovers with it was limited by exchangeability, and an arm that does not
+    was limited by the design information itself."""
+    reading = jnp.asarray(event.response, jnp.float32)[..., None]
+    if design_scaled is None or not reveal_design:
+      identity = jnp.broadcast_to(jnp.eye(self.n_probes, dtype=jnp.float32), reading.shape[:-1] + (self.n_probes, ))
+      return jnp.concatenate([reading, identity], axis=-1)
     design_scaled = jnp.asarray(design_scaled, jnp.float32)
     positions = self._probe_positions(jnp.reshape(design_scaled, design_scaled.shape[:-1] + (-1, )))
     if positions.ndim == 2:  # one design for the whole event batch
       positions = jnp.broadcast_to(positions, event.response.shape[:-1] + positions.shape)
-    edge = max(abs(self.probe_bounds[0]), abs(self.probe_bounds[1]))
-    scale = float(np.sqrt(self.n_dimensions * edge**2 + 1.0))
-    return jnp.concatenate([(event.response / scale)[..., None], positions], axis=-1)
+    return jnp.concatenate([reading, positions], axis=-1)
 
   def element_mask(self, event, mask):
     return mask  # element == probe

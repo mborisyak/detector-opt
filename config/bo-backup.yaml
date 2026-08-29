@@ -40,6 +40,7 @@ plot_per_epoch: 8
 training:
   n0: 2048
   n_increment: 1024
+  param_mix: 0.1
   batch: 128
   # Gradient-free evaluation batch for the sequential train+val loss passes
   # (no backprop, so it can exceed the training batch).

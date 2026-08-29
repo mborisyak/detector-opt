@@ -30,7 +30,12 @@ __all__ = [
 
 class Regressor(Model):
     @classmethod
-    def from_config(cls, detector: Detector, config, *, rngs: nnx.Rngs):
+    def from_config(cls, detector: Detector, config, *, rngs: nnx.Rngs, design: bool = True):
+        """These dense regressors take the RAW event shape and concatenate the physical design
+        themselves, so they never read ``combined_event_shape`` and a withheld design is not
+        expressible here -- ``design=False`` is refused rather than silently ignored."""
+        if not design:
+            raise ValueError(f'{cls.__name__} always concatenates the design; it has no design-free form')
         return cls(detector, rngs=rngs, **config)
 
     def __init__(self, detector: Detector, *, rngs: nnx.Rngs):

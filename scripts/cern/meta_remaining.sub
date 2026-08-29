@@ -1,0 +1,18 @@
+universe       = vanilla
+executable     = meta_cell.sh
+arguments      = $(seed) $(pair) $(repr) $(reveal) /afs/cern.ch/work/m/maborisy/ship-meta/$(repr)-$(reveal)/$(seed)/pair$(pair)
+output         = logs/meta_$(seed)_$(pair).$(ClusterId).$(ProcId).out
+error          = logs/meta_$(seed)_$(pair).$(ClusterId).$(ProcId).err
+log            = logs/meta.$(ClusterId).log
+request_gpus   = 1
+request_cpus   = 1
+request_memory = 4000
+requirements   = TARGET.GPUs_GlobalMemoryMb >= 16000 && (TARGET.GPUs_Capability =?= undefined || TARGET.GPUs_Capability >= 8.0)
++MaxRuntime    = 72000
++JobBatchName  = "ship-meta-rest"
+queue seed,pair,repr,reveal from (
+  126382657, 10, strip, none
+  330924253, 11, address, none
+  330924253, 11, strip, none
+  330924253, 11, layerset, none
+)

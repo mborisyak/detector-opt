@@ -1,0 +1,28 @@
+# EXTENSION of the reveal=design control to draws 2-5, so it rests on 5 paired seeds rather than 1.
+#
+# Draw 1 (1244111331) already ran and the two detectors DISAGREED: on the angle task revealing the
+# design beat the withheld twin (0.2032 vs 0.2166, clearing loss_precision) while on the intersect
+# task it was slightly worse (0.2377 vs 0.2313, BELOW the bar, i.e. no resolvable effect). One seed
+# cannot separate those readings from seed noise, and the intersect trajectories CROSS -- withheld
+# reaches 0.25 first, revealed reaches 0.24 first -- so the endpoint alone is not the answer.
+#
+# Seeds are draws 2-5 of the campaign generator `random.Random(123456).randint(0, 2**31-1)`, all four
+# already present in the base tree, so every cell here pairs with a banked reveal=none `continue`.
+universe       = vanilla
+executable     = geom_cell.sh
+arguments      = ship_angle_prec1e2_w2x_3m $(seed) $(arm) $(reveal) /afs/cern.ch/work/m/maborisy/ship-angle-w2x-3m-reveal/$(seed)/$(arm)
+output         = logs/angle3mrev_$(seed)_$(arm).$(ClusterId).$(ProcId).out
+error          = logs/angle3mrev_$(seed)_$(arm).$(ClusterId).$(ProcId).err
+log            = logs/angle3mrev.$(ClusterId).log
+request_gpus   = 1
+request_cpus   = 2
+request_memory = 12000
+requirements   = TARGET.GPUs_GlobalMemoryMb >= 20000
++MaxRuntime    = 259200
++JobBatchName  = "ship-angle-w2x-3m-reveal"
+queue seed,arm,reveal from (
+  126382657, continue, design
+  750143450, continue, design
+  9577242, continue, design
+  330924253, continue, design
+)

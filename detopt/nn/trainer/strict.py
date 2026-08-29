@@ -24,7 +24,8 @@ import numpy as np
 from ...utils.training import masked_mean_sem
 from .common import Trainer, TrainResult, _round_down, fresh_design_network, window_sample_indices
 from .replay import (
-  carried_network_state, load_carried_network_state, persistent_network, replay_sample_indices, replay_sample_weights
+  carried_network_state, load_carried_network_state, persistent_network, replay_carried_network, replay_sample_indices,
+  replay_sample_weights
 )
 
 __all__ = ["StrictDesignTrainer", "StrictContinualTrainer"]
@@ -35,6 +36,13 @@ class _StrictBase(Trainer):
   abstract so each strategy supplies its own."""
 
   @classmethod
+  def spent_calls(self):
+    """Reserves nothing, so the pools' fill IS the spend."""
+    return self.train_pool.current + self.val_pool.current
+
+  def _round_extra(self, n_train):
+    """Trains on the proposed designs alone, so a round costs exactly what it asked for."""
+
   def from_config(cls, detector, config, *, checkpoint_dir=None, seed=0):
     from ...utils.config import optimizer as make_optimizer, resolve_device
 
@@ -163,12 +171,19 @@ class _StrictBase(Trainer):
       manager.wait_until_finished()
     self._persist_network(params, state, opt_state)
     objective_loss, objective_std = objective
-    spent = (tp.current - w0_train) + (vp.current - w0_val)
-    return TrainResult(objective_loss, objective_std, spent, params)
+    spent_train, spent_val = tp.current - w0_train, vp.current - w0_val
+    return TrainResult(
+      objective_loss, objective_std, spent_train + spent_val, params, spent_train=spent_train, spent_val=spent_val
+    )
 
 
 class StrictDesignTrainer(_StrictBase):
   """A FRESH network per design, minibatches over the current window alone."""
+
+  def default_reveal(self):
+    """A fresh network per design, so the design is constant across the whole batch. Withheld by
+    default; set ``training.reveal`` to override."""
+    return 'none'
 
   def _sample_indices(self, key, start, count):
     return window_sample_indices(self, key, start, count)
@@ -185,9 +200,17 @@ class StrictDesignTrainer(_StrictBase):
   def _load_carried_state(self, data):
     """Nothing to load -- see :meth:`_carried_state`."""
 
+  def _replay_carried_state(self, rows):
+    """Nothing crosses a design boundary here -- see :meth:`_carried_state`."""
+
 
 class StrictContinualTrainer(_StrictBase):
   """ONE persistent network across designs, with experience replay."""
+
+  def default_reveal(self):
+    """One network across every design with replay, so the design is what tells a replay row from a
+    current one."""
+    return 'design'
 
   def __init__(self, *args, replay_weight: float = 1.0, **kwargs):
     self.replay_weight = float(replay_weight)
@@ -212,3 +235,6 @@ class StrictContinualTrainer(_StrictBase):
 
   def _load_carried_state(self, data):
     self._running = load_carried_network_state(self._running, data, self.device)
+
+  def _replay_carried_state(self, rows):
+    self._running = replay_carried_network(self, rows)

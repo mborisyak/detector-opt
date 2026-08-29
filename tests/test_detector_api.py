@@ -89,7 +89,7 @@ def test_shape_invariants():
     # combine() gathers per-hit design context into a compact fixed width
     # [TDC, norm_z, wire_y_left, wire_y_right] (field is fixed -> not a feature).
     assert d.combined_event_shape() == (d.max_hits_per_event, 4)
-    assert d.combined_feature_dim == 4
+    assert d.combined_feature_dim() == 4
 
 
 def test_scaled_nominal_roundtrip():
@@ -157,7 +157,7 @@ def test_combine_scaled_shape_and_broadcast():
 
     feats_1d = d.combine_scaled(event, d_enc)
     feats_2d = d.combine_scaled(event, jnp.broadcast_to(d_enc[None, :], (B, d.design_dim())))
-    assert feats_1d.shape == (B, d.max_hits_per_event, d.combined_feature_dim)  # compact fixed width
+    assert feats_1d.shape == (B, d.max_hits_per_event, d.combined_feature_dim())  # compact fixed width
     # A 1-D design broadcasts to the per-row design.
     np.testing.assert_allclose(np.asarray(feats_1d), np.asarray(feats_2d), rtol=1e-5)
 

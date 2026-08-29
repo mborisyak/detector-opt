@@ -1,0 +1,54 @@
+universe       = vanilla
+executable     = campaign_cell.sh
+arguments      = ship_addr_prec1e2_2m $(seed) $(arm) $(reveal) /afs/cern.ch/work/m/maborisy/ship-addr-prec1e2-2M/$(seed)/$(arm)
+output         = logs/addr2m_$(seed)_$(arm).$(ClusterId).$(ProcId).out
+error          = logs/addr2m_$(seed)_$(arm).$(ClusterId).$(ProcId).err
+log            = logs/addr2m.$(ClusterId).log
+request_gpus   = 1
+request_cpus   = 2
+request_memory = 12000
+requirements   = TARGET.GPUs_GlobalMemoryMb >= 20000
++MaxRuntime    = 172800
++JobBatchName  = "ship-addr-prec1e2-2M"
+queue seed,arm,reveal from (
+  1244111331, from_scratch, none
+  1244111331, continue, none
+  1244111331, closest, none
+  1244111331, meta, design
+  126382657, from_scratch, none
+  126382657, continue, none
+  126382657, closest, none
+  126382657, meta, design
+  750143450, from_scratch, none
+  750143450, continue, none
+  750143450, closest, none
+  750143450, meta, design
+  9577242, from_scratch, none
+  9577242, continue, none
+  9577242, closest, none
+  9577242, meta, design
+  330924253, from_scratch, none
+  330924253, continue, none
+  330924253, closest, none
+  330924253, meta, design
+  219094734, from_scratch, none
+  219094734, continue, none
+  219094734, closest, none
+  219094734, meta, design
+  1153299222, from_scratch, none
+  1153299222, continue, none
+  1153299222, closest, none
+  1153299222, meta, design
+  122012491, from_scratch, none
+  122012491, continue, none
+  122012491, closest, none
+  122012491, meta, design
+  499913522, from_scratch, none
+  499913522, continue, none
+  499913522, closest, none
+  499913522, meta, design
+  983655707, from_scratch, none
+  983655707, continue, none
+  983655707, closest, none
+  983655707, meta, design
+)

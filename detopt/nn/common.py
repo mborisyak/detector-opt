@@ -26,15 +26,18 @@ Shape: TypeAlias = Sequence[int]
 
 class Model(nnx.Module):
     @classmethod
-    def from_config(cls, detector: Detector, config, *, rngs: nnx.Rngs):
+    def from_config(cls, detector: Detector, config, *, rngs: nnx.Rngs, design: bool = True):
         """The single factory for every Model: derive the universal external SHAPES from the detector --
         the per-hit/-element feature shape ``input_shape``, the ``target_shape`` and ``ground_truth_shape``
         -- and pass them + the config hyper-parameters to ``__init__``. Each Model takes the SAME three
         shapes and derives its own specifics (``input_shape[-1]`` etc.). Models that genuinely need the
         detector's geometry FACTORIZATION beyond these shapes (the hierarchical + legacy regressors) keep
-        their own detector-based factory."""
+        their own detector-based factory.
+
+        ``design`` selects WHICH of the two feature layouts the model is built for -- with the design
+        resolved into the features, or without it. It changes ``input_shape`` and nothing else."""
         return cls(
-            detector.combined_event_shape(),
+            detector.combined_event_shape(design),
             (detector.target_dim(),),
             (detector.ground_truth_dim(),),
             rngs=rngs,

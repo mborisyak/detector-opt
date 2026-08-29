@@ -1,98 +1,24 @@
-# ⚠️ CORRECTED 2026-08-20 to match the NOMINATION. As first written this file carried values from a
-# REJECTED cell of the noise sweep -- the m=2 file held m=4's nominated noise (0.0125) and the m=4
-# file held the rejected 0.025 cell (with `concentration_bounds` [0.05, 0.8] and a matching
-# tolerance). The winning cells were run via command-line overrides, not from these files, so the
-# files were never the thing that was measured. Corrected here so that running the config reproduces
-# the nomination rather than a rejected point.
+# Michaelis-Menten hexokinase depletion cell, m = 4 experiments per design.
 #
-# `integration_tolerance` is kept at 10% of `measurement_noise`, the rule `config/detector/enzyme.yaml`
-# uses: the integration must not disturb what the read-out itself resolves.
-# `enzyme_depletion` (EnzymeDepletionDetector) at the HEXOKINASE prior, 4 experiments.
+#     dA/dt = -q A / (A + K),   A(0) = A0
 #
-#     dA/dt = -q A / (A + K),   A(0) = A0,   target (ln q, ln K)
+# Design = the m initial concentrations A0 (mM); target = (ln q, ln K). Times are seconds, so q is
+# mM/s and K is mM. Priors, window and read-out count are shared with the m = 2 cell; the two cells
+# differ in `n_experiments`, `measurement_noise` and the box floor tied to it.
 #
-# Concentrations mM, times seconds, so q is mM/s and K is mM. NO temperature, NO pH, NO inhibitor,
-# NO product inhibition, NO unfolding: the rate law above is the whole model and the task has no
-# nuisance parameters at all. Only the PRIOR and the SCALES are taken from
-# `config/detector/enzyme.yaml`; none of its model structure is.
-#
-# ORDER OF DERIVATION (user protocol, 2026-08-20): prior -> design box -> time window -> measurement
-# count, all fixed BEFORE the read-out noise, and none of them from a landscape or a finished run.
-# Reproduced by `output/mm-tune/derive.py`, 4e5 prior draws.
-#
-# KNEE VISIBILITY is the binding condition, because K is identified only where the depletion curve
-# bends: [A] reaches K at t = ((A0 - K) + K ln(A0/K)) / q, which exists only for A0 > K. VISIBLE
-# means that time falls inside 80% of the window; BRACKETED additionally asks it to fall at or after
-# the first read-out, so the curve is sampled on both sides of the knee. Measured at the settings
-# below, over the whole box: every design shows the knee for at least 28.7% of prior draws (0.287 at
-# the top of the box, 0.700 at the bottom, both definitions agreeing to 3 digits at the binding end);
-# the best design shows it for 93.5% (A0 = 0.2 mM); and 100.0% of prior draws have SOME design in the
-# box that shows their knee. Those are the user's three conditions -- >= 25% everywhere, >= 90%
-# somewhere, full coverage -- and they are what fix the box and the duration jointly.
+# The box floor was re-derived on 2026-08-20 by the same rule as the m = 2 cell. Neither the ceiling
+# nor `n_grid` transfers from it: both were measured on this cell and rejected. See
+# docs/decision-log.md (D169).
 enzyme_depletion:
-  # The designed batch: BO searches n_experiments dimensions and the design is a SET, so the
-  # surrogate must be `sorting-rbf` with `exchangeable: n_experiments`.
   n_experiments: 4
-
-  # [A] read-outs per experiment, evenly spaced, the last at `duration`. KEPT at 8 (user): 2 is the
-  # minimum that can see the half decay, 8 samples the knee on both sides, and MORE risks making the
-  # problem trivial, which is the failure mode this tuning exists to fight.
   n_measurements: 8
-
-  # Two hours. DERIVED, not chosen: it is the SHORTEST window at which some design in the box shows
-  # the knee for >= 90% of prior draws (0.935 at 2 h; 0.918 at the same setting with the half-time
-  # anchored velocity prior, 0.688 at 1 h), and it is the longest that still keeps a design at the
-  # bottom of the box bracketing its knee (at 3 h the first read-out lands at 22.5 min and the
-  # A0 = 0.1 mM design's bracketed fraction falls to 0.200, below the 25% floor). "An experiment of
-  # order an hour", per the scale of config/detector/enzyme.yaml.
   duration: 7200.0
-
-  # q = Vmax = k_cat [E]. k_cat 30 .. 300 /s is the hexokinase literature band quoted in
-  # config/detector/enzyme.yaml (whose own calibration puts the median at ~60/s), and [E] = 1 nM is
-  # FIXED -- the enzyme concentration is NOT a design coordinate. 1 nM is the assay concentration
-  # that puts half depletion of a 0.33 mM reference at 0.18 .. 1.8 h, i.e. inside the window, which
-  # is the same property `half_time_bounds: [0.25, 2.0]` gives the reference config; it is 15x below
-  # its 15 nM mixture because that model's bi-substrate and product-inhibition factors slow the
-  # effective rate by about that much and this one has neither.
-  velocity_bounds: [3.0e-5, 3.0e-4]
-
-  # K = K_M for glucose. COPIED from config/detector/enzyme.yaml (`log_K0_A: [-3.91, -1.61]`): the
-  # approximate literature spread across hexokinase isoforms and species (HK I/II/III, yeast), NOT
-  # one isoform, with glucokinase (HK IV, K_M ~ 5-10 mM) deliberately excluded there. One decade.
-  # This REPLACES the [0.01, 20.0] mM of the earlier configs, which was up to two orders of magnitude
-  # too high at the top: with a design box at 0.45 .. 4.0 mM, half of that prior had K above the box
-  # floor and a fifth above the box ceiling, so for those draws the substrate never reached its own
-  # K and the knee was never in view.
   michaelis_bounds: [0.02, 0.2]
-
-  # The design box, DERIVED from the two rules that use only the prior and the noise floor:
-  #   floor  0.05 mM = max(2 * measurement_noise, 0.036 mM), the larger of the read-out limit and
-  #          the smallest concentration whose knee is still visible for 25% of the prior;
-  #   ceiling 0.8 mM, inside the 0.870 mM at which knee visibility falls to the 25% floor at this
-  #          duration, and 4x the top of the K prior so every draw's knee is reachable.
-  # Measured visibility across it: 0.700 at 0.1 mM, 0.935 at 0.2 mM, 0.600 at 0.4 mM, 0.287 at
-  # 0.8 mM.
-  concentration_bounds: [0.04, 0.8]
-
-  # Read-out noise: ABSOLUTE Gaussian on [A], independent of the concentration read. 0.05 mM is the
-  # read-out of config/detector/enzyme.yaml. It is the LAST thing tuned, after everything above, and
-  # the box floor is coupled to it by the 2-sigma rule, so a cell at a different noise carries a
-  # different floor.
+  velocity_bounds: [3.0e-5, 3.0e-4]
+  concentration_bounds: [0.025, 0.8]
   measurement_noise: 0.0125
-
-  # RKC2, unchanged from the calibrated settings of config/detector/enzyme_depletion.yaml: the pole
-  # at A = -K, not linear stability, sets the step. dt = duration / (n_measurements *
-  # steps_per_measurement) = 14.06 s here.
   n_stages: 5
   steps_per_measurement: 64
   damping: 0.15384615384615385
-
-  # The dt-against-dt/2 bar, asserted host-side on EVERY call, at 10% of the read-out noise -- the
-  # integration must not disturb what the read-out itself resolves (the discipline of
-  # config/detector/enzyme.yaml).
   integration_tolerance: 1.25e-3
-
-  # The estimator grid, even on (ln q, ln K) over the two priors. The prior is now 1 decade x 1
-  # decade against the earlier 1 x 3.3, so 65 points per axis is 3.3x FINER in the K direction than
-  # the setting that was resolution-checked.
   n_grid: 65

@@ -1,0 +1,15 @@
+universe       = vanilla
+executable     = campaign_cell.sh
+arguments      = ship_addr_prec5e3_probe $(seed) $(arm) $(reveal) /afs/cern.ch/work/m/maborisy/ship-prec5e3-probe/$(seed)/$(arm)
+output         = logs/p5e3probe_$(seed)_$(arm).$(ClusterId).$(ProcId).out
+error          = logs/p5e3probe_$(seed)_$(arm).$(ClusterId).$(ProcId).err
+log            = logs/p5e3probe.$(ClusterId).log
+request_gpus   = 1
+request_cpus   = 2
+request_memory = 12000
+requirements   = TARGET.GPUs_GlobalMemoryMb >= 20000
++MaxRuntime    = 172800
++JobBatchName  = "ship-prec5e3-probe"
+queue seed,arm,reveal from (
+  1244111331, from_scratch, none
+)

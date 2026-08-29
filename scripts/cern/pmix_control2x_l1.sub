@@ -1,0 +1,17 @@
+universe       = vanilla
+executable     = pmix_control2x_cell.sh
+arguments      = $(seed) $(design) $(pmix) $(trial) /afs/cern.ch/work/m/maborisy/ship-pmix/mix$(pmix)/trial$(trial)
+output         = logs/pmixctl2xl1_$(pmix)_$(trial).$(ClusterId).$(ProcId).out
+error          = logs/pmixctl2xl1_$(pmix)_$(trial).$(ClusterId).$(ProcId).err
+log            = logs/pmixctl2xl1.$(ClusterId).log
+request_gpus   = 1
+request_cpus   = 1
+request_memory = 4000
+requirements   = TARGET.GPUs_GlobalMemoryMb >= 10000 && (TARGET.GPUs_Capability =?= undefined || TARGET.GPUs_Capability >= 8.0)
++MaxRuntime    = 72000
++JobBatchName  = "ship-pmix-control-2x-l1"
+queue seed,design,pmix,trial from (
+  1244111331, 4, 1.0, 0
+  1244111331, 4, 1.0, 1
+  1244111331, 4, 1.0, 2
+)

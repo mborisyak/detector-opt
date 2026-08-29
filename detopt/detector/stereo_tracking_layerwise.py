@@ -13,6 +13,12 @@ The straw TDCs are scattered into a dense per-layer grid: a fired straw holds
 station-z / stereo angle are design-dependent (differentiable); the TDC grid is not. The per-element
 mask is all-ones ``(B, n_layers)`` -- every layer is always a valid element -- so a plain
 :class:`SetRegressor` pools over the 32 layers and the causal ``PredictiveSetRegressor`` streams them.
+
+WITH THE DESIGN WITHHELD exactly those two design-dependent features go, from BOTH leaves: the set
+rows become ``3 + n_straws`` (``[view_norm, layer_norm, y_offset_norm]`` ++ the grid) and the image
+loses two channels. The grid is untouched -- scattering fired straws needs no design -- so the
+narrower features are the layer's ADDRESS beside the same reading. The measurement does not depend on
+the design, so ``design_scaled=None`` is honoured and treated as ``reveal_design=False``.
 """
 
 import jax
@@ -111,17 +117,29 @@ class StereoLayerGrid(StereoStrawDetector):
 
 
 class StereoLayerWise(StereoLayerGrid):
-    """Per-LAYER SET combine: ``(B, n_layers, 5 + n_straws)`` rows for a :class:`SetRegressor`."""
+    """Per-LAYER SET combine: ``(B, n_layers, 5 + n_straws)`` rows for a :class:`SetRegressor`, or
+    ``3 + n_straws`` with the design withheld."""
 
-    def combined_event_shape(self):
-        # element axis = global layers; per-layer feature = [station_z, view, layer, angle, y_offset] ++ TDC grid
-        return (self.n_layers, 5 + self.n_straws)
+    def combined_event_shape(self, design: bool = True):
+        # element axis = global layers; per-layer feature = [station_z, view, layer, angle, y_offset] ++ TDC grid.
+        # Without the design, station_z and angle are unknowable and only the address survives.
+        return (self.n_layers, (5 if design else 3) + self.n_straws)
 
-    def combine_scaled(self, event, design_scaled, mask=None):
+    def combine_scaled(self, event, design_scaled=None, mask=None, reveal_design: bool = True):
         """Raw ``StrawEvent`` + SCALED design -> per-LAYER features ``(B, n_layers, 5 + n_straws)``:
         ``[station_z_norm, view_norm, layer_norm, angle_norm, y_offset_norm]`` ++ the per-layer TDC grid.
-        REQUIRES ``mask``."""
+        REQUIRES ``mask``.
+
+        WITH THE DESIGN WITHHELD -- ``reveal_design=False`` or ``design_scaled=None`` -- ``station_z_norm``
+        and ``angle_norm`` are dropped, since they ARE the design, and the row is
+        ``(B, n_layers, 3 + n_straws)``: ``[view_norm, layer_norm, y_offset_norm]`` ++ the same grid."""
         grid, B = self._tdc_grid(event, mask)
-        station_z_norm, view_norm, layer_norm, angle_norm, y_offset_norm = self._layer_positions(design_scaled, B)
+        reveal = reveal_design and design_scaled is not None
+        scaled = design_scaled if reveal else jnp.zeros((B, self.design_dim()), jnp.float32)
+        station_z_norm, view_norm, layer_norm, angle_norm, y_offset_norm = self._layer_positions(scaled, B)
+        if not reveal:
+            # station_z and angle ARE the design; view/layer/y_offset are the layer's address.
+            address = jnp.stack([view_norm, layer_norm, y_offset_norm], axis=-1)  # (B, n_layers, 3)
+            return jnp.concatenate([address, grid], axis=-1)  # (B, n_layers, 3 + n_straws)
         positions = jnp.stack([station_z_norm, view_norm, layer_norm, angle_norm, y_offset_norm], axis=-1)  # (B,n_layers,5)
         return jnp.concatenate([positions, grid], axis=-1)  # (B, n_layers, 5 + n_straws)

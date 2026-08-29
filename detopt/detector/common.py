@@ -37,12 +37,20 @@ detectors decide *how*.
     search the scaled cube directly, so a uniform draw there IS a uniform design.
 
   * ``combine_scaled(event, d_scaled) -> features`` merges a *raw* event and a
-    *scaled* design into a single design-informed event -- it normalises/packs
-    the event itself (there is no separate ``normalize``), differentiable w.r.t.
-    the scaled design; the hit ``mask`` is threaded separately by the caller.
-    ``combine(event, design)`` is the convenience wrapper
+    *scaled* design into the network's input -- it normalises/packs the event
+    itself (there is no separate ``normalize``), differentiable w.r.t. the scaled
+    design; the hit ``mask`` is threaded separately by the caller.
+    ``combine(event, design)`` is the FINAL wrapper
     ``combine_scaled(event, to_scaled(design))`` used when training from
     buffers that store the raw physical design.
+
+    THE DESIGN IS OPTIONAL, in two distinct ways. ``reveal_design=False`` keeps
+    the design in the MEASUREMENT and withholds it from the NETWORK; ``design=None``
+    says there is no design at all, which a detector whose measurement depends on
+    one refuses. Either way the features get NARROWER, never corrupted, and
+    ``combined_event_shape(design=False)`` reports that narrower shape. Which of
+    the two layouts a run uses is the TRAINER's call (``Trainer.reveals_design``),
+    not the detector's, so a detector must implement both.
 
   * ``normalize_target(Target) -> Array`` maps targets into the network's flat
     prediction space; ``denormalize_predictions(Array) -> Target`` is its inverse.
@@ -53,10 +61,11 @@ detectors decide *how*.
     array against the flat normalised label and return per-sample ``(B,)`` arrays.
 
   * The ``*_spec`` records are the source of truth; the ``*_dim`` accessors
-    (``design_dim``, ``target_dim``, ``ground_truth_dim``, ``combined_feature_dim``)
+    (``design_dim``, ``target_dim``, ``ground_truth_dim``, ``combined_feature_dim(design)``)
     are derived for the convenience of the networks. ``design_shape`` and
-    ``combined_event_shape`` stay flat-array shapes; ``design_shape`` covers both
-    design spaces, which share a width.
+    ``combined_event_shape(design)`` stay flat-array shapes; ``design_shape``
+    covers both design spaces, which share a width. The two combined accessors
+    take the ``design`` flag because their answer depends on it.
 """
 
 import math
@@ -127,8 +136,11 @@ class Detector(object):
         coordinate at a time on ``[0, 1]``, so it has the same width (defined per detector)."""
         raise NotImplementedError()
 
-    def combined_event_shape(self):
-        """Per-hit feature shape ``(M, F)`` produced by :meth:`combine` (a flat float array)."""
+    def combined_event_shape(self, design: bool = True):
+        """The shape of what :meth:`combine` produces, without the batch axis, for the case where the
+        design IS (``design=True``) or IS NOT (``design=False``) supplied. Usually ``(M, F)``, and the
+        two cases usually differ only in ``F``. ``Model.from_config`` passes this straight through as
+        ``input_shape``, so a model must be built for the same case the trainer will feed it."""
         raise NotImplementedError()
 
     # ------------------------------------------------------------------ #
@@ -143,10 +155,12 @@ class Detector(object):
     def ground_truth_dim(self):
         return _spec_dim(self.ground_truth_spec())
 
-    @property
-    def combined_feature_dim(self):
-        """Per-hit feature count produced by :meth:`combine`."""
-        return int(self.combined_event_shape()[-1])
+    def combined_feature_dim(self, design: bool = True):
+        """Per-element feature count produced by :meth:`combine`, with the design revealed or not.
+
+        ⚠️ A METHOD, NOT A PROPERTY: the count depends on which of the two layouts is meant, so it
+        cannot be read without saying so."""
+        return int(self.combined_event_shape(design)[-1])
 
     def __call__(self, design, event_index):
         """Simulate the events at the integer ``event_index`` for ``design`` -- a DETERMINISTIC function
@@ -246,23 +260,52 @@ class Detector(object):
         raise NotImplementedError()
 
     # ------------------------------------------------------------------ #
-    # Combine: raw event (+ design) -> flat per-hit network features.
+    # Combine: raw event (+ design) -> the network's input.
     # ------------------------------------------------------------------ #
-    def combine_scaled(self, event, design_scaled, mask=None):
-        """Merge a raw ``Event`` and a SCALED design into ``features (..., M, F)`` (defined per
-        detector). Normalises/packs the event internally; differentiable w.r.t. the scaled design.
+    def combine_scaled(self, event, design_scaled=None, mask=None, reveal_design: bool = True):
+        """Merge a raw ``Event`` and a SCALED design into the network's input (defined per detector).
+        Normalises/packs the event internally; differentiable w.r.t. the scaled design.
 
-        ``mask`` (the per-hit validity mask) is OPTIONAL: hit-wise combines ignore it (padded hits
+        USUALLY one array ``features (..., M, F)``, with the design already resolved into the
+        per-element features. It MAY instead be a PYTREE whose leaves share the leading axes, for a
+        detector that hands the design apart from the measurement. Whatever this returns is what
+        reaches the regressor: nothing between here and ``Model.__call__`` inspects it, EXCEPT the
+        trainer's ensemble path, which reshapes it as an array -- so a non-array combine requires
+        ``n_models: null``. ``combined_event_shape`` mirrors the structure.
+
+        EVERY IMPLEMENTATION HANDLES THE DESIGN-FREE CASE. ``reveal_design=False`` must still use
+        ``design_scaled`` wherever the MEASUREMENT depends on it and drop only what would announce
+        WHICH design was used; ``design_scaled=None`` must be honoured by a detector whose measurement
+        does not depend on the design, and REFUSED with a ``ValueError`` by one whose does. The result
+        is the narrower layout ``combined_event_shape(design=False)`` reports -- never a corrupted or
+        zero-filled version of the wide one. See :meth:`combine`.
+
+        ``mask`` (the per-hit validity mask) is OPTIONAL: hit-wise combines ignore it (masked hits
         carry index 0 and are zeroed downstream by the regressor mask). Combines whose element axis
         is NOT the hit axis (e.g. layer-wise, which scatters hits into a per-layer grid) REQUIRE it
-        to distinguish real hits from padding, and raise if it is ``None``."""
+        to tell a real hit from a masked slot, and raise if it is ``None``."""
         raise NotImplementedError()
 
-    def combine(self, event, design, mask=None):
+    def combine(self, event, design=None, mask=None, reveal_design: bool = True):
         """Merge a raw ``Event`` and a NOMINAL design: scale it, then :meth:`combine_scaled`. NEVER
-        overridden -- the feature layout varies through :meth:`combine_scaled`. (The FairShip replay is
-        NOT design-blind: the caller passes the geometry the data was recorded at -- it already has it.)"""
-        return self.combine_scaled(event, self.to_scaled(design), mask=mask)
+        overridden -- the feature layout varies through :meth:`combine_scaled`.
+
+        TWO WAYS TO WITHHOLD THE DESIGN, and they are not the same thing.
+
+        ``reveal_design=False`` says the CALLER HAS the design but the NETWORK IS NOT TOLD IT. The
+        detector still uses it wherever the MEASUREMENT depends on it -- the visible-window task applies
+        its aperture, so the network sees what was actually captured -- and drops only what would
+        announce which design produced it. This is what a design-blind training arm wants.
+
+        ``design=None`` says there IS no design to use. Detectors whose measurement does not depend on
+        the design (the straw family, the enzyme family) treat it exactly like ``reveal_design=False``;
+        one whose measurement DOES depend on it cannot honour it and raises.
+
+        Either way the features become narrower, never corrupted, and
+        ``combined_event_shape(design=False)`` reports their shape."""
+        return self.combine_scaled(
+            event, None if design is None else self.to_scaled(design), mask=mask, reveal_design=reveal_design
+        )
 
     def element_mask(self, event, mask):
         """Per-ELEMENT validity mask ``(..., n_elements)`` for the regressor aggregation -- the element

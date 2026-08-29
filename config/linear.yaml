@@ -9,8 +9,9 @@
 # protocol, the seed sequence, the trainers -- where a silent mistake would otherwise look like noise.
 #
 # regressor -- a tiny MLP over the set of probes: one element per probe, its features being its own
-#   reading and its own position, so the network is design-conditioned and permutation-invariant in
-#   the probes, which is the symmetry of the problem. The bottleneck is deliberate and it is the whole
+#   reading and its own position. The position reaches the network only in the arms that REVEAL the
+#   design (`Trainer.reveals_design`); the inference is permutation-invariant in the probes either
+#   way, which is the symmetry of the problem. The bottleneck is deliberate and it is the whole
 #   reason the task runs at all: CAPACITY IS THE LEVER ON THE BINDING TERM. MEASURED at `corner-high`
 #   (+1, +1), the worst design in the box, at `iteration_limit` 65536 -- at [[16,16],[16,16]] (7048
 #   parameters) the train/validation gap sticks at diff 0.0150 and the design NEVER converges; at

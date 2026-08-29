@@ -9,9 +9,19 @@
 
 WHY. The neural campaign cannot converge on uninformative designs: the trainer stops when
 `diff + err < loss_precision`, `err` is the loss estimate's standard error (falls like `1/sqrt(n)`)
-and `diff` is the train/validation gap, which is an OVERFITTING BIAS and does not fall with more data.
-Measured, `diff` alone reaches 0.0083, which forced `loss_precision` to 8.0e-3 and put criterion (d)'s
+and `diff` is the train/validation gap, which falls with data too -- both splits are IID from one
+stream and the network is fixed-capacity -- so what bites is the pre-asymptotic regime at an
+affordable window. Measured there, `diff` alone reaches 0.0083, which forced `loss_precision` to 8.0e-3 and put criterion (d)'s
 bar (`10 x loss_precision`) at 0.080 against an achievable span of ~0.09-0.20.
+
+⚠️ NOT MONOTONE, and the sign is design-dependent. Uniform convergence gives `diff -> 0`
+ASYMPTOTICALLY; it says nothing about the path. At small `n` an underfitting network holds train
+and val both high and close, so `diff` is small; as `n` grows and the network starts to fit, train
+falls faster than val and `diff` RISES; only later does val catch up and `diff` fall. Measured on
+SHiP: median slope `dlog(diff)/dlog(window) = -1.38` over 9 designs, but `+0.428` on one design
+that was still rising at window 262,144 (`err` on that same design fell at -0.495, matching
+`n^-1/2` to three digits, so the measurement is sound and it is `diff` alone that is unruly).
+Do NOT assume a sign for the affordable range.
 
 The question this answers is whether that floor belongs to the TASK or to the ESTIMATOR. It takes a
 tenth of the campaign's per-run budget at ONE design and fits XGBoost instead of the deep set, with
@@ -36,7 +46,6 @@ import argparse
 import json
 import os
 
-
 # Cap BLAS threads BEFORE numpy is imported (SLURM restricts WHICH cores, not how many threads).
 _threads = os.environ.get("SLURM_CPUS_PER_TASK", "4")
 for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
@@ -48,7 +57,6 @@ import yaml
 
 import detopt
 import detopt.detector
-
 
 def build(detector, design_scaled, n_events, chunk=16384):
   """`(features (n, m, F), label (n,))` at ONE design, sampled in chunks to bound memory.
@@ -73,7 +81,6 @@ def build(detector, design_scaled, n_events, chunk=16384):
     done += size
   return np.concatenate(features), np.concatenate(labels).astype(np.int64)
 
-
 def augment(features, labels, n_permutations, rng):
   """Permute the EXPERIMENT axis. Each experiment's design coordinates sit in its own row, so a
   permutation leaves the label untouched -- an exact symmetry, not a heuristic distortion."""
@@ -86,7 +93,6 @@ def augment(features, labels, n_permutations, rng):
     out_features.append(np.take_along_axis(features, order[:, :, None], axis=1).reshape(n, -1))
     out_labels.append(labels)
   return np.concatenate(out_features), np.concatenate(out_labels)
-
 
 def main():
   parser = argparse.ArgumentParser()
@@ -177,7 +183,6 @@ def main():
       "train_curve": train_curve.tolist(), "val_curve": val_curve.tolist(),
     }, f, indent=2, default=float)
   print(f"\nwrote {arguments.output}")
-
 
 if __name__ == "__main__":
   main()

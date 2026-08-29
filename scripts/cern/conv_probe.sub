@@ -1,0 +1,12 @@
+universe       = vanilla
+executable     = conv_probe.sh
+output         = logs/convprobe.$(ClusterId).out
+error          = logs/convprobe.$(ClusterId).err
+log            = logs/convprobe.$(ClusterId).log
+request_gpus   = 1
+request_cpus   = 2
+request_memory = 8000
+requirements   = TARGET.GPUs_GlobalMemoryMb >= 20000 && TARGET.GPUs_Capability >= 8.0
++MaxRuntime    = 1800
++JobBatchName  = "conv-probe"
+queue 1

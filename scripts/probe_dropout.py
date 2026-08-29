@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
-"""Does REGULARISATION close the train/validation gap that makes uninformative designs unconvergeable?
+"""Does REGULARISATION close the train/validation gap that blocks convergence at an affordable window?
 
     python scripts/probe_dropout.py =enzyme_inhib --results output/campaign-inhib/126382657/from_scratch/results.json \
         --dropout 0.1 0.2 0.3 --output output/screen/dropout-probe.json
 
 THE PROBLEM THIS MEASURES. `detopt/nn/trainer` calls a design converged when `diff + err` falls under
 `loss_precision`, where `err` is the loss estimate's standard error and `diff` is the train/validation
-gap. `err` falls like `1/sqrt(window)`, so more data always fixes it. `diff` does NOT: on an
-uninformative design the network fits read-out noise, and the gap is an OVERFITTING BIAS that sits
-where it is however much data arrives. Two campaign runs died exactly there --
+gap. `err` falls like `1/sqrt(window)`, so more data always fixes it -- and obviously, diff falls with data
+too, for the same reason: both splits are IID from one stream and the network is fixed-capacity, so
+both empirical risks converge to the same population risk. What bites is the PRE-ASYMPTOTIC regime at
+the windows a run can afford. Two campaign runs died exactly there --
+
+⚠️ NOT MONOTONE, and the sign is design-dependent. Uniform convergence gives `diff -> 0`
+ASYMPTOTICALLY; it says nothing about the path. At small `n` an underfitting network holds train
+and val both high and close, so `diff` is small; as `n` grows and the network starts to fit, train
+falls faster than val and `diff` RISES; only later does val catch up and `diff` fall. Measured on
+SHiP: median slope `dlog(diff)/dlog(window) = -1.38` over 9 designs, but `+0.428` on one design
+that was still rising at window 262,144 (`err` on that same design fell at -0.495, matching
+`n^-1/2` to three digits, so the measurement is sound and it is `diff` alone that is unruly).
+Do NOT assume a sign for the affordable range.
 
     diff=0.0053   err=0.0022  ->  0.00748  vs precision 0.006
     diff=0.008349 err=0.0028  ->  0.0112   vs precision 0.008
@@ -50,7 +60,6 @@ import detopt
 import detopt.detector
 from detopt.nn.trainer import DesignTrainer
 
-
 def _per_window(history):
   """Collapse the per-epoch history into one row per WINDOW SIZE (i.e. per data-addition round).
 
@@ -80,7 +89,6 @@ def _per_window(history):
       "diff_mean": float(diff[sel].mean()), "diff_max": float(diff[sel].max()),
     })
   return rows
-
 
 def main():
   parser = argparse.ArgumentParser()
@@ -199,7 +207,6 @@ def main():
   print(f"\nwrote {arguments.output}")
   print("READ IT AS: a higher dropout is worth it only if the converged LEVEL rises by less than the")
   print("gap falls -- the level sets the span the criterion is measured against.")
-
 
 if __name__ == "__main__":
   main()

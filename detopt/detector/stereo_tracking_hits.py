@@ -8,6 +8,14 @@ emits one feature vector per HIT (not per layer / per straw-grid):
 ``station_z_norm`` and ``angle_norm`` are design-dependent (the gradient flows through them); the rest
 are the hit's address (view/layer/straw, the wire stagger) + its normalized TDC. ``element_mask`` is the
 hit mask (default) -- the continuous-conv regressor treats each hit as a graph node.
+
+WITH THE DESIGN WITHHELD those two design-dependent features are exactly what goes, leaving
+
+    (B, M, 5)   = [view_norm, layer_norm, y_offset_norm, straw_norm, tdc_norm]
+
+-- the hit's address and its reading, which is all this detector can say without knowing where the
+stations sit or how the views are tilted. The measurement does not depend on the design, so
+``design_scaled=None`` is honoured and treated exactly like ``reveal_design=False``.
 """
 
 import jax.numpy as jnp
@@ -23,15 +31,18 @@ class StereoHits(StereoStrawDetector):
         self.tdc_scale = float(tdc_scale)
         self.tdc_clip = float(tdc_clip)
 
-    def combined_event_shape(self):
-        return (self.max_hits_per_event, 7)
+    def combined_event_shape(self, design: bool = True):
+        # 7 with the design; without it station_z and the stereo angle are unknowable -> 5
+        return (self.max_hits_per_event, 7 if design else 5)
 
     def element_mask(self, event, mask):
         return mask  # element == hit (the continuous-conv regressor treats each hit as a graph node)
 
-    def combine_scaled(self, event, design_scaled, mask=None):
-        """Raw ``StrawEvent`` + SCALED design -> per-HIT features ``(B, M, 7)`` (``mask`` accepted but
-        not needed -- padded hits are gated by the regressor's hit mask)."""
+    def combine_scaled(self, event, design_scaled=None, mask=None, reveal_design: bool = True):
+        """Raw ``StrawEvent`` + SCALED design -> per-HIT features ``(B, M, 7)``, or ``(B, M, 5)`` with
+        the design withheld -- ``station_z_norm`` and ``angle_norm`` are the design and are dropped,
+        the address and the TDC are not. (``mask`` accepted but not needed -- masked hits are gated by
+        the regressor's hit mask.)"""
         station = jnp.asarray(event.station, jnp.int32)  # (B, M)
         view = jnp.asarray(event.view, jnp.int32)
         layer = jnp.asarray(event.layer, jnp.int32)
@@ -41,7 +52,11 @@ class StereoHits(StereoStrawDetector):
         per_station = self.n_views_per_station * self.n_layers_per_view
         g = jnp.clip(station * per_station + view * self.n_layers_per_view + layer, 0, self.n_layers - 1)  # (B,M)
 
-        d_scaled = jnp.asarray(design_scaled, jnp.float32)
+        if design_scaled is None:
+            d_scaled = jnp.zeros((B, self.design_dim()), jnp.float32)  # unused: reveal_design is False below
+            reveal_design = False
+        else:
+            d_scaled = jnp.asarray(design_scaled, jnp.float32)
         if d_scaled.ndim == 1:
             d_scaled = jnp.broadcast_to(d_scaled[None, :], (B, d_scaled.shape[0]))
         phys = self._to_nominal_flat(d_scaled)  # (B, n_stations + 1) physical [station_z..., stereo_angle]
@@ -67,5 +82,8 @@ class StereoHits(StereoStrawDetector):
         straw_norm = (2.0 / max(self.n_straws - 1, 1)) * jnp.clip(straw, 0, self.n_straws - 1).astype(jnp.float32) - 1.0
         tdc_norm = jnp.clip(tdc, 0.0, self.tdc_clip) / self.tdc_scale  # (B, M) >= 0
 
+        if not reveal_design:
+            # station_z and angle are the design; view/layer/y_offset/straw/TDC are the hit's address.
+            return jnp.stack([view_norm, layer_norm, y_offset_norm, straw_norm, tdc_norm], axis=-1)  # (B, M, 5)
         return jnp.stack([station_z_norm, view_norm, layer_norm, angle_norm, y_offset_norm, straw_norm, tdc_norm],
                          axis=-1)  # (B, M, 7)

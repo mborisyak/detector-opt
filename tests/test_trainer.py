@@ -32,7 +32,7 @@ def test_dropout_active_only_when_training(seed):
         rngs=nnx.Rngs(seed),
     )
     rng = np.random.default_rng(seed)
-    B, M, F = 4, det.max_hits_per_event, det.combined_feature_dim
+    B, M, F = 4, det.max_hits_per_event, det.combined_feature_dim()
     features = jnp.asarray(rng.standard_normal((B, M, F)), dtype=jnp.float32)
     mask = jnp.ones((B, M), dtype=jnp.int32)
 
@@ -47,7 +47,8 @@ def test_dropout_active_only_when_training(seed):
     assert not np.allclose(np.asarray(c), np.asarray(d))
 
 
-def _small_trainer(loss_precision, *, n0, n_increment, iteration_limit, budget, seed, checkpoint_dir=None):
+def _small_trainer(loss_precision, *, n0, n_increment, iteration_limit, budget, seed, checkpoint_dir=None,
+                   reveal=None):
     det = analytic_detector()
     return det, DesignTrainer(
         det,
@@ -66,6 +67,7 @@ def _small_trainer(loss_precision, *, n0, n_increment, iteration_limit, budget, 
         device=None,
         checkpoint_dir=checkpoint_dir,
         seed=seed,
+        reveal=reveal,
     )
 
 
@@ -207,11 +209,16 @@ def test_continual_replay_sampling():
 
 
 def test_trainers_are_design_conditioned():
-    """No design scramble: the per-event PHYSICAL design fed to ``combine`` reaches the network, so
-    the shared loss kernel (used by every trainer) gives a different loss for the real design than
-    for a shifted one. The pool now stores raw events + raw physical design; ``combine`` encodes it."""
+    """A trainer that REVEALS the design feeds it to ``combine``, so the shared loss kernel gives a
+    different loss for the real design than for a shifted one. The pool stores raw events + raw
+    physical design; ``combine`` encodes it.
+
+    ⚠️ WHICH ARMS REVEAL IT IS A PER-STRATEGY DEFAULT (``Trainer.default_reveal``): the
+    per-design arms withhold unless ``training.reveal`` says otherwise, so this asks for it
+    explicitly rather than assuming every trainer is design-conditioned."""
     det = analytic_detector()
-    _, trainer = _small_trainer(0.5, n0=256, n_increment=128, iteration_limit=512, budget=20_000, seed=0)
+    _, trainer = _small_trainer(0.5, n0=256, n_increment=128, iteration_limit=512, budget=20_000, seed=0,
+                                reveal='design')
     reg_def, params, state = trainer._build_regressor(0)
     loss_fn = trainer._make_loss_fn(reg_def)
 
@@ -226,3 +233,45 @@ def test_trainers_are_design_conditioned():
     loss_real, _ = loss_fn(params, state, key, event, mask, design_real, target)
     loss_alt, _ = loss_fn(params, state, key, event, mask, design_alt, target)
     assert abs(float(loss_real) - float(loss_alt)) > 1e-4  # the design actually feeds combine
+
+
+def test_zero_design_keeps_the_shape_and_removes_the_information():
+    """``reveal='zeros'`` is the CAPACITY-MATCHED control: the design is still revealed, so the
+    features keep their full width and the regressor its full input, but the values handed to
+    ``combine`` are zeros. That is a different thing from ``reveal='none'``, which narrows the input
+    instead."""
+    det = analytic_detector()
+    _, sighted = _small_trainer(0.5, n0=256, n_increment=128, iteration_limit=512, budget=20_000, seed=0,
+                                reveal='design')
+    _, zeroed = _small_trainer(0.5, n0=256, n_increment=128, iteration_limit=512, budget=20_000, seed=0,
+                               reveal='zeros')
+
+    B = 16
+    phys = np.broadcast_to(_DEBUG_DESIGN[None, :], (B, det.design_dim())).astype(np.float32)
+    _gt, event, mask, _target = det(phys, np.arange(B))
+    design = jnp.asarray(phys)
+
+    with_design = sighted._combine(event, design, mask)
+    with_zeros = zeroed._combine(event, design, mask)
+    # same shape -- the regressor is unchanged, only the values it reads are
+    assert with_design.shape == with_zeros.shape
+    assert float(jnp.max(jnp.abs(with_design - with_zeros))) > 1e-6
+
+    # and it really is the ZERO design, not some other one
+    straight = det.combine(event, jnp.zeros_like(design), mask=mask)
+    assert float(jnp.max(jnp.abs(with_zeros - straight))) == 0.0
+
+    # two DIFFERENT designs are indistinguishable to a zero-design arm
+    other = design + 40.0
+    assert float(jnp.max(jnp.abs(zeroed._combine(event, other, mask) - with_zeros))) == 0.0
+    assert float(jnp.max(jnp.abs(sighted._combine(event, other, mask) - with_design))) > 1e-6
+
+
+def test_unknown_reveal_is_refused():
+    """``reveal`` names one of the three layouts in ``REVEAL``. Anything else is refused at
+    construction rather than falling through to the strategy default, which would silently train a
+    different arm than the one the config asked for -- the old two-flag spelling
+    (``reveal_design`` + ``zero_design``) is exactly the sort of stale value this catches."""
+    with pytest.raises(ValueError, match='reveal must be one of'):
+        _small_trainer(0.5, n0=256, n_increment=128, iteration_limit=512, budget=20_000, seed=0,
+                       reveal='zero_design')

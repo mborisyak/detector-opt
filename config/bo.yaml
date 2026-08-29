@@ -62,9 +62,10 @@ nominal_design:
 
 regressor:
   set-regressor:
-    features: [[24, 32], [32, 24]]
+    features: [[16, 24], [24, 16]]
     n_models: null
     p_dropout: null
+    activation: celu
 
 device: cuda
 plot_per_epoch: 8

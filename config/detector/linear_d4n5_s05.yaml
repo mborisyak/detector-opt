@@ -1,0 +1,18 @@
+# The `linear` detector at 4 dimensions with 5 probes, sigma 0.5 -- the TOP rung of the dimension
+# ladder, 20 design coordinates. `n_probes = n_dimensions + 1`, the structural rule of this family, so
+# no design is rank deficient and the loss floor from rank deficiency is 0.0.
+#
+# ⚠️ NOT `config/detector/linear_d4n5.yaml`, which is the same cell at sigma 0.7. That file is the
+# operating point `scripts/linear_exact_bo.py` selected for the acceptance-gate study and carries its
+# own justification; this one exists so the ladder rungs differ in DIMENSION ALONE, matching the
+# sigma 0.5 of `linear_d2n3.yaml` and `linear_d3n4.yaml`.
+#
+# ⚠️ THE OPTIMUM IS A CORNER DESIGN here as at every other cell of this family, and
+# `docs/benchmark-acceptance.md` 1.1 names that as the gate's failure mode: the box IS the answer.
+# Anything measured here is a MACHINERY comparison against `LinearDetector.bayes_risk`, never evidence
+# about the acceptance gate.
+linear:
+  n_probes: 5
+  n_dimensions: 4
+  noise: 0.5
+  probe_bounds: [-1.0, 1.0]

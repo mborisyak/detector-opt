@@ -20,18 +20,25 @@ call occupies a contiguous **window** ``[w0, w0 + n)`` (``w0`` = the pool fill w
 it started); training and evaluation address it by a runtime ``start`` offset, so a
 single compiled kernel serves any window position/fill without recompiling.
 
-Every event carries its own **raw physical design** in the pool, and ``combine`` is
-always **design-conditioned**: each event is merged with its own design
-(``combine`` scales it, then ``combine_scaled`` un-scales + gathers per-hit), so the
-network sees the true detector geometry -- and a mixed-design batch (e.g. replay) is
-handled per event. Pools store RAW records (events/targets/design); ``combine`` +
-``normalize_target`` run per batch inside the kernels, not at fill time.
+Every event carries its own **raw physical design** in the pool, and ``combine``
+always receives that TRUE design: each event is merged with its own (``combine``
+scales it, then ``combine_scaled`` un-scales + gathers per-hit), so a mixed-design
+batch (e.g. replay) is handled per event. Pools store RAW records
+(events/targets/design); ``combine`` + ``normalize_target`` run per batch inside the
+kernels, not at fill time.
+
+Whether the NETWORK is told the design is a separate question, answered per
+strategy by the abstract :meth:`Trainer.reveals_design` and threaded into
+``combine`` by :meth:`Trainer._combine`. Withholding narrows the features; it never
+changes what the detector measured.
 """
 
 from __future__ import annotations
 
 import os
 from typing import NamedTuple
+
+import warnings
 
 import jax
 import jax.numpy as jnp
@@ -50,6 +57,8 @@ class TrainResult(NamedTuple):
   objective_std: float  # |val - train| + hypot(train_sem, val_sem) -- spread + error of the means
   spent: int  # detector calls this design added to the pools (train + val)
   params: object  # trained regressor params (for warm-starting later designs)
+  spent_train: int = 0  # of `spent`, how many landed in the TRAIN pool; 0 = not reported by this trainer
+  spent_val: int = 0  # of `spent`, how many landed in the VALIDATION pool; 0 = not reported by this trainer
 
 
 def _round_down(n0: int, n_increment: int, limit: int) -> int:
@@ -133,6 +142,9 @@ def fresh_design_network(trainer, init_seq, init_params):
   return (jax.device_put(params, d), jax.device_put(state, d), jax.device_put(opt_state, d))
 
 
+REVEAL = ('none', 'design', 'zeros')
+
+
 class Trainer:
   """Shared base: budget pools, JIT kernels, sampling, network lifecycle, checkpoints.
 
@@ -144,7 +156,7 @@ class Trainer:
   def __init__(
     self, detector, *, regressor_config: dict, optimizer: optax.GradientTransformation, batch: int, budget: int,
     iteration_limit: int, val_iteration_limit: int, val_fraction: float = 0.25, eval_batch: int | None = None, device=None,
-    checkpoint_dir: str | None = None, seed: int = 0,
+    checkpoint_dir: str | None = None, seed: int = 0, reveal: str | None = None,
   ):
     """Store shared state, size the budget pools, and build the JIT kernels.
 
@@ -153,6 +165,19 @@ class Trainer:
         The concrete trainer derives both, and ``optimizer``, from its own knobs.
         """
     self.detector = detector
+    if reveal is not None and reveal not in REVEAL:
+      raise ValueError(f'reveal must be one of {sorted(REVEAL)} or None for the strategy default, got {reveal!r}')
+    self._reveal = reveal
+    if self.default_reveal() == 'design' and self.reveal() != 'design':
+      # A strategy whose default is 'design' needs it: its batch MIXES designs, and the design is the
+      # only thing telling a replay row from a current one. Withheld or zeroed, it is fitting a
+      # mixture it cannot separate -- legitimate as an experiment, never as a default.
+      warnings.warn(
+        f'{type(self).__name__} defaults to reveal=\'design\' because its batch mixes the current '
+        f'design with replay from earlier ones; running it at reveal={self.reveal()!r} leaves the '
+        f'network unable to tell those rows apart. This is a deliberate experiment or a mistake -- '
+        f'it is not a neutral setting.', RuntimeWarning, stacklevel=2
+      )
     self.regressor_config = regressor_config
     self.optimizer = optimizer
     self.batch = int(batch)
@@ -236,7 +261,7 @@ class Trainer:
         :func:`regressor_rngs`, which is where they are defined and why."""
     from detopt.nn import from_config
 
-    reg = from_config(self.detector, config=self.regressor_config, rngs=regressor_rngs(seed))
+    reg = from_config(self.detector, config=self.regressor_config, rngs=regressor_rngs(seed), design=self.reveal() != 'none')
     return nnx.split(reg, nnx.Param, nnx.Variable)
 
   def _build_kernels(self, seed):
@@ -251,7 +276,7 @@ class Trainer:
         """
     from detopt.nn import from_config
 
-    reg = from_config(self.detector, config=self.regressor_config, rngs=regressor_rngs(seed))
+    reg = from_config(self.detector, config=self.regressor_config, rngs=regressor_rngs(seed), design=self.reveal() != 'none')
     self.n_ensemble = reg.ensemble()
     self.draw_batch = self.batch * (self.n_ensemble or 1)  # indices drawn per train step
     reg_def = nnx.split(reg, nnx.Param, nnx.Variable)[0]
@@ -266,8 +291,46 @@ class Trainer:
   # ``count`` (one compiled kernel serves any window). ``combine`` + ``normalize_target``
   # run here, per batch, on the raw records (not at pool-fill time).
   # ------------------------------------------------------------------ #
+  def default_reveal(self):
+    """What this strategy shows the network ABSENT an explicit setting: ``'design'`` or ``'none'``.
+    ABSTRACT, and the TRAINER'S call.
+
+    ⚠️ CONSTANT IS NOT THE SAME AS FREE. A per-design strategy sees one design across its whole batch,
+    but where the design fixes the measurement geometry a network denied it has to INFER that geometry
+    from the readings, which costs data. The default is what a run gets when it says nothing, not a
+    claim that withholding is free."""
+    raise NotImplementedError()
+
+  def reveal(self):
+    """What this RUN shows the network -- ``training.reveal`` when set, else :meth:`default_reveal`.
+    FINAL; a strategy varies the default, not this.
+
+    ``'design'`` -- the design reaches the network, resolved into the features as the detector sees fit.
+
+    ``'none'`` -- WITHHELD. The features are NARROWER: the detector emits what it can say without the
+    design, and the regressor is built for that width. The measurement is unchanged -- a task whose
+    measurement depends on its design still applies it.
+
+    ``'zeros'`` -- revealed in SHAPE but not in CONTENT: full feature width, full regressor input, and
+    ``zeros_like(design)`` handed to ``combine``. The CAPACITY-MATCHED control; ``'none'`` is the
+    narrow-input one.
+
+    ⛔️ ZEROS ARE A POINT, NOT AN ABSENCE. They are the NOMINAL zero, which for most detectors lies
+    outside the design box, and where the measurement depends on the design the detector applies it --
+    the visible window is degenerate at zero extent. Read a ``'zeros'`` arm as "conditioned on one
+    fixed, possibly unphysical design", never as "unconditioned"."""
+    return self.default_reveal() if self._reveal is None else self._reveal
+
+  def _combine(self, event, design, mask):
+    """``detector.combine`` as the TRAINING PROCEDURE performs it, under :meth:`reveal`."""
+    reveal = self.reveal()
+    if reveal == 'zeros':
+      design = jax.tree.map(jnp.zeros_like, design)
+    return self.detector.combine(event, design, mask=mask, reveal_design=reveal != 'none')
+
   def _make_loss_fn(self, reg_def):
     detector = self.detector
+    combine = self._combine
     members = self.n_ensemble
     batch = self.batch
     weights = self._sample_weights()  # None = uniform; built once, static per trainer
@@ -276,7 +339,7 @@ class Trainer:
       # deterministic=False -> dropout ACTIVE; the rng is threaded in
       # explicitly (fresh per step) so it lives at the current trace level.
       reg = nnx.merge(reg_def, params, state)
-      features = detector.combine(event_b, design_b, mask=mask_b)  # design_b: per-event PHYSICAL design
+      features = combine(event_b, design_b, mask_b)
       emask = detector.element_mask(event_b, mask_b)  # per-element mask (== hit mask, unless layer-wise)
       target = detector.normalize_target(target_b)
       # The MODEL owns the forward (reg.loss) so it can inject net-specific loss terms.
@@ -366,6 +429,7 @@ class Trainer:
   def _build_eval(self, reg_def, window):
     """Eval kernel scanning ``window`` rows from ``start`` (gradient-free)."""
     detector = self.detector
+    combine = self._combine
     eval_batch = self.eval_batch
     members = self.n_ensemble
     n_chunks = -(-window // eval_batch)  # ceil
@@ -381,7 +445,7 @@ class Trainer:
         safe = jnp.clip(idxs, 0, pool_size - 1)
         ev = jax.tree.map(lambda a: a[safe], event_buf)
         mask_b = mask_buf[safe]
-        features = detector.combine(ev, jax.tree.map(lambda a: a[safe], design_buf), mask=mask_b)
+        features = combine(ev, jax.tree.map(lambda a: a[safe], design_buf), mask_b)
         emask = detector.element_mask(ev, mask_b)
         target_b = detector.normalize_target(jax.tree.map(lambda a: a[safe], target_buf))
         if members is None:
@@ -444,7 +508,28 @@ class Trainer:
     self._fill_pool(design, tp, n_train, self._train_index)
     if n_val > 0:
       self._fill_pool(design, vp, n_val, self._val_index)
+    # WHAT ELSE THIS STRATEGY BUYS WITH THE SAME ROUND. A strategy whose training set is not only the
+    # designs BO proposed adds its own events HERE, alongside the round, so "the trainer asked for more
+    # data" and "the extra data arrived" are one event and the pools can never disagree about how much
+    # of the budget has been spent.
+    self._round_extra(n_train)
     return n_train
+
+  def spent_calls(self):
+    """Detector calls this trainer has actually SIMULATED. ABSTRACT -- the strategy that decides what
+        its pools hold also decides how to count them.
+
+        Not the same as the pools' fill: a strategy may RESERVE pool slots it has not paid for yet, and
+        `bo.py` reports this as the run's spend, so a reserve counted here would be budget claimed
+        without a detector call behind it."""
+    raise NotImplementedError()
+
+  def _round_extra(self, n_train):
+    """Events this strategy appends ALONGSIDE a round of ``n_train`` observed ones. ABSTRACT -- the
+        strategy that decides what its training set holds also decides what a data request costs.
+
+        Most strategies train on the proposed designs alone and add nothing."""
+    raise NotImplementedError()
 
   # ------------------------------------------------------------------ #
   # Network lifecycle (overridden by ContinualTrainer to persist the net).
@@ -475,12 +560,16 @@ class Trainer:
     from ...utils import io
 
     if self.checkpoint_dir is None or len(self.checkpoint_dir) == 0:
-      raise ValueError("a warm start reads the per-design checkpoints, so a run that warm-starts must "
-                       "have been given a checkpoint_dir")
+      raise ValueError(
+        "a warm start reads the per-design checkpoints, so a run that warm-starts must "
+        "have been given a checkpoint_dir"
+      )
     path = os.path.join(self.checkpoint_dir, f"design_{iteration:04d}")
     if not os.path.isdir(path):
-      raise FileNotFoundError(f"no checkpoint at {path} -- a warm start continues the network this run "
-                              f"reported for design {iteration}, so that design's checkpoint must be kept")
+      raise FileNotFoundError(
+        f"no checkpoint at {path} -- a warm start continues the network this run "
+        f"reported for design {iteration}, so that design's checkpoint must be kept"
+      )
     manager = io.get_checkpointer(path)
     if manager.latest_step() is None:
       raise ValueError(f"{path} holds no saved epoch")
@@ -533,8 +622,10 @@ class Trainer:
       raise FileNotFoundError(f"no trainer state at {path} (nor {path}.old)")
     with np.load(source) as data:
       if int(data["seed"]) != self.seed:
-        raise ValueError(f"{source}: state was written at seed {int(data['seed'])}, this trainer is at "
-                         f"{self.seed}; the seed fixes the train/val split and the event order")
+        raise ValueError(
+          f"{source}: state was written at seed {int(data['seed'])}, this trainer is at "
+          f"{self.seed}; the seed fixes the train/val split and the event order"
+        )
       # THE LAYOUT COMES BACK FROM THE STATE, and a raised budget EXTENDS it rather than recutting it.
       #
       # ⚠️ A STATE WRITTEN BEFORE `generations` EXISTED MUST BE READ AS THE BLOCK IT ACTUALLY WAS,
@@ -548,17 +639,21 @@ class Trainer:
       else:
         saved = tuple(int(np.shape(data[f"{name}_leaf_0"])[0]) for name in ("train", "val"))
         stored = [saved]
-        print(f"[migrate] {source}: written before the event-index layout was recorded; reading it as one "
-              f"block of {saved[0]}+{saved[1]} events (the saved pools' own capacity).")
+        print(
+          f"[migrate] {source}: written before the event-index layout was recorded; reading it as one "
+          f"block of {saved[0]}+{saved[1]} events (the saved pools' own capacity)."
+        )
       spent_train = sum(train for train, _ in stored)
       spent_val = sum(val for _, val in stored)
       extra_train = self.train_pool.capacity - spent_train
       extra_val = self.val_pool.capacity - spent_val
       if extra_train < 0 or extra_val < 0:
-        raise ValueError(f"{source}: state was written for a budget of {spent_train}+{spent_val} events and "
-                         f"this trainer is configured for {self.train_pool.capacity}+{self.val_pool.capacity}; "
-                         f"a budget may be RAISED between runs but never lowered -- the smaller pools cannot "
-                         f"hold events already paid for")
+        raise ValueError(
+          f"{source}: state was written for a budget of {spent_train}+{spent_val} events and "
+          f"this trainer is configured for {self.train_pool.capacity}+{self.val_pool.capacity}; "
+          f"a budget may be RAISED between runs but never lowered -- the smaller pools cannot "
+          f"hold events already paid for"
+        )
       self._generations = stored if extra_train == 0 and extra_val == 0 else stored + [(extra_train, extra_val)]
       self._rebuild_event_index()
       # Release the allocated pool BEFORE building the restored one, and keep the leaves on the HOST
@@ -574,11 +669,52 @@ class Trainer:
         specs, device, capacity = pool.specs, pool.device, pool.capacity
         for buffer in jax.tree.leaves(pool.buffers()):
           buffer.delete()
-        setattr(self, attribute, Pool.load({
-          "slots": jax.tree.unflatten(structure, leaves),
-          "current": int(data[f"{name}_current"]),
-        }, specs, capacity=capacity, device=device))
+        setattr(
+          self, attribute,
+          Pool.load({
+            "slots": jax.tree.unflatten(structure, leaves),
+            "current": int(data[f"{name}_current"]),
+          }, specs, capacity=capacity, device=device)
+        )
       self._load_carried_state(data)
+
+  def replay(self, rows):
+    """Refill the pools by RE-SIMULATING the trajectory, instead of loading a saved snapshot.
+
+        ``rows`` are the COMMITTED results entries in order; each carries its design in the scaled cube
+        plus the ``spent_train`` / ``spent_val`` it added. ``detector(design, event_index)`` is
+        deterministic and the event index is a function of (detector size, seed, generations), so
+        replaying the rows reproduces the pools exactly. What it costs is the simulation, not the
+        science -- which is why the run no longer has to carry a budget-sized state file.
+
+        The pools must be EMPTY: this rebuilds them, it does not top them up.
+        """
+    if self.train_pool.current > 0 or self.val_pool.current > 0:
+      raise ValueError(
+        f"replay() rebuilds the pools and needs them empty, but they hold "
+        f"{self.train_pool.current}+{self.val_pool.current} events"
+      )
+    for row in rows:
+      design = self.detector.to_nominal(np.asarray(row["x_scaled"], dtype=np.float32))
+      n_train, n_val = int(row["spent_train"]), int(row["spent_val"])
+      if n_train > self.train_pool.capacity - self.train_pool.current or \
+          n_val > self.val_pool.capacity - self.val_pool.current:
+        raise ValueError(
+          f"replaying iteration {row.get('iteration')} needs {n_train}+{n_val} events but the "
+          f"pools hold only {self.train_pool.capacity - self.train_pool.current}+"
+          f"{self.val_pool.capacity - self.val_pool.current} more; the budget was LOWERED"
+        )
+      self._fill_pool(design, self.train_pool, n_train, self._train_index)
+      if n_val > 0:
+        self._fill_pool(design, self.val_pool, n_val, self._val_index)
+    self._replay_carried_state(rows)
+
+  def _replay_carried_state(self, rows):
+    """Recover whatever this strategy carries ACROSS designs, given the replayed trajectory. ABSTRACT.
+
+        A per-design strategy carries nothing. A continual one carries its persistent network, which is
+        already written per design by :meth:`_save_checkpoint`, so it reads it back from there."""
+    raise NotImplementedError()
 
   def _carried_state(self):
     """Arrays this strategy carries ACROSS designs, as a ``name -> array`` payload for :meth:`persist`.
