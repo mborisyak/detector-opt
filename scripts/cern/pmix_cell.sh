@@ -1,5 +1,5 @@
 #!/bin/bash
-# One cell of the param_mix probe: ONE mid-BO design trained from scratch at one lambda, one trial.
+# One cell of the rewind probe: ONE mid-BO design trained from scratch at one lambda, one trial.
 # and i+1 with NO training, warm-start it onto i+1, and cold train i+1 as the control.
 #
 # Same environment contract as campaign_cell.sh; every export is load-bearing (docs/lxplus-htcondor-gpu.md).
@@ -30,16 +30,16 @@ rm -f "$AFSOUT/status.txt"
 
 echo "host:   $(hostname)"
 echo "gpu:    $(nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | head -1)"
-echo "probe:  seed=$SEED design=$DESIGN param_mix=$PMIX trial=$TRIAL"
+echo "probe:  seed=$SEED design=$DESIGN rewind=$PMIX trial=$TRIAL"
 echo "start:  $(date -u)"
 
 set -o pipefail
 # EVERY cell runs its own fixed-window control, at the budget THAT cell's growth run reported.
-$PY -u scripts/probe_param_mix.py --run "$RUN" --design "$DESIGN" --param-mix "$PMIX" \
+$PY -u scripts/probe_rewind.py --run "$RUN" --design "$DESIGN" --param-mix "$PMIX" \
     --seed "$TRIAL" --device cuda --output "$AFSOUT" --control 2>&1 | tee "$AFSOUT/run.log"
 RC=$?
 set +o pipefail
 
 { echo "status=$([ $RC -eq 0 ] && echo COMPLETED || echo EXIT_$RC)"; echo "exit=$RC"
-  echo "seed=$SEED design=$DESIGN param_mix=$PMIX trial=$TRIAL"; echo "host=$(hostname)"; echo "finished=$(date -u)"; } > "$AFSOUT/status.txt"
+  echo "seed=$SEED design=$DESIGN rewind=$PMIX trial=$TRIAL"; echo "host=$(hostname)"; echo "finished=$(date -u)"; } > "$AFSOUT/status.txt"
 exit $RC

@@ -129,4 +129,4 @@ if __name__ == "__main__":
 
   import gearup
 
-  gearup.gearup(probe).with_config("config/bo.yaml")(sys.argv[1:])
+  gearup.gearup(probe).with_config("config/root.yaml")(sys.argv[1:])

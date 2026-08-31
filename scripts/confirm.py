@@ -210,4 +210,4 @@ def evaluate(checkpoint, seed: int = 0, step=None, **config):
 if __name__ == "__main__":
     import gearup
 
-    gearup.gearup(confirm=confirm, evaluate=evaluate).with_config("config/bo.yaml")()
+    gearup.gearup(confirm=confirm, evaluate=evaluate).with_config("config/root.yaml")()

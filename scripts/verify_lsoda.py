@@ -111,4 +111,4 @@ def verify_lsoda(n_draws: int = 16, n_temperatures: int = 5, rtol: float = 1e-10
 if __name__ == "__main__":
     import gearup
 
-    gearup.gearup(verify_lsoda).with_config("config/bo.yaml")()
+    gearup.gearup(verify_lsoda).with_config("config/root.yaml")()

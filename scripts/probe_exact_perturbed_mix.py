@@ -121,7 +121,7 @@ target at all.
 
 THE PROCEDURE IS THE CAMPAIGN'S OWN, unchanged. The loop in :func:`measure` is
 `detopt/nn/trainer/design.py::_DesignBase.train`, clause for clause and in its order -- warmup, the
-bayesian gap/plateau tests, `n_increment` growth on (1) or (2.1), the `param_mix` rewind with the
+bayesian gap/plateau tests, `n_increment` growth on (1) or (2.1), the `rewind` rewind with the
 optimiser reset, and the exit on `|val - train| + hypot(sems) <= loss_precision`. Every kernel it steps
 is the trainer's own. `design.py` is NOT modified and NOT subclassed by this file's arm classes beyond
 the abstract hooks. The loop is copied rather than called because this study needs a held-out pool the
@@ -482,8 +482,8 @@ def measure(trainer, detector, arm, test_pool, eval_test, n_test, base_scaled, s
       status = "capped"
       test_per_row = np.asarray(test_eval, np.float32)[:n_test]
       break
-    if trainer.param_mix > 0.0:
-      mix = trainer.param_mix
+    if trainer.rewind > 0.0:
+      mix = trainer.rewind
       params = jax.tree.map(lambda p, q: q + (1.0 - mix) * (p - q), params, initial_params)
       opt_state = trainer.optimizer.init(params)
     round_start = len(history["train"])

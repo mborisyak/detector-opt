@@ -1,0 +1,21 @@
+# THE ROOT MARKER FOR gearup'S CONFIG RESOLUTION. Not a run config, and deliberately empty.
+#
+# Every driver is launched as `python scripts/<driver>.py =<name> key=value ...` and passes this path
+# to `gearup(...).with_config("config/root.yaml")`. gearup uses it for TWO things, and the second is
+# the one that matters:
+#
+#   1. the base config, which `=<name>` replaces WHOLESALE (`assign(config, [], value)` returns the
+#      new value), so nothing here can survive into a run and nothing belongs in it;
+#   2. THE ROOT DIRECTORY for hierarchical resolution -- `os.path.dirname` of this path. That is what
+#      makes `=angle` resolve to `config/angle.yaml` and `strategy=angle-meta-norewind` resolve to
+#      `config/strategy/angle-meta-norewind.yaml`.
+#
+# So the file must EXIST even though it must be empty, and gearup raises FileNotFoundError if it does
+# not. This role used to be played by `config/bo.yaml`, an outdated stereo-straw run config; retiring
+# that config took every driver down with it, which is why the marker now has a name that says what
+# it is and holds nothing that could go stale.
+#
+# ⚠️ A key here whose name matched a DIRECTORY under config/ would be resolved as a sub-config
+# reference -- that is exactly how `strategy:` works -- so this file stays empty rather than carrying
+# defaults.
+{}

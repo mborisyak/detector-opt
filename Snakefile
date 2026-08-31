@@ -212,9 +212,13 @@ def device(task):
 
 CPU_ONLY = {task for task in TASKS if device(task) == "cpu"}
 
-SUPER_SEED = 123456
-rng = random.Random(SUPER_SEED)
-SEEDS = [rng.randint(0, 2 ** 31 - 1) for _ in range(2)]
+SUPER_SEED_TEST = 123456
+rng = random.Random(SUPER_SEED_TEST)
+SEEDS_TEST = [rng.randint(0, 2 ** 31 - 1) for _ in range(10)]
+
+SUPER_SEED_VAL = 654321
+rng = random.Random(SUPER_SEED_VAL)
+SEEDS_VAL = [rng.randint(0, 2 ** 31 - 1) for _ in range(3)]
 
 STRATEGIES = ["from_scratch", "continue", "closest", "meta"]
 

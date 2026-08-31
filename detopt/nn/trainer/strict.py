@@ -36,13 +36,6 @@ class _StrictBase(Trainer):
   abstract so each strategy supplies its own."""
 
   @classmethod
-  def spent_calls(self):
-    """Reserves nothing, so the pools' fill IS the spend."""
-    return self.train_pool.current + self.val_pool.current
-
-  def _round_extra(self, n_train):
-    """Trains on the proposed designs alone, so a round costs exactly what it asked for."""
-
   def from_config(cls, detector, config, *, checkpoint_dir=None, seed=0):
     from ...utils.config import optimizer as make_optimizer, resolve_device
 
@@ -52,9 +45,16 @@ class _StrictBase(Trainer):
       device=resolve_device(config.get("device")), checkpoint_dir=checkpoint_dir, seed=seed, **training
     )
 
+  def spent_calls(self):
+    """Reserves nothing, so the pools' fill IS the spend."""
+    return self.train_pool.current + self.val_pool.current
+
+  def _round_extra(self, n_train):
+    """Trains on the proposed designs alone, so a round costs exactly what it asked for."""
+
   def __init__(
     self, detector, *, n0: int, n_increment: int, iteration_limit: int, batch: int, val_fraction: float = 0.25,
-    warmup_epochs: int = 32, patience: int = 10, loss_precision: float = 1.0e-2, param_mix: float = 0.0, **kwargs
+    warmup_epochs: int = 32, patience: int = 10, loss_precision: float = 1.0e-2, rewind: float = 0.0, **kwargs
   ):
     iteration_limit = _round_down(int(n0), int(n_increment), int(iteration_limit))
     val_iteration_limit = max(int(batch), round(iteration_limit * val_fraction / (1.0 - val_fraction)))
@@ -67,7 +67,7 @@ class _StrictBase(Trainer):
     self.warmup_epochs = int(warmup_epochs)
     self.patience = int(patience)
     self.loss_precision = float(loss_precision)
-    self.param_mix = float(param_mix)
+    self.rewind = float(rewind)
 
   def train(self, design_scaled, seed, *, init_params=None, on_epoch=None, step=0) -> TrainResult | None:
     """Train one design. Returns a :class:`TrainResult`, or ``None`` if the shared budget pool is
@@ -148,8 +148,8 @@ class _StrictBase(Trainer):
             f"(window={train_count}); gap={gap:.4g} err={err:.4g} gap+err={gap + err:.4g} vs "
             f"precision={self.loss_precision:.4g}."
           )
-        if self.param_mix > 0.0:
-          mix = self.param_mix
+        if self.rewind > 0.0:
+          mix = self.rewind
           params = jax.tree.map(lambda p, q: q + (1.0 - mix) * (p - q), params, initial_params)
           opt_state = self.optimizer.init(params)
         epoch_in_round = 0

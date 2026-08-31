@@ -1,0 +1,41 @@
+# THE RANDOM-BUFFER ARMS on `ship-intersect-w2x-2m`: 5 seeds x 2 new trainers.
+#
+# `meta_random_frozen` / `meta_random_online` are `meta` plus a THIRD training source -- events at
+# uniformly random designs, one design per event -- bought out of the SAME budget at `alpha = 0.125`,
+# so each cell reaches its first design 262144 detector calls down. The two differ only in WHEN that
+# spend happens: frozen buys the whole random prefix up front, online buys it with each round.
+#
+# THE CONTROL IS THE BANKED `meta` CELL AT THE SAME SEED (user, 2026-08-29). `config/..._random.yaml`
+# differs from the campaign config by exactly two keys, `training.alpha` and `training.random_weight`,
+# both dropped by STRATEGY_KNOBS for every arm that does not own them -- so the comparison is against a
+# cell that ran the identical detector, network, budget and convergence procedure.
+#
+# Seeds are draws 1-5 of `random.Random(123456).randint(0, 2**31-1)`, all five already banked in the
+# base tree with a completed `meta` cell, so every row here pairs.
+#
+# Its own tree: the campaign's per-seed directory holds exactly the four campaign arm names, and a plot
+# over that tree would silently pool arms that spent an eighth of their budget differently.
+universe       = vanilla
+executable     = geom_cell.sh
+arguments      = ship_intersect_prec1e2_w2x_2m_random $(seed) $(arm) $(reveal) /afs/cern.ch/work/m/maborisy/ship-intersect-w2x-2m-random/$(seed)/$(arm)
+output         = logs/isect2mrnd_$(seed)_$(arm).$(ClusterId).$(ProcId).out
+error          = logs/isect2mrnd_$(seed)_$(arm).$(ClusterId).$(ProcId).err
+log            = logs/isect2mrnd.$(ClusterId).log
+request_gpus   = 1
+request_cpus   = 2
+request_memory = 12000
+requirements   = TARGET.GPUs_GlobalMemoryMb >= 20000
++MaxRuntime    = 172800
++JobBatchName  = "ship-intersect-w2x-2m-random"
+queue seed,arm,reveal from (
+  1244111331, meta_random_frozen, design
+  126382657,  meta_random_frozen, design
+  750143450,  meta_random_frozen, design
+  9577242,    meta_random_frozen, design
+  330924253,  meta_random_frozen, design
+  1244111331, meta_random_online, design
+  126382657,  meta_random_online, design
+  750143450,  meta_random_online, design
+  9577242,    meta_random_online, design
+  330924253,  meta_random_online, design
+)

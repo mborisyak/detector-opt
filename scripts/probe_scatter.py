@@ -64,7 +64,7 @@ dataset grows, but no row ever changes -- so the effective sample size is the sa
 THE PROCEDURE IS THE CAMPAIGN'S OWN, unchanged. The loop below is `detopt/nn/trainer/design.py`'s
 `train`, copied because this study needs a THIRD pool that the trainer does not have and a per-row
 design that `Trainer._fill_pool` cannot express. Everything it does is that file's: warmup, the
-bayesian gap/plateau tests in their fixed order, `n_increment` growth on (1) or (2.1), the `param_mix`
+bayesian gap/plateau tests in their fixed order, `n_increment` growth on (1) or (2.1), the `rewind`
 rewind toward the run's initial network with the optimiser reset, and the exit on
 `|val - train| + hypot(sems) <= loss_precision`. The kernels are the trainer's own -- the scan-folded
 jitted epoch (`Trainer._build_train_epoch`) and its eval passes -- never a python-driven step loop.
@@ -437,8 +437,8 @@ def measure(trainer, detector, test_pool, eval_test, n_test, base_scaled, sigma,
       status = "capped"
       test_per_row = np.asarray(test_eval, np.float32)[:n_test]
       break
-    if trainer.param_mix > 0.0:
-      mix = trainer.param_mix
+    if trainer.rewind > 0.0:
+      mix = trainer.rewind
       params = jax.tree.map(lambda p, q: q + (1.0 - mix) * (p - q), params, initial_params)
       opt_state = trainer.optimizer.init(params)
     round_start = len(train_history)

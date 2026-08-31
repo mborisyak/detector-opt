@@ -26,7 +26,7 @@ would not be about optimisers at all. `optax.nadam` and `optax.amsgrad` carry no
 they are built as `nadamw` and as an explicit `scale_by_amsgrad -> add_decayed_weights ->
 scale_by_learning_rate` chain, which is exactly how optax composes `adamw`. Everything else except the
 data schedule above -- the architecture, `batch`, `iteration_limit`, `patience`, `warmup_epochs`,
-`param_mix`, `loss_precision` and the whole convergence procedure -- comes from the campaign config
+`rewind`, `loss_precision` and the whole convergence procedure -- comes from the campaign config
 untouched.
 
 THE SCHEDULES. `constant` is the config's own 2.5e-4. `hyperbolic` is `alpha / (t / K + 1)`,
@@ -311,4 +311,4 @@ if __name__ == "__main__":
 
   import gearup
 
-  gearup.gearup(bakeoff).with_config("config/bo.yaml")(sys.argv[1:])
+  gearup.gearup(bakeoff).with_config("config/root.yaml")(sys.argv[1:])

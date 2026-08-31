@@ -19,8 +19,12 @@ THREE THINGS ARE READ OFF, in increasing order of what they would catch:
   see. The bar is therefore `loss < floor - sigma_tolerance * loss_std`, not `loss < floor`.
 * **How far above the floor the trainer lands**, per design and in aggregate. This is the honest cost
   of a finite network and a finite window, and it is the number to watch when a trainer changes.
-* **Where the search ended up.** The optimum is the pair of box corners, in either order, so the best
-  design's distance to it is a direct statement about the optimiser -- not a curve that only goes down.
+* **Where the search ended up.** At ONE dimension and TWO probes the optimum is the pair of box
+  corners, in either order, so the best design's distance to it is a direct statement about the
+  optimiser -- not a curve that only goes down. THAT COLUMN EXISTS ONLY THERE. For a wider rung the
+  optimum is not a corner pair in closed form (`n = d + 1` probes in `[-1, 1]^d` admits no orthogonal
+  design in general), so rather than assert one this prints `--` and reports the floor checks alone,
+  which are the verification proper and need no optimum.
 
 Exit status is 1 if anything landed below its floor, so this can gate a pipeline change.
 """
@@ -79,15 +83,20 @@ def main():
 
     with open(f"config/detector/{arguments.detector}.yaml") as f:
         detector = detopt.detector.from_config(yaml.safe_load(f))
-    optimum = detector.bayes_risk(np.array([-1.0, 1.0], np.float32))
-    corner = np.array([-1.0, 1.0])
+    # The corner pair is the optimum ONLY for the 1-dimension / 2-probe rung; see the module docstring.
+    corner = np.array([-1.0, 1.0]) if detector.design_dim() == 2 else None
+    optimum = float(detector.bayes_risk(corner.astype(np.float32))) if corner is not None else None
 
     found = runs_under(arguments.root)
     if len(found) == 0:
         raise SystemExit(f"score_linear: no results.json or partial.json under {arguments.root}")
 
-    print(f"analytic optimum {optimum:.6f} at the box corners (either order); "
-          f"the no-information level is 1.0\n")
+    if optimum is not None:
+      print(f"analytic optimum {optimum:.6f} at the box corners (either order); "
+            f"the no-information level is 1.0\n")
+    else:
+      print(f"design_dim {detector.design_dim()}: no closed-form optimum, so |d-corner| is omitted; "
+            f"the floor check below is the verification. The no-information level is 1.0\n")
     print(f"{'run':<28} {'n':>4} {'best':>9} {'floor':>9} {'excess':>9} {'|d-corner|':>10} "
           f"{'med excess':>10} {'min excess':>10}")
     below = []
@@ -98,11 +107,15 @@ def main():
         designs, reported, floor, excess, error = score(detector, rows)
         best = int(np.argmin(reported))
         # The design is a SET, so the corner is matched in either order.
-        distance = min(float(np.max(np.abs(np.sort(designs[best]) - np.sort(corner)))), float(
-            np.max(np.abs(np.sort(designs[best])[::-1] - np.sort(corner)))))
+        if corner is None:
+          distance = None
+        else:
+          distance = min(float(np.max(np.abs(np.sort(designs[best]) - np.sort(corner)))), float(
+              np.max(np.abs(np.sort(designs[best])[::-1] - np.sort(corner)))))
         mark = "" if completed else "  (in flight)"
         print(f"{label:<28} {len(rows):>4} {reported[best]:>9.6f} {floor[best]:>9.6f} "
-              f"{excess[best]:>+9.6f} {distance:>10.4f} {np.median(excess):>10.6f} "
+              f"{excess[best]:>+9.6f} {'--' if distance is None else format(distance, '.4f'):>10} "
+              f"{np.median(excess):>10.6f} "
               f"{np.min(excess):>+10.6f}{mark}")
         sigma = excess / np.maximum(error, 1e-12)
         below.extend((label, d, r, f, z) for d, r, f, z in zip(designs, reported, floor, sigma)
@@ -110,7 +123,7 @@ def main():
         if arguments.per_design:
             for d, r, f, e, z in zip(designs, reported, floor, excess, sigma):
                 flag = "  BELOW THE FLOOR" if z < -arguments.sigma_tolerance else ""
-                print(f"      ({d[0]:+.3f}, {d[1]:+.3f})  reported {r:.6f}  floor {f:.6f}  "
+                print(f"      ({', '.join(format(v, '+.3f') for v in np.ravel(d))})  reported {r:.6f}  floor {f:.6f}  "
                       f"excess {e:+.6f} ({z:+.1f} sigma){flag}")
 
     print()
@@ -118,7 +131,8 @@ def main():
         print(f"{len(below)} DESIGN(S) BELOW THEIR BAYES RISK BY MORE THAN {arguments.sigma_tolerance} SIGMA "
               f"-- too far to be sampling noise, so it is a defect in the pipeline, not a result:")
         for label, d, r, f, z in below[:10]:
-            print(f"  {label}  ({d[0]:+.3f}, {d[1]:+.3f})  reported {r:.6f} vs floor {f:.6f}  ({z:+.1f} sigma)")
+            print(f"  {label}  ({', '.join(format(v, '+.3f') for v in np.ravel(d))})  "
+                  f"reported {r:.6f} vs floor {f:.6f}  ({z:+.1f} sigma)")
         raise SystemExit(1)
     print(f"no design sits more than {arguments.sigma_tolerance} sigma below its Bayes risk")
 

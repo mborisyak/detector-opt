@@ -21,10 +21,15 @@ the observed data appends after it. That keeps three sources addressable by inde
 one buffer, needs no change to any shared method, and has the side benefit that `bo.py` counts the
 random events in `detector_calls_used` for free, so the plotted x-axis is the true spend.
 
+RANDOM DATA ARRIVES WITH THE ROUND. `Trainer._round_extra` is called by `_sample_round` the moment a
+round's own events land, so "the trainer asked for more data" and "the extra data arrived" are ONE
+event and the pools can never disagree about how much of the budget is spent.
+
 THE PREFIX FILL IS A FUNCTION OF THE OBSERVED FILL, never a stored cursor. `train_epoch` is jitted
 ONCE in `_build_kernels`, so anything the sampler closes over is baked at trace time and a growing
-cursor would be stale. Instead both the filler and the sampler compute the same `_random_fill(start)`
-from `start`, which the kernel already receives as a live value. The frozen leaf returns the whole
+cursor would go stale. Instead the filler and the sampler compute the same `_random_fill(observed)` --
+host-side from `train_pool.current`, inside the kernel from `start + count`, which are the same number
+because a round ends with the window running to the pool's fill. The frozen leaf returns the whole
 prefix; the online leaf returns a fixed ratio of the observed fill.
 
 WEIGHTS ARE PER-SOURCE MEANS, NOT PER-ROW. Each source's rows are averaged and the three means are

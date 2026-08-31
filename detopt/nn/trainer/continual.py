@@ -55,7 +55,7 @@ class _ReplayBase(_DesignBase):
       ignored). The OPTIMISER IS RESTARTED AT EVERY DESIGN BOUNDARY: what is
       continued is the network, not Adam's moment estimates, which are a
       property of the window just finished rather than of what has been learned.
-      Within a design the moments are likewise rebuilt at every ``param_mix``
+      Within a design the moments are likewise rebuilt at every ``rewind``
       rewind (``design.py``), for the same reason.
 
       That makes the carried state COMPLETE -- params and buffers are all there

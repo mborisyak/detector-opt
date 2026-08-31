@@ -262,7 +262,7 @@ def growth():
 
   THE CURVES. `output/optimizer-bakeoff/*.json` are growth runs at the CAMPAIGN's own settings
   (steps_per_epoch 2048, n0 8192, n_increment 4096, patience 16, warmup 2, loss_precision 1.0e-2,
-  param_mix 0.25), continuing `output/enzyme_extremes/1244111331/meta`'s persistent network and event
+  rewind 0.25), continuing `output/enzyme_extremes/1244111331/meta`'s persistent network and event
   pools on that run's own best design. `output/screen/activation-*.json` are the same procedure at a
   finer data schedule and carry a per-round summary.
   """

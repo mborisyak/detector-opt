@@ -54,10 +54,6 @@ class FixedWindowTrainer(Trainer):
   """One design, a window fixed at construction, exit on the training-loss plateau."""
 
   @classmethod
-  def spent_calls(self):
-    """Reserves nothing, so the pools' fill IS the spend."""
-    return self.train_pool.current + self.val_pool.current
-
   def from_config(cls, detector, config, *, window, val_window, max_epochs, seed=0, train_offset=0, val_offset=0):
     """Build from a run-config dict. ``window`` / ``val_window`` are the growth run's own final
         spend, so this trainer draws exactly the events that run held; ``budget`` stays the run's, so
@@ -73,6 +69,10 @@ class FixedWindowTrainer(Trainer):
                                 0.25), eval_batch=training.get("eval_batch"), device=resolve_device(config.get("device")),
       seed=seed, reveal=training.get("reveal"), train_offset=train_offset, val_offset=val_offset,
     )
+
+  def spent_calls(self):
+    """Reserves nothing, so the pools' fill IS the spend."""
+    return self.train_pool.current + self.val_pool.current
 
   def __init__(
     self, detector, *, regressor_config: dict, optimizer, batch: int, budget: int, window: int, val_window: int,

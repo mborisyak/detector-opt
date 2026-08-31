@@ -1,0 +1,164 @@
+# CAMPAIGN CONFIG -- `linear` at (d=2, n_probes=3), noise 0.5, budget 2^18. A QUICK EXPERIMENT.
+#
+# Sibling of config/linear_d4n5_growth.yaml at a smaller cell. What differs and why:
+#
+#   detector          linear_d4n5_growth -> linear_d2n3     d 4->2, probes 5->3, noise 0.5 unchanged
+#   training.budget               524288 -> 262144          (2^18)
+#   training.iteration_limit      262144 -> 131072          window cap AND epoch length
+#   training.loss_precision       5.0e-3 -> 1.0e-2          set from the measurement below
+#   training.optimizer.learning_rate  2.5e-4 -> 1.25e-4     halved, to shrink the overfitting term
+#   bo.gp.kernel.exchangeable          5 ->     3           = n_probes; the design is a SET of probes
+#
+# `n0` 4096, `n_increment` 2048, `batch` 128, the network, `param_mix`, `patience`, `warmup_epochs`
+# and the rest of the `bo` block are unchanged.
+#
+# WHY THIS CELL. The design dimension falls from 20 to 6, which is the point: at (4,5) with a 2^19
+# budget, 5 of 20 runs never improved on their 5-design Sobol block at all, because a median of 12
+# designs leaves BO only ~7 GP-driven proposals in 20 dimensions. Six dimensions is a search problem
+# BO can actually be expected to make progress on.
+#
+# AND IT IS THE CELL WHERE THE GATE OBJECTION IS WEAKEST -- see the detector config. The optimum here
+# has a probe at an EDGE MIDPOINT rather than being an all-corner design, so the answer is not simply
+# a property of the box. That is documented in docs/HANDOFF.md 4.1 and confirmed here by multi-start
+# on the closed form.
+#
+# ⚠️ `iteration_limit` 131072 KNOWINGLY BREAKS THE THREE-WINDOW PRINCIPLE (user, 2026-08-17). It caps
+# the per-design window, and the train share of a 2^18 budget is 196608:
+#
+#   iteration_limit 262144 -> 0.75 windows   ONE design could exceed the entire train pool
+#   iteration_limit 131072 -> 1.50 windows   <- this; one capped design = 67% of the whole budget
+#   iteration_limit  65536 -> 3.00 windows   the parent config's principle -- but see below
+#
+# 65536 was tried FIRST and is what failed: four designs hit that cap with diff+err 0.0116-0.0124 and
+# five runs died. The cap had to rise for those designs to have anywhere to grow. The accepted risk is
+# that a capped design now consumes two thirds of a run's budget; it is a TAIL risk rather than the
+# typical case, because the median design converges at the FLOOR (5461 calls, no growth at all). The
+# symptom to recognise is a run ending with very few designs. Raising the budget to 2^19 would
+# restore 3.0 windows and is one line plus a resume.
+#
+# It is ALSO the epoch length: at batch 128 this gives 1024-step epochs, twice the 512 every
+# convergence measurement of 2026-08-14 was taken at, so `patience` 16 spans twice the measured
+# horizon.
+#
+# ⚠️ `loss_precision` 1.0e-2, AND THE FIRST ATTEMPT AT IT WAS WRONG in a way worth recording.
+# 9.0e-3 was set by scaling the 5.0e-3 of (4,5) by the LOSS LEVEL ratio 1.784
+# (optimum 0.0937 against 0.0525). That reasoning only governs `err`, the statistical term, and it
+# does not transfer: at (4,5) the slack is "97% error term and 3% overfitting bias" (the handoff),
+# whereas HERE the train/val gap DOMINATES -- the failures came in at diff 0.0064-0.0073 against err
+# 0.0050-0.0052, i.e. ~58% diff. A level-scaling rule cannot predict a diff-dominated regime.
+#
+# MEASURED over 99 designs of the 2026-08-17 19:50 attempt at this exact cell:
+#
+#   95 designs CONVERGED   diff+err  min 0.00350  p50 0.00810  p90 0.00890  max 0.00900
+#    4 designs CAPPED      diff+err  0.01156  0.01212  0.01234  0.01238   -> 5 runs died
+#
+# 1.0e-2 sits just above the 0.0090 the converged designs actually reached and BELOW the 0.0116-0.0124
+# the capped four needed at a 65536 window -- so the bar alone does not rescue them. It is paired with
+# the two changes that attack the slack itself: the window cap doubles (err ~ w^-0.5, so 0.0052 ->
+# 0.0037) and the LEARNING RATE HALVES to 1.25e-4, aimed at the diff term that dominates here. That
+# is a deliberate deviation from the settled trainer default of 2.5e-4, and it costs wall clock:
+# a lower rate needs more epochs to satisfy the same patience.
+#
+# 1.0e-2 remains well inside the 0.0266 that docs/linear-highdim.md's table says criterion (d) would
+# DEMAND at this cell, so the bar is still admissible.
+#
+# ⚠️ THE CAPPED FOUR ARE A LOWER BOUND on what they needed: they stopped growing at the 65536 window,
+# so their true requirement is >= 0.0124, not = it. If designs cap again at 1.8e-2, the diagnosis is
+# NOT to keep raising the bar -- the next hypothesis is network capacity, since a 19316-parameter net
+# on a 3-target, 6-dimensional problem may simply overfit, which is what a diff-dominated slack looks
+# like.
+#
+# ⚠️ DESIGN COUNT IS GENUINELY UNCERTAIN HERE and is the thing to read first. At (4,5) designs cost a
+# median 27309 calls, which at this budget would give ~10 designs -- too few again. But this is a much
+# smaller learning problem (3 targets instead of 5, 6 design dimensions instead of 20), so designs
+# should converge on far less data and the growth schedule should find that. If the median per-design
+# cost does NOT fall substantially, the budget is the first thing to raise -- one line plus a resume,
+# since `results.json` + `done.txt` keep every design already computed.
+#
+# ⛔️ `bo.gp.log_lengthscale_prior_bounds` STAYS `[-2.0, 1.0]`. Relaxing it would make BO converge
+# faster and the acceptance criterion easier to pass -- the NO TRICKS clause of
+# docs/benchmark-acceptance.md.
+
+#
+# 2026-08-18 -- regressor.dropconnect SET TO 0.0. MEASURED on `linear`, 72 crossed cells (2 arms x
+# 4 doses x 3 designs x 3 seeds, paired within design and seed, `bo`): dropconnect adds BIAS THAT THE
+# CRITERION CANNOT SEE. Held-out excess against the closed-form floor rises monotonically to +0.00479
+# at dose 0.2 -- 48% of the bar -- while `gap`, the only overfitting signal the exit test has, FALLS
+# (-0.00041), and the exit window is UNCHANGED (ratio 1.00 at every dose in both arms). The procedure
+# therefore buys no extra data in compensation and reports a worse number at the same price. `meta` is
+# hurt about half as much as `from_scratch` (+0.00262 against +0.00479 at 0.2), so replay is partly
+# REDUNDANT with dropconnect rather than protected from it.
+
+#
+# 2026-08-18 (later) -- dropconnect 0.05, NOT null. Reverted from the `null` set earlier the same day.
+#
+# TURNING IT OFF REMOVED THE TERMINATION MECHANISM FROM BOTH PROCEDURES, which the bias measurement
+# did not anticipate:
+#   growth  -- the gap gate `gap + err <= loss_precision` needs the gap held down; unregularised the
+#              config's own record says designs cap (later shown to be an artefact of a 131072 cap,
+#              but the cost is real: 278512 calls/design against ~98281, i.e. 2.8x).
+#   fixed   -- stops on the TRAIN-SETTLED test alone, so the only thing that can end a design is the
+#              training curve flattening. MEASURED: with dropconnect 0.1, 394 of 394 designs
+#              terminated, median 109 s, max 271 s. With dropconnect null, median 476 s, max 2919 s,
+#              and designs still running past 3500 epochs with validation rising since epoch 600.
+#
+# 0.05 RATHER THAN 0.1 because that is where the bias is negligible. MEASURED on `linear`, 72 crossed
+# cells, held-out excess against the closed-form floor, paired within (design, seed):
+#     dose    from_scratch   meta
+#     0.05      +0.00007    +0.00001
+#     0.10      +0.00110    +0.00050
+#     0.20      +0.00479    +0.00262
+# and this task's own earlier record puts 0.05 at -0.0004 on the objective, i.e. free. 0.05 therefore
+# buys termination at a bias two orders of magnitude below the dose that motivated turning it off.
+
+detector: linear_d2n3
+
+regressor:
+  set-regressor:
+    features: [[32, 24], [24, 32]]
+    n_models: 4
+    dropconnect: 0.05
+device: cuda
+plot_per_epoch: 8
+
+training:
+  n0: 4096
+  n_increment: 2048
+  batch: 128
+  eval_batch: 1024
+  warmup_epochs: 2
+  patience: 16
+  budget: 262144
+  iteration_limit: 131072
+  val_fraction: 0.25
+  loss_precision: 1.0e-2
+  param_mix: 0.25
+  optimizer:
+    adamaxw:
+      learning_rate: 1.25e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-3
+
+bo:
+  n_init: 5
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds: [-2.0, 1.0]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+    kernel:
+      normalised-invariant-rbf:
+        exchangeable: 3
+  ei:
+    n_restarts: 32
+    n_steps: 100
+
+verify:
+  n_points: 10
+  epochs: 200
+  val_every_epochs: 10
+  budget: null
+  batch: null

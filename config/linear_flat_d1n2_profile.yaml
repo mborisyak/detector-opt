@@ -1,0 +1,53 @@
+# ⚠️ PROFILING RUN, not a result. Its only job is to measure the per-design `spent` distribution of
+# the MLP on this rung so that `n0` and `n_increment` can be CHOSEN rather than guessed.
+#
+# The ladder here is deliberately FINE (n0 256, n_increment 128) so a design stops close to where it
+# actually converges; a coarse ladder would round every measurement up and the chosen n0 would
+# inherit that rounding. `budget` is short for the same reason -- enough designs for a distribution,
+# not a campaign. NOTHING measured with this file is a campaign result.
+detector: linear_flat_d1n2
+regressor:
+  mlp-regressor:
+    features: [64, 32, 16]
+    n_models: null
+device: cuda
+plot_per_epoch: 8
+training:
+  n0: 256
+  n_increment: 128
+  batch: 128
+  eval_batch: 4096
+  warmup_epochs: 2
+  patience: 16
+  budget: 65536
+  iteration_limit: 65536
+  val_fraction: 0.25
+  loss_precision: 2.0e-2
+  rewind: 0.25
+  optimizer:
+    adamaxw:
+      learning_rate: 2.5e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-3
+bo:
+  n_init: 5
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds: [-2.0, 1.0]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+    kernel:
+      normalised-invariant-rbf:
+        exchangeable: 2
+  ei:
+    n_restarts: 32
+    n_steps: 100
+verify:
+  n_points: 10
+  epochs: 200
+  val_every_epochs: 10
+  budget: null
+  batch: null

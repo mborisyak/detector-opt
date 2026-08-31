@@ -1,0 +1,18 @@
+# STRATEGY: continue on `angle`, parameter retention `rewind-01`.
+#
+# A strategy is the ARM plus what it keeps of the previous network at a data addition, and nothing
+# else. Ladder, budget, optimiser and detector stay in the task config so they are held FIXED across
+# the comparison; `scripts/bo.py` refuses a task config that also sets a retention knob, so there is
+# never a second source of truth for these three values.
+#
+#   rewind        params <- initial + (1 - rewind) * (params - initial)   [0 = keep everything]
+#   shrink        params <- shrink * params + param_noise * fresh_draw    [1 = keep everything]
+#   param_noise   scale of the fresh random init added by shrink-and-perturb
+#
+# The two mechanisms are mutually exclusive: the trainer raises if `rewind` is non-zero alongside a
+# `shrink` below 1 or a non-zero `param_noise`.
+
+nn_init_strategy: continue
+rewind: 0.1
+shrink: 1.0
+param_noise: 0.0

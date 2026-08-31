@@ -11,7 +11,7 @@ THREE, and only the ``regressor`` block may differ from ``baseline`` -- asserted
 EVERY DESIGN IS TRAINED THROUGH ``trainer.train``. That call is where the growth decision, the exit
 test and the REWIND live, and a probe that reimplements the epoch loop silently drops all three:
 
-* ``param_mix`` (the rewind) fires AT EVERY DATA ADDITION -- ``params = initial + (1 - lambda) *
+* ``rewind`` (the rewind) fires AT EVERY DATA ADDITION -- ``params = initial + (1 - lambda) *
   (current - initial)`` -- and also resets the optimiser moments and rewinds the parameter average.
   Without it the fitted weights carry across every window growth, the window is memorised, and the
   loss-versus-samples curve becomes a sawtooth that describes the missing rewind rather than the
@@ -190,7 +190,7 @@ def probe(
       'batch': int(trainer.batch),
       'steps_per_epoch': int(trainer.steps_per_epoch),
       'loss_precision': float(config['training']['loss_precision']),
-      'param_mix': float(config['training'].get('param_mix', 0.0)),
+      'rewind': float(config['training'].get('rewind', 0.0)),
       'regressor': config['regressor'],
       'config': config,
       'completed': completed,
@@ -204,8 +204,8 @@ def probe(
     os.replace(staged, os.path.join(output, 'probe.json'))
 
   print(
-    f'probe: arm={arm} seed={seed} measure_at={measured} GROWTH PROCEDURE (param_mix='
-    f'{config["training"].get("param_mix", 0.0)}, loss_precision={config["training"]["loss_precision"]}) <- {reference}',
+    f'probe: arm={arm} seed={seed} measure_at={measured} GROWTH PROCEDURE (rewind='
+    f'{config["training"].get("rewind", 0.0)}, loss_precision={config["training"]["loss_precision"]}) <- {reference}',
     flush=True
   )
   for step in range(measured[-1] + 1):
@@ -243,4 +243,4 @@ if __name__ == '__main__':
 
   import gearup
 
-  gearup.gearup(probe).with_config('config/bo.yaml')(sys.argv[1:])
+  gearup.gearup(probe).with_config('config/root.yaml')(sys.argv[1:])

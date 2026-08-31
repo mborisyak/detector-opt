@@ -1,0 +1,65 @@
+# INDEPENDENT VERIFICATION of every COMPLETE cell of `ship-intersect-w2x-2m`.
+#
+# Re-scores `verify.n_points` = 5 incumbents per trajectory on data the run never saw (fresh events at
+# the fixed design, 6:2:2 split, the design's own reported checkpoint continued for `verify.epochs`,
+# best-validation parameters scored ONCE on held-out test). The question is whether the numbers this
+# campaign REPORTED survive independent data -- the reported values are faithful to what the run
+# measured, but the run measured them on data it also trained on.
+#
+# CAPPED AND INCOMPLETE CELLS ARE EXCLUDED, not verified and failed: a capped cell has no trajectory to
+# re-score, and verifying one would produce a number that looks like a result.
+#
+# Writes verification.json / verification.png / plots/ INTO each cell and touches nothing else, so a
+# verification cannot damage the trajectory it checks. Resumable: banked points under identical
+# settings are reused, so a cell cut off by +MaxRuntime resumes on resubmission.
+universe       = vanilla
+executable     = verify_cell.sh
+arguments      = ship_intersect_prec1e2_w2x_2m $(seed) /afs/cern.ch/work/m/maborisy/ship-intersect-w2x-2m/$(seed)/$(arm)
+output         = logs/isectver_$(seed)_$(arm).$(ClusterId).$(ProcId).out
+error          = logs/isectver_$(seed)_$(arm).$(ClusterId).$(ProcId).err
+log            = logs/isectver.$(ClusterId).log
+request_gpus   = 1
+request_cpus   = 2
+request_memory = 12000
+requirements   = TARGET.GPUs_GlobalMemoryMb >= 20000
++MaxRuntime    = 172800
++JobBatchName  = "verify-ship-intersect-w2x-2m"
+queue seed,arm from (
+  1153299222, closest
+  1153299222, continue
+  1153299222, from_scratch
+  1153299222, meta
+  122012491, closest
+  122012491, continue
+  122012491, from_scratch
+  122012491, meta
+  1244111331, closest
+  1244111331, continue
+  1244111331, from_scratch
+  1244111331, meta
+  126382657, closest
+  126382657, continue
+  126382657, meta
+  219094734, closest
+  219094734, continue
+  219094734, from_scratch
+  219094734, meta
+  330924253, closest
+  330924253, continue
+  330924253, from_scratch
+  330924253, meta
+  499913522, continue
+  499913522, from_scratch
+  499913522, meta
+  750143450, closest
+  750143450, continue
+  750143450, from_scratch
+  750143450, meta
+  9577242, closest
+  9577242, continue
+  9577242, from_scratch
+  9577242, meta
+  983655707, continue
+  983655707, from_scratch
+  983655707, meta
+)

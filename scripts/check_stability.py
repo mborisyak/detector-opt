@@ -172,4 +172,4 @@ def check_stability(n_draws: int = 2048, n_rounds: int = 5, n_extent: int = 128,
 if __name__ == "__main__":
     import gearup
 
-    gearup.gearup(check_stability).with_config("config/bo.yaml")()
+    gearup.gearup(check_stability).with_config("config/root.yaml")()

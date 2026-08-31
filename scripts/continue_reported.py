@@ -368,4 +368,4 @@ def _plot(point, path):
 if __name__ == "__main__":
   import gearup
 
-  gearup.gearup(continued).with_config("config/bo.yaml")()
+  gearup.gearup(continued).with_config("config/root.yaml")()

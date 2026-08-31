@@ -2,8 +2,8 @@
 # Submit one 10-seed x 4-arm `linear` campaign to the local SLURM cluster, one cell per job.
 #
 #   scripts/launch_linear_ladder.sh <config> <output_dir> <job_prefix> [count] [skip]
-#   scripts/launch_linear_ladder.sh linear_d1n2_fine output/linear-d1n2-10seed D1
-#   scripts/launch_linear_ladder.sh linear_d3n4_fine output/linear-10seed L 10 10
+#   scripts/launch_linear_ladder.sh linear_d1n2 output/linear-d1n2-10seed D1
+#   scripts/launch_linear_ladder.sh linear_d3n4 output/linear-10seed L 10 10
 #
 # THE SEEDS ARE DERIVED, NOT LISTED, AND THE GENERATOR IS THE SNAKEFILE'S: `random.Random(123456)`
 # with `randint(0, 2**31 - 1)`, which is `SUPER_SEED` and the exact call at `Snakefile:215-217`.

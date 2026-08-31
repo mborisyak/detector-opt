@@ -190,4 +190,4 @@ def probe(output, run, run_seed: int, index: int, arm: str, repeats: int = 3, ho
 
 
 if __name__ == "__main__":
-  gearup.gearup(probe).with_config("config/bo.yaml")(sys.argv[1:])
+  gearup.gearup(probe).with_config("config/root.yaml")(sys.argv[1:])

@@ -4,7 +4,7 @@
     python scripts/plot_growth_experiments.py --output output/figures/growth
 
 WHAT IS AND IS NOT PLOTTED. Only runs whose training went through ``trainer.train`` -- i.e. with the
-growth decision, the exit test and the ``param_mix`` rewind live. Everything under
+growth decision, the exit test and the ``rewind`` rewind live. Everything under
 ``output/VOID-probe-semihyper-NO-GROWTH-PROCEDURE`` is excluded by construction: it was produced by a
 hand-rolled fixed schedule and is not evidence about anything.
 

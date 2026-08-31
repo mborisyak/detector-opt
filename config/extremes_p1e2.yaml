@@ -40,7 +40,7 @@ training:
   iteration_limit: 262144
   val_fraction: 0.25
   loss_precision: 1.0e-2
-  param_mix: 0.25
+  rewind: 0.25
   optimizer:
     adamaxw:
       learning_rate: 2.5e-4

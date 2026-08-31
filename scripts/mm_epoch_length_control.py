@@ -4,7 +4,7 @@
     python scripts/mm_epoch_length_control.py
 
 THE FREE CONTROL. The two MM campaigns run the SAME detector, regressor, BO block, `patience` 16,
-`warmup_epochs` 2 and `param_mix` 0.25, and differ in the growth schedule and the EPOCH LENGTH:
+`warmup_epochs` 2 and `rewind` 0.25, and differ in the growth schedule and the EPOCH LENGTH:
 
     campaign-mm        loss_precision 2.0e-3  n0 8192  n_increment 4096  batch 256  ->  2048 steps/epoch
     campaign-mm-p5e3   loss_precision 5.0e-3  n0 2048  n_increment 1024  batch 128  ->   512 steps/epoch

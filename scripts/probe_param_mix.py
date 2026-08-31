@@ -1,8 +1,8 @@
-"""What does the REWIND cost and buy? One mid-BO design trained from scratch at several ``param_mix``.
+"""What does the REWIND cost and buy? One mid-BO design trained from scratch at several ``rewind``.
 
-    python scripts/probe_param_mix.py --run <cell> --design 4 --param-mix 0.1 --seed 0 --output <dir>
+    python scripts/probe_rewind.py --run <cell> --design 4 --param-mix 0.1 --seed 0 --output <dir>
 
-``param_mix`` fires at every data addition: ``params <- (1 - lambda) * current + lambda * INITIAL``,
+``rewind`` fires at every data addition: ``params <- (1 - lambda) * current + lambda * INITIAL``,
 where INITIAL is the network the run started from, and the optimiser moments are reset with it. The
 two ENDPOINTS are measured (pure carry capped 6/9 designs, rebuild 0/9); what this probe records is
 the INTERIOR, at one fixed design, so lambda is the only systematic difference between cells.
@@ -155,7 +155,7 @@ def main():
   )
   parser.add_argument(
     "--control-only", action="store_true",
-    help="skip the growth run: read its spend from an existing param_mix.json and run the "
+    help="skip the growth run: read its spend from an existing rewind.json and run the "
     "control alone, rewriting that file"
   )
   parser.add_argument(
@@ -190,7 +190,7 @@ def main():
   if arguments.design >= len(results):
     sys.exit(f"{arguments.run}: design {arguments.design} needs {arguments.design + 1} rows, run has {len(results)}")
 
-  config = {**payload["config"], "training": {**payload["config"]["training"], "param_mix": float(arguments.param_mix)}}
+  config = {**payload["config"], "training": {**payload["config"]["training"], "rewind": float(arguments.rewind)}}
   if arguments.device is not None:
     config["device"] = arguments.device
   for key, value in (("n0", arguments.n0), ("n_increment", arguments.n_increment),
@@ -223,13 +223,13 @@ def main():
   detector = detopt.detector.from_config(config["detector"])
   design_scaled = np.asarray(results[arguments.design]["x_scaled"], np.float32)
   print(
-    f"[probe] design {arguments.design} of {len(results)}  param_mix={arguments.param_mix}  "
+    f"[probe] design {arguments.design} of {len(results)}  rewind={arguments.rewind}  "
     f"trial seed={arguments.seed}  reveal={config['training'].get('reveal')}", flush=True
   )
   print(f"[probe] features {detector.combined_event_shape(config['training'].get('reveal') != 'none')}", flush=True)
 
   os.makedirs(arguments.output, exist_ok=True)
-  target = os.path.join(arguments.output, "param_mix.json")
+  target = os.path.join(arguments.output, "rewind.json")
 
   if arguments.control_only:
     with open(target) as handle:
@@ -268,7 +268,7 @@ def main():
   report = {
     "run": arguments.run,
     "design": int(arguments.design),
-    "param_mix": float(arguments.param_mix),
+    "rewind": float(arguments.rewind),
     "trial_seed": int(arguments.seed),
     "reveal": config["training"].get("reveal"),
     "loss_precision": config["training"].get("loss_precision"),

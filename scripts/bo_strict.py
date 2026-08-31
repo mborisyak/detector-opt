@@ -51,7 +51,7 @@ def main():
     "[bo_strict] STRICT-GROWTH: warmup, then add data while gap+err > loss_precision, "
     "converge on `patience` epochs without improvement", flush=True
   )
-  gearup.gearup(bo.bo).with_config("config/bo.yaml")(arguments)
+  gearup.gearup(bo.bo).with_config("config/root.yaml")(arguments)
 
 
 if __name__ == "__main__":

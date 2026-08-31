@@ -102,14 +102,30 @@ def _load_trajectory(path):
   if os.path.isdir(path):
     path = os.path.join(path, "results.json")
   with open(path) as f:
-    rs = json.load(f)["results"]
+    payload = json.load(f)
+  rs = payload["results"]
   if len(rs) == 0:
     raise ValueError(f"{path}: empty BO results")
   # RETURNS the scored rows: a finished run ends with an `incomplete` row -- the design the budget
   # could not pay for -- whose `loss`/`spent` are null and must never reach arithmetic.
   rs = io.check_bo_results(rs, path)
+  # WHAT THE RUN SHOWED ITS NETWORK, taken from the trajectory's OWN recorded config rather than from
+  # the config file this script was handed. The two disagree by construction: `training.reveal` is a
+  # command-line override per ARM (`geom_cell.sh` passes it, `make.sh` passes it), so the file on disk
+  # does not carry it and every arm of a campaign shares one file. Reading it here makes verification
+  # self-describing -- a cell cannot be verified at the wrong feature width, which silently fails as
+  # `Size of label 'i' for operand 1 (4) does not match previous terms (5)` when a withheld arm's
+  # 5-feature checkpoint meets a regressor built for the revealed 4.
+  banked = payload.get("config") or {}
+  if isinstance(banked, str):
+    banked = json.loads(banked)
+  reveal = (banked.get("training") or {}).get("reveal")
+  if reveal is None:
+    strategy = payload.get("nn_init_strategy") or banked.get("nn_init_strategy") or ""
+    reveal = "design" if strategy.startswith("meta") else "none"
   return {
     "path": path,
+    "reveal": reveal,
     "physical": np.asarray([r["design"] for r in rs], np.float32),
     "scaled": np.asarray([r["x_scaled"] for r in rs], np.float32),
     "calls": np.cumsum([int(r["spent"]) for r in rs]).astype(np.float64),
@@ -240,7 +256,12 @@ def verify(trajectory, seed: int = 0, output=None, progress: str = "bar", force:
 
   # Template regressor: the graphdef (architecture) is shared by every point, so the JIT kernels
   # compile once; each point re-initialises fresh params below.
-  model = detopt.nn.from_config(detector, config=config["regressor"], rngs=regressor_rngs(_seed(template_seq)))
+  reveals = traj["reveal"] != "none"
+  print(
+    f"[reveal] trajectory ran at reveal={traj['reveal']!r}; "
+    f"features {detector.combined_event_shape(reveals)}", flush=True
+  )
+  model = detopt.nn.from_config(detector, config=config["regressor"], rngs=regressor_rngs(_seed(template_seq)), design=reveals)
   reg_def = nnx.split(model, nnx.Param, nnx.Variable)[0]
   members = model.ensemble()
   # Single-cycle cosine-decayed learning rate over the whole per-point training (peak -> ~0),
@@ -272,7 +293,7 @@ def verify(trajectory, seed: int = 0, output=None, progress: str = "bar", force:
 
   def _net_loss(params, state, drop_key, theta, event_b, mask_b, target_b):
     reg = nnx.merge(reg_def, params, state)
-    feats = detector.combine_scaled(event_b, theta, mask=mask_b)  # fixed design (scaled), per hit
+    feats = detector.combine_scaled(event_b, theta, mask=mask_b, reveal_design=reveals)
     emask = detector.element_mask(event_b, mask_b)  # per-element mask (== hit mask, unless layer-wise)
     loss = jnp.mean(
       _forward_loss(
@@ -316,7 +337,7 @@ def verify(trajectory, seed: int = 0, output=None, progress: str = "bar", force:
       idx = jnp.clip(c * eval_batch + jnp.arange(eval_batch, dtype=jnp.int32), 0, pool_rows - 1)
       ev = jax.tree.map(lambda a: a[idx], event_buf)
       m = mask_buf[idx]
-      feats = detector.combine_scaled(ev, theta, mask=m)
+      feats = detector.combine_scaled(ev, theta, mask=m, reveal_design=reveals)
       emask = detector.element_mask(ev, m)
       tnorm = detector.normalize_target(jax.tree.map(lambda a: a[idx], tgt_buf))
       pred = _predict_shared(reg, feats, emask, members)
@@ -398,7 +419,9 @@ def verify(trajectory, seed: int = 0, output=None, progress: str = "bar", force:
     # network (the optimiser state is not checkpointed, so only its moments restart), so the two
     # numbers describe the same network and differ only in the data: all of it is fresh here.
     # ``from_config`` only supplies the architecture; the weights are replaced by the checkpoint's.
-    point_model = detopt.nn.from_config(detector, config=config["regressor"], rngs=regressor_rngs(_seed(point_seq)))
+    point_model = detopt.nn.from_config(
+      detector, config=config["regressor"], rngs=regressor_rngs(_seed(point_seq)), design=reveals
+    )
     _, params, state = nnx.split(point_model, nnx.Param, nnx.Variable)
     pure_params, pure_state, ckpt_design = _restore_design_network(run_dir, p, (params, state))
     if not np.allclose(np.asarray(ckpt_design["scaled"], np.float32), np.asarray(traj["scaled"][p], np.float32)):
@@ -582,4 +605,4 @@ if __name__ == "__main__":
 
   # gearup's CLI is ``key=value``; ``--force`` is the conventional spelling, translated here.
   arguments = ["force=yes" if a == "--force" else a for a in sys.argv[1:]]
-  gearup.gearup(verify).with_config("config/bo.yaml")(arguments)
+  gearup.gearup(verify).with_config("config/root.yaml")(arguments)

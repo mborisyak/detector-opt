@@ -126,4 +126,4 @@ def plot(output, n_draws: int = 10, n_times: int = 64, replot: bool = False, **c
 if __name__ == "__main__":
     import gearup
 
-    gearup.gearup(plot).with_config("config/bo.yaml")()
+    gearup.gearup(plot).with_config("config/root.yaml")()

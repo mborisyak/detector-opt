@@ -203,7 +203,7 @@ def replay_design(detector, config, results_path, seed):
 
 def run_config_for(
   config, *, weight_decay, iteration_limit, precision, device, n0=None, n_increment=None, warmup_epochs=None, patience=None,
-  n_models=None, p_dropout=None, reinit_on_grow=None, param_mix=None, plot_per_epoch=None, features=None, dropconnect=None
+  n_models=None, p_dropout=None, reinit_on_grow=None, rewind=None, plot_per_epoch=None, features=None, dropconnect=None
 ):
   """A deep copy of the run config with this cell's overrides applied (nothing is written to disk).
 
@@ -251,8 +251,8 @@ def run_config_for(
   # apply, so a run that does not ask for either is unaffected by the options existing.
   if reinit_on_grow is not None:
     training["reinit_on_grow"] = bool(reinit_on_grow)
-  if param_mix is not None:
-    training["param_mix"] = float(param_mix)
+  if rewind is not None:
+    training["rewind"] = float(rewind)
   if plot_per_epoch is not None:
     run["plot_per_epoch"] = bool(int(plot_per_epoch))
   if device is not None:
@@ -590,7 +590,7 @@ def main():
     done = {(
       r["design"], r["seed"], r["weight_decay"], r["iteration_limit"], r["plot_per_epoch"], r.get("n0", -1),
       r.get("loss_precision",
-            -1.0), r.get("param_mix", 0.0), r.get("n_models", -1), r.get("p_dropout", -1.0), r.get("reinit_on_grow", False)
+            -1.0), r.get("rewind", 0.0), r.get("n_models", -1), r.get("p_dropout", -1.0), r.get("reinit_on_grow", False)
     )
             for r in rows}
     print(f"resume: {len(done)} cells already in {arguments.output}")
@@ -613,11 +613,11 @@ def main():
             device=arguments.device, n0=arguments.n0, n_increment=arguments.n_increment, warmup_epochs=arguments.warmup_epochs,
             patience=arguments.patience, n_models=arguments.n_models, p_dropout=arguments.p_dropout,
             features=(json.loads(arguments.features) if arguments.features is not None else None),
-            dropconnect=arguments.dropconnect, reinit_on_grow=arguments.reinit_on_grow, param_mix=arguments.param_mix,
+            dropconnect=arguments.dropconnect, reinit_on_grow=arguments.reinit_on_grow, rewind=arguments.rewind,
             plot_per_epoch=plot
           )
-          if arguments.param_mix is not None:
-            run["training"]["param_mix"] = float(arguments.param_mix)
+          if arguments.rewind is not None:
+            run["training"]["rewind"] = float(arguments.rewind)
           (optimizer_name, ), = (run["training"]["optimizer"].keys(), )
           (regressor_name, ), = (run["regressor"].keys(), )
           # Either may be ABSENT from a config -- or present and `null`, which the image-task configs
@@ -631,7 +631,7 @@ def main():
           cell = (
             design_name, int(seed), float(run["training"]["optimizer"][optimizer_name]["weight_decay"]),
             int(run["training"]["iteration_limit"]), int(plot), int(run["training"]["n0"]),
-            float(run["training"]["loss_precision"]), float(run["training"].get("param_mix", 0.0)), n_models_set, p_dropout_set,
+            float(run["training"]["loss_precision"]), float(run["training"].get("rewind", 0.0)), n_models_set, p_dropout_set,
             bool(run["training"].get("reinit_on_grow", False))
           )
           if cell in done:
@@ -641,12 +641,12 @@ def main():
             f"\n[cell] design={design_name} seed={seed} weight_decay={cell[2]:g} "
             f"iteration_limit={cell[3]} plot_per_epoch={plot} n0={cell[5]} precision={cell[6]:g} "
             f"n_models={cell[8]} p_dropout={cell[9]:g} reinit_on_grow={cell[10]} "
-            f"param_mix={cell[7]:g}", flush=True
+            f"rewind={cell[7]:g}", flush=True
           )
           plot_dir = os.path.join(arguments.plots_dir, f"{design_name}-s{seed}") if plot == 1 else None
           row = measure(detector, run, x_scaled, int(seed), plot_dir=plot_dir)
           row.update({
-            "param_mix": float(run["training"].get("param_mix", 0.0)),
+            "rewind": float(run["training"].get("rewind", 0.0)),
             "design": design_name,
             "seed": int(seed),
             "weight_decay": cell[2],

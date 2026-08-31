@@ -1,4 +1,4 @@
-# ⚠️ `training.n0` 512 and `training.n_increment` 256, HALF `config/linear_d3n4_fine.yaml`'s values.
+# ⚠️ `training.n0` 512 and `training.n_increment` 256, HALF `config/linear_d3n4.yaml`'s values.
 # That is a THIRD difference from the d3n4 rung and it breaks byte-identity with it, so a spend
 # comparison ACROSS rungs is no longer like for like -- the per-design floor here is 683 detector
 # calls against 1365 there, and the growth step 341 against 682.
@@ -13,25 +13,24 @@
 # preferentially -- the incumbent sat exactly at the first window in 9 of 16 cells. A smaller n0
 # reduces the optimism per design but not the selection on it.
 
-# ⚠️ SIBLING of `config/linear_d3n4_fine.yaml` at the MIDDLE of the dimension ladder. Beyond n0 and
-# n_increment above, two keys differ: `detector` -> `linear_d2n3` (2 dimensions, 3 probes, noise 0.5, 6 design coordinates) and
-# `bo.gp.kernel.normalised-invariant-rbf.exchangeable` 4 -> 3. Every training, budget, regressor and
-# BO setting is byte-identical, so a difference between the two runs is attributable to the cell.
+# ⚠️ SIBLING of `config/linear_d3n4.yaml` at the SMALL end of the dimension ladder. Beyond n0 and
+# n_increment above, two keys differ: `detector` -> `linear_d1n2` (1 dimension, 2 probes, noise 0.5, 2 design coordinates)
+# and `bo.gp.kernel.normalised-invariant-rbf.exchangeable` 4 -> 2. Every training, budget, regressor
+# and BO setting is byte-identical, so a difference between the two runs is attributable to the cell.
 #
 # `exchangeable` MUST equal `n_probes`. The design is a SET of probes and the invariant kernel
 # quotients that permutation symmetry; a mismatched value raises `no design field of length <n> to
 # permute` at the first GP fit.
 #
-# MEASURED in docs/linear-highdim.md, closed form over 200000 uniform designs at this cell: optimum
-# 0.0937, median random 0.3597, ceiling 0.6923, structural floor 0.0000, span 0.2660 -- within 1.4% of
-# the 12-coordinate cell's span, so the two are comparable in how much there is to win.
-#
-# ⚠️ WHAT THIS RUN CAN AND CANNOT SEPARATE. Section 3.2 of that document puts the driver's residual at
-# 0.1%-8% of the range at n = 20 for d = 1 and 2, against 8%-19% at d = 3, and criterion (c) passes
-# 0/10 seeds here. So this cell is closer to solved than the 12-coordinate one and is run as the
-# middle rung of a dimension ladder, not as a powered arm comparison.
+# ⚠️ WHAT THIS RUN CAN AND CANNOT SEPARATE. docs/linear-highdim.md section 3.2 measures the repo's BO
+# driver against the closed form at this cell over 10 seeds: the residual is 0.1%-8% of the whole
+# baseline-to-optimum range at n = 20, and the live 1-dimensional neural campaign reads 0%-6% at
+# n = 10. The cell is effectively SOLVED within the run length, so this is NOT powered to separate
+# `from_scratch` / `continue` / `closest` / `meta` on final loss -- expect all four at the optimum.
+# What it can read is per-design SPEND and designs-to-optimum as a function of design dimension,
+# against the 6-coordinate and 12-coordinate cells run at identical settings.
 
-detector: linear_d2n3
+detector: linear_d1n2
 
 regressor:
   set-regressor:
@@ -52,7 +51,7 @@ training:
   iteration_limit: 65536
   val_fraction: 0.25
   loss_precision: 2.0e-2
-  param_mix: 0.25
+  rewind: 0.25
   optimizer:
     adamaxw:
       learning_rate: 2.5e-4
@@ -71,7 +70,7 @@ bo:
     log_amplitude_prior_bounds: [-6.0, 1.5]
     kernel:
       normalised-invariant-rbf:
-        exchangeable: 3
+        exchangeable: 2
   ei:
     n_restarts: 32
     n_steps: 100

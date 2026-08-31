@@ -1,22 +1,3 @@
-# ⚠️ VARIANT of `config/linear_d3n4.yaml`: `training.n0` 4096 -> 1024 and `training.n_increment`
-# 4096 -> 512. Nothing else moves.
-#
-# WHY. A design cannot cost less than `n0 * (1 + val_fraction/(1 - val_fraction))`, so at n0 = 4096 the
-# floor was 5,461 detector calls -- 4.2% of the whole 131,072 budget -- and spend was quantised to
-# multiples of it. MEASURED on the completed campaigns: 75% of designs in `linear-d3n4-revealed` and
-# 67% in `linear-set-onehot` exited at the FIRST window, so their true requirement was at most 5,461
-# and otherwise unobserved. Per-design cost was censored from below for the majority of designs, and
-# two designs needing 800 and 3,000 calls were recorded identically.
-#
-# At n0 = 1024 the floor is 1,365 (96 designs per budget instead of 24) and the increment is 683, so
-# the procedure can resolve what a design actually needed instead of clipping it.
-#
-# ⚠️ `iteration_limit` is deliberately NOT rescaled. It sets `steps_per_epoch = iteration_limit //
-# batch` = 512, independent of the window, so the first window now sees 64 passes per epoch where it
-# saw 16. That is a real change to the early-window regime, not a pure accounting fix; it is accepted
-# here because the alternative -- moving `iteration_limit` -- would silently redefine what an epoch is
-# and break comparability with everything measured on this task.
-
 # LINEAR at d = 3 with n_probes = 4, GROWTH procedure, short run.
 #
 # Delta against `config/linear.yaml`: `detector` -> `linear_d3n4` (3 dimensions, 4 probes, noise 0.5,
@@ -54,8 +35,8 @@ device: cuda
 plot_per_epoch: 8
 
 training:
-  n0: 1024
-  n_increment: 512
+  n0: 4096
+  n_increment: 4096
   batch: 128
   eval_batch: 4096
   warmup_epochs: 2

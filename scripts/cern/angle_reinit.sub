@@ -1,0 +1,29 @@
+# `meta_reinit` on `ship-angle-w2x-3m`: 5 seeds, draws 1-5.
+#
+# WHAT IT ISOLATES. `meta_reinit` IS `meta` with the NETWORK CARRY REMOVED: design still revealed,
+# replay batch still mixed, but a FRESH random network at every design. The banked `meta` cells at the
+# same seeds ran this identical config, so the pair separates what the carried network is worth from
+# what the replay is worth -- two things `meta` changes together.
+#
+# ITS OWN TREE, not a 5th arm in the campaign directory: `plot_median.py --paired` keeps only seeds
+# complete in EVERY arm, so adding an arm that exists for a subset of seeds silently empties the
+# paired set for the whole tree. Learned on the extremes campaign, 2026-08-30.
+universe       = vanilla
+executable     = geom_cell.sh
+arguments      = ship_angle_prec1e2_w2x_3m $(seed) $(arm) $(reveal) /afs/cern.ch/work/m/maborisy/ship-angle-w2x-3m-reinit/$(seed)/$(arm)
+output         = logs/anglereinit_$(seed)_$(arm).$(ClusterId).$(ProcId).out
+error          = logs/anglereinit_$(seed)_$(arm).$(ClusterId).$(ProcId).err
+log            = logs/anglereinit.$(ClusterId).log
+request_gpus   = 1
+request_cpus   = 2
+request_memory = 12000
+requirements   = TARGET.GPUs_GlobalMemoryMb >= 20000
++MaxRuntime    = 259200
++JobBatchName  = "ship-angle-w2x-3m-reinit"
+queue seed,arm,reveal from (
+  1244111331, meta_reinit, design
+  126382657,  meta_reinit, design
+  750143450,  meta_reinit, design
+  9577242,    meta_reinit, design
+  330924253,  meta_reinit, design
+)

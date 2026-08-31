@@ -1,0 +1,169 @@
+# The final SHiP campaign -- docs/final.md. ONE workflow for both detectors: the TASK IS INFERRED
+# FROM THE PATH, exactly as the repo's main Snakefile does it. A target names where the campaign goes
+# and which detector it is in the same string:
+#
+#   snakemake -s ship.snake -j8 --resources local_gpu=2   # everything, both tasks
+#   snakemake -s ship.snake output/angle/campaign.txt     # one task, start to finish
+#   snakemake -s ship.snake output/angle/validation.txt   # stage 1 only
+#   snakemake -s ship.snake output/angle/selected.txt     # stages 1-3, stop before the test runs
+#   snakemake -s ship.snake -n                            # dry run
+#
+# `<prefix>` is ANY path and may span directories; `<task>` is exactly ONE directory pinned to the
+# alternation of the two campaign configs, which is what makes the split unambiguous -- in
+# `output/rehearsal/2026-09/angle/campaign.txt` only `angle` can be the task. Because both tasks are
+# rules in ONE workflow, a single snakemake invocation drives them; two invocations in this directory
+# would collide on snakemake's working-directory lock.
+#
+# THE FOUR STAGES:
+#   1. validation   3 validation seeds x 3 arms at `norewind`, the setting with nothing to choose
+#   2. probe        7 retention settings re-score ONE middle-of-BO design per (arm, seed) -> 63 cells
+#   3. select       rank integral over the best-so-far curves -> config/strategy/<task>-<arm>-optimal.yaml
+#   4. test         10 test seeds x 3 arms at the selected settings, then a 10-point verification
+#
+# ⛔️ STAGE 4 CANNOT RUN AGAINST A STALE SETTING. `test_bo` depends on `selected.txt`, which only
+# `select` can produce, so snakemake regenerates the settings from the probe records before any test
+# cell starts.
+#
+# THE `-optimal.yaml` FILES ARE A SIDE EFFECT, NOT A DECLARED OUTPUT, and that is forced rather than
+# chosen: snakemake requires every output of a rule to carry the SAME wildcards, and those paths have
+# a `<task>` but no `<prefix>`. Two consequences, one good and one to know:
+#
+#   * GOOD: snakemake deletes a rule's declared outputs before running it, so an undeclared config
+#     file cannot be wiped by an unrelated rerun.
+#   * KNOW: deleting an `-optimal.yaml` by hand without deleting `selected.txt` will NOT trigger a
+#     rebuild. Use `--forcerun select`.
+#
+# RESOURCES ARE EXECUTOR-AGNOSTIC. Rules declare `threads` plus portable resources (`mem_mb`,
+# `runtime`) and `local_gpu`, a plain counter no plugin interprets, so `--resources local_gpu=K` caps
+# GPU jobs locally. HOW a GPU is requested belongs to the profile -- `--gres=shard:6` for this
+# workstation's SLURM, `request_gpus` for HTCondor. Do not put either in this file.
+#
+# A killed `bo` job RESUMES: the declared output is `done.txt`, touched only after the driver exits
+# cleanly, while `results.json` and the checkpoints are undeclared and never deleted. Invalidating a
+# finished run is `rm done.txt`.
+#
+# `closest` is not here -- dropped from the final campaign, see docs/final.md.
+TASKS = ["angle", "intersect"]
+DEFAULT_PREFIX = config.get("prefix", "output")
+
+SEEDS_VAL = [282522616, 2036255796, 160541601]
+SEEDS_TEST = [
+  1244111331, 126382657, 750143450, 9577242, 330924253,
+  219094734, 1153299222, 122012491, 499913522, 983655707,
+]
+ARMS = ["from_scratch", "continue", "meta"]
+VARIANTS = [
+  "norewind",
+  "rewind-01", "rewind-025", "rewind-05",
+  "sp-06-001", "sp-03-0005", "sp-015-00025",
+]
+
+ENV = "XLA_PYTHON_CLIENT_PREALLOCATE=false PYTHONUNBUFFERED=1"
+
+
+wildcard_constraints:
+  prefix=".+",
+  task="|".join(TASKS),
+  seed="|".join(str(s) for s in SEEDS_TEST + SEEDS_VAL),
+  arm="|".join(ARMS),
+  variant="|".join(VARIANTS),
+
+
+localrules: all, validation, probe, select, campaign
+
+
+rule all:
+  input:
+    expand(f"{DEFAULT_PREFIX}/{{task}}/campaign.txt", task=TASKS)
+
+
+rule validation:
+  input:
+    expand("{{prefix}}/{{task}}/validation/{seed}/{arm}/done.txt", seed=SEEDS_VAL, arm=ARMS)
+  output:
+    touch("{prefix}/{task}/validation.txt")
+
+
+rule probe:
+  input:
+    expand("{{prefix}}/{{task}}/probe/{seed}/{arm}/{variant}.json", seed=SEEDS_VAL, arm=ARMS, variant=VARIANTS)
+  output:
+    touch("{prefix}/{task}/probes.txt")
+
+
+rule campaign:
+  input:
+    expand("{{prefix}}/{{task}}/test/{seed}/{arm}/verified.txt", seed=SEEDS_TEST, arm=ARMS)
+  output:
+    touch("{prefix}/{task}/campaign.txt")
+
+
+rule validation_bo:
+  output:
+    touch("{prefix}/{task}/validation/{seed}/{arm}/done.txt")
+  threads: 4
+  resources:
+    local_gpu=1, mem_mb=12000, runtime=2880
+  shell:
+    ENV + " python scripts/bo.py ={wildcards.task}"
+    " strategy={wildcards.task}-{wildcards.arm}-norewind"
+    " output={wildcards.prefix}/{wildcards.task}/validation/{wildcards.seed}/{wildcards.arm}"
+    " seed={wildcards.seed}"
+
+
+rule retention_probe:
+  input:
+    "{prefix}/{task}/validation/{seed}/{arm}/done.txt"
+  output:
+    "{prefix}/{task}/probe/{seed}/{arm}/{variant}.json"
+  threads: 4
+  resources:
+    local_gpu=1, mem_mb=12000, runtime=720
+  shell:
+    ENV + " python scripts/probe_retention.py ={wildcards.task}"
+    " strategy={wildcards.task}-{wildcards.arm}-{wildcards.variant}"
+    " trajectory={wildcards.prefix}/{wildcards.task}/validation/{wildcards.seed}/{wildcards.arm}/results.json"
+    " seed={wildcards.seed} output={output}"
+
+
+rule select:
+  input:
+    "{prefix}/{task}/probes.txt"
+  output:
+    marker=touch("{prefix}/{task}/selected.txt"),
+    report="{prefix}/{task}/selection.txt"
+  threads: 1
+  resources:
+    local_gpu=0, mem_mb=2000, runtime=20
+  shell:
+    "python scripts/select_retention.py --task {wildcards.task}"
+    " --probes {wildcards.prefix}/{wildcards.task}/probe --write --report {output.report}"
+
+
+rule test_bo:
+  input:
+    "{prefix}/{task}/selected.txt"
+  output:
+    touch("{prefix}/{task}/test/{seed}/{arm}/done.txt")
+  threads: 4
+  resources:
+    local_gpu=1, mem_mb=12000, runtime=2880
+  shell:
+    ENV + " python scripts/bo.py ={wildcards.task}"
+    " strategy={wildcards.task}-{wildcards.arm}-optimal"
+    " output={wildcards.prefix}/{wildcards.task}/test/{wildcards.seed}/{wildcards.arm}"
+    " seed={wildcards.seed}"
+
+
+rule verify:
+  input:
+    "{prefix}/{task}/test/{seed}/{arm}/done.txt"
+  output:
+    touch("{prefix}/{task}/test/{seed}/{arm}/verified.txt")
+  threads: 4
+  resources:
+    local_gpu=1, mem_mb=12000, runtime=2880
+  shell:
+    ENV + " python scripts/verify_trajectory.py ={wildcards.task}"
+    " trajectory={wildcards.prefix}/{wildcards.task}/test/{wildcards.seed}/{wildcards.arm}/results.json"
+    " seed={wildcards.seed} progress=plain"

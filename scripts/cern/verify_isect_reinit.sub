@@ -1,0 +1,23 @@
+# ONE-POINT VERIFICATION of the `meta_reinit` cells of `ship-intersect-w2x-2m-reinit`.
+# Re-scores ONLY the final incumbent -- the run's answer -- on data the run never saw. `n_points=1`
+# because `_select_points` always includes the last incumbent, so one point IS the final design.
+# The config is the CAMPAIGN's: these cells ran it, and verification must match the design encoding.
+universe       = vanilla
+executable     = verify_cell.sh
+arguments      = ship_intersect_prec1e2_w2x_2m $(seed) /afs/cern.ch/work/m/maborisy/ship-intersect-w2x-2m-reinit/$(seed)/meta_reinit 1
+output         = logs/isectrv_$(seed).$(ClusterId).$(ProcId).out
+error          = logs/isectrv_$(seed).$(ClusterId).$(ProcId).err
+log            = logs/isectrv.$(ClusterId).log
+request_gpus   = 1
+request_cpus   = 2
+request_memory = 12000
+requirements   = TARGET.GPUs_GlobalMemoryMb >= 20000
++MaxRuntime    = 172800
++JobBatchName  = "verify-ship-intersect-w2x-2m-reinit"
+queue seed from (
+  1244111331
+  126382657
+  750143450
+  9577242
+  330924253
+)

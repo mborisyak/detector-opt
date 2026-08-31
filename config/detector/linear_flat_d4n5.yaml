@@ -1,0 +1,14 @@
+# The linear task at 4 dimensions / 5 probes, sigma 0.7 -- IDENTICAL physics to
+# `config/detector/linear_d4n5.yaml`, on the `linear-flat` detector.
+#
+# `linear-flat` differs from `linear` in ONE thing: the feature layout when the design is WITHHELD.
+# `linear` emits the reading plus a one-hot of the probe index, which exists only to break a
+# permutation-invariant set regressor's exchangeability. An MLP is order-dependent -- probe i always
+# occupies the same input slots -- so the one-hot is dead weight and the withheld input is the
+# readings alone. Revealed, the two detectors are BYTE-IDENTICAL (verified), so `meta` sees exactly
+# what it would on `linear`.
+linear-flat:
+  n_probes: 5
+  n_dimensions: 4
+  noise: 0.7
+  probe_bounds: [-1.0, 1.0]

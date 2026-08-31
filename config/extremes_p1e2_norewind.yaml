@@ -1,0 +1,69 @@
+# ⚠️⚠️ REWIND-OFF ABLATION of `config/extremes_p1e2.yaml`. ONE key differs and nothing else moves:
+#
+#   training.rewind                                0.25 -> 0.0
+#
+# ⛔️ THIS TURNS THE REWIND OFF AND BREAKS A STANDING RULE ON PURPOSE. The rule is `rewind` > 0
+# ALWAYS; what matters is rewind ON vs OFF, not the value. The CODE default is 0.0, so an omitted
+# `rewind` silently disables it -- this file sets 0.0 EXPLICITLY. Finding this value in a config
+# that is not a rewind ablation is a bug.
+#
+# WHY EXTREMES IS THE PLACE TO LOOK. Its `rewind` is 0.25, the LARGEST rewind in the project
+# (SHiP runs 0.1), so if shrinking toward the initial network costs anything it should be most
+# visible here. `rewind` walks the same axis as `reinit_on_grow`: at each data addition it pulls
+# parameters toward the network THIS RUN STARTED FROM, which sheds a fraction of the accumulated fit
+# and resets the optimiser moments with it.
+#
+# PAIRS WITH the banked `output/extremes-p1e2-5seed/<seed>/meta` cells: same seeds, same budget
+# 1310720, same ladder 4096/2048, same `iteration_limit`, same `loss_precision`. Only `rewind`
+# differs, so a difference is attributable to the rewind alone.
+#
+# META ARM ONLY, by explicit request -- this is a deviation from the usual four-arm run and is
+# stated here so nobody reads a missing arm as a lost cell.
+#
+detector: enzyme_extremes
+regressor:
+  set-regressor:
+    features: [[24, 16], [16, 24]]
+    n_models: 4
+    dropconnect: 0.05
+device: cuda
+plot_per_epoch: 8
+training:
+  n0: 4096
+  n_increment: 2048
+  batch: 256
+  eval_batch: 2048
+  warmup_epochs: 2
+  patience: 16
+  budget: 1310720
+  iteration_limit: 262144
+  val_fraction: 0.25
+  loss_precision: 1.0e-2
+  rewind: 0.0
+  optimizer:
+    adamaxw:
+      learning_rate: 2.5e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-3
+bo:
+  n_init: 5
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds: [-2.0, 1.0]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+    kernel:
+      normalised-invariant-rbf:
+        exchangeable: 4
+  ei:
+    n_restarts: 32
+    n_steps: 100
+verify:
+  n_points: 10
+  epochs: 200
+  val_every_epochs: 10
+  budget: null
+  batch: null

@@ -126,8 +126,82 @@ STRATEGY_KNOBS = {
 }
 
 
+def drop_foreign_knobs(config, nn_init_strategy):
+  """``config`` with the ``training`` knobs this arm's trainer does not accept removed.
+
+    A run config written for a multi-arm campaign carries EVERY arm's knobs, and a trainer handed one
+    it does not take dies with `TypeError: __init__() got an unexpected keyword argument` before the
+    first design. Dropped LOUDLY, one line per drop: a setting that vanishes without a line in the log
+    is how a run ends up measuring something else.
+
+    Used by every entry point that builds a trainer from a campaign config -- the driver and the
+    retention probe -- so the two cannot disagree about which knob belongs to which arm.
+  """
+  for knob, owners in STRATEGY_KNOBS.items():
+    if nn_init_strategy not in owners and knob in config.get("training", {}):
+      config = {**config, "training": {k: v for k, v in config["training"].items() if k != knob}}
+      print(
+        f"[config] dropped `training.{knob}`: it applies to {'/'.join(owners)} only, "
+        f"not `{nn_init_strategy}`", flush=True
+      )
+  return config
+
+
+# THE THREE KNOBS THAT DEFINE PARAMETER RETENTION, and the only keys a strategy config may set
+# besides the arm itself. `rewind` mixes the network back toward its own initialisation at each data
+# addition; `shrink`/`param_noise` are shrink-and-perturb. They are mutually exclusive and the
+# trainer enforces that.
+RETENTION_KNOBS = ("rewind", "shrink", "param_noise")
+
+
+def _resolve_strategy(config):
+  """Fold a named strategy config into the run config.
+
+    `strategy=<name>` resolves, through gearup, to `config/strategy/<name>.yaml`: a top-level key
+    whose value is a string is loaded from the directory of the same name. That file names the ARM
+    and its retention knobs and nothing else, so a campaign cell is addressed as
+    `=ship_angle_final strategy=angle-meta-rewind-025` instead of repeating four overrides, and the
+    file that defines the arm is named in the submit line and recorded in `config.yaml`.
+
+    THERE IS NO PRECEDENCE RULE, BY DESIGN. A task config that also sets `nn_init_strategy` or a
+    retention knob is an error rather than a loser, because a campaign in which one of these is
+    silently overridden measures something other than what its name says.
+  """
+  strategy = config.get("strategy")
+  if strategy is None:
+    return config
+
+  allowed = ("nn_init_strategy", ) + RETENTION_KNOBS
+  unknown = sorted(set(strategy) - set(allowed))
+  if len(unknown) > 0:
+    raise ValueError(f"strategy config may only set {allowed}, got extra keys {unknown}")
+  if "nn_init_strategy" not in strategy:
+    raise ValueError("strategy config must name `nn_init_strategy`")
+
+  training = dict(config.get("training", {}))
+  clashes = sorted(k for k in RETENTION_KNOBS if k in training)
+  if len(clashes) > 0:
+    raise ValueError(
+      f"training sets {clashes} but a strategy config is in use; retention knobs belong to the "
+      f"strategy alone -- remove them from the task config"
+    )
+  if config.get("nn_init_strategy") is not None:
+    raise ValueError("task config sets `nn_init_strategy` but a strategy config is in use; remove it")
+
+  for knob in RETENTION_KNOBS:
+    if knob in strategy:
+      training[knob] = strategy[knob]
+  resolved = {**config, "nn_init_strategy": strategy["nn_init_strategy"], "training": training}
+  print(
+    f"[strategy] {strategy['nn_init_strategy']}; "
+    + ", ".join(f"{k}={training[k]}" for k in RETENTION_KNOBS if k in training), flush=True
+  )
+  return resolved
+
+
 def bo(output, seed: int, force: bool = False, **config):
   seed = int(seed)
+  config = _resolve_strategy(config)
 
   # THE CONFIG THAT ACTUALLY RAN, written BEFORE anything else happens, so it exists even for a run
   # that dies in setup. A run is launched as `=<name>` plus command-line overrides, so neither the
@@ -250,15 +324,7 @@ def bo(output, seed: int, force: bool = False, **config):
   # what the network is shown must never be silent -- an earlier run recorded a knob that no longer
   # exists and could not be reproduced.
 
-  # Drop every knob this arm's trainer does not accept (see STRATEGY_KNOBS above), one line per
-  # drop so the log says exactly which settings this cell did not use.
-  for knob, owners in STRATEGY_KNOBS.items():
-    if nn_init_strategy not in owners and knob in config.get("training", {}):
-      config = {**config, "training": {k: v for k, v in config["training"].items() if k != knob}}
-      print(
-        f"[config] dropped `training.{knob}`: it applies to {'/'.join(owners)} only, "
-        f"not `{nn_init_strategy}`", flush=True
-      )
+  config = drop_foreign_knobs(config, nn_init_strategy)
 
   trainer = trainer_cls.from_config(
     detector, config, checkpoint_dir=os.path.join(output, "checkpoints"), seed=int(network_seq.generate_state(1)[0]),
@@ -282,6 +348,9 @@ def bo(output, seed: int, force: bool = False, **config):
   # interruption, so this list is restored on resume and warm starts keep working across one.
   proposed_scaled = []
   results = []
+  # Detector calls already charged to a row. Resume rebuilds it from the restored rows, so a resumed
+  # run does not re-attribute a constructor purchase that an earlier attempt already recorded.
+  attributed = 0
   best_loss, best_design = np.inf, None
 
   def _commit_state():
@@ -325,6 +394,7 @@ def bo(output, seed: int, force: bool = False, **config):
     # observation its pool has not paid for.
     trainer.replay(resume)
     results = list(resume)
+    attributed = sum(int(row.get("spent", 0)) for row in results)
     proposed_scaled = [np.asarray(r["x_scaled"], dtype=np.float32) for r in resume]
     scored = [float(r["loss"]) for r in resume]
     if len(scored) > 0:
@@ -481,8 +551,17 @@ def bo(output, seed: int, force: bool = False, **config):
         print(f"  [warm-start] closest = iter {warm_from} (dist={float(dists[warm_from]):.3f})")
       init_params = trainer.restore_design_parameters(warm_from)
 
-    used = trainer.train_pool.current + trainer.val_pool.current
+    used = trainer.spent_calls()
     print(f"[iter {i+1}] training... ({budget - used} detector calls left)")
+    # THE SPEND THIS ITERATION IS THE TRAINER'S, NOT THE DESIGN'S. `TrainResult.spent` counts what the
+    # proposed design consumed; a strategy may buy other events out of the same budget, and those are
+    # detector calls the run has to answer for. The delta is measured against everything ALREADY
+    # ATTRIBUTED to a row rather than against the fill at the top of this iteration, because a strategy
+    # may also buy events in its CONSTRUCTOR -- `meta_random_frozen` buys its whole random prefix before
+    # iteration 1 exists, and a per-iteration bracket misses it entirely, leaving `sum(spent)` short of
+    # `detector_calls_used` by exactly `alpha * budget` and the arm's curve wrongly shifted left.
+    # Anything unattributed lands on the FIRST row, which is where the spend actually happened.
+    # Arms that buy nothing extra see a delta of exactly `result.spent`, so their records are unchanged.
     try:
       result = trainer.train(x_prop, iteration_seed, init_params=init_params, on_epoch=on_epoch, step=i, )
     except RuntimeError as error:
@@ -502,6 +581,8 @@ def bo(output, seed: int, force: bool = False, **config):
     if result is None:
       print(f"[budget] pool exhausted; finishing BO after {i} completed iterations.")
       break
+    # Detector calls this iteration bought BESIDES the proposed design's own window.
+    spent_random = max(0, (trainer.spent_calls() - attributed) - int(result.spent))
     trained_loss = float(result.objective_loss)
     penalty = detector.design_penalty(design_phys)
     penalty = None if penalty is None else float(penalty)
@@ -522,7 +603,8 @@ def bo(output, seed: int, force: bool = False, **config):
     priced = "" if penalty is None else f" (trained {trained_loss:.5f} + penalty {penalty:.5f})"
     print(
       f"[iter {i+1}] loss={loss:.5f}±{result.objective_std:.4f}{priced} "
-      f"spent={result.spent} time={elapsed:.1f}s{marker}"
+      f"spent={result.spent}{f' +{spent_random} random' if spent_random > 0 else ''} "
+      f"time={elapsed:.1f}s{marker}"
     )
 
     results.append({
@@ -533,13 +615,16 @@ def bo(output, seed: int, force: bool = False, **config):
       "trained_loss": trained_loss,
       "design_penalty": penalty,
       "loss_std": float(result.objective_std),
-      "spent": int(result.spent),
+      "spent": int(result.spent) + spent_random,
       "spent_train": int(result.spent_train),
       "spent_val": int(result.spent_val),
+      "spent_random": spent_random,
       "time_s": float(elapsed),
       "nn_init_strategy": nn_init_strategy,
       "warm_start_from": warm_from,
     })
+    attributed += int(result.spent) + spent_random
+
     # THE RECORD FIRST, then the state -- see `_commit_state` for why this order is the
     # recoverable one.
     _save_results(i + 1, completed=False)
@@ -562,4 +647,4 @@ if __name__ == "__main__":
 
   # gearup's CLI is `key=value`; `--force` is the conventional spelling, translated here.
   arguments = ["force=yes" if a == "--force" else a for a in sys.argv[1:]]
-  gearup.gearup(bo).with_config("config/bo.yaml")(arguments)
+  gearup.gearup(bo).with_config("config/root.yaml")(arguments)

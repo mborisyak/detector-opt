@@ -149,7 +149,7 @@ def design_band(landscape, detector, q_low, q_high, n_designs):
 
 
 def run_config_for(
-  config, *, features, budget, param_mix, dropconnect, p_dropout, iteration_limit=None, device=None, loss_precision=None
+  config, *, features, budget, rewind, dropconnect, p_dropout, iteration_limit=None, device=None, loss_precision=None
 ):
   """A deep copy of the run config with this arm's overrides applied (nothing is written to disk).
 
@@ -173,7 +173,7 @@ def run_config_for(
   # rate of 0; the brief asks for None, so None is what is stored.
   regressor["p_dropout"] = None if p_dropout is None else float(p_dropout)
   regressor["dropconnect"] = None if dropconnect is None else float(dropconnect)
-  run["training"]["param_mix"] = float(param_mix)
+  run["training"]["rewind"] = float(rewind)
   run["training"]["budget"] = int(budget)
   if loss_precision is not None:
     run["training"]["loss_precision"] = float(loss_precision)
@@ -428,7 +428,7 @@ def main():
   parser.add_argument("--width", default="config", help="a NAME for this width, recorded in the output")
   parser.add_argument("--p-dropout", type=float, default=None, help="regressor `p_dropout`; unset means None (no layer built)")
   parser.add_argument("--dropconnect", type=float, default=0.1, help="regressor `dropconnect` (weight dropping)")
-  parser.add_argument("--param-mix", type=float, default=0.25, help="`training.param_mix` at every data addition")
+  parser.add_argument("--param-mix", type=float, default=0.25, help="`training.rewind` at every data addition")
   parser.add_argument(
     "--loss-precision", type=float, default=None, metavar="P",
     help="the convergence BAR both arms are measured against; unset means the config's own. Sweeping "
@@ -475,16 +475,16 @@ def main():
   meta_budget = power_of_two_budget(pooled_train + iteration_limit, val_fraction)
 
   pretrain_run = run_config_for(
-    config, features=features, budget=pretrain_budget, param_mix=arguments.param_mix, dropconnect=arguments.dropconnect,
+    config, features=features, budget=pretrain_budget, rewind=arguments.rewind, dropconnect=arguments.dropconnect,
     p_dropout=arguments.p_dropout, loss_precision=arguments.loss_precision, iteration_limit=pooled_train,
     device=arguments.device
   )
   measure_run = run_config_for(
-    config, features=features, budget=measure_budget, param_mix=arguments.param_mix, dropconnect=arguments.dropconnect,
+    config, features=features, budget=measure_budget, rewind=arguments.rewind, dropconnect=arguments.dropconnect,
     p_dropout=arguments.p_dropout, loss_precision=arguments.loss_precision, device=arguments.device
   )
   meta_run = run_config_for(
-    config, features=features, budget=meta_budget, param_mix=arguments.param_mix, dropconnect=arguments.dropconnect,
+    config, features=features, budget=meta_budget, rewind=arguments.rewind, dropconnect=arguments.dropconnect,
     p_dropout=arguments.p_dropout, loss_precision=arguments.loss_precision, device=arguments.device
   )
   (regressor_name, ), = (measure_run["regressor"].keys(), )
@@ -492,7 +492,7 @@ def main():
   print(f"config {arguments.config} | width `{arguments.width}` | seed {arguments.seed}")
   print(f"regressor: {json.dumps(measure_run['regressor'][regressor_name])}")
   print(
-    f"training: param_mix={measure_run['training']['param_mix']} weight_decay="
+    f"training: rewind={measure_run['training']['rewind']} weight_decay="
     f"{list(measure_run['training']['optimizer'].values())[0]['weight_decay']} "
     f"iteration_limit={iteration_limit} loss_precision={measure_run['training']['loss_precision']}"
   )
@@ -516,7 +516,7 @@ def main():
     "n_models": measure_run["regressor"][regressor_name].get("n_models"),
     "p_dropout": measure_run["regressor"][regressor_name].get("p_dropout"),
     "dropconnect": measure_run["regressor"][regressor_name].get("dropconnect"),
-    "param_mix": measure_run["training"]["param_mix"],
+    "rewind": measure_run["training"]["rewind"],
     "weight_decay": list(measure_run["training"]["optimizer"].values())[0]["weight_decay"],
     "loss_precision": measure_run["training"]["loss_precision"],
     "iteration_limit": iteration_limit,

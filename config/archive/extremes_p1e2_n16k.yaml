@@ -1,0 +1,90 @@
+# EXTREMES AT A COARSER GROWTH LADDER: n0 4096 -> 16384, n_increment 2048 -> 8192 (user, 2026-08-30).
+# Everything else is `extremes_p1e2.yaml` untouched -- same detector, network, budget, precision and
+# convergence knobs -- so the ONLY difference is how the window grows.
+#
+# WHY. Over the 1488 banked designs the median design took 13-20 growth ROUNDS (meta 13, the
+# per-design arms 18-20), so most of a cell's 2.16 h median went on re-testing convergence rather than
+# on training. This ladder moves the same data in a quarter of the steps.
+#
+# `iteration_limit` IS DELIBERATELY UNCHANGED at 262144, so `steps_per_epoch` stays 1024 and
+# `patience` / `warmup_epochs` keep their meaning. n0 and n_increment do not set the epoch; that trap
+# belongs to `iteration_limit` and is what forced patience/warmup to move in the angle campaign.
+#
+# ⚠️ IT CENSORS CONSUMPTION FROM BELOW, AND NOT EVENLY. No design can report less than the n0 round,
+# now 21845 train+val calls. Measured against the banked corpus, the fraction of designs that would be
+# floored is meta 9.5%, from_scratch 2.0%, continue 0.9%, closest 0.8% -- a 5-12x asymmetry falling on
+# the arm whose median design is CHEAPEST (40964 vs 53-60k). It does not touch the loss comparison; it
+# does bias any SPEND comparison against meta, and meta's median design sits only ~2 increments above
+# the new floor, so the ladder is coarse relative to what it is measuring.
+#
+# ⛔️ CELLS RUN HERE CANNOT BE POOLED WITH `output/extremes-p1e2-5seed`, which ran 4096/2048.
+# Extremes campaign at `loss_precision 1.0e-2`. Supersedes the 2.0e-3 line, which is abandoned
+# (`ABANDONED.md` in each 2.0e-3 tree; reasoning in `docs/decision-log.md`).
+#
+# The regressor width and the growth schedule are MEASURED, not inherited. `[[24,16],[16,24]]` was
+# chosen by the pre-registered rule in `docs/prereg-extremes-p1e2-campaign.md` from a three-width
+# sweep on design 6 of `output/extremes-campaign-p2e3/1244111331/from_scratch`: at 1.0e-2 the widths
+# scored 0.58387 / 0.59425 / 0.60779 for train spends 90112 / 57344 / 49152, a loss spread of 0.02392
+# against the 0.01 bar, so the differences are real and the middle width is middle on BOTH loss and
+# spend. The wide net buys 0.0104 of loss for 1.57x the spend.
+#
+# Schedule. `n0` and `n_increment` are half the derived S/4 and S/16, so meta's roughly 2x saving in
+# per-design data is RESOLVABLE: from_scratch takes ~26 growth steps and meta ~12, and a schedule too
+# coarse to show that is the recorded failure mode (the strip config gave meta zero growth steps and
+# hid the effect entirely).
+#
+# `iteration_limit` is 64 x n0, the base config's own ratio. It is the per-design CAP as well as the
+# epoch length, and per-design spend varies several-fold within one config, so a CAPPED cell is a
+# real risk here and must be reported as a failure, never recorded as a result.
+#
+# `budget` gives ~17 designs per baseline arm at the measured per-design spend of 76460. No power of
+# two lands in the 15-20 window (2^20 gives 13.7, 2^21 gives 27.4), so the power-of-two convention is
+# deliberately broken; 1310720 is 5 x 2^18 and an exact multiple of both n0 and n_increment. It is
+# well under the 6291456-event pool ceiling.
+detector: enzyme_extremes
+regressor:
+  set-regressor:
+    features: [[24, 16], [16, 24]]
+    n_models: 4
+    dropconnect: 0.05
+device: cuda
+plot_per_epoch: 8
+training:
+  n0: 16384
+  n_increment: 8192
+  batch: 256
+  eval_batch: 2048
+  warmup_epochs: 2
+  patience: 16
+  budget: 1310720
+  iteration_limit: 262144
+  val_fraction: 0.25
+  loss_precision: 1.0e-2
+  param_mix: 0.25
+  optimizer:
+    adamaxw:
+      learning_rate: 2.5e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-3
+bo:
+  n_init: 5
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds: [-2.0, 1.0]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+    kernel:
+      normalised-invariant-rbf:
+        exchangeable: 4
+  ei:
+    n_restarts: 32
+    n_steps: 100
+verify:
+  n_points: 10
+  epochs: 200
+  val_every_epochs: 10
+  budget: null
+  batch: null

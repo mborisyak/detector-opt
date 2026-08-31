@@ -1,126 +1,56 @@
-# CAMPAIGN CONFIG -- `linear` at 4 dimensions / 5 probes / sigma 0.7 (detector:
-# config/detector/linear_d4n5.yaml).
+# ⚠️ SIBLING of `config/linear_d3n4.yaml` at the TOP of the dimension ladder. Two keys differ:
+# `detector` -> `linear_d4n5_s05` (4 dimensions, 5 probes, noise 0.5, 20 design coordinates) and
+# `bo.gp.kernel.normalised-invariant-rbf.exchangeable` 4 -> 5. Training, budget, regressor and BO
+# settings are byte-identical to the d3n4 rung, which is the completed 20-seed campaign, so the two
+# are directly comparable.
 #
-# `device` -- cuda, and this REVERSES the CPU-only choice this file was written with. That choice was
-#   made on the assumption that an analytic detector costs nothing to run on a host; what costs here is
-#   the NETWORK, not the events. MEASURED on this cell, one design end to end
-#   (`scripts/probe_precision.py`, the same 5 designs both ways): at the width this file used to
-#   declare, 26-129 s a design on one GPU shard against 420-880 s on 2 CPU cores -- a factor of 10
-#   (`output/linear-criterion/width-16-8.json` against `output/screen/precision-linear-d4n5.json`). At
-#   the width it declares now it is 29-72 s a shard-design, mean 47. A 5-seed x 2-arm campaign of 24
-#   designs a run is 2.5 h of wall clock over the two shards and over a day on two CPU slots, so the
-#   CPU reading is what does not fit. The events being analytic is still true and still means this task
-#   never needs a simulator; it does not mean the trainer is free.
+# `n0` 1024 / `n_increment` 512 are NOT reduced to the 512/256 the small rungs were moved to. The
+# reduction there answered a censoring problem: 26% of d1n2 designs exited at the very first window.
+# Designs cost MORE as the design space grows, so the larger cell is the less censored one -- d3n4
+# measured 24% at the floor and this rung should be lower still. Keeping 1024/512 also preserves
+# byte-identity with the d3n4 campaign.
 #
-# BUDGET ARITHMETIC, because it does not follow the enzyme rule and the deviation is deliberate. The
-# profile's own selection is the 10 -> 20 doubling pair, so a run must reach 20 designs. With `n0` =
-# `iteration_limit` (no growth, below) each design spends n0 / (1 - val_fraction) = 349525 calls, so 20
-# designs need 6990506. `budget` 8388608 (2^23) gives 24. The enzyme configs' `iteration_limit =
-# budget / 4` CANNOT hold here -- it would leave 3 designs -- so `iteration_limit` is set from the
-# window a design actually needs and the budget from the design count the criterion requires.
+# ⚠️ `budget` 262144, TWICE the 131072 every other linear campaign ran at. This rung has 20 design
+# coordinates against the d3n4 rung's 12, and the analytic scan of the same cell
+# (`output/linear-exact-d4n5`) shows the incumbent still stepping down at design 40 without reaching
+# the optimum 0.052464 -- so the search is not finished at the old budget and a cell there would be
+# measuring the cut-off rather than the arm.
 #
-# NO GROWTH (`n0` = `n_increment` = `iteration_limit`), MEASURED: starting at the full window converged
-# 18/18 designs in 11-12 epochs at 46.3 s median with max slack 0.00922, while growing from 16384 took
-# 31-56 epochs and its `err` term alone at that window is 0.0113. Growth exists to avoid simulating
-# events that are not needed; `linear`'s events are analytic, so it buys nothing here.
+# `iteration_limit` STAYS at 65536 and that is now `budget / 4`, the settled default, where at the old
+# budget it was `budget / 2`. So the doubling leaves `steps_per_epoch = iteration_limit // batch` = 512
+# unchanged -- the epoch means the same thing here as on every other rung -- while bringing the ratio
+# INTO line with the default rather than away from it.
 #
-# `loss_precision` 7.5e-3 is MEASURED on this detector, not carried: `scripts/probe_precision.py` over
-# 10 designs x 2 seeds (`output/screen/precision-linear-d4n5.json`) -- the exact optimum, six landscape
-# order statistics, three extra ranks at the good end and the uninformative top corner. All 20 cells
-# converged, none hit the window cap, and the MAXIMUM slack was 0.00502 at `corner-high`. 7.5e-3 is
-# 1.5x that maximum, the headroom covering seeds not measured. The choice of headroom is not
-# outcome-determining: criterion (d)'s bar is 10x, i.e. 0.075 here, and the exact-scorer improvement at
-# this cell was +0.1006, which clears any headroom between 1.0x and 2.0x the measured maximum.
-#
-# ⚠️ RE-CHECKED at the width below, since `loss_precision` is a property of the OPERATING POINT and the
-# width moved. 5 designs x 2 seeds at each of four widths, 30 cells, all converged, and the maximum
-# slack is 0.00479-0.00503 at EVERY width -- it does not move with capacity here, because the term that
-# binds is `err` (the loss estimate's own standard error at the window) and not the train/validation
-# gap. 7.5e-3 therefore keeps the same 1.5x headroom it was set with, and is carried unchanged rather
-# than re-tuned.
-#
-# `regressor.features` -- [[64, 32], [32, 64]], 45460 parameters at `n_models` 4, and this WIDENS the
-#   [[16, 8], [8, 16]] the 1-dimensional fixture settled on by an order of magnitude. That narrow width
-#   was chosen at d = 1, where capacity WAS the binding term and the wider net never closed its
-#   train/validation gap. At this cell the ladder runs the other way, and it is monotone. MEASURED,
-#   5 designs x 2 seeds at each width (one seed at the narrowest), every cell converged
-#   (`output/linear-criterion/width-*.json`), scoring the achieved validation loss against
-#   `LinearDetector.bayes_risk` AT THE SAME DESIGN -- which is what makes "faithful" a number here
-#   rather than an impression:
-#
-#     [[8, 4], [4, 8]]      1220 parameters   excess over the floor -0.0008 .. +0.0366   128 s a design
-#     [[16, 8], [8, 16]]    3700 parameters   excess over the floor -0.0011 .. +0.0034    74 s a design
-#     [[32, 16], [16, 32]] 12500 parameters   excess over the floor -0.0014 .. +0.0017    50 s a design
-#     [[64, 32], [32, 64]] 45460 parameters   excess over the floor -0.0014 .. +0.0008    47 s a design
-#
-#   More capacity is BOTH more faithful and cheaper here: the wider net reaches the plateau in fewer
-#   epochs, so it buys wall clock rather than spending it, and the maximum slack does not move
-#   (0.00479-0.00503 at every width), so `loss_precision` keeps its 1.5x headroom throughout. The
-#   excess matters because the landscape it has to resolve spans 0.291: 0.0366 is 12.6% of that,
-#   0.0034 is 1.2%, 0.0008 is 0.3%.
-#
-#   THE LADDER STOPS HERE FOR A STATED REASON, not for time. The last step buys 0.0009 of bias, and the
-#   seed-to-seed spread at a fixed width is 0.0005 -- so a further step would be optimising a quantity
-#   this probe can no longer resolve, and it is 0.3% of the span against a run-to-run spread of 0.024
-#   in the statistic the benchmark is actually scored on.
-#
-# `bo.gp.kernel.exchangeable` is 5 = `n_probes`: the design record is one field per axis, each 5 wide,
-# so the kernel finds 4 blocks permuted TOGETHER and reads the design as a set of probes.
+# ⚠️ NOT byte-identical to `config/linear_d3n4.yaml` any more: three keys differ (`detector`,
+# `exchangeable`, `budget`). A spend comparison against the d3n4 campaign is still valid because the
+# x axis is detector calls, but a "designs per cell" comparison is not.
 
-#
-# 2026-08-18 -- regressor.dropconnect SET TO 0.0. MEASURED on `linear`, 72 crossed cells (2 arms x
-# 4 doses x 3 designs x 3 seeds, paired within design and seed, `bo`): dropconnect adds BIAS THAT THE
-# CRITERION CANNOT SEE. Held-out excess against the closed-form floor rises monotonically to +0.00479
-# at dose 0.2 -- 48% of the bar -- while `gap`, the only overfitting signal the exit test has, FALLS
-# (-0.00041), and the exit window is UNCHANGED (ratio 1.00 at every dose in both arms). The procedure
-# therefore buys no extra data in compensation and reports a worse number at the same price. `meta` is
-# hurt about half as much as `from_scratch` (+0.00262 against +0.00479 at 0.2), so replay is partly
-# REDUNDANT with dropconnect rather than protected from it.
+# `exchangeable` MUST equal `n_probes`. The design is a SET of probes and the invariant kernel
+# quotients that permutation symmetry; a mismatched value raises `no design field of length <n> to
+# permute` at the first GP fit.
 
-#
-# 2026-08-18 (later) -- dropconnect 0.05, NOT null. Reverted from the `null` set earlier the same day.
-#
-# TURNING IT OFF REMOVED THE TERMINATION MECHANISM FROM BOTH PROCEDURES, which the bias measurement
-# did not anticipate:
-#   growth  -- the gap gate `gap + err <= loss_precision` needs the gap held down; unregularised the
-#              config's own record says designs cap (later shown to be an artefact of a 131072 cap,
-#              but the cost is real: 278512 calls/design against ~98281, i.e. 2.8x).
-#   fixed   -- stops on the TRAIN-SETTLED test alone, so the only thing that can end a design is the
-#              training curve flattening. MEASURED: with dropconnect 0.1, 394 of 394 designs
-#              terminated, median 109 s, max 271 s. With dropconnect null, median 476 s, max 2919 s,
-#              and designs still running past 3500 epochs with validation rising since epoch 600.
-#
-# 0.05 RATHER THAN 0.1 because that is where the bias is negligible. MEASURED on `linear`, 72 crossed
-# cells, held-out excess against the closed-form floor, paired within (design, seed):
-#     dose    from_scratch   meta
-#     0.05      +0.00007    +0.00001
-#     0.10      +0.00110    +0.00050
-#     0.20      +0.00479    +0.00262
-# and this task's own earlier record puts 0.05 at -0.0004 on the objective, i.e. free. 0.05 therefore
-# buys termination at a bias two orders of magnitude below the dose that motivated turning it off.
-
-detector: linear_d4n5
+detector: linear_d4n5_s05
 
 regressor:
   set-regressor:
-    features: [[64, 32], [32, 64]]
+    features: [[24, 32], [32, 24]]
     n_models: 4
-    dropconnect: 0.05
+
 device: cuda
 plot_per_epoch: 8
 
 training:
-  n0: 262144
-  n_increment: 262144
-  batch: 64
-  eval_batch: 1024
+  n0: 1024
+  n_increment: 512
+  batch: 128
+  eval_batch: 4096
   warmup_epochs: 2
   patience: 16
-  budget: 8388608
-  iteration_limit: 262144
+  budget: 262144
+  iteration_limit: 65536
   val_fraction: 0.25
-  loss_precision: 7.5e-3
-  param_mix: 0.25
+  loss_precision: 2.0e-2
+  rewind: 0.25
   optimizer:
     adamaxw:
       learning_rate: 2.5e-4

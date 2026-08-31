@@ -12,8 +12,13 @@ SRC=lxplus:/afs/cern.ch/work/m/maborisy
 TREES="ship-addr-prec1e2 ship-addr-prec1e2-2M ship-addr-prec1e2-nl ship-addr-w2x ship-addr-w15x-deep
        ship-addr-b3taper ship-addr-norewind ship-addr-w2x-2m ship-addr-w2x-2m-norewind ship-addr-b3taper-2m
        ship-intersect-w2x ship-angle-w2x
-       ship-intersect-w2x-2m ship-angle-w2x-2m ship-angle-w2x-3m
-       ship-intersect-w2x-2m-reveal ship-angle-w2x-3m-reveal"
+       ship-intersect-w2x-2m ship-angle-w2x-2m ship-angle-w2x-3m"
+# RETIRED, not pulled. Each is fully mirrored under output/ship-cern/ and carries a RETIRED.txt with
+# its result, so a pull only costs time; re-add a name here if that stops being true.
+#
+#   ship-intersect-w2x-2m-reveal   COMPLETE 5/5   the reveal control, concluded
+#   ship-angle-w2x-3m-reveal       COMPLETE 5/5   the reveal control, concluded
+#   ship-intersect-w2x-2m-random   PARTIAL        stopped by request; frozen 5/5, online 2/5
 mkdir -p "$DEST"
 for t in $TREES; do
   rsync -a --prune-empty-dirs \

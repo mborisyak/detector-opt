@@ -146,7 +146,7 @@ def main():
 
   import bo as bo_module
 
-  gearup.gearup(bo_module.bo).with_config('config/bo.yaml')(arguments)
+  gearup.gearup(bo_module.bo).with_config('config/root.yaml')(arguments)
 
 
 if __name__ == '__main__':

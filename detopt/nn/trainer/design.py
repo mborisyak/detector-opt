@@ -62,7 +62,7 @@ The shared budget bounds the whole run: when the pool can't fit the next sample,
 :meth:`train` returns ``None`` and the BO loop stops.
 
 At a data addition the network is CARRIED by default -- same params, same optimiser state, a larger
-window. ``reinit_on_grow`` rebuilds it instead and ``param_mix`` interpolates toward the
+window. ``reinit_on_grow`` rebuilds it instead and ``rewind`` interpolates toward the
 network the run started from (see ``__init__``); both default off. Neither is part of the procedure
 above and neither may alter it.
 
@@ -114,10 +114,31 @@ class _DesignBase(Trainer):
     )
 
   def __init__(
-    self, detector, *, regressor_config: dict, optimizer: optax.GradientTransformation, batch: int, n0: int, n_increment: int,
-    iteration_limit: int, warmup_epochs: int, patience: int, loss_precision: float, budget: int, reinit_on_grow: bool = False,
-    param_mix: float = 0.0, param_average_epochs: float = 0.0, val_fraction: float = 0.25, eval_batch: int | None = None,
-    device=None, checkpoint_dir: str | None = None, seed: int = 0, reveal: str | None = None,
+    self,
+    detector,
+    *,
+    regressor_config: dict,
+    optimizer: optax.GradientTransformation,
+    batch: int,
+    n0: int,
+    n_increment: int,
+    iteration_limit: int,
+    warmup_epochs: int,
+    patience: int,
+    loss_precision: float,
+    budget: int,
+    reinit_on_grow: bool = False,
+    rewind: float = 0.0,
+    shrink: float = 1.0,
+    param_noise: float = 0.0,
+    param_mix: float | None = None,
+    param_average_epochs: float = 0.0,
+    val_fraction: float = 0.25,
+    eval_batch: int | None = None,
+    device=None,
+    checkpoint_dir: str | None = None,
+    seed: int = 0,
+    reveal: str | None = None,
   ):
     self.n0 = int(n0)
     self.n_increment = int(n_increment)
@@ -135,7 +156,33 @@ class _DesignBase(Trainer):
     # state) at every addition, holding the SCHEDULE fixed while varying the network -- the
     # complement of the schedule sweeps, which hold the network and vary the schedule.
     self.reinit_on_grow = bool(reinit_on_grow)
-    # `param_mix` walks the SAME axis as `reinit_on_grow`, continuously: at a data addition the
+    # SHRINK-AND-PERTURB (Ash & Adams, "On Warm-Starting Neural Network Training"): at a data
+    # addition, `params <- shrink * params + param_noise * fresh_draw`. It is a DIFFERENT axis from
+    # `rewind`, which interpolates toward THIS RUN'S OWN initial network; this pulls toward ZERO
+    # and re-injects randomness. `shrink = 1.0, param_noise = 0.0` is a strict no-op and is the default,
+    # so nothing that does not ask for it changes.
+    #
+    # THE PERTURBATION IS A SCALED FRESH INITIALISATION, not iid Gaussian at one sigma. The paper is
+    # explicit that noise is added "by adding parameters from a scaled, randomly-initialized
+    # network, to compensate for the fact that many random initialization schemes use different
+    # variances for different kinds of parameters" -- here `EnsembleLinear` draws Lecun-scaled
+    # normals while the activation parameters initialise to ones, so a single sigma would be wrong
+    # for one of them.
+    #
+    # ⚠️ CADENCE. The paper applies this ONCE PER RETRAINING ROUND (a new data chunk); this trainer
+    # fires at EVERY data addition -- 9 per design on the resized SHiP ladder, 80+ on the old one.
+    # `params <- shrink * params + noise` is an AR(1) recursion, so it does not collapse (its
+    # stationary scale is set by the noise), but it forgets with a horizon of about
+    # `1 / (1 - shrink)` additions. At the paper's shrink = 0.6 that horizon is ~2.5 additions, so a
+    # carried network is erased almost immediately and `meta` degenerates toward `from_scratch`.
+    # Anything run here at the paper's value is testing that prediction, not porting the method.
+    self.shrink = float(shrink)
+    self.param_noise = float(param_noise)
+    if not 0.0 <= self.shrink <= 1.0:
+      raise ValueError(f'shrink must lie in [0, 1], got {shrink}')
+    if not self.param_noise >= 0.0:
+      raise ValueError(f'param_noise must be non-negative, got {param_noise}')
+    # `rewind` walks the SAME axis as `reinit_on_grow`, continuously: at a data addition the
     # parameters become `(1 - lambda) * current + lambda * INITIAL`, where INITIAL is the network
     # this run started from -- so 0 is the carried network and 1 rewinds to the start. It REPLACED an isotropic-kick knob (`param_noise`), which was withdrawn:
     #
@@ -148,17 +195,31 @@ class _DesignBase(Trainer):
     # summary of the trajectory that produced the current parameters, and a rewind throws part of
     # that trajectory away, so carrying them forward would step the rewound network under second
     # moments it never earned. What remains between the two knobs is the network they move toward
-    # -- `param_mix = 1.0` rewinds to the network THIS RUN STARTED FROM, `reinit_on_grow` draws a
+    # -- `rewind = 1.0` rewinds to the network THIS RUN STARTED FROM, `reinit_on_grow` draws a
     # NEW one -- and the buffer state, which only `reinit_on_grow` rebuilds.
     #
     # CONFOUND, stated because it is not removable by construction: if the current parameters and a
     # fresh draw have similar scale and are roughly independent, their average has ~0.71 of their
     # RMS. So a mix shrinks the network as well as moving it, and at lambda = 0.5 that shrink is
     # comparable to a strong weight decay applied once.
-    self.param_mix = float(param_mix)
-    if self.reinit_on_grow and self.param_mix > 0.0:
+    # `param_mix` WAS THIS KNOB'S NAME until 2026-08-31 and is accepted as a deprecated alias. It is
+    # not cosmetic to keep: 87 archived configs still spell it that way, and EVERY banked
+    # `results.json` records `training.param_mix`, so `probe_param_mix.py` and `probe_meta_capacity.py`
+    # re-run from those payloads. Dropping the alias would make a restored config raise
+    # `unexpected keyword argument` and a re-analysis silently lose the rewind.
+    if param_mix is not None:
+      if rewind:
+        raise ValueError('pass either `rewind` or the deprecated `param_mix`, not both')
+      rewind = param_mix
+    self.rewind = float(rewind)
+    if (self.shrink < 1.0 or self.param_noise > 0.0) and self.rewind > 0.0:
       raise ValueError(
-        "reinit_on_grow and param_mix both act at the SAME point in the loop (the "
+        'shrink/param_noise and rewind both act at the SAME point in the loop and would confound '
+        'two mechanisms; set rewind to 0 when using shrink-and-perturb'
+      )
+    if self.reinit_on_grow and self.rewind > 0.0:
+      raise ValueError(
+        "reinit_on_grow and rewind both act at the SAME point in the loop (the "
         "data addition) and are alternatives; pass at most one"
       )
 
@@ -193,7 +254,7 @@ class _DesignBase(Trainer):
     #
     # NO SEPARATE RESET AT A DATA ADDITION. `warmup_epochs` epochs of unconditional training follow
     # every addition before any decision, so iterates from the smaller window are discounted by
-    # `exp(-warmup_epochs / horizon)` by the time anything is read. `param_mix` / `reinit_on_grow`
+    # `exp(-warmup_epochs / horizon)` by the time anything is read. `rewind` / `reinit_on_grow`
     # re-initialise the optimiser state at the addition anyway, which reseeds the average on the
     # network they leave behind.
     self.param_average_epochs = float(param_average_epochs)
@@ -232,7 +293,7 @@ class _DesignBase(Trainer):
     # Network for this design (base: fresh / optionally warm-started; the
     # continual trainer keeps and continues the same one across designs).
     params, state, opt_state = self._init_design_network(init_seq, init_params)
-    # The network this run STARTED from, kept for `param_mix`. Not a fresh draw: mixing toward the
+    # The network this run STARTED from, kept for `rewind`. Not a fresh draw: mixing toward the
     # run's own initial parameters is `initial + (1 - lambda) * (current - initial)`, i.e. a pure
     # SHRINK OF WHAT WAS LEARNED, with no new randomness introduced and no scale artefact (the two
     # are not independent, so their average does not lose RMS the way two independent draws would).
@@ -454,7 +515,20 @@ class _DesignBase(Trainer):
           # rounds are independent inits rather than the same one repeated; the FIRST network
           # is untouched, since nothing is spawned before it is built.
           params, state, opt_state = self._init_design_network(init_seq.spawn(1)[0], None)
-        elif self.param_mix > 0.0:
+        elif self.shrink < 1.0 or self.param_noise > 0.0:
+          # SHRINK AND PERTURB toward ZERO plus a scaled fresh draw -- see the constructor for the
+          # method, the reason the noise is an initialisation rather than one sigma, and the cadence
+          # caveat. The optimiser is reset for the same reason the rewind resets it: the moments
+          # describe a trajectory that no longer reaches these parameters.
+          _, fresh, _ = self._build_regressor(int(init_seq.spawn(1)[0].generate_state(1)[0]))
+          shrink, param_noise = self.shrink, self.param_noise
+
+          def shrink_perturb(current, draw):
+            return shrink * current + param_noise * draw
+
+          params = jax.tree.map(shrink_perturb, params, jax.device_put(fresh, self.device))
+          opt_state = self.optimizer.init(params)
+        elif self.rewind > 0.0:
           # Toward the network THIS RUN WAS INITIALISED WITH, not toward a new random draw.
           # `params = initial + (1 - lambda) * (current - initial)`: it discards a fraction of
           # the accumulated fit and nothing else. A fresh draw would confound "throw away what
@@ -472,7 +546,7 @@ class _DesignBase(Trainer):
           # history the rewind did not throw away, since a partial rewind keeps `1 - lambda`
           # of the network and should keep `1 - lambda` of the average. The optimiser moments
           # still reset -- only the average is mixed rather than rebuilt.
-          mix = self.param_mix
+          mix = self.rewind
 
           def rewind(current, initial):
             return initial + (1.0 - mix) * (current - initial)

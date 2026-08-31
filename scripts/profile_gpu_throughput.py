@@ -258,4 +258,4 @@ def run(dataset, seconds: float = 90.0, seed: int = 0, warmup_chunks: int = 1, m
 if __name__ == "__main__":
   import gearup
 
-  gearup.gearup(make=make, run=run).with_config("config/bo.yaml")(sys.argv[1:])
+  gearup.gearup(make=make, run=run).with_config("config/root.yaml")(sys.argv[1:])

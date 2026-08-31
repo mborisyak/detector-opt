@@ -1,0 +1,30 @@
+# THE REWIND PROBE on `ship-intersect-w2x-2m`: 5 seeds, one job each.
+#
+# Mid-BO designs from ONE banked trajectory (the designs are the controlled variable; the seeds vary
+# the training). Three conditions per design, both arms:
+#     rewind 0.25   rewind ON  (the settled default)
+#     rewind 0.0    rewind OFF
+#     FixedWindowTrainer at that cell's own final window -- the FULL WINDOW, NO GROWTH
+# 3 consecutive designs x 5 seeds x 2 arms x 2 rewind, each growth cell matched by its own control.
+#
+# Every cell scores on the SAME held-out test pool at the exact design, so the three conditions are
+# compared on data none of them trained on.
+universe       = vanilla
+executable     = rewind_cell.sh
+arguments      = ship_intersect_prec1e2_w2x_2m $(seed) /afs/cern.ch/work/m/maborisy/ship-intersect-w2x-2m/1244111331/meta/results.json /afs/cern.ch/work/m/maborisy/ship-rewind-probe
+output         = logs/rewind_$(seed).$(ClusterId).$(ProcId).out
+error          = logs/rewind_$(seed).$(ClusterId).$(ProcId).err
+log            = logs/rewind.$(ClusterId).log
+request_gpus   = 1
+request_cpus   = 2
+request_memory = 12000
+requirements   = TARGET.GPUs_GlobalMemoryMb >= 20000
++MaxRuntime    = 172800
++JobBatchName  = "ship-rewind-probe"
+queue seed from (
+  1244111331
+  126382657
+  750143450
+  9577242
+  330924253
+)

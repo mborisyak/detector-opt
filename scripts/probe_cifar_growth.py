@@ -216,7 +216,7 @@ def train(mode, data, params0, graphdef, state, kernels, settings):
 
   ``mode`` is ``'baseline'`` (full window, plateau exit) or ``'growth'`` (the design procedure with
   the exhausted-pool fallback). Everything else -- optimiser, epoch length, warmup, patience,
-  precision, initial parameters -- is shared. ``settings['param_mix']`` is the rewind strength applied
+  precision, initial parameters -- is shared. ``settings['rewind']`` is the rewind strength applied
   at every successful data addition; at 0.0 the network and its optimiser state simply carry.
   """
   train_epoch, score = kernels
@@ -227,7 +227,7 @@ def train(mode, data, params0, graphdef, state, kernels, settings):
   precision = settings['loss_precision']
   n_train = data['n_train']
   chunk = settings['eval_chunk']
-  param_mix = float(settings['param_mix'])
+  rewind = float(settings['rewind'])
 
   tx = settings['tx']
   params = jax.tree.map(lambda x: x, params0)
@@ -328,13 +328,13 @@ def train(mode, data, params0, graphdef, state, kernels, settings):
       continue
     if add_data:
       window = min(window + settings['n_increment'], n_train)
-      if param_mix > 0.0:
+      if rewind > 0.0:
         before = deviation_norm(params, params0)
-        params = jax.tree.map(lambda current, initial: initial + (1.0 - param_mix) * (current - initial), params, params0)
+        params = jax.tree.map(lambda current, initial: initial + (1.0 - rewind) * (current - initial), params, params0)
         opt_state = tx.init(params)
         after = deviation_norm(params, params0)
         print(
-          f"  [{mode}/rewind] lambda={param_mix:.3f} epoch={epoch} window={window} "
+          f"  [{mode}/rewind] lambda={rewind:.3f} epoch={epoch} window={window} "
           f"|params-initial| {before:.4f} -> {after:.4f} ratio={after / max(before, 1.0e-12):.4f}",
           flush=True
         )
@@ -471,7 +471,7 @@ def main():
     'n_increment': arguments.n_increment,
     'shuffle_seed': arguments.shuffle_seed,
     'eval_chunk': arguments.eval_chunk,
-    'param_mix': arguments.param_mix,
+    'rewind': arguments.rewind,
     'tx': tx,
   }
 
@@ -490,7 +490,7 @@ def main():
     'max_epochs': arguments.max_epochs,
     'n0': arguments.n0,
     'n_increment': arguments.n_increment,
-    'param_mix': arguments.param_mix,
+    'rewind': arguments.rewind,
     'channels': list(CHANNELS),
     'activation': 'relu',
     'n_parameters': n_parameters,
@@ -510,7 +510,7 @@ def main():
     raise ValueError(f'--run-name names ONE output directory, so it needs exactly one arm; got {requested}')
   for mode in requested:
     name = arguments.run_name if len(arguments.run_name) > 0 else mode
-    print(f"=== {name} (mode={mode}, param_mix={arguments.param_mix}) ===", flush=True)
+    print(f"=== {name} (mode={mode}, rewind={arguments.rewind}) ===", flush=True)
     history = train(mode, data, params0, graphdef, state, kernels, settings)
     run_directory = os.path.join(arguments.output, name)
     os.makedirs(run_directory, exist_ok=True)
@@ -523,7 +523,7 @@ def main():
       snapshot(history, data['n_validation']), 0, {
         'run': name,
         'mode': mode,
-        'param_mix': arguments.param_mix,
+        'rewind': arguments.rewind,
         'split_seed': arguments.split_seed,
         'init_seed': arguments.init_seed,
         'window_start': history['window_per_epoch'][0],
