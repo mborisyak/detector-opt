@@ -142,7 +142,7 @@ def fresh_design_network(trainer, init_seq, init_params):
   return (jax.device_put(params, d), jax.device_put(state, d), jax.device_put(opt_state, d))
 
 
-REVEAL = ('none', 'design', 'zeros')
+REVEAL = ('none', 'design', 'zeros', 'append')
 
 
 class Trainer:
@@ -261,7 +261,7 @@ class Trainer:
         :func:`regressor_rngs`, which is where they are defined and why."""
     from detopt.nn import from_config
 
-    reg = from_config(self.detector, config=self.regressor_config, rngs=regressor_rngs(seed), design=self.reveal() != 'none')
+    reg = from_config(self.detector, config=self.regressor_config, rngs=regressor_rngs(seed), design=self.reveal())
     return nnx.split(reg, nnx.Param, nnx.Variable)
 
   def _build_kernels(self, seed):
@@ -276,7 +276,7 @@ class Trainer:
         """
     from detopt.nn import from_config
 
-    reg = from_config(self.detector, config=self.regressor_config, rngs=regressor_rngs(seed), design=self.reveal() != 'none')
+    reg = from_config(self.detector, config=self.regressor_config, rngs=regressor_rngs(seed), design=self.reveal())
     self.n_ensemble = reg.ensemble()
     self.draw_batch = self.batch * (self.n_ensemble or 1)  # indices drawn per train step
     reg_def = nnx.split(reg, nnx.Param, nnx.Variable)[0]
@@ -315,6 +315,12 @@ class Trainer:
     ``zeros_like(design)`` handed to ``combine``. The CAPACITY-MATCHED control; ``'none'`` is the
     narrow-input one.
 
+    ``'append'`` -- the design reaches the network as RAW NUMBERS rather than resolved into the
+    features: ``'none'``'s layout with the scaled design concatenated onto every element. It splits
+    what ``'design'`` conflates -- the design's INFORMATION from the detector's OWN way of folding it
+    into per-element geometry. Against ``'design'`` it isolates the value of that resolution; against
+    ``'none'`` / ``'zeros'`` it isolates the value of the information.
+
     ⛔️ ZEROS ARE A POINT, NOT AN ABSENCE. They are the NOMINAL zero, which for most detectors lies
     outside the design box, and where the measurement depends on the design the detector applies it --
     the visible window is degenerate at zero extent. Read a ``'zeros'`` arm as "conditioned on one
@@ -326,6 +332,13 @@ class Trainer:
     reveal = self.reveal()
     if reveal == 'zeros':
       design = jax.tree.map(jnp.zeros_like, design)
+    if reveal == 'append':
+      # The design-free features with the SCALED design concatenated onto every element. Generic by
+      # construction: it acts on `combine`'s OUTPUT, so the same rule serves an element set (M, F) and
+      # an image (H, W, C) alike, and no detector implements anything for it.
+      features = self.detector.combine(event, design, mask=mask, reveal_design=False)
+      scaled = jnp.asarray(self.detector.to_scaled(design), features.dtype)
+      return jnp.concatenate([features, jnp.broadcast_to(scaled, (*features.shape[:-1], scaled.shape[-1]))], axis=-1)
     return self.detector.combine(event, design, mask=mask, reveal_design=reveal != 'none')
 
   def _make_loss_fn(self, reg_def):

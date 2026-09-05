@@ -149,6 +149,26 @@ class Detector(object):
     def design_dim(self):
         return _prod(self.design_shape())
 
+    def combined_event_shape_for(self, reveal: str):
+        """:meth:`combined_event_shape` under a TRAINER's ``reveal`` setting rather than a bool.
+
+        ``'design'`` and ``'zeros'`` both take the design-revealed layout -- ``'zeros'`` differs in the
+        VALUE handed to ``combine``, not the width. ``'none'`` takes the design-free one.
+
+        ``'append'`` is the design-free layout WIDENED by ``design_dim``: the trainer concatenates the
+        scaled design onto whatever ``combine`` emits without it. It is defined on ``combine``'s OUTPUT,
+        so no detector implements it -- the rule is the same whether that output is an element set
+        ``(M, F)`` or an image ``(H, W, C)``, where the design becomes ``design_dim`` constant channels.
+
+        ⚠️ ``'none'`` IS NOT ``'design'`` WITH THE DESIGN COLUMNS DELETED. Several detectors emit a WIDER
+        design-free layout, substituting an identity encoding so elements stay distinguishable --
+        ``stereo_tracking_layerset`` is ``(n_layers, 2 if design else n_layers)``. So ``'append'`` is
+        that substitute encoding PLUS the raw design, not the bare readings plus the design."""
+        if reveal == 'append':
+            *lead, features = self.combined_event_shape(False)
+            return (*lead, features + self.design_dim())
+        return self.combined_event_shape(reveal != 'none')
+
     def target_dim(self):
         return _spec_dim(self.target_spec())
 

@@ -1,82 +1,129 @@
 #!/usr/bin/env python3
-"""Pick each arm's retention setting from POINTWISE RANKS along its convergence curve -- stage 3 of
-`docs/final.md`.
+"""Pick each strategy's training regime by INTEGRAL RANK over best-so-far curves -- `docs/final.md`.
 
-    python scripts/select_retention.py --task angle --probes output/final/angle/probe --write
+    python scripts/select_retention.py --task angle --runs output/angle/select --write
 
-THE WHOLE CURVE, NOT ITS ENDPOINT, AND THAT IS THE POINT. There are only three probed designs per
-arm, so a procedure that reduces each to one final loss selects among seven settings from three
-numbers -- enough to separate a setting that is always first from one that is always last, and
-nothing finer. Ranking pointwise along the best-so-far trajectory instead makes every epoch a
-comparison, and it asks the question that actually matters: which setting reaches a given loss for
-the least data, not merely which one ends lowest.
+TERMINOLOGY, because the two are easy to swap and the procedure depends on which is which. A
+STRATEGY is the arm -- `from_scratch`, `continue`, `meta` -- and governs behaviour BETWEEN designs. A
+TRAINING REGIME governs behaviour WITHIN a design, at each data addition -- `norewind`, the `rewind`
+values, shrink-and-perturb. This script chooses a REGIME for each STRATEGY; it never compares
+strategies with each other.
 
-THE PROCEDURE, per arm:
+WHAT IT CONSUMES. One run per (strategy, seed, regime): the same 5-design SOBOL sequence, scored as
+if it were a BO sequence. Because `n_init` covers the whole run the GP is never fitted, so every
+regime sees the SAME designs in the SAME order -- the comparison is paired, and a difference between
+curves is attributable to the regime rather than to which designs a regime happened to sample.
 
-  1. BEST-SO-FAR. Each probe record carries `objective_per_epoch` -- `(train + val) / 2` epoch by
-     epoch, the same quantity `TrainResult.objective_loss` reports at convergence -- against
-     `window_per_epoch`, the training rows behind each epoch. The trajectory is the running minimum
-     of the first as a function of the second, so it is monotone non-increasing by construction.
-     `window` plateaus WITHIN a growth round, so the curve is collapsed to one value per distinct
-     window before anything is interpolated.
-  2. PSEUDO POINT AND UNION SUPPORT. The settings stop at different windows -- that IS the effect
-     under study. Each trajectory gets a pseudo point at the per-design budget (`iteration_limit`)
-     carrying its best-seen loss, so a setting that converged cheaply is credited for holding that
-     loss rather than truncating everyone else's comparison range. Every curve then spans the same
-     range, and the grid is the UNION of all the settings' points -- no extrapolation anywhere.
-  3. RANK INTEGRAL. Rank the settings at each grid point, then integrate that rank over the budget
-     and divide by the full span, which keeps the score in RANK UNITS (1 to the number of settings).
-     The ranks are constant between grid points, so the integral is exact as a sum of rank times
-     interval width. This is budget-weighted, not an average over grid points, and the grid is never
-     even: growth rounds sit `n_increment` apart while the pseudo point is far out at
-     `iteration_limit`. Unweighted, a cluster of early closely-spaced additions would outvote the
-     whole stretch of budget after every setting has converged. The per-trajectory integrals are then
-     averaged across trajectories. Ranks are competition ranks with ties sharing the smaller rank, so
-     two indistinguishable settings cannot be separated by float noise.
+THE PROCEDURE, per strategy and per trajectory (a trajectory is one validation seed, holding all the
+regimes' runs for that seed):
 
-THE STATISTIC IS THE MEAN. `docs/final.md`'s stage-3 heading says "median rank" while its bullets say
-"average rank" twice; the user settled it as AVERAGE (2026-08-31), which is also what the bullets
-specify, so the mean is what selects. The median over grid points and trajectories is still computed
-and printed beside it -- not as a competing rule, but because a selection that flips between the two
-is one resting on a skewed handful of grid points, and that is worth seeing.
+  1. BEST-SO-FAR against CUMULATIVE DETECTOR CALLS -- the running minimum of the per-design loss.
+  2. A FINAL POINT AT THE BUDGET carrying the best loss the run ever saw. Regimes reach the end of
+     the sequence having spent different amounts (`meta` converges cheaper), so without it the curves
+     would end at different x and could not be compared over a common range. Carrying the best-seen
+     loss flat to the budget states the true thing -- it reached that loss and would still be at it,
+     having spent nothing more -- so converging cheaply is CREDITED, not truncated.
+  3. LEFT-CONSTANT INTERPOLATION onto the union of all inflection points. Best-so-far is a step
+     function: between two scored designs nothing has been learned, so the value cannot move.
+     Interpolating linearly would invent a descent that did not happen.
+  4. INTEGRAL RANK: rank the regimes at each point, integrate that rank over the budget, divide by
+     the span. The ranks are constant between inflection points, so the integral is exact as a sum of
+     rank times interval width, and dividing by the span keeps the score in RANK UNITS. This is
+     budget-weighted rather than an average over points, which matters because the points are never
+     evenly spaced -- designs cost 200k-470k calls apiece and the final point sits far out at the
+     budget. Unweighted, the early designs would outvote the whole stretch after every regime has
+     finished the sequence.
+  5. Average the per-trajectory integral ranks across trajectories, within a strategy. Lowest wins.
 
-TIES ARE BROKEN DETERMINISTICALLY, in decreasing order of how much the data says: the rank
-rank integral, then weighted median rank, then budget-weighted mean best-so-far, then the config
-name. A tie that reaches the name is reported as unresolved rather than presented as a choice.
-
-WHAT `--write` DOES: copies the winning `config/strategy/<task>-<arm>-<variant>.yaml` to
-`config/strategy/<task>-<arm>-optimal.yaml` with a provenance header. Without it nothing is written.
+⚠️ THE BASIS IS THREE TRAJECTORIES PER STRATEGY. That resolves a regime that is consistently ahead
+from one consistently behind; it does not resolve neighbours. The full per-trajectory matrix and the
+margin to the runner-up are printed so a selection resting on one seed is visible as one.
 """
 import argparse
 import collections
 import glob
 import json
 import os
-import statistics
-
-import numpy as np
 
 
-def step(grid, window, value):
-  """``value`` sampled onto ``grid`` with a ZERO-ORDER HOLD -- the last value at or before each point.
+def best_so_far(rows, budget):
+  """``(x, y)`` step curve: cumulative detector calls against the running-minimum loss.
 
-    The best-so-far curve is piecewise CONSTANT in the window: between two data additions the design
-    has acquired nothing, so its best loss cannot move. Interpolating linearly would invent a descent
-    that did not happen, and would let two settings cross strictly between grid points -- exactly the
-    case the rank integral assumes away when it holds each rank across its interval.
+    A final point is appended at ``budget`` carrying the best loss seen, so every regime's curve
+    spans the same range whatever it spent.
     """
-  return value[np.clip(np.searchsorted(window, grid, side="right") - 1, 0, len(value) - 1)]
+  x, y, spent, best = [], [], 0, float("inf")
+  for row in rows:
+    if row.get("loss") is None:
+      continue
+    spent += int(row.get("spent", 0))
+    best = min(best, float(row["loss"]))
+    x.append(float(spent))
+    y.append(best)
+  if len(x) == 0:
+    return None
+  if budget > x[-1]:
+    x.append(float(budget))
+    y.append(y[-1])
+  return x, y
 
 
-def weighted_median(values, weights):
-  """The value at which the cumulative weight first reaches half the total."""
-  order = np.argsort(values)
-  cumulative = np.cumsum(np.asarray(weights, dtype=np.float64)[order])
-  return float(np.asarray(values)[order][int(np.searchsorted(cumulative, 0.5 * cumulative[-1]))])
+def verified_curve(payload, budget):
+  """``(x, y)`` BEST-SO-FAR step curve built from a ``verification.json``: cumulative detector calls
+    against the running minimum of the HELD-OUT score of every design of the run.
+
+    Same construction as :func:`best_so_far`, on verified losses instead of reported ones -- that is
+    the point. The two curves are compared and ranked against each other, so they must be built the
+    same way; a raw (non-monotone) verified curve against a monotone reported one compares two
+    different objects and the integral rank of the pair means nothing.
+
+    A final point at ``budget`` carries the best score seen, so regimes that converge cheaply are
+    credited rather than truncated.
+    """
+  points = sorted(payload.get("points", []), key=lambda p: p.get("detector_calls", 0))
+  x, y, best = [], [], float("inf")
+  for point in points:
+    if point.get("test_loss") is None or point.get("detector_calls") is None:
+      continue
+    best = min(best, float(point["test_loss"]))
+    x.append(float(point["detector_calls"]))
+    y.append(best)
+  if len(x) == 0:
+    return None
+  if budget > x[-1]:
+    x.append(float(budget))
+    y.append(y[-1])
+  return x, y
 
 
-def _provenance(path):
-  """The `SELECTED-FROM:` probe directory recorded in an existing optimal config, or None."""
+def left_constant(grid, x, y):
+  """``y`` sampled onto ``grid``, holding the last value at or before each point."""
+  out, j = [], 0
+  for g in grid:
+    while j + 1 < len(x) and x[j + 1] <= g:
+      j += 1
+    out.append(y[j] if g >= x[0] else y[0])
+  return out
+
+
+def ranks(values):
+  """Ranks, 1 = smallest, ties sharing the AVERAGE of the positions they span."""
+  order = sorted(range(len(values)), key=lambda i: values[i])
+  out = [0.0] * len(values)
+  i = 0
+  while i < len(order):
+    j = i
+    while j + 1 < len(order) and values[order[j + 1]] == values[order[i]]:
+      j += 1
+    shared = (i + j) / 2.0 + 1.0
+    for k in range(i, j + 1):
+      out[order[k]] = shared
+    i = j + 1
+  return out
+
+
+def provenance(path):
+  """The `SELECTED-FROM:` directory recorded in an existing optimal config, or None."""
   if not os.path.exists(path):
     return None
   with open(path) as handle:
@@ -88,161 +135,143 @@ def _provenance(path):
   return None
 
 
-def rank(values):
-  """Competition ranks, 1 = smallest. Ties share the smaller rank."""
-  order = sorted(range(len(values)), key=lambda i: values[i])
-  ranks = [0] * len(values)
-  i = 0
-  while i < len(order):
-    j = i
-    while j + 1 < len(order) and values[order[j + 1]] == values[order[i]]:
-      j += 1
-    for k in range(i, j + 1):
-      ranks[order[k]] = i + 1
-    i = j + 1
-  return ranks
-
-
-def best_so_far(record):
-  """``(window, best_so_far_objective)`` -- one point per distinct window, monotone non-increasing,
-    with a PSEUDO POINT at the per-design budget carrying the best loss the trajectory ever saw.
-
-    The pseudo point is what makes the settings comparable. They stop at different windows -- that is
-    the effect under study -- and without it a setting that converged early would either truncate
-    every other setting's comparison range or have to be extrapolated. Carrying its best-seen loss
-    flat to the budget instead states the true thing: it reached that loss and would still be at it,
-    having spent nothing more. A setting that converges cheaply is CREDITED by this, not penalised.
-    """
-  objective = np.asarray(record["objective_per_epoch"], dtype=np.float64)
-  window = np.asarray(record["window_per_epoch"], dtype=np.float64)
-  if len(objective) == 0 or len(objective) != len(window):
-    raise SystemExit(f"select_retention: malformed curve in {record.get('trajectory')} ({record.get('variant')})")
-  running = np.minimum.accumulate(objective)
-  # The LAST epoch at each distinct window carries the running minimum for that window.
-  keep = np.concatenate([window[1:] != window[:-1], [True]])
-  window, running = window[keep], running[keep]
-  budget = float(record["iteration_limit"])
-  if budget > window[-1]:
-    window = np.append(window, budget)
-    running = np.append(running, running[-1])
-  return window, running
-
-
 def main():
   parser = argparse.ArgumentParser()
   parser.add_argument("--task", required=True)
-  parser.add_argument("--probes", required=True, help="directory holding <seed>/<arm>/<variant>.json")
-  parser.add_argument("--write", action="store_true", help="copy winners to <task>-<arm>-optimal.yaml")
-  parser.add_argument("--report", default=None, help="also write the table here")
+  parser.add_argument("--runs", required=True, help="directory holding <seed>/<strategy>/<regime>/results.json")
+  parser.add_argument("--write", action="store_true")
+  parser.add_argument("--report", default=None)
+  parser.add_argument("--force-write", action="store_true")
   parser.add_argument(
-    "--force-write", action="store_true", help="overwrite an optimal config that was selected from a DIFFERENT probe directory"
+    "--verified", action="store_true",
+    help="rank the HELD-OUT verification curves (verification.json beside each results.json) rather "
+    "than the losses the runs reported for their own designs"
+  )
+  parser.add_argument(
+    "--pooled", action="store_true",
+    help="runs are <rung>/<seed>/<strategy>/<regime>/; pool rungs into ONE selection, treating "
+    "each (rung, seed) as a separate trajectory"
   )
   args = parser.parse_args()
 
-  records = []
-  for path in sorted(glob.glob(os.path.join(args.probes, "*", "*", "*.json"))):
+  # POOLED IS ONE EXTRA DIRECTORY LEVEL AND ONE MORE TRAJECTORY KEY, nothing else. The linear ladder
+  # selects a single regime per strategy for all four rungs, so its runs live under
+  # <rung>/<seed>/<strategy>/<regime> and a trajectory is a (rung, seed) pair -- 4 x 3 = 12 of them,
+  # against 3 for a per-task selection. The ranking itself is unchanged: regimes are still compared
+  # only WITHIN a trajectory, so rungs of different difficulty are never put on a common loss scale.
+  depth = ("*", "*", "*", "*") if args.pooled else ("*", "*", "*")
+  runs, verified, declared = {}, {}, set()
+  for path in sorted(glob.glob(os.path.join(args.runs, *depth, "results.json"))):
+    parts = path.split(os.sep)
+    if args.pooled:
+      rung, seed, strategy, regime = parts[-5:-1]
+      trajectory = f"{rung}/{seed}"
+    else:
+      seed, strategy, regime = parts[-4:-1]
+      trajectory = seed
     with open(path) as handle:
-      record = json.load(handle)
-    record["variant"] = os.path.splitext(os.path.basename(path))[0]
-    records.append(record)
-  if len(records) == 0:
-    raise SystemExit(f"select_retention: no probe records under {args.probes}")
+      payload = json.load(handle)
+    payload_rows = payload.get("results", [])
+    runs[(strategy, trajectory, regime)] = payload_rows
+    # THE BUDGET IS THE CONFIGURED ONE, NOT THE SPEND THAT HAPPENED. Deriving it from the runs made the
+    # score depend on whichever run spent most, and when the runs stopped on a DESIGN cap far short of
+    # their budget the two limits disagreed enough to flip a verdict. Read what the run was told to
+    # spend; the runs are budget-limited, so they reach it.
+    declared.add(int(payload.get("config", {}).get("training", {}).get("budget", 0)))
+    if args.verified:
+      verification = os.path.join(os.path.dirname(path), "verification.json")
+      if not os.path.exists(verification):
+        raise SystemExit(
+          f"select_retention: --verified but no verification.json beside {path}; the search runs must "
+          f"be verified before they can be ranked on held-out scores"
+        )
+      with open(verification) as handle:
+        payload = json.load(handle)
+      # ⛔️ A PARTIAL VERIFICATION IS NOT A SHORT ONE, IT IS A WRONG ONE. A verification killed in
+      # flight leaves a payload holding the points it reached, and nothing marks it as unfinished.
+      # Ranked, its best-so-far curve is built from one or two points and flattens across the whole
+      # budget -- which reads as a regime that converged early and cheaply, the strongest possible
+      # result. Three such payloads (1, 1 and 4 points) existed when a spot box died mid-campaign.
+      designs = len([row for row in payload_rows if row.get("loss") is not None])
+      have = len([p for p in payload.get("points", []) if p.get("test_loss") is not None])
+      if have < designs:
+        raise SystemExit(
+          f"select_retention: {verification} holds {have} verified point(s) but the trajectory has "
+          f"{designs} scored design(s); verification scores every design, so this one is INCOMPLETE. "
+          f"Re-run it, or exclude the cell -- do not rank on it."
+        )
+      verified[(strategy, trajectory, regime)] = payload
+  if len(runs) == 0:
+    raise SystemExit(f"select_retention: no runs under {args.runs}")
 
-  by_arm = collections.defaultdict(list)
-  for record in records:
-    by_arm[record["arm"]].append(record)
-
+  declared.discard(0)
+  if len(declared) > 1:
+    raise SystemExit(f"select_retention: runs declare different budgets {sorted(declared)}; not comparable")
+  budget = declared.pop() if len(declared) == 1 else max(sum(int(r.get("spent", 0)) for r in rows) for rows in runs.values())
+  strategies = sorted({s for s, _, _ in runs})
   lines, winners = [], {}
-  for arm in sorted(by_arm):
-    rows = by_arm[arm]
-    variants = sorted({r["variant"] for r in rows})
-    designs = sorted({(r["seed"], r["design_index"]) for r in rows})
 
-    per_design_mean, per_design_median, per_design_level, used = {}, {}, {}, []
-    spans = {}
-    for design in designs:
-      cell = {r["variant"]: r for r in rows if (r["seed"], r["design_index"]) == design}
-      missing = [v for v in variants if v not in cell]
+  for strategy in strategies:
+    seeds = sorted({k for s, k, _ in runs if s == strategy})
+    regimes = sorted({r for s, _, r in runs if s == strategy})
+    per_seed = collections.defaultdict(list)
+    used = []
+    for seed in seeds:
+      curves = {}
+      for regime in regimes:
+        rows = runs.get((strategy, seed, regime))
+        if args.verified:
+          payload = verified.get((strategy, seed, regime))
+          curve = None if payload is None else verified_curve(payload, budget)
+        else:
+          curve = None if rows is None else best_so_far(rows, budget)
+        if curve is not None:
+          curves[regime] = curve
+      missing = [r for r in regimes if r not in curves]
       if len(missing) > 0:
-        lines.append(f"  [skip] {arm} {design}: missing {missing}")
+        lines.append(f"  [skip] {strategy} seed {seed}: missing {missing}")
         continue
-      curves = {v: best_so_far(cell[v]) for v in variants}
-      # THE COMMON SUPPORT IS THE UNION OF ALL POINTS (`docs/final.md`). Every trajectory now runs
-      # from n0 to the same budget because of its pseudo point, so the union is well defined and no
-      # trajectory is ever extrapolated -- each is evaluated only inside its own range.
-      grid = np.unique(np.concatenate([w for w, _ in curves.values()]))
-      spans[design] = (
-        float(grid[0]), float(grid[-1]), len(grid),
-        min(variants, key=lambda v: curves[v][0][-2] if len(curves[v][0]) > 1 else curves[v][0][-1])
-      )
-      values = np.stack([step(grid, curves[v][0], curves[v][1]) for v in variants])
-      pointwise = np.stack([rank(list(column)) for column in values.T])  # (grid, variants)
-
-      # THE RANK INTEGRAL. Each grid point opens an interval of budget running to the next one, and the
-      # ranks hold across it, so a setting's score is the AREA under its rank curve DIVIDED BY THE FULL
-      # SPAN -- which keeps it in rank units, 1 to len(variants), directly readable as "this setting
-      # was on average k-th across the budget".
-      #
-      # This is a budget-weighted average, NOT an average over grid points, and the distinction is not
-      # cosmetic: the grid is never even. Growth rounds sit `n_increment` apart while the pseudo point
-      # is far out at `iteration_limit`, so unweighted, a cluster of early closely-spaced additions
-      # would outvote the entire stretch of budget after every setting has converged.
-      width = np.diff(grid)
-      span = float(width.sum())
-      if span <= 0.0:
-        lines.append(f"  [skip] {arm} {design}: zero-width support")
+      grid = sorted({v for x, _ in curves.values() for v in x})
+      sampled = {r: left_constant(grid, *curves[r]) for r in regimes}
+      widths = [grid[i + 1] - grid[i] for i in range(len(grid) - 1)]
+      span = sum(widths)
+      if span <= 0:
+        lines.append(f"  [skip] {strategy} seed {seed}: zero-width support")
         continue
-      used.append(design)
-      for i, variant in enumerate(variants):
-        per_design_mean.setdefault(variant, []).append(float(np.dot(pointwise[:-1, i], width) / span))
-        per_design_median.setdefault(variant, []).append(weighted_median(pointwise[:-1, i], width))
-        per_design_level.setdefault(variant, []).append(float(np.dot(values[i][:-1], width) / span))
+      used.append(seed)
+      pointwise = [ranks([sampled[r][i] for r in regimes]) for i in range(len(grid) - 1)]
+      for k, regime in enumerate(regimes):
+        per_seed[regime].append(sum(p[k] * w for p, w in zip(pointwise, widths)) / span)
 
     if len(used) == 0:
-      lines.append(f"  [skip] {arm}: no usable design")
+      lines.append(f"  [skip] {strategy}: no usable trajectory")
       continue
 
-    lines.append(f"\n=== {args.task} / {arm} -- {len(used)} design(s), {len(variants)} settings ===")
+    lines.append(f"\n=== {args.task} / {strategy} -- {len(used)} trajectories, {len(regimes)} regimes ===")
+    summary = sorted((sum(v) / len(v), r) for r, v in per_seed.items())
+    # THE PER-TRAJECTORY COLUMNS ONLY FIT WHILE THERE ARE FEW OF THEM. A pooled ladder selection has 12
+    # trajectories, and a row of 12 twelve-wide columns runs to ~230 characters -- it wraps in a
+    # terminal AND in the report file, which makes the permanent record unreadable exactly where the
+    # decision is justified. Past six trajectories the spread is summarised and the full matrix follows
+    # underneath, one line per trajectory, which stays legible at any width.
+    if len(used) > 6:
+      lines.append("  %-13s %9s %9s %9s  %13s" % ("regime", "min", "median", "max", "integral rank"))
+      for average, regime in summary:
+        v = sorted(per_seed[regime])
+        lines.append("  %-13s %9.3f %9.3f %9.3f  %13.3f" % (regime, v[0], v[len(v) // 2], v[-1], average))
+      lines.append("  per trajectory (regime=rank):")
+      for i, label in enumerate(used):
+        lines.append("    %-18s %s" % (label, "  ".join("%s=%.2f" % (r, per_seed[r][i]) for _, r in summary)))
+    else:
+      lines.append("  %-13s %s  %11s" % ("regime", " ".join("%12s" % s for s in used), "integral rank"))
+      for average, regime in summary:
+        lines.append("  %-13s %s  %11.3f" % (regime, " ".join("%12.3f" % v for v in per_seed[regime]), average))
+    best, runner = summary[0], summary[1]
+    winners[strategy] = best[1]
     lines.append(
-      "  %-16s %s  %8s %8s %11s" %
-      ("setting", " ".join("%11s" % f"{s}@{i}" for s, i in used), "rank-int", "median", "mean level")
+      f"  -> {best[1]}  (integral rank {best[0]:.3f}); RUNNER-UP {runner[1]} at {runner[0]:.3f}, "
+      f"margin {runner[0] - best[0]:.3f}"
     )
-    summary = []
-    for variant in variants:
-      summary.append((
-        statistics.mean(per_design_mean[variant]), statistics.mean(per_design_median[variant]),
-        statistics.mean(per_design_level[variant]), variant
-      ))
-    for mean_rank, median_rank, level, variant in sorted(summary):
-      lines.append(
-        "  %-16s %s  %8.3f %8.2f %11.5f" %
-        (variant, " ".join("%11.3f" % v for v in per_design_mean[variant]), mean_rank, median_rank, level)
-      )
-
-    # The support is REPORTED, not assumed. If every setting converged at n0 the union is two points
-    # (n0 and the budget) and the comparison rests on almost nothing, which must be visible.
-    for design, (low, high, points, earliest) in sorted(spans.items()):
-      lines.append(
-        "  support %s@%d: windows [%d, %d], %d union point(s)%s; earliest to stop: %s" %
-        (design[0], design[1], low, high, points, "  <-- DEGENERATE" if points <= 2 else "", earliest)
-      )
-
-    best, runner = sorted(summary)[0], sorted(summary)[1]
-    winners[arm] = best[3]
-    unresolved = best[:3] == runner[:3]
-    lines.append(
-      f"  -> {best[3]}  (rank integral {best[0]:.3f}, weighted median {best[1]:.2f})" + (
-        f"; RUNNER-UP {runner[3]} at {runner[0]:.3f}, margin {runner[0] - best[0]:.3f}"
-        if not unresolved else f"; ⚠️ TIED with {runner[3]} on every criterion -- selection is arbitrary"
-      )
-    )
-    by_median = sorted(summary, key=lambda e: (e[1], e[0]))[0][3]
-    if by_median != best[3]:
-      lines.append(
-        f"  ⚠️ NOT ROBUST TO THE STATISTIC: the rank integral selects {best[3]}, the weighted median would "
-        f"select {by_median}. The integral is the rule; a flip means the ranks are skewed across the budget "
-        f"rather than consistently favouring one setting."
-      )
 
   text = "\n".join(lines)
   print(text)
@@ -251,32 +280,23 @@ def main():
     with open(args.report, "w") as handle:
       handle.write(text + "\n")
 
+  if args.write and os.path.exists("SELECT_HOLD"):
+    raise SystemExit("select_retention: SELECT_HOLD is present -- refusing to WRITE. See the file.")
   if args.write:
-    for arm, variant in winners.items():
-      source = f"config/strategy/{args.task}-{arm}-{variant}.yaml"
-      target = f"config/strategy/{args.task}-{arm}-optimal.yaml"
-      # ⛔️ THE TARGET PATH CARRIES NO PREFIX, so two campaigns run at different output prefixes
-      # resolve to the SAME file. That is forced by `docs/final.md` pinning the name, and snakemake
-      # cannot catch it because these are undeclared side effects. So the provenance is written into
-      # the file and checked on the way back in: overwriting a selection made from a DIFFERENT probe
-      # directory is an error, not a silent replacement. `--force-write` is the deliberate override.
-      previous = _provenance(target)
-      if previous is not None and previous != args.probes and not args.force_write:
-        raise SystemExit(
-          f"select_retention: {target} was selected from probes under {previous!r}, but this run used "
-          f"{args.probes!r}. Overwriting would silently repoint a campaign at another campaign's "
-          f"settings. Pass --force-write if that is intended, or delete the file."
-        )
+    for strategy, regime in winners.items():
+      source = f"config/strategy/{args.task}-{strategy}-{regime}.yaml"
+      target = f"config/strategy/{args.task}-{strategy}-optimal.yaml"
+      previous = provenance(target)
+      if previous is not None and previous != args.runs and not args.force_write:
+        raise SystemExit(f"select_retention: {target} came from {previous!r}, this run used {args.runs!r}")
       with open(source) as handle:
         body = handle.read()
       with open(target, "w") as handle:
         handle.write(
-          f"# SELECTED-FROM: {args.probes}\n"
-          f"# Written by scripts/select_retention.py, by the rank integral along the best-so-far curve\n"
-          f"# over the union support. This is a COPY of {os.path.basename(source)}; edit THAT file and\n"
-          f"# re-run the selection -- edits here are discarded on the next run.\n"
-          f"# The `SELECTED-FROM:` line is load-bearing: it is what stops a second campaign at another\n"
-          f"# output prefix from silently overwriting this selection.\n#\n"
+          f"# SELECTED-FROM: {args.runs}\n"
+          f"# Written by scripts/select_retention.py, by integral rank of the best-so-far curves over\n"
+          f"# a shared 5-design Sobol sequence. A COPY of {os.path.basename(source)}; edit THAT file\n"
+          f"# and re-run the selection -- edits here are discarded on the next run.\n#\n"
         )
         handle.write(body)
       print(f"[write] {source} -> {target}")

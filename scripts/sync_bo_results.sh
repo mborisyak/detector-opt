@@ -1,51 +1,47 @@
-#!/usr/bin/env bash
-# Pull campaign results back from the preemptible box `bo` to this workstation.
+#!/bin/bash
+# Mirror the `bo` campaign's results to this workstation.
 #
-# `bo` is PREEMPTIBLE and has been reclaimed mid-provision at least once, so results have to land
-# here while the run is alive, not at the end. Run this on a loop from the workstation.
+#   scripts/sync_bo_results.sh [dest]        # default output/final-bo
 #
-# THE HEAVY FILES ARE EXCLUDED DELIBERATELY. `trainer.npz` and `optimizer.npz` are the resume state
-# and the event pools; on this workstation they are 181.3 GB of a 184.4 GB output tree while the
-# whole scientific record is 1.64 GB. They are also useless here: a resume happens ON bo, against
-# bo's own copy. What is pulled is the record -- results.json, convergence.json, the logs and the
-# plots -- plus `checkpoints/`, which is what `verify_trajectory.py` needs to re-score a run.
+# ⚠️ RESULTS ONLY -- THIS MIRROR CANNOT BE RESTORED FROM. Checkpoints are not pulled, and
+# `verify_trajectory.py` restores the network each design was REPORTED with from
+# `checkpoints/design_NNNN`. A cell rebuilt from this mirror therefore has results.json and done.txt
+# but no checkpoints, and its verification dies with
 #
-# `flock -n` so a second copy cannot start: a duplicated sweep here once truncated its own log.
-# Never `--delete`: bo's tree is the live one, and a cell that has not been written yet must not
-# remove what an earlier pass already brought back.
+#   FileNotFoundError: no checkpoint at .../checkpoints/design_0000
 #
-#   bash scripts/sync_bo_results.sh output/campaign-emnist
-set -euo pipefail
+# THIS HAS ALREADY HAPPENED. Cells relayed between sites with these filters looked complete -- done.txt
+# present, designs banked -- and only failed hours later when verification reached them; they had to be
+# recomputed. Use this script for PLOTTING ONLY. To move work between machines, or to protect a spot
+# instance, copy the whole tree (`scripts/evacuate_bo_loop.sh`).
+#
+# WHY THIS EXISTS. `bo` is a name that has pointed at four hosts; three were preemptible and were
+# destroyed, twice in one afternoon. The current instance is persistent, but a site whose results live
+# only on itself is one provider action away from losing them. Run this on a schedule, not once.
+#
+# The layout is preserved so `plot_median.py` can be pointed straight at a mirrored tree:
+#
+#   python scripts/plot_median.py <dest>/intersect/test --mean
+set -eu
+DEST="${1:-output/final-bo}"
+SRC=bo:/root/detector-opt/output
 
-REMOTE=${REMOTE:-bo}
-REMOTE_ROOT=${REMOTE_ROOT:-/mnt/work/repo}
-SSH_OPTS=${SSH_OPTS:-}
-LOCAL_ROOT=${LOCAL_ROOT:-/home/max/dev/detector-opt}
-LOCK=${LOCK:-/tmp/sync-bo-results.lock}
+mkdir -p "$DEST"
+rsync -a --prune-empty-dirs \
+  --include='*/' \
+  --include='results.json' --include='done.txt' --include='verified.txt' \
+  --include='verification.json' --include='selection.txt' --include='selected.txt' \
+  --include='status.txt' --include='CAPPED.txt' \
+  --exclude='*' \
+  "$SRC/" "$DEST/"
 
-if [ "$#" -lt 1 ]; then
-  echo "usage: $0 <output-subdir> [<output-subdir> ...]" >&2
-  exit 2
-fi
-
-exec 9>"$LOCK"
-if ! flock -n 9; then
-  echo "another sync holds $LOCK -- skipping this pass"
-  exit 0
-fi
-
-for sub in "$@"; do
-  mkdir -p "${LOCAL_ROOT}/${sub}"
-  echo "=== ${sub}"
-  rsync -az --partial ${SSH_OPTS:+-e "ssh ${SSH_OPTS}"} \
-    --exclude '*.npz' --exclude 'ship-4gpu/' \
-    "${REMOTE}:${REMOTE_ROOT}/${sub}/" "${LOCAL_ROOT}/${sub}/"
-  find "${LOCAL_ROOT}/${sub}" -name results.json | while read -r f; do
-    python3 -c "
-import json,sys,os
-d=json.load(open(sys.argv[1])); r=d.get('results',[])
-l=[x['loss'] for x in r if x.get('loss') is not None]
-print(f\"  {os.path.relpath(sys.argv[1], sys.argv[2]):<44} {len(r):3d} designs  best {min(l) if len(l)>0 else float('nan'):.4f}  completed={d.get('completed')}\")
-" "$f" "${LOCAL_ROOT}/${sub}"
-  done
+echo "mirrored into $DEST:"
+for task in angle intersect linear; do
+  [ -d "$DEST/$task" ] || continue
+  printf "  %-12s select %3s done / %3s verified   test %3s done / %3s verified\n" "$task" \
+    "$(find "$DEST/$task" -path '*/select/*' -name done.txt 2>/dev/null | wc -l)" \
+    "$(find "$DEST/$task" -path '*/select/*' -name verified.txt 2>/dev/null | wc -l)" \
+    "$(find "$DEST/$task" -path '*/test/*' -name done.txt 2>/dev/null | wc -l)" \
+    "$(find "$DEST/$task" -path '*/test/*' -name verified.txt 2>/dev/null | wc -l)"
 done
+du -sh "$DEST"

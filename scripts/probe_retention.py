@@ -135,7 +135,7 @@ def probe_retention(output, trajectory, seed: int, design_index: int = -1, **con
     "shrink":
     float(config["training"].get("shrink", 1.0)),
     "param_noise":
-    float(config["training"].get("param_noise", 0.0)),
+    None if config["training"].get("param_noise") is None else float(config["training"]["param_noise"]),
     "loss":
     trained_loss if penalty is None else trained_loss + penalty,
     "trained_loss":

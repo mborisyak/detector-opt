@@ -1,0 +1,30 @@
+# STRATEGY: meta on `angle`, parameter retention `sp-06`.
+#
+# A strategy is the ARM plus what it keeps of the previous network at a data addition, and nothing
+# else. Ladder, budget, optimiser and detector stay in the task config so they are held FIXED across
+# the comparison; `scripts/bo.py` refuses a task config that also sets a retention knob, so there is
+# never a second source of truth.
+#
+#   rewind   params <- initial + (1 - rewind) * (params - initial)
+#            Interpolates toward THIS RUN'S OWN initial network. 0 keeps everything.
+#
+#   shrink   params <- shrink * params + sqrt(1 - shrink^2) * fresh_draw
+#            Shrink-and-perturb (Ash & Adams): partially RESAMPLES toward a new draw. 1 keeps
+#            everything, 0 is a full re-initialisation.
+#
+# THE PERTURBATION SCALE IS DERIVED, NOT CONFIGURED. `p <- a*p + c*draw` is an AR(1) with stationary
+# variance `c^2/(1 - a^2)` times the draw's, so `c = sqrt(1 - shrink^2)` makes it exactly 1: a
+# parameter at initialisation scale stays there for any shrink and any number of applications.
+# An independent noise knob previously sat at 0.01 against shrink 0.6, where the scale-preserving
+# value is 0.8; that turned the method into decay (every kernel fell to 4.8% of its norm over six
+# additions). There is now one knob and it cannot be set to a value that deletes the network.
+#
+# The two mechanisms are mutually exclusive: the trainer raises if `rewind` is non-zero alongside a
+# `shrink` below 1.
+#
+# shrink 0.60 -> perturbation scale sqrt(1 - 0.60^2) = 0.800; the AR(1) memory horizon is
+# 1/(1 - shrink) = 2.5 data additions.
+
+nn_init_strategy: meta
+rewind: 0.0
+shrink: 0.6

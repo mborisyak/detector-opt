@@ -1,0 +1,18 @@
+# STRATEGY: from_scratch on the LINEAR LADDER, training regime `rewind-025`.
+#
+# ONE SET FOR ALL FOUR RUNGS. `docs/final.md`'s procedure selects one regime per strategy, and for the
+# ladder that selection is shared across d1n2/d2n3/d3n4/d4n5 rather than made per rung -- so these
+# configs are named `linear-<strategy>-<regime>` and every rung's task config resolves the same file.
+#
+# A strategy is the ARM (behaviour BETWEEN designs); a training regime is behaviour WITHIN a design,
+# at each data addition. Ladder, budget, optimiser and detector stay in the rung's task config so they
+# are held FIXED across the comparison; `scripts/bo.py` refuses a task config that also sets a
+# retention knob, so there is never a second source of truth.
+#
+#   rewind   params <- initial + (1 - rewind) * (params - initial)
+#   shrink   params <- shrink * params + param_noise * fresh_draw
+#            `shrink` and `param_noise` are separate knobs and BOTH must be given.
+
+nn_init_strategy: from_scratch
+rewind: 0.25
+shrink: 1.0

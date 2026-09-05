@@ -1,0 +1,42 @@
+# Full default config for the `straw` detector (FreeStrawDetector): EVERY __init__ parameter across
+# the class hierarchy, written at its default value. A reference / starting point -- copy and edit.
+# Required parameters (no default) are left null and MUST be set. `engine: simplified` + `data_dir:
+# null` is the no-data analytic source; `engine: realistic` needs a `data_dir`.
+straw:
+  n_stations: 4
+  n_views_per_station: 4
+  n_layers_per_view: 2
+  n_straws_per_layer: 316
+  straw_pitch: 2.0
+  straw_length: 400.0
+  max_B: -0.151
+  z0: 8957.0
+  B_sigma: 283.0
+  layer_bounds: [8000.0, 10000.0]
+  angles_bounds: null
+  dt: null
+  max_dt: 1.0
+  max_time: 200.0
+  max_particles: 5
+  max_hits_per_event: 384
+  material: 'kapton'
+  wall_thickness: 0.0036
+  delta_Tcut: 0.28
+  lambda_conv_cm: 95.0
+  enable_decay: true
+  noise_rate: 0.0
+  scatter_xX0: 0.00025
+  enable_eloss: true
+  eloss_min_ke: 0.05
+  eloss_scale: 0.45
+  decay_mean: [-0.2423, 0.2345, 6205.6]
+  decay_sigma: [76.11, 101.06, 1365.96]
+  momentum_mean: [-0.0027, 0.0021, 46.686]
+  momentum_sigma: [0.5421, 0.6479, 28.203]
+  daughter_momentum_mean: [-0.0014, 0.001, 23.3433]
+  daughter_momentum_sigma: [0.4243, 0.474, 20.58]
+  mass_mean: 0.5
+  mass_sigma: 0.5
+  data_dir: null
+  boundary_z: null
+  engine: 'realistic'

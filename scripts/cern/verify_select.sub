@@ -1,0 +1,106 @@
+# VERIFICATION of the five banked regimes' final results: 2 tasks x 3 seeds x 3 strategies x 5 regimes = 90 cells.
+# All 90 trajectories are complete; the cell script still refuses any that is not (exit 93).
+universe       = vanilla
+executable     = verify_select_cell.sh
+arguments      = $(task) $(seed) $(arm) $(regime) $(tree)
+output         = logs/vs_$(task)_$(seed)_$(arm)_$(regime).$(ClusterId).$(ProcId).out
+error          = logs/vs_$(task)_$(seed)_$(arm)_$(regime).$(ClusterId).$(ProcId).err
+log            = logs/verify_select.$(ClusterId).log
+request_gpus   = 1
+request_cpus   = 2
+request_memory = 12000
+requirements   = TARGET.GPUs_GlobalMemoryMb >= 20000
++MaxRuntime    = 172800
++JobBatchName  = "ship-verify-select"
+queue task,seed,arm,regime,tree from (
+  angle, 282522616, from_scratch, norewind, select
+  angle, 282522616, from_scratch, rewind-01, select
+  angle, 282522616, from_scratch, rewind-025, select
+  angle, 282522616, from_scratch, sp-03, select
+  angle, 282522616, from_scratch, sp-06, select
+  angle, 282522616, continue, norewind, select
+  angle, 282522616, continue, rewind-01, select
+  angle, 282522616, continue, rewind-025, select
+  angle, 282522616, continue, sp-03, select
+  angle, 282522616, continue, sp-06, select
+  angle, 282522616, meta, norewind, select
+  angle, 282522616, meta, rewind-01, select
+  angle, 282522616, meta, rewind-025, select
+  angle, 282522616, meta, sp-03, select
+  angle, 282522616, meta, sp-06, select
+  angle, 2036255796, from_scratch, norewind, select
+  angle, 2036255796, from_scratch, rewind-01, select
+  angle, 2036255796, from_scratch, rewind-025, select
+  angle, 2036255796, from_scratch, sp-03, select
+  angle, 2036255796, from_scratch, sp-06, select
+  angle, 2036255796, continue, norewind, select
+  angle, 2036255796, continue, rewind-01, select
+  angle, 2036255796, continue, rewind-025, select
+  angle, 2036255796, continue, sp-03, select
+  angle, 2036255796, continue, sp-06, select
+  angle, 2036255796, meta, norewind, select
+  angle, 2036255796, meta, rewind-01, select
+  angle, 2036255796, meta, rewind-025, select
+  angle, 2036255796, meta, sp-03, select
+  angle, 2036255796, meta, sp-06, select
+  angle, 160541601, from_scratch, norewind, select
+  angle, 160541601, from_scratch, rewind-01, select
+  angle, 160541601, from_scratch, rewind-025, select
+  angle, 160541601, from_scratch, sp-03, select
+  angle, 160541601, from_scratch, sp-06, select
+  angle, 160541601, continue, norewind, select
+  angle, 160541601, continue, rewind-01, select
+  angle, 160541601, continue, rewind-025, select
+  angle, 160541601, continue, sp-03, select
+  angle, 160541601, continue, sp-06, select
+  angle, 160541601, meta, norewind, select
+  angle, 160541601, meta, rewind-01, select
+  angle, 160541601, meta, rewind-025, select
+  angle, 160541601, meta, sp-03, select
+  angle, 160541601, meta, sp-06, select
+  intersect, 282522616, from_scratch, norewind, select
+  intersect, 282522616, from_scratch, rewind-01, select
+  intersect, 282522616, from_scratch, rewind-025, select
+  intersect, 282522616, from_scratch, sp-03, select
+  intersect, 282522616, from_scratch, sp-06, select
+  intersect, 282522616, continue, norewind, select
+  intersect, 282522616, continue, rewind-01, select
+  intersect, 282522616, continue, rewind-025, select
+  intersect, 282522616, continue, sp-03, select
+  intersect, 282522616, continue, sp-06, select
+  intersect, 282522616, meta, norewind, select
+  intersect, 282522616, meta, rewind-01, select
+  intersect, 282522616, meta, rewind-025, select
+  intersect, 282522616, meta, sp-03, select
+  intersect, 282522616, meta, sp-06, select
+  intersect, 2036255796, from_scratch, norewind, select
+  intersect, 2036255796, from_scratch, rewind-01, select
+  intersect, 2036255796, from_scratch, rewind-025, select
+  intersect, 2036255796, from_scratch, sp-03, select
+  intersect, 2036255796, from_scratch, sp-06, select
+  intersect, 2036255796, continue, norewind, select
+  intersect, 2036255796, continue, rewind-01, select
+  intersect, 2036255796, continue, rewind-025, select
+  intersect, 2036255796, continue, sp-03, select
+  intersect, 2036255796, continue, sp-06, select
+  intersect, 2036255796, meta, norewind, select
+  intersect, 2036255796, meta, rewind-01, select
+  intersect, 2036255796, meta, rewind-025, select
+  intersect, 2036255796, meta, sp-03, select
+  intersect, 2036255796, meta, sp-06, select
+  intersect, 160541601, from_scratch, norewind, select
+  intersect, 160541601, from_scratch, rewind-01, select
+  intersect, 160541601, from_scratch, rewind-025, select
+  intersect, 160541601, from_scratch, sp-03, select
+  intersect, 160541601, from_scratch, sp-06, select
+  intersect, 160541601, continue, norewind, select
+  intersect, 160541601, continue, rewind-01, select
+  intersect, 160541601, continue, rewind-025, select
+  intersect, 160541601, continue, sp-03, select
+  intersect, 160541601, continue, sp-06, select
+  intersect, 160541601, meta, norewind, select
+  intersect, 160541601, meta, rewind-01, select
+  intersect, 160541601, meta, rewind-025, select
+  intersect, 160541601, meta, sp-03, select
+  intersect, 160541601, meta, sp-06, select
+)

@@ -51,10 +51,10 @@
 #
 # THE EXIT TEST IS UNTOUCHED: loss_precision stays 1.0e-2 and no condition is reordered or retuned.
 #
-# THE INTERSECTION PENALTY IS overlap_weight 1.0e-3. Only 2 of the 6 station pairs can overlap (the
+# THE INTERSECTION PENALTY IS overlap_weight 1.5e-3. Only 2 of the 6 station pairs can overlap (the
 # magnet holds cross-side pairs 380 cm apart), each contributing at most 100 cm, so the penalty is
-# exactly 0.200 under full intersection -- the scale docs/final.md asks for, against an
-# optimal-constant-predictor ceiling of 1.045 on this task.
+# exactly 0.300 under full intersection -- about the worst loss observed on this task (user, 2026-09-04),
+# against an optimal-constant-predictor ceiling of 1.045.
 #
 # DETECTOR PROVENANCE (FairShip SST V2023): 316 straws/layer at 2 cm pitch (|y| <= 316 cm); magnet
 # centre z0 = 8957 cm (c.z = 89.57 m); field_integral -1.071 T.m = int Bx dz for MainSpectrometerField
@@ -86,7 +86,7 @@ detector:
     max_time: 300.0
     material: kapton
     data_dir: data/mc/numpy_newFS
-    overlap_weight: 0.001
+    overlap_weight: 0.0015
 nominal_design:
   stations:
   - 8407.0
@@ -118,16 +118,18 @@ training:
   loss_precision: 0.01
   patience: 16
   replay_weight: 0.25
+  cosine_epochs: 16
+  cosine_peak: 4.0
   optimizer:
-    adamaxw:
+    adamw:
       learning_rate: 0.0005
       b1: 0.9
       b2: 0.999
       eps: 1.0e-08
       weight_decay: 0.001
 verify:
-  n_points: 10
-  epochs: 64
+  epochs: 128
+  warmup_epochs: 16
   val_every_epochs: 1
   eval_batch: 1024
   sample_batch: 1024

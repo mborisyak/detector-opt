@@ -120,16 +120,18 @@ training:
   loss_precision: 0.01
   patience: 16
   replay_weight: 0.25
+  cosine_epochs: 16
+  cosine_peak: 4.0
   optimizer:
-    adamaxw:
+    adamw:
       learning_rate: 0.0005
       b1: 0.9
       b2: 0.999
       eps: 1.0e-08
       weight_decay: 0.001
 verify:
-  n_points: 10
-  epochs: 64
+  epochs: 128
+  warmup_epochs: 16
   val_every_epochs: 1
   eval_batch: 1024
   sample_batch: 1024

@@ -3,16 +3,19 @@
 # A strategy is the ARM plus what it keeps of the previous network at a data addition, and nothing
 # else. Ladder, budget, optimiser and detector stay in the task config so they are held FIXED across
 # the comparison; `scripts/bo.py` refuses a task config that also sets a retention knob, so there is
-# never a second source of truth for these three values.
+# never a second source of truth.
 #
-#   rewind        params <- initial + (1 - rewind) * (params - initial)   [0 = keep everything]
-#   shrink        params <- shrink * params + param_noise * fresh_draw    [1 = keep everything]
-#   param_noise   scale of the fresh random init added by shrink-and-perturb
+#   rewind   params <- initial + (1 - rewind) * (params - initial)
+#            Interpolates toward THIS RUN'S OWN initial network. 0 keeps everything.
+#
+#   shrink   params <- shrink * params + param_noise * fresh_draw
+#            Shrink-and-perturb (Ash & Adams, arXiv:1910.08475): partially RESAMPLES toward a fresh
+#            initialisation of the whole network. 1 keeps everything. `shrink` and `param_noise` are
+#            separate knobs and BOTH must be given.
 #
 # The two mechanisms are mutually exclusive: the trainer raises if `rewind` is non-zero alongside a
-# `shrink` below 1 or a non-zero `param_noise`.
+# `shrink` below 1.
 
 nn_init_strategy: continue
 rewind: 0.25
 shrink: 1.0
-param_noise: 0.0

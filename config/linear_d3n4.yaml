@@ -1,3 +1,17 @@
+# WINDOWS 2026-09-06: `training.n0` 4096 and `training.n_increment` 2048 on EVERY rung, regressor activation `celu`,
+# `iteration_limit` 131072. The paragraphs below that argue for 512/256 or 1024/512 describe the adamaxw era and are
+# SUPERSEDED: under adamw + cosine a window grown from a few hundred rows accumulates training optimism
+# (2 sigma^2 p_eff / N over thousands of epochs) and never meets the 0.02 bar before ~140k rows, while a 4096 first
+# window converges designs at 8k-47k rows with the reported loss on the closed-form Bayes risk. Measured on d2n3 /
+# seed 160541601; probes and figure in output/probe-linear-ladder-2026-09-05/, record in docs/handoff-2026-09-04b.md §9.
+#
+# THE ARM AND ITS TRAINING REGIME ARE NOT IN THIS FILE. They live in `config/strategy/`, shared
+# across the whole ladder (one selection, not one per rung), and named on the command line:
+#
+#     python scripts/bo.py =linear_d3n4 strategy=linear-meta-sp-l06-s1e2 output=... seed=...
+#
+# `scripts/bo.py` raises if this file also sets `nn_init_strategy` or a retention knob.
+strategy: linear-from_scratch-norewind
 # ⚠️ VARIANT of `config/linear_d3n4.yaml`: `training.n0` 4096 -> 1024 and `training.n_increment`
 # 4096 -> 512. Nothing else moves.
 #
@@ -49,24 +63,26 @@ regressor:
   set-regressor:
     features: [[24, 32], [32, 24]]
     n_models: 4
+    activation: celu
 
 device: cuda
 plot_per_epoch: 8
 
 training:
-  n0: 1024
-  n_increment: 512
+  n0: 4096
+  n_increment: 2048
   batch: 128
   eval_batch: 4096
   warmup_epochs: 2
   patience: 16
-  budget: 131072
-  iteration_limit: 65536
+  budget: 524288
+  iteration_limit: 262144
   val_fraction: 0.25
   loss_precision: 2.0e-2
-  rewind: 0.25
+  cosine_epochs: 16
+  cosine_peak: 4.0
   optimizer:
-    adamaxw:
+    adamw:
       learning_rate: 2.5e-4
       b1: 0.9
       b2: 0.999
@@ -89,8 +105,8 @@ bo:
     n_steps: 100
 
 verify:
-  n_points: 10
-  epochs: 200
+  epochs: 128
+  warmup_epochs: 16
   val_every_epochs: 10
   budget: null
   batch: null

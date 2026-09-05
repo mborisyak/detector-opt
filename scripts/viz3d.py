@@ -24,7 +24,9 @@ CFG = "config/detector/straw.yaml"
 def build_detector(data_path):
     """FreeStrawDetector + nominal physical design array from the FairShip-derived config."""
     cfg = yaml.safe_load(open(CFG))
-    det = detopt.detector.FreeStrawDetector(**cfg["straw"], data_dir=data_path)
+    straw_cfg = dict(cfg["straw"])
+    straw_cfg["data_dir"] = data_path  # the config ships `data_dir: null`, so override rather than pass twice
+    det = detopt.detector.FreeStrawDetector(**straw_cfg)
     nd = yaml.safe_load(open("config/detector/nominal_design.yaml"))["nominal_design"]
     design = detopt.detector.free_design_array(
         nd["station_z"],

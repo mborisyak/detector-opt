@@ -1,0 +1,32 @@
+# `bo` profile: 2 x RTX PRO 6000 Blackwell (97887 MiB each), 6 shards per GPU, `shard:12` on the node.
+#
+# ONE shard is 97887/6 = 16315 MiB, and a cell asks for `shard:1`, so 12 run at once -- 6 per card.
+#
+# WHY 4 PER CARD. Measured on the 2-GPU box against CERN's dedicated cards: at 8 cells/GPU a cell
+# managed 157 detector calls/s against 260 there, so 8-way sharing cost ~40% of per-cell speed and
+# turned a 2.7x concurrency advantage into only 1.27x aggregate throughput. Fewer cells per card buys
+# back per-cell speed, and with FOUR cards the aggregate no longer depends on packing each one: 4 x 4
+# = 16 concurrent is already more than the 12 the 2-GPU box ran. Per-cell speed is what matters for a
+# search stage that cannot proceed until its SLOWEST cell finishes.
+#
+# THREADS ARE SIZED FROM MEASURED USE, NOT FROM WHAT A CELL LOOKS LIKE IT NEEDS. A search cell is
+# GPU-bound and spends well under one core; asking for 4 or 6 made CPUs -- not shards -- the binding
+# constraint, and SLURM then placed every cell on the first GPU and left the second card idle for
+# hours. Two is already generous headroom over what a cell draws. Check with `ps -eo pcpu` against
+# the running cells before raising it: the failure is silent, and it costs half the box.
+executor: slurm
+slurm-status-command: squeue
+default-resources:
+  - gres='shard:1'
+set-threads:
+  - select_run=2
+  - verify_select_run=2
+  - test_bo=2
+  - verify=2
+resources:
+  - local_gpu=12
+jobs: 40
+latency-wait: 30
+retries: 2
+keep-going: true
+rerun-incomplete: true

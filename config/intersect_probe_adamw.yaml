@@ -1,0 +1,151 @@
+# PROBE VARIANT of `config/intersect.yaml`: the optimiser is plain `adamw` (Adam, RMS second moment, no
+# Nesterov) at the same learning rate, betas, eps and weight decay. Nothing else moves. The control that
+# separates nadamw's Nesterov lookahead from its normaliser.
+# FINAL SHiP CAMPAIGN -- `intersection_penalty`. Implements `docs/final.md`; nothing here is a knob to
+# tune once the campaign is running.
+#
+# THE ARM AND ITS PARAMETER RETENTION ARE NOT IN THIS FILE. They live in `config/strategy/`, named
+# on the command line, and this file raises if it set either:
+#
+#     python scripts/bo.py =intersect strategy=intersect-meta-rewind-025 output=... seed=...
+#
+# gearup resolves a top-level key whose value is a string against the directory of the same name, so
+# `strategy=intersect-meta-rewind-025` loads `config/strategy/intersect-meta-rewind-025.yaml`. The
+# strategy that ran is therefore in the submit line AND in the run's own `config.yaml`.
+#
+# THE GROWTH LADDER AND THE PER-DESIGN LIMIT, and why these values:
+#
+#   n0 32768, n_increment 16384   Chosen against a replay of 735 banked designs onto candidate
+#                                 ladders, rounding TRAIN rows (`spent * (1 - val_fraction)`) rather
+#                                 than `spent` -- the ladder is a grid on the training window, and
+#                                 rounding `spent` applies it to a train+val quantity, a grid 33%
+#                                 too coarse.
+#
+#                                 IT DOES NOT COST THE EFFECT UNDER STUDY. Paired within seed against
+#                                 16384/8192 (the ladder the corpus itself ran on), meta's consumption
+#                                 advantage reads 22.5 +- 2.0 vs 24.5 +- 1.4 on angle and 28.8 +- 2.4
+#                                 vs 29.3 +- 2.2 on intersect -- erosions of 0.8 and 0.2 SE, neither
+#                                 resolvable. It over-serves NOTHING: the cheapest design on record
+#                                 needed 40960 training rows, above n0.
+#
+#                                 THE LADDER IS ALSO THE MEASUREMENT GRID FOR STAGE 3, whose retention
+#                                 selection integrates rank along the best-so-far curve -- and that
+#                                 curve's points ARE the growth windows. Here `meta` gets a median of
+#                                 7 grid points and 0.5% of its curves degenerate to a single window
+#                                 plus the pseudo point. At 65536/32768 that fraction is 31.6%, which
+#                                 is why a coarser ladder was rejected despite costing fewer steps.
+#
+#                                 ⚠️ COARSER LADDERS DO NOT SIMPLY ERODE THE ESTIMATE, THEY CORRUPT IT.
+#                                 The advantage is a ratio of two medians; once both snap to grid
+#                                 points it becomes a ratio of grid points and can be biased EITHER
+#                                 way. At 131072/131072 all ten intersect seeds return exactly 50.0%
+#                                 with zero variance -- not precision, but an estimator with one
+#                                 attainable value.
+#   iteration_limit 524288        A design is killed at spent = iteration_limit / (1 - val_fraction)
+#                                 = 699051, and a killed cell excludes its whole seed from paired
+#                                 analysis. At the previous 262144 that threshold was 349525 while
+#                                 the largest spend on record is 469688 -- so cells died, and they
+#                                 died UNEVENLY across arms (9 deaths: 4 closest, 2 continue, 2
+#                                 from_scratch, 1 meta). 524288 puts the threshold 1.49x above the
+#                                 worst spend observed, removing the mechanism rather than leaving
+#                                 its sign to be argued.
+#   patience 16, warmup_epochs 2  `steps_per_epoch = iteration_limit // batch`, so both are counted
+#                                 in epochs that are now twice as long. These are the settled values.
+#
+# THE EXIT TEST IS UNTOUCHED: loss_precision stays 1.0e-2 and no condition is reordered or retuned.
+#
+# THE INTERSECTION PENALTY IS overlap_weight 1.5e-3. Only 2 of the 6 station pairs can overlap (the
+# magnet holds cross-side pairs 380 cm apart), each contributing at most 100 cm, so the penalty is
+# exactly 0.200 under full intersection -- the scale docs/final.md asks for, against an
+# optimal-constant-predictor ceiling of 1.045 on this task.
+#
+# DETECTOR PROVENANCE (FairShip SST V2023): 316 straws/layer at 2 cm pitch (|y| <= 316 cm); magnet
+# centre z0 = 8957 cm (c.z = 89.57 m); field_integral -1.071 T.m = int Bx dz for MainSpectrometerField
+# at negative polarity, with B_sigma 283 cm the on-axis Gaussian matched to it; magnet_half_cm 140
+# excludes the 1.4 m YokeDepth from the station bounds. max_hits_per_event 128 is the NN-facing cap
+# (the solver emits the 128 earliest-TDC straws) and censors the busiest ~5% of events.
+
+strategy: intersect-from_scratch-norewind
+detector:
+  intersection_penalty:
+    n_stations_upstream: 2
+    n_stations_downstream: 2
+    n_layers_per_view: 2
+    n_straws_per_layer: 316
+    straw_length: 400.0
+    straw_pitch: 2.0
+    layer_z_gap: 1.732
+    view_z_gap: 5.0
+    magnet_half_cm: 140.0
+    field_integral: -1.071
+    z0: 8957.0
+    B_sigma: 283.0
+    layer_bounds:
+    - 8275.0
+    - 9750.0
+    max_particles: 1024
+    max_hits_per_event: 128
+    max_dt: 1.0
+    max_time: 300.0
+    material: kapton
+    data_dir: data/mc/numpy_newFS
+    overlap_weight: 0.0015
+nominal_design:
+  stations:
+  - 8407.0
+  - 8607.0
+  - 9307.0
+  - 9507.0
+  view_angle: 0.0798
+regressor:
+  set-regressor:
+    features:
+    - - 32
+      - 48
+    - - 48
+      - 32
+    n_models: null
+    p_dropout: null
+    activation: celu
+device: cuda
+plot_per_epoch: 8
+training:
+  n0: 32768
+  n_increment: 16384
+  batch: 256
+  eval_batch: 2048
+  warmup_epochs: 2
+  budget: 2097152
+  iteration_limit: 524288
+  val_fraction: 0.25
+  loss_precision: 0.01
+  patience: 16
+  replay_weight: 0.25
+  optimizer:
+    adamw:
+      learning_rate: 0.0005
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-08
+      weight_decay: 0.001
+verify:
+  epochs: 64
+  val_every_epochs: 1
+  eval_batch: 1024
+  sample_batch: 1024
+bo:
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds:
+    - -6.0
+    - 4.0
+    log_amplitude_prior_bounds:
+    - -6.0
+    - 1.5
+    kernel:
+      ard-rbf: {}
+  ei:
+    n_restarts: 32
+    n_steps: 100

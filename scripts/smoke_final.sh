@@ -25,7 +25,7 @@ for ARM in from_scratch continue meta; do
 done
 
 for ARM in from_scratch continue meta; do
-  for V in norewind rewind-025 sp-06-001; do
+  for V in norewind rewind-025 sp-l06-s1e2; do
     echo "### probe $ARM $V"
     python scripts/probe_retention.py =angle strategy=angle-$ARM-$V \
       trajectory=$OUT/validation/$SEED/$ARM/results.json seed=$SEED \

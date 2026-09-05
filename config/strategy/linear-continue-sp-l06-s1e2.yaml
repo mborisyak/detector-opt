@@ -1,0 +1,24 @@
+# STRATEGY: continue on the LINEAR LADDER, training regime `sp-l06-s1e2`: shrink-and-perturb with an
+# INDEPENDENT noise scale, lambda 0.6 at sigma 1.0e-2.
+#
+# ONE SET FOR ALL FOUR RUNGS. `docs/final.md`'s procedure selects one regime per strategy, and for the
+# ladder that selection is shared across d1n2/d2n3/d3n4/d4n5 rather than made per rung -- so these
+# configs are named `linear-<strategy>-<regime>` and every rung's task config resolves the same file.
+#
+# A strategy is the ARM (behaviour BETWEEN designs); a training regime is behaviour WITHIN a design,
+# at each data addition. Ladder, budget, optimiser and detector stay in the rung's task config so they
+# are held FIXED across the comparison; `scripts/bo.py` refuses a task config that also sets a
+# retention knob, so there is never a second source of truth.
+#
+#   shrink   params <- shrink * params + param_noise * fresh_draw
+#            Shrink-and-perturb (Ash & Adams, arXiv:1910.08475): partially RESAMPLES toward a fresh
+#            initialisation of the whole network. `shrink` and `param_noise` are separate knobs, as
+#            the paper sweeps them, and BOTH must be given.
+#
+# Sigma is held at 0.01 across every lambda so the arms differ in one thing. `rewind` and `shrink`
+# are mutually exclusive: the trainer raises if `rewind` is non-zero alongside a `shrink` below 1.
+
+nn_init_strategy: continue
+rewind: 0.0
+shrink: 0.6
+param_noise: 0.01

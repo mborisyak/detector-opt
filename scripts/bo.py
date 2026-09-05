@@ -149,8 +149,10 @@ def drop_foreign_knobs(config, nn_init_strategy):
 
 # THE THREE KNOBS THAT DEFINE PARAMETER RETENTION, and the only keys a strategy config may set
 # besides the arm itself. `rewind` mixes the network back toward its own initialisation at each data
-# addition; `shrink`/`param_noise` are shrink-and-perturb. They are mutually exclusive and the
-# trainer enforces that.
+# addition; `shrink` and `param_noise` are shrink-and-perturb in its PUBLISHED form (Ash & Adams,
+# arXiv:1910.08475), where the shrink and the noise scale are independent knobs and BOTH must be
+# given -- the trainer refuses a `shrink` below 1 without a `param_noise`, the derived-sigma form
+# being retired. `rewind` and `shrink` are mutually exclusive and the trainer enforces it.
 RETENTION_KNOBS = ("rewind", "shrink", "param_noise")
 
 
@@ -191,10 +193,11 @@ def _resolve_strategy(config):
   for knob in RETENTION_KNOBS:
     if knob in strategy:
       training[knob] = strategy[knob]
+
   resolved = {**config, "nn_init_strategy": strategy["nn_init_strategy"], "training": training}
   print(
-    f"[strategy] {strategy['nn_init_strategy']}; "
-    + ", ".join(f"{k}={training[k]}" for k in RETENTION_KNOBS if k in training), flush=True
+    f"[strategy] {strategy['nn_init_strategy']}; " + ", ".join(f"{k}={training[k]}" for k in RETENTION_KNOBS if k in training),
+    flush=True
   )
   return resolved
 
@@ -461,8 +464,25 @@ def bo(output, seed: int, force: bool = False, **config):
     if os.path.exists(partial_path):
       os.remove(partial_path)
 
+  # A FIXED NUMBER OF DESIGNS, for the hyper-parameter selection runs. `bo.n_designs` stops the loop
+  # after that many scored designs instead of when the budget pool fills.
+  #
+  # WHY IT EXISTS: `docs/final.md` selects a training regime by running every regime over the SAME
+  # short Sobol sequence, so each run must stop at the end of that sequence. Left to the budget the
+  # runs would stop at different design counts -- `meta` converges cheaper and would bank more --
+  # and the curves would no longer be paired, which is the whole point of using a shared design set.
+  #
+  # With `n_init >= n_designs` the GP is never fitted and every proposal comes from the scrambled
+  # Sobol block, which is exactly what BO itself draws before it has anything worth fitting.
+  n_designs = config.get("bo", {}).get("n_designs")
+  n_designs = None if n_designs is None else int(n_designs)
+  if n_designs is not None and n_init < n_designs:
+    raise ValueError(
+      f"bo.n_designs={n_designs} exceeds n_init={n_init}: designs past n_init come from the fitted "
+      f"GP, not the Sobol block, so the sequence would stop being shared across regimes"
+    )
   print(
-    f"BO: running until the budget pool fills "
+    f"BO: running until {'%d designs' % n_designs if n_designs is not None else 'the budget pool fills'} "
     f"(budget={budget} detector calls, n_init={n_init}, d={d}, plot_per_epoch={plot_every})"
   )
 
@@ -633,6 +653,10 @@ def bo(output, seed: int, force: bool = False, **config):
     # Refresh the convergence plot after every completed iteration.
     plot_convergence(results, output)
     i += 1
+
+    if n_designs is not None and len(results) >= n_designs:
+      print(f"[designs] reached bo.n_designs={n_designs}; finishing.")
+      break
 
   _save_results(i, completed=True)  # the budget pool filled -- reruns skip this output
   plot_convergence(results, output)

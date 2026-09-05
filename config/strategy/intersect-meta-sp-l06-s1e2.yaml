@@ -1,0 +1,29 @@
+# STRATEGY: meta on `intersect`, parameter retention `sp-l06-s1e2`: shrink-and-perturb with an
+# INDEPENDENT noise scale, lambda 0.6 at sigma 1.0e-2.
+#
+# A strategy is the ARM plus what it keeps of the previous network at a data addition, and nothing
+# else. Ladder, budget, optimiser and detector stay in the task config so they are held FIXED across
+# the comparison; `scripts/bo.py` refuses a task config that also sets a retention knob, so there is
+# never a second source of truth.
+#
+#   shrink   params <- shrink * params + param_noise * fresh_draw
+#            Shrink-and-perturb (Ash & Adams, arXiv:1910.08475): partially RESAMPLES toward a fresh
+#            initialisation of the whole network. `shrink` and `param_noise` are separate knobs, as
+#            the paper sweeps them, and BOTH must be given.
+#
+# SIGMA IS HELD AT 0.01 ACROSS EVERY LAMBDA, so the arms differ in ONE thing. That is a design
+# choice, not a citation: the paper prescribes no default and says the lambda/sigma trade-off must be
+# tuned per dataset and architecture. Its Fig. 7 reports lambda 0.6 performing like random
+# initialisation on validation accuracy, so lambda 0.6 is a reference point, not a recommendation.
+#
+# ⚠️ CADENCE: the paper shrinks ONCE PER RETRAINING ROUND then retrains to convergence; this trainer
+# fires at EVERY data addition. Report the parameter norm beside the loss, or a decaying network
+# reads as a regime.
+#
+# `rewind` and `shrink` are mutually exclusive: the trainer raises if `rewind` is non-zero alongside
+# a `shrink` below 1.
+
+nn_init_strategy: meta
+rewind: 0.0
+shrink: 0.6
+param_noise: 0.01

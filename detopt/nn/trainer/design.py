@@ -85,6 +85,7 @@ import optax
 from ...utils.training import (bayesian_trend, masked_mean_sem, probability_above, probability_change_below)
 from .averaging import decay_for_horizon, parameter_average, with_average, with_parameter_average
 from .common import (Trainer, TrainResult, _round_down, window_sample_indices, fresh_design_network, design_init_sequence, )
+from .schedule import cosine_floor_schedule, rephase, with_cosine_floor
 
 __all__ = ["DesignTrainer"]
 
@@ -114,31 +115,11 @@ class _DesignBase(Trainer):
     )
 
   def __init__(
-    self,
-    detector,
-    *,
-    regressor_config: dict,
-    optimizer: optax.GradientTransformation,
-    batch: int,
-    n0: int,
-    n_increment: int,
-    iteration_limit: int,
-    warmup_epochs: int,
-    patience: int,
-    loss_precision: float,
-    budget: int,
-    reinit_on_grow: bool = False,
-    rewind: float = 0.0,
-    shrink: float = 1.0,
-    param_noise: float = 0.0,
-    param_mix: float | None = None,
-    param_average_epochs: float = 0.0,
-    val_fraction: float = 0.25,
-    eval_batch: int | None = None,
-    device=None,
-    checkpoint_dir: str | None = None,
-    seed: int = 0,
-    reveal: str | None = None,
+    self, detector, *, regressor_config: dict, optimizer: optax.GradientTransformation, batch: int, n0: int, n_increment: int,
+    iteration_limit: int, warmup_epochs: int, patience: int, loss_precision: float, budget: int, reinit_on_grow: bool = False,
+    rewind: float = 0.0, shrink: float = 1.0, param_noise: float | None = None, cosine_epochs: int = 0,
+    cosine_peak: float = 4.0, param_mix: float | None = None, param_average_epochs: float = 0.0, val_fraction: float = 0.25,
+    eval_batch: int | None = None, device=None, checkpoint_dir: str | None = None, seed: int = 0, reveal: str | None = None,
   ):
     self.n0 = int(n0)
     self.n_increment = int(n_increment)
@@ -156,32 +137,43 @@ class _DesignBase(Trainer):
     # state) at every addition, holding the SCHEDULE fixed while varying the network -- the
     # complement of the schedule sweeps, which hold the network and vary the schedule.
     self.reinit_on_grow = bool(reinit_on_grow)
-    # SHRINK-AND-PERTURB (Ash & Adams, "On Warm-Starting Neural Network Training"): at a data
-    # addition, `params <- shrink * params + param_noise * fresh_draw`. It is a DIFFERENT axis from
-    # `rewind`, which interpolates toward THIS RUN'S OWN initial network; this pulls toward ZERO
-    # and re-injects randomness. `shrink = 1.0, param_noise = 0.0` is a strict no-op and is the default,
-    # so nothing that does not ask for it changes.
+    # SHRINK-AND-PERTURB (Ash & Adams, arXiv:1910.08475): at a data addition,
+    # `params <- shrink * params + param_noise * fresh_draw`. It is a DIFFERENT axis from `rewind`,
+    # which interpolates toward THIS RUN'S OWN initial network; this partially RESAMPLES toward a new
+    # one. `shrink = 1.0` is a strict no-op and is the default, so nothing that does not ask for it
+    # changes.
     #
-    # THE PERTURBATION IS A SCALED FRESH INITIALISATION, not iid Gaussian at one sigma. The paper is
-    # explicit that noise is added "by adding parameters from a scaled, randomly-initialized
-    # network, to compensate for the fact that many random initialization schemes use different
-    # variances for different kinds of parameters" -- here `EnsembleLinear` draws Lecun-scaled
-    # normals while the activation parameters initialise to ones, so a single sigma would be wrong
-    # for one of them.
+    # THE PERTURBATION IS A SCALED FRESH INITIALISATION, not iid Gaussian at one sigma: the paper adds
+    # "parameters from a scaled, randomly-initialized network" because initialisation schemes use
+    # different variances for different kinds of parameters, and so does `EnsembleLinear` here.
     #
-    # ⚠️ CADENCE. The paper applies this ONCE PER RETRAINING ROUND (a new data chunk); this trainer
-    # fires at EVERY data addition -- 9 per design on the resized SHiP ladder, 80+ on the old one.
-    # `params <- shrink * params + noise` is an AR(1) recursion, so it does not collapse (its
-    # stationary scale is set by the noise), but it forgets with a horizon of about
-    # `1 / (1 - shrink)` additions. At the paper's shrink = 0.6 that horizon is ~2.5 additions, so a
-    # carried network is erased almost immediately and `meta` degenerates toward `from_scratch`.
-    # Anything run here at the paper's value is testing that prediction, not porting the method.
+    # `shrink` AND `param_noise` ARE INDEPENDENT KNOBS, as the paper sweeps them, and BOTH must be
+    # given. The earlier form that derived the noise scale from the shrink factor is RETIRED: asking
+    # for a `shrink` below 1 without a `param_noise` is an error, not a default.
+    #
+    # ⚠️ CADENCE. The paper applies this ONCE PER RETRAINING ROUND; this trainer fires at EVERY data
+    # addition, so a carried network is forgotten within about `1 / (1 - shrink)` additions and the
+    # published sigma can decay it. Report the parameter norm beside the loss.
     self.shrink = float(shrink)
-    self.param_noise = float(param_noise)
     if not 0.0 <= self.shrink <= 1.0:
       raise ValueError(f'shrink must lie in [0, 1], got {shrink}')
-    if not self.param_noise >= 0.0:
-      raise ValueError(f'param_noise must be non-negative, got {param_noise}')
+    if param_noise is None:
+      if self.shrink < 1.0:
+        raise ValueError(
+          'the derived-sigma shrink-and-perturb (param_noise = sqrt(1 - shrink^2)) is retired; '
+          f'param_noise must be given explicitly alongside shrink = {self.shrink}'
+        )
+      self.param_noise = 0.0
+    else:
+      if self.shrink >= 1.0:
+        raise ValueError('param_noise has no effect at shrink = 1.0; set shrink < 1 to perturb')
+      if float(param_noise) < 0.0:
+        raise ValueError(f'param_noise must be >= 0, got {param_noise}')
+      self.param_noise = float(param_noise)
+    self.cosine_epochs = int(cosine_epochs)
+    self.cosine_peak = float(cosine_peak)
+    if self.cosine_epochs < 0:
+      raise ValueError(f'cosine_epochs must be >= 0 (0 = off), got {cosine_epochs}')
     # `rewind` walks the SAME axis as `reinit_on_grow`, continuously: at a data addition the
     # parameters become `(1 - lambda) * current + lambda * INITIAL`, where INITIAL is the network
     # this run started from -- so 0 is the carried network and 1 rewinds to the start. It REPLACED an isotropic-kick knob (`param_noise`), which was withdrawn:
@@ -212,9 +204,9 @@ class _DesignBase(Trainer):
         raise ValueError('pass either `rewind` or the deprecated `param_mix`, not both')
       rewind = param_mix
     self.rewind = float(rewind)
-    if (self.shrink < 1.0 or self.param_noise > 0.0) and self.rewind > 0.0:
+    if self.shrink < 1.0 and self.rewind > 0.0:
       raise ValueError(
-        'shrink/param_noise and rewind both act at the SAME point in the loop and would confound '
+        'shrink and rewind both act at the SAME point in the loop and would confound '
         'two mechanisms; set rewind to 0 when using shrink-and-perturb'
       )
     if self.reinit_on_grow and self.rewind > 0.0:
@@ -257,10 +249,14 @@ class _DesignBase(Trainer):
     # `exp(-warmup_epochs / horizon)` by the time anything is read. `rewind` / `reinit_on_grow`
     # re-initialise the optimiser state at the addition anyway, which reseeds the average on the
     # network they leave behind.
+    steps_per_epoch = max(1, int(iteration_limit) // int(batch))
+    self.cosine_schedule = None
+    if self.cosine_epochs > 0:
+      self.cosine_schedule = cosine_floor_schedule(steps_per_epoch, self.cosine_epochs, self.cosine_peak)
+      optimizer = with_cosine_floor(optimizer, self.cosine_schedule)
     self.param_average_epochs = float(param_average_epochs)
     self.param_average_decay = None
     if self.param_average_epochs > 0.0:
-      steps_per_epoch = max(1, int(iteration_limit) // int(batch))
       self.param_average_decay = decay_for_horizon(steps_per_epoch * self.param_average_epochs)
       optimizer = with_parameter_average(optimizer, self.param_average_decay)
     val_iteration_limit = max(int(batch), round(iteration_limit * val_fraction / (1.0 - val_fraction)))
@@ -293,6 +289,8 @@ class _DesignBase(Trainer):
     # Network for this design (base: fresh / optionally warm-started; the
     # continual trainer keeps and continues the same one across designs).
     params, state, opt_state = self._init_design_network(init_seq, init_params)
+    if self.cosine_schedule is not None:
+      opt_state = rephase(opt_state)
     # The network this run STARTED from, kept for `rewind`. Not a fresh draw: mixing toward the
     # run's own initial parameters is `initial + (1 - lambda) * (current - initial)`, i.e. a pure
     # SHRINK OF WHAT WAS LEARNED, with no new randomness introduced and no scale artefact (the two
@@ -515,7 +513,7 @@ class _DesignBase(Trainer):
           # rounds are independent inits rather than the same one repeated; the FIRST network
           # is untouched, since nothing is spawned before it is built.
           params, state, opt_state = self._init_design_network(init_seq.spawn(1)[0], None)
-        elif self.shrink < 1.0 or self.param_noise > 0.0:
+        elif self.shrink < 1.0:
           # SHRINK AND PERTURB toward ZERO plus a scaled fresh draw -- see the constructor for the
           # method, the reason the noise is an initialisation rather than one sigma, and the cadence
           # caveat. The optimiser is reset for the same reason the rewind resets it: the moments
@@ -558,6 +556,8 @@ class _DesignBase(Trainer):
           opt_state = self.optimizer.init(params)
           if average is not None:
             opt_state = with_average(opt_state, average)
+        elif self.cosine_schedule is not None:
+          opt_state = rephase(opt_state)
         round_start = len(train_loss_history)
         epoch_in_round = 0
         print(f"  [grow] window -> {tp.current - w0_train}, pool {tp.current}/{tp.capacity}")

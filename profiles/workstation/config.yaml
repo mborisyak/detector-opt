@@ -1,0 +1,53 @@
+# WORKSTATION profile: one 8 GB RTX 3070 exposed by SLURM as `shard:24` (a divisor, ~341 MiB per shard), 11 CPUs,
+# 26000 MB of host memory, MPS on. Launch through `scripts/run_linear_campaign.sh`, which checks MPS and takes
+# the lock; the snakefile names no machine, and everything machine-bound lives here.
+#
+# `shard:6` PER CELL -> FOUR CONCURRENT (24/6), the width the user set on 2026-09-05. It is a VRAM ration, not a
+# measurement: a linear cell was MEASURED at 310-500 MiB, so four are nowhere near the card; the ration is what
+# keeps a fifth from starting. Widen or narrow it here and restart the orchestrator -- the profile is read at
+# launch, and a running orchestrator keeps the old request for every resubmission.
+#
+# NO SNAKEMAKE THROTTLE. `local_gpu` is not capped here: SLURM does the scheduling (user, 2026-09-05), and the
+# other three limits already bind before it could -- shards 24/6 = 4, CPUs 11/2 = 5, memory 26000/2400 = 10.
+# A `local_gpu` cap only ever re-imposes one of those with a second number to keep in step.
+#
+# THREADS COME FROM THE SNAKEFILE (2 per rule, user 2026-09-04). A `set-threads` override here silently replaced
+# them with 1 until 2026-09-06; a linear cell MEASURED 0.41 of a core, so 2 is ~5x headroom and four cells use
+# 8 of the 11 CPUs.
+#
+# `mem_mb` 2400 PER CELL: MEASURED host RSS 1.9 GB (2.1 GB peak). The snakefile's 8000 would let only three cells
+# fit in 26000 MB; check `AllocMem`, not `CPUAlloc` -- a shard idles silently while the queue looks merely busy.
+#
+# ⚠️ THIS CARD DRIVES A DESKTOP, which holds ~1-2 GB permanently and SLURM knows nothing about it; a job that needs
+# most of the card fails as an allocation error, not a scheduling refusal. Small cells never notice. A SHiP
+# verification (6032 MiB) needs the whole card here and does not belong on this machine.
+#
+# ⚠️ MPS MUST BE RUNNING, and its absence is SILENT: without it the four processes time-slice instead of sharing the
+# SMs, which is slower and looks identical in `nvidia-smi`. The launcher refuses to start without a server. Start it
+# in the launching shell so sbatch propagates the pipe directory:
+#
+#     export CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps CUDA_MPS_LOG_DIRECTORY=/tmp/nvidia-mps-log
+#     nvidia-cuda-mps-control -d
+#
+# The proof it took is the Type column of `nvidia-smi`: `M+C` is an MPS client, plain `C` bypassed the server.
+#
+# ⚠️ THE GPU REQUEST IS THE `gres` DEFAULT RESOURCE, NOT `slurm_extra`. The SLURM plugin refuses `--gres` inside
+# `slurm_extra` and fails every submission; a profile that forgets `gres` submits GPU work with no GPU request at
+# all (`squeue -o %b` shows N/A) and the cells die on the desktop's card share.
+#
+# `slurm-status-command: squeue` IS MANDATORY on this node: the sacct binary exists but no slurmdbd runs, so
+# without it snakemake hangs forever with every job already finished.
+executor: slurm
+slurm-status-command: squeue
+default-resources:
+  - gres='shard:6'
+set-resources:
+  - select_run:mem_mb=2400
+  - verify_select_run:mem_mb=2400
+  - test_bo:mem_mb=2400
+  - verify:mem_mb=2400
+jobs: 200
+latency-wait: 30
+retries: 2
+keep-going: true
+rerun-incomplete: true

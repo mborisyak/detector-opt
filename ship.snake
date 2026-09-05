@@ -14,11 +14,27 @@
 # rules in ONE workflow, a single snakemake invocation drives them; two invocations in this directory
 # would collide on snakemake's working-directory lock.
 #
-# THE FOUR STAGES:
-#   1. validation   3 validation seeds x 3 arms at `norewind`, the setting with nothing to choose
-#   2. probe        7 retention settings re-score ONE middle-of-BO design per (arm, seed) -> 63 cells
-#   3. select       rank integral over the best-so-far curves -> config/strategy/<task>-<arm>-optimal.yaml
-#   4. test         10 test seeds x 3 arms at the selected settings, then a 10-point verification
+# THE THREE STAGES:
+#   1. select_run   every TRAINING REGIME run to the SAME BUDGET over the SAME Sobol sequence, for
+#                   each STRATEGY and validation seed: 3 seeds x 3 strategies x 5 regimes = 45 per task.
+#
+#                   IT IS THE BUDGET THAT STOPS THESE RUNS, NOT A DESIGN COUNT. The previous form
+#                   capped them at `bo.n_designs=5` while declaring a 3145728 budget, so they stopped
+#                   having spent 546k-1.14M -- 26% of it on average -- and the best-so-far curves
+#                   never reached the budget. "Integral rank over the budget" was then undefined:
+#                   `select_retention.py` integrated to max(observed spend) while `plot_median`
+#                   extended to the configured budget, and the two limits DISAGREED, flipping the
+#                   `continue` verdict on both tasks. Now every regime stops at the same budget and
+#                   the curve is defined over the whole of it.
+#
+#                   NOTHING IS OVERRIDDEN ANY MORE -- not the budget, not a design count, not
+#                   `n_init`. A search run is a test-stage cell with a different strategy config, so
+#                   a regime is screened under the conditions it will be used in. The GP is fitted
+#                   after the initial designs exactly as in a campaign cell, so past that point the
+#                   regimes follow their own trajectories and the comparison is NOT design-for-design.
+#                   That is why the ranking is taken on verified losses rather than reported ones.
+#   2. select       integral rank of the best-so-far curves -> config/strategy/<task>-<strategy>-optimal.yaml
+#   3. test         10 test seeds x 3 strategies at the selected regimes, then a 10-point verification
 #
 # ⛔️ STAGE 4 CANNOT RUN AGAINST A STALE SETTING. `test_bo` depends on `selected.txt`, which only
 # `select` can produce, so snakemake regenerates the settings from the probe records before any test
@@ -51,25 +67,37 @@ SEEDS_TEST = [
   1244111331, 126382657, 750143450, 9577242, 330924253,
   219094734, 1153299222, 122012491, 499913522, 983655707,
 ]
-ARMS = ["from_scratch", "continue", "meta"]
-VARIANTS = [
-  "norewind",
-  "rewind-01", "rewind-025", "rewind-05",
-  "sp-06-001", "sp-03-0005", "sp-015-00025",
-]
+STRATEGIES = ["from_scratch", "continue", "meta"]
+REGIMES = ["norewind", "rewind-01", "rewind-025", "sp-l03-s1e2", "sp-l06-s1e2"]
 
-ENV = "XLA_PYTHON_CLIENT_PREALLOCATE=false PYTHONUNBUFFERED=1"
+# The search runs are the TEST STAGE's own procedure: no budget override, no design cap, and no
+# `n_init` override either, so the GP is fitted after the config's initial designs exactly as it is
+# in a campaign cell. A regime is therefore screened under the conditions it will be used in.
+#
+# THE PAIRING IS ONLY OVER THE INITIAL SOBOL BLOCK. Past `n_init` the designs come from each
+# regime's own fitted GP, so the trajectories diverge and the comparison is no longer design-for-
+# design. That is the deliberate trade: a paired comparison of a procedure nobody runs is worth
+# less than an unpaired comparison of the real one. It also means the ranking is noisier -- which
+# is why it is taken on VERIFIED losses rather than reported ones.
+
+# The search is ranked on VERIFIED losses, not on the loss each run reported for its own designs: the
+# reported number is faithful but optimistic, and regimes separated by ~0.005 sit inside the range
+# where optimism and noise decide the order. Each search run is re-scored on a freshly sampled,
+# disjoint train/validation/test split it never saw, at the same number of points as the test stage.
+
+PREAMBLE = config.get("preamble", "")
+ENV = PREAMBLE + "XLA_PYTHON_CLIENT_PREALLOCATE=false PYTHONUNBUFFERED=1"
 
 
 wildcard_constraints:
   prefix=".+",
   task="|".join(TASKS),
   seed="|".join(str(s) for s in SEEDS_TEST + SEEDS_VAL),
-  arm="|".join(ARMS),
-  variant="|".join(VARIANTS),
+  strategy="|".join(STRATEGIES),
+  regime="|".join(REGIMES),
 
 
-localrules: all, validation, probe, select, campaign
+localrules: all, selection_runs, select, campaign
 
 
 rule all:
@@ -77,93 +105,90 @@ rule all:
     expand(f"{DEFAULT_PREFIX}/{{task}}/campaign.txt", task=TASKS)
 
 
-rule validation:
+rule selection_runs:
   input:
-    expand("{{prefix}}/{{task}}/validation/{seed}/{arm}/done.txt", seed=SEEDS_VAL, arm=ARMS)
+    expand("{{prefix}}/{{task}}/select/{seed}/{strategy}/{regime}/verified.txt",
+           seed=SEEDS_VAL, strategy=STRATEGIES, regime=REGIMES)
   output:
-    touch("{prefix}/{task}/validation.txt")
-
-
-rule probe:
-  input:
-    expand("{{prefix}}/{{task}}/probe/{seed}/{arm}/{variant}.json", seed=SEEDS_VAL, arm=ARMS, variant=VARIANTS)
-  output:
-    touch("{prefix}/{task}/probes.txt")
+    touch("{prefix}/{task}/selection_runs.txt")
 
 
 rule campaign:
   input:
-    expand("{{prefix}}/{{task}}/test/{seed}/{arm}/verified.txt", seed=SEEDS_TEST, arm=ARMS)
+    expand("{{prefix}}/{{task}}/test/{seed}/{strategy}/verified.txt", seed=SEEDS_TEST, strategy=STRATEGIES)
   output:
     touch("{prefix}/{task}/campaign.txt")
 
 
-rule validation_bo:
+rule select_run:
   output:
-    touch("{prefix}/{task}/validation/{seed}/{arm}/done.txt")
-  threads: 4
+    touch("{prefix}/{task}/select/{seed}/{strategy}/{regime}/done.txt")
+  threads: 2
   resources:
-    local_gpu=1, mem_mb=12000, runtime=2880
+    local_gpu=1, mem_mb=8000, runtime=1440
   shell:
     ENV + " python scripts/bo.py ={wildcards.task}"
-    " strategy={wildcards.task}-{wildcards.arm}-norewind"
-    " output={wildcards.prefix}/{wildcards.task}/validation/{wildcards.seed}/{wildcards.arm}"
-    " seed={wildcards.seed}"
+    " strategy={wildcards.task}-{wildcards.strategy}-{wildcards.regime}"
+    " output={wildcards.prefix}/{wildcards.task}/select/{wildcards.seed}/{wildcards.strategy}/{wildcards.regime}"
+    f" seed={{wildcards.seed}}"
 
 
-rule retention_probe:
+rule verify_select_run:
+  """Re-score each search run's incumbents on data it never saw, so the regimes are ranked on a
+    HELD-OUT number rather than on the loss each run reported for its own designs. Every
+    design of the trajectory is re-scored, exactly as in the test stage."""
   input:
-    "{prefix}/{task}/validation/{seed}/{arm}/done.txt"
+    "{prefix}/{task}/select/{seed}/{strategy}/{regime}/done.txt"
   output:
-    "{prefix}/{task}/probe/{seed}/{arm}/{variant}.json"
-  threads: 4
+    touch("{prefix}/{task}/select/{seed}/{strategy}/{regime}/verified.txt")
+  threads: 2
   resources:
-    local_gpu=1, mem_mb=12000, runtime=720
+    local_gpu=1, mem_mb=6000, runtime=2880
   shell:
-    ENV + " python scripts/probe_retention.py ={wildcards.task}"
-    " strategy={wildcards.task}-{wildcards.arm}-{wildcards.variant}"
-    " trajectory={wildcards.prefix}/{wildcards.task}/validation/{wildcards.seed}/{wildcards.arm}/results.json"
-    " seed={wildcards.seed} output={output}"
+    ENV + " python scripts/verify_trajectory.py ={wildcards.task}"
+    " trajectory={wildcards.prefix}/{wildcards.task}/select/{wildcards.seed}/{wildcards.strategy}"
+    "/{wildcards.regime}/results.json"
+    " seed={wildcards.seed} progress=plain"
 
 
 rule select:
   input:
-    "{prefix}/{task}/probes.txt"
+    "{prefix}/{task}/selection_runs.txt"
   output:
     marker=touch("{prefix}/{task}/selected.txt"),
     report="{prefix}/{task}/selection.txt"
-  threads: 1
+  threads: 2
   resources:
     local_gpu=0, mem_mb=2000, runtime=20
   shell:
-    "python scripts/select_retention.py --task {wildcards.task}"
-    " --probes {wildcards.prefix}/{wildcards.task}/probe --write --report {output.report}"
+    PREAMBLE + "python scripts/select_retention.py --task {wildcards.task}"
+    " --runs {wildcards.prefix}/{wildcards.task}/select --verified --write --report {output.report}"
 
 
 rule test_bo:
   input:
     "{prefix}/{task}/selected.txt"
   output:
-    touch("{prefix}/{task}/test/{seed}/{arm}/done.txt")
-  threads: 4
+    touch("{prefix}/{task}/test/{seed}/{strategy}/done.txt")
+  threads: 2
   resources:
-    local_gpu=1, mem_mb=12000, runtime=2880
+    local_gpu=1, mem_mb=6000, runtime=2880
   shell:
     ENV + " python scripts/bo.py ={wildcards.task}"
-    " strategy={wildcards.task}-{wildcards.arm}-optimal"
-    " output={wildcards.prefix}/{wildcards.task}/test/{wildcards.seed}/{wildcards.arm}"
+    " strategy={wildcards.task}-{wildcards.strategy}-optimal"
+    " output={wildcards.prefix}/{wildcards.task}/test/{wildcards.seed}/{wildcards.strategy}"
     " seed={wildcards.seed}"
 
 
 rule verify:
   input:
-    "{prefix}/{task}/test/{seed}/{arm}/done.txt"
+    "{prefix}/{task}/test/{seed}/{strategy}/done.txt"
   output:
-    touch("{prefix}/{task}/test/{seed}/{arm}/verified.txt")
-  threads: 4
+    touch("{prefix}/{task}/test/{seed}/{strategy}/verified.txt")
+  threads: 2
   resources:
-    local_gpu=1, mem_mb=12000, runtime=2880
+    local_gpu=1, mem_mb=6000, runtime=2880
   shell:
     ENV + " python scripts/verify_trajectory.py ={wildcards.task}"
-    " trajectory={wildcards.prefix}/{wildcards.task}/test/{wildcards.seed}/{wildcards.arm}/results.json"
+    " trajectory={wildcards.prefix}/{wildcards.task}/test/{wildcards.seed}/{wildcards.strategy}/results.json"
     " seed={wildcards.seed} progress=plain"

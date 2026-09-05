@@ -1,0 +1,209 @@
+# The linear-ladder campaign, following the same protocol as `docs/final.md` does for SHiP.
+#
+#   setsid nohup scripts/run_linear_campaign.sh > logs/linear-local.log 2>&1 < /dev/null &   # everything, detached
+#   scripts/run_linear_campaign.sh output/linear/selected.txt      # stop after the selection
+#   scripts/run_linear_campaign.sh output/linear/d3n4/campaign.txt # one rung's test stage
+#   scripts/run_linear_campaign.sh -n                              # dry run
+#
+# The launcher checks MPS, takes the lock and applies profiles/workstation (shards per cell, memory).
+#
+# ONE SELECTION FOR THE WHOLE LADDER, and that is the difference from `ship.snake`. There, each task
+# selects its own regime. Here a single regime per strategy is chosen and applied to every rung, so
+# the selection runs from ALL FOUR rungs pool into ONE decision -- 4 rungs x 3 seeds = 12 trajectories
+# per (strategy, regime) instead of 3. That is affordable because a linear cell is minutes rather than
+# the ~1.5 h a SHiP cell takes; the cost is ~15 GPU-hours, not the ~270 the same fan-out would cost on
+# SHiP. To select on a single rung instead, cut SELECT_RUNGS to one entry.
+#
+# THE THREE STAGES:
+#   1. select_run   every regime over the SAME 5-design Sobol sequence, per rung/strategy/seed:
+#                   4 x 3 x 3 x 5 = 180 runs. `bo.n_designs=5` with `n_init=5` means the GP is never
+#                   fitted, so every regime sees identical designs and the comparison is PAIRED.
+#   2. select       integral rank of the best-so-far curves, pooled over rungs and seeds
+#                   -> config/strategy/linear-<strategy>-optimal.yaml
+#   3. test         10 test seeds x 3 strategies on EVERY rung, then a 10-point verification.
+#
+# ⛔️ THIS FILE NAMES NO MACHINE. It declares only portable resources -- `threads`, `mem_mb`,
+# `runtime`, and `local_gpu` -- and says nothing about how a GPU is requested, how many fit, or which
+# executor runs it. All of that lives in a PROFILE under `profiles/`, so the same workflow runs on the
+# workstation and on `bo` with no edit and no `--config` on the launch line:
+#
+#   snakemake -s linear.snake --profile profiles/workstation
+#   snakemake -s linear.snake --profile profiles/bo
+#
+# ⛔️ `local_gpu` DOES NOT REQUEST A GPU. It is a plain counter snakemake uses only to throttle when a
+# profile sets `resources: local_gpu=K`; no executor maps it to a scheduler flag. The ACTUAL request is
+# the SLURM plugin's `gres` resource, supplied by the profile as a default-resource. WITHOUT IT these
+# jobs are submitted with NO Gres -- GPU work running outside the scheduler's accounting, which this
+# project forbids. Verified by the first launch: `scontrol show job` reported no Gres and
+# `squeue -o %b` reported `N/A`. A profile that forgets `gres` reintroduces exactly that bug, so every
+# profile here sets it explicitly rather than relying on a default.
+#
+# ⚠️ IT MUST BE THE `gres` RESOURCE, NOT `slurm_extra`. The plugin refuses `--gres` inside
+# `slurm_extra` ("is set by the snakemake executor plugin and must not be overwritten") and fails
+# every submission, so the obvious spelling is the wrong one.
+RUNGS = ["d1n2", "d2n3", "d3n4", "d4n5"]
+SELECT_RUNGS = RUNGS
+DEFAULT_PREFIX = config.get("prefix", "output/linear")
+
+SEEDS_VAL = [282522616, 2036255796, 160541601]
+SEEDS_TEST = [
+  1244111331, 126382657, 750143450, 9577242, 330924253,
+  219094734, 1153299222, 122012491, 499913522, 983655707,
+]
+STRATEGIES = ["from_scratch", "continue", "meta"]
+REGIMES = ["norewind", "rewind-01", "rewind-025", "sp-l03-s1e2", "sp-l06-s1e2"]
+
+# The search runs are the TEST STAGE's own procedure: no budget override, no design cap, and no
+# `n_init` override either, so the GP is fitted after the config's initial designs exactly as it is
+# in a campaign cell. A regime is therefore screened under the conditions it will be used in.
+#
+# THE PAIRING IS ONLY OVER THE INITIAL SOBOL BLOCK. Past `n_init` the designs come from each
+# regime's own fitted GP, so the trajectories diverge and the comparison is no longer design-for-
+# design. That is the deliberate trade: a paired comparison of a procedure nobody runs is worth
+# less than an unpaired comparison of the real one. It also means the ranking is noisier -- which
+# is why it is taken on VERIFIED losses rather than reported ones.
+
+# The search is ranked on VERIFIED losses, not on the loss each run reported for its own designs: the
+# reported number is faithful but optimistic, and regimes separated by ~0.005 sit inside the range where
+# optimism and noise decide the order. Each search run is re-scored on a freshly sampled, disjoint
+# train/validation/test split it never saw, at the same number of points as the test stage. Note the
+# count is a CEILING: it verifies every best-so-far INCUMBENT, and across 59 archived cells the number
+# of incumbents ran 2-8, so the cap never bound.
+
+# ⛔️ THE SELECTION RUNS NEED A LARGER PER-DESIGN LIMIT THAN THE TASK CONFIG, and the banked ladder does
+# NOT calibrate it. Over 8073 banked designs the largest train window ever needed was 58056, so the
+# task's `iteration_limit=65536` looks generous -- but those designs came from BO, which proposes near
+# where it has already learned. These runs use SOBOL: space-filling by construction, so it reaches hard
+# corners of the design box BO never proposes. One such design capped at 65536, missing the bar by
+# 0.001 (diff+err 0.02109 against precision 0.02).
+#
+# A CAP HERE IS NOT MERELY A LOST CELL, IT IS A BIASED COMPARISON. All five regimes score the SAME
+# Sobol design, so a hard design caps some regimes and not others -- reintroducing exactly the
+# arm-dependent censoring that raising `iteration_limit` removed from the SHiP campaign. 131072 is 2.3x
+# the largest window ever observed. This argument is STRONGER now than when it was written: the search
+# no longer stops after five designs, so with `n_init` above what the budget can buy EVERY design it
+# scores is a Sobol draw, and it draws many more of them.
+#
+# The TEST stage keeps the task config's own limit: it runs BO-proposed designs, which the banked
+# corpus does calibrate.
+SELECT_IL = 131072
+# ⛔️ `iteration_limit` SETS THE EPOCH, so raising it WITHOUT halving these is a silent 2x tax.
+# `steps_per_epoch = iteration_limit // batch`, and `patience` / `warmup_epochs` are counted in EPOCHS.
+# Doubling the limit (65536 -> 131072, i.e. 512 -> 1024 steps per epoch) doubles the optimisation an
+# epoch contains, so the same epoch counts silently demand twice the work. Halving them restores the
+# intended horizon. This is the project's settled rule and exactly what the SHiP campaign did when its
+# limit doubled (patience 32 -> 16, warmup 4 -> 2).
+#
+# MEASURED on the same cell and seed, three designs: 729/833/158 s at patience 16 against 339/557/94 s
+# at patience 8 -- 1.7x overall, ~30 h across this stage.
+SELECT_PATIENCE = 8
+SELECT_WARMUP = 1
+PREAMBLE = config.get("preamble", "")
+ENV = PREAMBLE + "XLA_PYTHON_CLIENT_PREALLOCATE=false PYTHONUNBUFFERED=1"
+
+
+wildcard_constraints:
+  prefix=".+",
+  rung="|".join(RUNGS),
+  seed="|".join(str(s) for s in SEEDS_TEST + SEEDS_VAL),
+  strategy="|".join(STRATEGIES),
+  regime="|".join(REGIMES),
+
+
+localrules: all, selection_runs, select, campaign
+
+
+rule all:
+  input:
+    expand(f"{DEFAULT_PREFIX}/{{rung}}/campaign.txt", rung=RUNGS)
+
+
+rule selection_runs:
+  input:
+    expand("{{prefix}}/select/{rung}/{seed}/{strategy}/{regime}/verified.txt",
+           rung=SELECT_RUNGS, seed=SEEDS_VAL, strategy=STRATEGIES, regime=REGIMES)
+  output:
+    touch("{prefix}/selection_runs.txt")
+
+
+rule campaign:
+  input:
+    expand("{{prefix}}/{{rung}}/test/{seed}/{strategy}/verified.txt", seed=SEEDS_TEST, strategy=STRATEGIES)
+  output:
+    touch("{prefix}/{rung}/campaign.txt")
+
+
+rule select_run:
+  output:
+    touch("{prefix}/select/{rung}/{seed}/{strategy}/{regime}/done.txt")
+  threads: 2
+  resources:
+    local_gpu=1, mem_mb=8000, runtime=240
+  shell:
+    ENV + " python scripts/bo.py =linear_{wildcards.rung}"
+    " strategy=linear-{wildcards.strategy}-{wildcards.regime}"
+    " output={wildcards.prefix}/select/{wildcards.rung}/{wildcards.seed}/{wildcards.strategy}/{wildcards.regime}"
+    f" seed={{wildcards.seed}}"
+    f" training.iteration_limit={SELECT_IL}"
+    f" training.patience={SELECT_PATIENCE} training.warmup_epochs={SELECT_WARMUP}"
+
+
+rule verify_select_run:
+  """Re-score each search run's incumbents on data it never saw, so the regimes are ranked on a
+    HELD-OUT number rather than on the loss each run reported for its own designs. The verification
+    inherits the run's own settings, including the raised `iteration_limit` above."""
+  input:
+    "{prefix}/select/{rung}/{seed}/{strategy}/{regime}/done.txt"
+  output:
+    touch("{prefix}/select/{rung}/{seed}/{strategy}/{regime}/verified.txt")
+  threads: 2
+  resources:
+    local_gpu=1, mem_mb=6000, runtime=480
+  shell:
+    ENV + " python scripts/verify_trajectory.py =linear_{wildcards.rung}"
+    " trajectory={wildcards.prefix}/select/{wildcards.rung}/{wildcards.seed}/{wildcards.strategy}"
+    "/{wildcards.regime}/results.json"
+    " seed={wildcards.seed} progress=plain"
+
+
+rule select:
+  input:
+    "{prefix}/selection_runs.txt"
+  output:
+    marker=touch("{prefix}/selected.txt"),
+    report="{prefix}/selection.txt"
+  threads: 2
+  resources:
+    local_gpu=0, mem_mb=2000, runtime=20
+  shell:
+    PREAMBLE + "python scripts/select_retention.py --task linear"
+    " --runs {wildcards.prefix}/select --pooled --verified --write --report {output.report}"
+
+
+rule test_bo:
+  input:
+    "{prefix}/selected.txt"
+  output:
+    touch("{prefix}/{rung}/test/{seed}/{strategy}/done.txt")
+  threads: 2
+  resources:
+    local_gpu=1, mem_mb=8000, runtime=480
+  shell:
+    ENV + " python scripts/bo.py =linear_{wildcards.rung}"
+    " strategy=linear-{wildcards.strategy}-optimal"
+    " output={wildcards.prefix}/{wildcards.rung}/test/{wildcards.seed}/{wildcards.strategy}"
+    " seed={wildcards.seed}"
+
+
+rule verify:
+  input:
+    "{prefix}/{rung}/test/{seed}/{strategy}/done.txt"
+  output:
+    touch("{prefix}/{rung}/test/{seed}/{strategy}/verified.txt")
+  threads: 2
+  resources:
+    local_gpu=1, mem_mb=8000, runtime=480
+  shell:
+    ENV + " python scripts/verify_trajectory.py =linear_{wildcards.rung}"
+    " trajectory={wildcards.prefix}/{wildcards.rung}/test/{wildcards.seed}/{wildcards.strategy}/results.json"
+    " seed={wildcards.seed} progress=plain"

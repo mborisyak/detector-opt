@@ -1,0 +1,10 @@
+# Nominal (initial/baseline) free-straw design -- NOT detector state. Kept in its own
+# file so the detector config (straw.yaml) is a single {name: args} dict consumable by
+# utils.config.extract. Read by scripts to build a concrete design via free_design_array.
+# Station z from FairShip geometry_config (magnet c.z=8957, TrMagGap=3.5 m, TrGap=2 m).
+nominal_design:
+  station_z: [8407.0, 8607.0, 9307.0, 9507.0]
+  view_angles: [0.0, 0.0798, -0.0798, 0.0]  # FairShip view_angle 4.57 deg = 0.0798 rad, [Y,+stereo,-stereo,Y]
+  view_z_gap: 12.0   # FairShip delta_z_view (cm)
+  layer_z_gap: 1.732  # FairShip delta_z_layer (cm)
+  B: -0.151

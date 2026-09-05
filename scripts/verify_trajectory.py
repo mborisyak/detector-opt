@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """Independent verification of a BO design-optimization trajectory.
 
-Reads a finished bo.py run's ``results.json`` (a run directory is searched for it), selects at most
-``verify.n_points`` INCUMBENTS -- the iterations where the run's best-so-far loss improved, always
-including the LAST such iteration, which is the run's answer -- and re-scores each of them on data
-the run never saw:
+Reads a finished bo.py run's ``results.json`` (a run directory is searched for it) and re-scores EVERY
+design of the trajectory on data the run never saw, so the verified best-so-far curve is built from
+held-out scores alone rather than from the incumbents the run's own reported losses chose:
 
   1. sample the verification budget of events at the FIXED design;
   2. split 6:2:2 into train / validation / test buffers (disjoint event sets, drawn once and shared
      by every point, so the scores along the trajectory are paired);
   3. restore the network the run REPORTED that design with (its last per-design checkpoint) and
-     continue training it on the fresh train buffer for ``verify.epochs`` epochs. Same network, all
+     continue training it on the fresh train buffer until the trainer's settle test fires,
+     ``P(train change over +patience < loss_precision / 2) > 0.9``, under the run's optimiser with a single-cycle
+     cosine decay over the ``verify.epochs`` horizon (128), which is also the cap. Same network, all
      new data: what changes between the reported number and this one is only the data it is measured
      on -- and, past epoch 0, the extra training the fresh budget buys;
-  4. every ``verify.val_every_epochs`` epochs, evaluate the WHOLE validation buffer (sequentially,
+  4. every epoch, evaluate the WHOLE train and validation buffers (sequentially,
      batch-by-batch) and keep the parameters with the best validation loss -- epoch 0 (the restored
      network, untouched) counts, so a design that only degrades keeps its reported network;
   5. at the end only, evaluate the WHOLE test buffer at those parameters and report the TEST loss
@@ -56,6 +57,7 @@ from flax import nnx
 
 import detopt
 from detopt.nn.trainer.common import regressor_rngs
+from detopt.utils.training import bayesian_trend, probability_change_below
 from detopt.utils import io
 from detopt.utils.config import resolve_device, split
 from detopt.utils.pools import RingBuffer
@@ -155,24 +157,9 @@ def _restore_design_network(run_dir, iteration, regressor):
   return parameters, state, design
 
 
-def _select_points(calls, reported, n_max):
-  """At most ``n_max`` trajectory indices, taken from the INCUMBENTS -- the iterations where the
-  best-so-far loss improves (the first point always is one). Those are the only designs the run
-  actually claims anything about: the rest of the trajectory is proposals the optimizer tried and
-  discarded, and re-scoring them says nothing about whether the optimization worked. The last
-  incumbent is the run's answer, so it is always kept; if there are more than ``n_max``, the ones in
-  between are thinned to those nearest to ``n_max`` levels uniform in cumulative detector calls."""
-  reported = np.asarray(reported, np.float64)
-  improves = np.flatnonzero(reported < np.minimum.accumulate(np.concatenate([[np.inf], reported[:-1]])))
-  if improves.shape[0] <= n_max:
-    return [int(i) for i in improves]
-  if n_max == 1:
-    return [int(improves[-1])]
-  calls = np.asarray(calls, np.float64)[improves]
-  targets = np.linspace(calls[0], calls[-1], n_max)
-  chosen = {int(improves[np.argmin(np.abs(calls - t))]) for t in targets}
-  chosen.add(int(improves[-1]))  # the run's answer -- the last target lands on it anyway
-  return sorted(chosen)
+def _all_points(reported):
+  """Every trajectory index: the whole trajectory is re-scored, incumbents and discarded proposals alike."""
+  return [int(i) for i in range(np.asarray(reported).shape[0])]
 
 
 def _split_indices(size, budget, seed):
@@ -207,15 +194,20 @@ def verify(trajectory, seed: int = 0, output=None, progress: str = "bar", force:
   training = config.get("training")
   if training is None:
     training = {}
-  n_points = int(v.get("n_points", 5))
   budget = v.get("budget")  # None or absent -> the run's training.budget
   if budget is None:
     budget = training.get("budget")
   if budget is None:
     raise ValueError("no verification budget: set verify.budget (or training.budget)")
   budget = int(budget)
-  epochs = int(v.get("epochs", 8))  # training epochs per trajectory point (epoch = one pass over the train buffer)
-  val_every_epochs = int(v.get("val_every_epochs", 1))  # validate (over the whole val buffer) every this many epochs
+  max_epochs = int(v.get("epochs", 128))
+  patience = int(training.get("patience", 16))
+  warmup_epochs = int(v.get("warmup_epochs", 16))
+  loss_precision = training.get("loss_precision")
+  if loss_precision is None:
+    raise ValueError("no loss_precision: verification stops on the trainer's settle test and needs training.loss_precision")
+  loss_precision = float(loss_precision)
+  overrun_epochs = patience if bool(v.get("overrun", True)) else 0
   batch = v.get("batch")  # None or absent -> the run's training.batch; minibatch size (per ensemble member)
   if batch is None:
     batch = training.get("batch", 256)
@@ -233,7 +225,7 @@ def verify(trajectory, seed: int = 0, output=None, progress: str = "bar", force:
       f"trajectory design dim {traj['physical'].shape[1]} != detector design dim {design_dim} "
       f"-- run with the config of the run that produced the trajectory"
     )
-  chosen = _select_points(traj["calls"], traj["reported"], n_points)
+  chosen = _all_points(traj["reported"])
   run_dir = os.path.dirname(os.path.abspath(traj["path"]))  # the run's own directory: results.json + checkpoints/
   out_dir = output if output is not None else run_dir
   os.makedirs(out_dir, exist_ok=True)
@@ -252,7 +244,7 @@ def verify(trajectory, seed: int = 0, output=None, progress: str = "bar", force:
   val_buf = RingBuffer(len(val_index), specs, device=device)
   test_buf = RingBuffer(len(test_index), specs, device=device)
   steps_per_epoch = max(1, len(train_index) // batch)
-  scan_steps = val_every_epochs * steps_per_epoch  # SGD steps folded into one train_epoch call
+  scan_steps = steps_per_epoch
 
   # Template regressor: the graphdef (architecture) is shared by every point, so the JIT kernels
   # compile once; each point re-initialises fresh params below.
@@ -264,11 +256,9 @@ def verify(trajectory, seed: int = 0, output=None, progress: str = "bar", force:
   model = detopt.nn.from_config(detector, config=config["regressor"], rngs=regressor_rngs(_seed(template_seq)), design=reveals)
   reg_def = nnx.split(model, nnx.Param, nnx.Variable)[0]
   members = model.ensemble()
-  # Single-cycle cosine-decayed learning rate over the whole per-point training (peak -> ~0),
-  # mirroring FullBudgetTrainer; each point's fresh ``opt.init`` restarts the cycle.
   opt_name, opt_args = split(config["training"]["optimizer"])
   opt_args = dict(opt_args)
-  schedule = optax.cosine_decay_schedule(init_value=opt_args.pop("learning_rate"), decay_steps=epochs * steps_per_epoch)
+  schedule = optax.cosine_decay_schedule(init_value=opt_args.pop("learning_rate"), decay_steps=max_epochs * steps_per_epoch)
   opt = getattr(optax, opt_name)(learning_rate=schedule, **opt_args)
   draw = (members or 1) * batch
 
@@ -306,7 +296,7 @@ def verify(trajectory, seed: int = 0, output=None, progress: str = "bar", force:
 
   @jax.jit
   def train_epoch(params, state, opt_state, key, theta, event_buf, mask_buf, tgt_buf, n):
-    """One validation interval -- ``val_every_epochs`` epochs of scan-folded SGD over the train buffer at
+    """One epoch of scan-folded SGD over the train buffer at
     the fixed ``theta``. Returns the per-step batch losses (the caller averages them)."""
 
     def step(carry, k):
@@ -352,7 +342,8 @@ def verify(trajectory, seed: int = 0, output=None, progress: str = "bar", force:
   print(f"trajectory: {traj['path']} ({traj['physical'].shape[0]} points) | verifying {len(chosen)} points: {chosen}")
   print(
     f"budget={budget} -> split train/val/test = {len(train_index)}/{len(val_index)}/{len(test_index)} | "
-    f"epochs={epochs} ({steps_per_epoch} steps each) batch={batch} members={members or 1} seed={seed}", flush=True,
+    f"max_epochs={max_epochs} ({steps_per_epoch} steps each) settle test: patience={patience} warmup={warmup_epochs} "
+    f"precision={loss_precision} | batch={batch} members={members or 1} seed={seed}", flush=True,
   )
 
   settings = {
@@ -360,12 +351,17 @@ def verify(trajectory, seed: int = 0, output=None, progress: str = "bar", force:
     "budget": budget,
     "split": [len(train_index), len(val_index), len(test_index)],
     "seed": int(seed),
-    "epochs": epochs,
-    "val_every_epochs": val_every_epochs,
+    "max_epochs": max_epochs,
+    "stop": "settle-test",
+    "patience": patience,
+    "warmup_epochs": warmup_epochs,
+    "loss_precision": loss_precision,
+    "overrun": overrun_epochs > 0,
     "steps_per_epoch": steps_per_epoch,
     "batch": batch,
     "members": members,
     "init": "checkpoint",  # the run's own network for this design, continued on fresh data
+    "scored": "all",
     "lr_schedule": "cosine",
   }
   record = {**settings, "reported": {"calls": traj["calls"].tolist(), "loss": traj["reported"].tolist()}, "points": []}
@@ -436,44 +432,81 @@ def verify(trajectory, seed: int = 0, output=None, progress: str = "bar", force:
     # the curve starts at what the reported network is worth on data it never saw -- and if training
     # on the fresh budget only makes it worse, best-val keeps the restored network.
     restored_val = float(evaluate(params, state, theta, *val_buf.buffers(), rows=len(val_buf))["loss"])
-    best = (restored_val, 0, params, state)  # (val_loss, epoch, params, state)
-    history = [[0, float("nan"), restored_val]]  # [epoch, train_loss (interval mean), val_loss]
-    train_loss = float("nan")
+    history = [[0, float("nan"), float("nan"), restored_val, float("nan")]]
+    trains, train_sems, vals, val_sems = [], [], [], []
+    epoch, converged, p_settled = 0, False, float("nan")
     print(f"  restored from checkpoint: val={restored_val:.4f} (reported={reported:.4f})", flush=True)
     plot_path = os.path.join(plots_dir, f"verification_{p:03d}.png")
-    epoch = 0
-    while epoch < epochs:
-      params, state, opt_state, losses = train_epoch(
-        params, state, opt_state, _key(point_seq), theta, *train_buf.buffers(), n_train
-      )
-      epoch += val_every_epochs
-      train_loss = float(jnp.mean(losses))
-      val_loss = float(evaluate(params, state, theta, *val_buf.buffers(), rows=len(val_buf))["loss"])
-      history.append([epoch, train_loss, val_loss])
-      if val_loss < best[0]:
-        best = (val_loss, epoch, params, state)
-      # Live learning curves, refreshed after every eval epoch (fire-and-forget daemon render).
-      threading.Thread(target=_plot_learning, args=(list(history), reported, None, None, p, plot_path), daemon=True).start()
+    stop_epoch, test_at_stop = None, None
+    while epoch < max_epochs:
+      params, state, opt_state, _ = train_epoch(params, state, opt_state, _key(point_seq), theta, *train_buf.buffers(), n_train)
+      epoch += 1
+      train_eval = evaluate(params, state, theta, *train_buf.buffers(), rows=len(train_buf))
+      val_eval = evaluate(params, state, theta, *val_buf.buffers(), rows=len(val_buf))
+      trains.append(float(train_eval["loss"]))
+      train_sems.append(float(train_eval["loss_sem"]))
+      vals.append(float(val_eval["loss"]))
+      val_sems.append(float(val_eval["loss_sem"]))
+      history.append([epoch, trains[-1], train_sems[-1], vals[-1], val_sems[-1]])
+      threading.Thread(
+        target=_plot_learning, args=([[h[0], h[1], h[3]] for h in history], reported, None, None, p, plot_path), daemon=True
+      ).start()
+      if stop_epoch is None and epoch > warmup_epochs and len(trains) - warmup_epochs >= 3:
+        series = np.asarray(trains[warmup_epochs:], np.float64)
+        sems = np.asarray(train_sems[warmup_epochs:], np.float64)
+        prior_sigma = max(trains[warmup_epochs], vals[warmup_epochs]) / 3.0
+        mean, cov = bayesian_trend(series, sems, prior_sigma)
+        p_settled = float(probability_change_below(mean, cov, patience, 0.5 * loss_precision))
+        converged = p_settled > 0.9
       if progress != "none":
-        print(f"  epoch {epoch}/{epochs}  train={train_loss:.4f}  val={val_loss:.4f}  best={best[0]:.4f}@{best[1]}", flush=True)
-
-    best_val, best_epoch, best_params, best_state = best
-    test = {k: float(x) for k, x in evaluate(best_params, best_state, theta, *test_buf.buffers(), rows=len(test_buf)).items()}
+        print(
+          f"  epoch {epoch}/{max_epochs}  train={trains[-1]:.4f}±{train_sems[-1]:.4f}  "
+          f"val={vals[-1]:.4f}±{val_sems[-1]:.4f}  P(settled)={p_settled:.3f}", flush=True
+        )
+      if converged and stop_epoch is None:
+        stop_epoch = epoch
+        test_at_stop = {k: float(x) for k, x in evaluate(params, state, theta, *test_buf.buffers(), rows=len(test_buf)).items()}
+        if overrun_epochs == 0:
+          break
+      elif stop_epoch is not None and epoch >= stop_epoch + overrun_epochs:
+        break
+    if stop_epoch is None:
+      stop_epoch = epoch
+      test_at_stop = {k: float(x) for k, x in evaluate(params, state, theta, *test_buf.buffers(), rows=len(test_buf)).items()}
+    test = test_at_stop
+    overrun = None
+    if converged and overrun_epochs > 0:
+      after = {k: float(x) for k, x in evaluate(params, state, theta, *test_buf.buffers(), rows=len(test_buf)).items()}
+      overrun = {
+        "epochs": int(epoch - stop_epoch),
+        "test_loss": after["loss"],
+        "test_sem": after["loss_sem"],
+        "train_loss": trains[-1],
+        "val_loss": vals[-1],
+      }
     print(
-      f"  -> best val={best_val:.4f} (epoch {best_epoch})  TEST={test['loss']:.4f}±{test['loss_sem']:.4f}  "
-      f"reported={reported:.4f}  delta(test-reported)={test['loss'] - reported:+.4f}", flush=True,
+      f"  -> {'settled' if converged else 'CAPPED'} at epoch {stop_epoch} (P={p_settled:.3f})  train={trains[stop_epoch - 1]:.4f}  "
+      f"val={vals[stop_epoch - 1]:.4f}  TEST={test['loss']:.4f}±{test['loss_sem']:.4f}  reported={reported:.4f}  "
+      f"delta(test-reported)={test['loss'] - reported:+.4f}" + (
+        "" if overrun is None else f"  | after +{overrun['epochs']} epochs: TEST={overrun['test_loss']:.4f} "
+        f"(delta {overrun['test_loss'] - test['loss']:+.4f})"
+      ), flush=True,
     )
-    _plot_learning(history, reported, test["loss"], test["loss_sem"], p, plot_path)
-
+    _plot_learning([[h[0], h[1], h[3]] for h in history], reported, test["loss"], test["loss_sem"], p, plot_path)
     record["points"].append({
       "point": int(p),
       "detector_calls": float(traj["calls"][p]),
       "reported_loss": reported,
       "design_physical": phys_flat.tolist(),
       "design_scaled": np.asarray(theta).tolist(),
-      "best_epoch": int(best_epoch),
-      "train_loss": train_loss,
-      "val_loss": float(best_val),
+      "epochs": int(stop_epoch),
+      "converged": bool(converged),
+      "p_settled": p_settled,
+      "train_loss": trains[stop_epoch - 1],
+      "train_sem": train_sems[stop_epoch - 1],
+      "val_loss": vals[stop_epoch - 1],
+      "val_sem": val_sems[stop_epoch - 1],
+      "overrun": overrun,
       "test_loss": test["loss"],
       "test_sem": test["loss_sem"],
       "test_metric": {

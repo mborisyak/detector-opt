@@ -1,0 +1,23 @@
+# STRATEGY: continue on the LINEAR LADDER, training regime `sp-06`.
+#
+# ONE SET FOR ALL FOUR RUNGS. `docs/final.md`'s procedure selects one regime per strategy, and for the
+# ladder that selection is shared across d1n2/d2n3/d3n4/d4n5 rather than made per rung -- so these
+# configs are named `linear-<strategy>-<regime>` and every rung's task config resolves the same file.
+#
+# A strategy is the ARM (behaviour BETWEEN designs); a training regime is behaviour WITHIN a design,
+# at each data addition. Ladder, budget, optimiser and detector stay in the rung's task config so they
+# are held FIXED across the comparison; `scripts/bo.py` refuses a task config that also sets a
+# retention knob, so there is never a second source of truth.
+#
+#   rewind   params <- initial + (1 - rewind) * (params - initial)
+#   shrink   params <- shrink * params + sqrt(1 - shrink^2) * fresh_draw
+#
+# The perturbation scale is DERIVED, not configured: `c = sqrt(1 - shrink^2)` makes the AR(1)
+# stationary variance exactly 1, so a parameter at initialisation scale stays there for any shrink
+# and any number of applications.
+#
+# shrink 0.60 -> perturbation sqrt(1 - 0.60^2) = 0.800; AR(1) memory horizon 2.5 additions.
+
+nn_init_strategy: continue
+rewind: 0.0
+shrink: 0.6

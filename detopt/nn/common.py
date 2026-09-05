@@ -37,7 +37,8 @@ class Model(nnx.Module):
         ``design`` selects WHICH of the two feature layouts the model is built for -- with the design
         resolved into the features, or without it. It changes ``input_shape`` and nothing else."""
         return cls(
-            detector.combined_event_shape(design),
+            detector.combined_event_shape_for(design) if isinstance(design, str)
+            else detector.combined_event_shape(design),
             (detector.target_dim(),),
             (detector.ground_truth_dim(),),
             rngs=rngs,
