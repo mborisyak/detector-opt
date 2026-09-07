@@ -1,0 +1,30 @@
+# WORKSTATION profile for the EXTREMES campaign (`extremes.snake`). Everything machine-bound -- MPS and how to start
+# it, `gres` vs `slurm_extra`, the mandatory `squeue` status command, the 26000 MB node budget, the desktop's share
+# of the card -- is documented in profiles/workstation/config.yaml and holds here unchanged. This file exists because
+# two numbers differ from the linear ladder's and a profile cannot be conditional on the snakefile:
+#
+# `shard:8` PER CELL -> THREE CONCURRENT (24/8). The user expects an extremes cell to need more VRAM than a linear
+# one (user, 2026-09-06: "extreme tasks might need more shards"): the enzyme detector simulates its events on the
+# GPU and the pools hold 1310720 of them. The ration is a STARTING POINT, not a measurement -- read the first cells'
+# VRAM in `nvidia-smi` and widen only if they are small; a running orchestrator keeps the request it was launched
+# with, so a change means a restart.
+#
+# `mem_mb` 4000 PER CELL, UNMEASURED for this detector: a linear cell holds 1.9 GB of host RSS and the extremes
+# pools add ~0.8 GB if they live host-side. Three cells use 12000 of the node's 26000 MB. Measure RSS on the first
+# cells and record it in docs/autonomous-log-2026-09-06.md.
+#
+# `jobs: unlimited`: snakemake submits every ready cell and SLURM owns the queue (user, 2026-09-06).
+executor: slurm
+slurm-status-command: squeue
+default-resources:
+  - gres='shard:8'
+set-resources:
+  - select_run:mem_mb=4000
+  - verify_select_run:mem_mb=4000
+  - test_bo:mem_mb=4000
+  - verify:mem_mb=4000
+jobs: unlimited
+latency-wait: 30
+retries: 2
+keep-going: true
+rerun-incomplete: true

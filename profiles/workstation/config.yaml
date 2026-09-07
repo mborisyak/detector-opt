@@ -9,14 +9,22 @@
 #
 # NO SNAKEMAKE THROTTLE. `local_gpu` is not capped here: SLURM does the scheduling (user, 2026-09-05), and the
 # other three limits already bind before it could -- shards 24/6 = 4, CPUs 11/2 = 5, memory 26000/2400 = 10.
-# A `local_gpu` cap only ever re-imposes one of those with a second number to keep in step.
+# A `local_gpu` cap only ever re-imposes one of those with a second number to keep in step. `jobs: unlimited` for
+# the same reason (user, 2026-09-06): snakemake submits every ready cell and SLURM owns the queue.
 #
 # THREADS COME FROM THE SNAKEFILE (2 per rule, user 2026-09-04). A `set-threads` override here silently replaced
 # them with 1 until 2026-09-06; a linear cell MEASURED 0.41 of a core, so 2 is ~5x headroom and four cells use
 # 8 of the 11 CPUs.
 #
-# `mem_mb` 2400 PER CELL: MEASURED host RSS 1.9 GB (2.1 GB peak). The snakefile's 8000 would let only three cells
-# fit in 26000 MB; check `AllocMem`, not `CPUAlloc` -- a shard idles silently while the queue looks merely busy.
+# `mem_mb` 5500 PER CELL (was 2400, then 4000). MEASURED 2026-09-06 on the running ladder: a cell starts at 1.85 GB
+# of host RSS and its anonymous memory GROWS ~39 MiB PER BANKED DESIGN, whatever the window sizes (3102 MiB peak at
+# 32 designs; cells bank up to 85), so a cell's peak is 1.85 GB + 0.04 GB x designs. The cause is not identified
+# (candidates: per-design matplotlib figures, per-design checkpoints held in memory -- a code question for the user,
+# not a profile one). At 15 designs a cell had pinned its 2400 MiB cgroup ceiling 22 times (`memory.events` max) and
+# was only kept alive by the node's swap (ConstrainRAMSpace=yes, swap unconstrained). Four cells use 22000 of
+# 26000 MB. Check `AllocMem`, not `CPUAlloc` -- a shard idles silently while the queue looks merely busy. A RUNNING
+# orchestrator keeps the value it was launched with; pending jobs can be raised in place by their owner with
+# `scontrol update JobId=<id> MinMemoryNode=5500`.
 #
 # ⚠️ THIS CARD DRIVES A DESKTOP, which holds ~1-2 GB permanently and SLURM knows nothing about it; a job that needs
 # most of the card fails as an allocation error, not a scheduling refusal. Small cells never notice. A SHiP
@@ -42,11 +50,11 @@ slurm-status-command: squeue
 default-resources:
   - gres='shard:6'
 set-resources:
-  - select_run:mem_mb=2400
-  - verify_select_run:mem_mb=2400
-  - test_bo:mem_mb=2400
-  - verify:mem_mb=2400
-jobs: 200
+  - select_run:mem_mb=5500
+  - verify_select_run:mem_mb=5500
+  - test_bo:mem_mb=5500
+  - verify:mem_mb=5500
+jobs: unlimited
 latency-wait: 30
 retries: 2
 keep-going: true

@@ -1,0 +1,158 @@
+# The EXTREMES campaign (enzyme inhibitor, `config/extremes.yaml`), following the same protocol as `docs/final.md`
+# does for SHiP and `linear.snake` for the ladder -- one task, one selection.
+#
+#   setsid nohup scripts/run_extremes_campaign.sh > logs/extremes-local.log 2>&1 < /dev/null &   # everything, detached
+#   scripts/run_extremes_campaign.sh output/extremes/selected.txt      # stop after the selection
+#   scripts/run_extremes_campaign.sh -n                                # dry run
+#
+# The launcher checks MPS, takes the lock and applies profiles/workstation-extremes (shards per cell, memory).
+#
+# THE THREE STAGES:
+#   1. select_run   every regime under the task config, per strategy/seed: 3 x 3 x 5 = 45 runs, each re-scored
+#                   on held-out data (`verify_select_run`). The `n_init=5` Sobol block is shared, so the first five
+#                   designs are PAIRED across regimes; past it each regime's own GP proposes and the pairing ends.
+#   2. select       integral rank of the VERIFIED best-so-far curves over the three seeds
+#                   -> config/strategy/extremes-<strategy>-optimal.yaml
+#   3. test         10 test seeds x 3 strategies with the selected regime, each verified; `campaign.txt` marks the end.
+#
+# THE SELECTION RUNS USE THE TASK CONFIG EXACTLY -- the same `iteration_limit`, `patience`, `warmup_epochs`, budget
+# and windows as the test stage -- and differ from it ONLY in the regime under selection (user, 2026-09-06: "exactly
+# the same config except for the optimized values"). The ranking is taken on VERIFIED losses: the reported number is
+# faithful but optimistic, and regimes a few thousandths apart sit inside the range where optimism decides the order.
+#
+# ⛔️ THIS FILE NAMES NO MACHINE. It declares only portable resources -- `threads`, `mem_mb`, `runtime` and
+# `local_gpu` -- and says nothing about how a GPU is requested or how many cells fit. That lives in a PROFILE under
+# `profiles/`; `local_gpu` is a plain counter and DOES NOT REQUEST A GPU -- the request is the SLURM plugin's `gres`
+# resource, supplied by the profile as a default-resource (see linear.snake for the two ways this has gone wrong).
+#
+# WATCH LIST (user, 2026-09-06). The knobs the operator may move on their own are `n0`, `n_increment`,
+# `iteration_limit`, `budget` and, if clearly warranted, the learning rate; every move is logged in
+# docs/autonomous-log-2026-09-06.md. The windows 4096/2048 are the adamaxw-era values and UNVERIFIED under adamw:
+#   * designs per cell -- at the adamaxw-era spend of 76460 calls the budget buys ~17 per baseline arm. A cell that
+#     ends with a handful is the linear ladder's failure (a small window run for thousands of memorising epochs, so
+#     training optimism never meets the bar): the windows are too small. Every design exiting at the FIRST window
+#     (16384 x 4/3 = 21845 calls) is the opposite: n0 is above the requirement and per-design cost is censored.
+#     The 4096/2048 ladder of the first attempt was the other failure: a median 34 growth rounds per design at
+#     17 epochs each (config/extremes.yaml, LADDER paragraph).
+#   * the trainer RAISES when a design does not meet `loss_precision` within `iteration_limit` rows -- a failure to
+#     report and a reason to look at the windows, never a result.
+#   * wall time -- a cell far slower than its siblings points to a bug, a misconfiguration or windows too small.
+#
+# RUNTIME (2026-09-06 21:10): `runtime` 1440 min for the BO rules and 720 for the verifications. Under
+# `iteration_limit` 524288 / budget 2097152 a selection cell at CERN needs ~40 min per design once BO proposes
+# informative designs, i.e. 10-17 h for its budget; the first launch's 720 min would have killed the slow half of
+# the cells at the 12 h mark with their results.json intact but nobody to resubmit them. At CERN `runtime` is the
+# condor +MaxRuntime (scripts/cern/extremes/snakemake_submit.sh); on the workstation it is SLURM's --time.
+DEFAULT_PREFIX = config.get("prefix", "output/extremes")
+
+SEEDS_VAL = [282522616, 2036255796, 160541601]
+SEEDS_TEST = [
+  1244111331, 126382657, 750143450, 9577242, 330924253,
+  219094734, 1153299222, 122012491, 499913522, 983655707,
+]
+STRATEGIES = ["from_scratch", "continue", "meta"]
+REGIMES = ["norewind", "rewind-01", "rewind-025", "sp-l03-s1e2", "sp-l06-s1e2"]
+PREAMBLE = config.get("preamble", "")
+ENV = PREAMBLE + "XLA_PYTHON_CLIENT_PREALLOCATE=false PYTHONUNBUFFERED=1"
+
+
+wildcard_constraints:
+  prefix=".+",
+  seed="|".join(str(s) for s in SEEDS_TEST + SEEDS_VAL),
+  strategy="|".join(STRATEGIES),
+  regime="|".join(REGIMES),
+
+
+localrules: all, selection_runs, select, campaign
+
+
+rule all:
+  input:
+    f"{DEFAULT_PREFIX}/campaign.txt"
+
+
+rule selection_runs:
+  input:
+    expand("{{prefix}}/select/{seed}/{strategy}/{regime}/verified.txt",
+           seed=SEEDS_VAL, strategy=STRATEGIES, regime=REGIMES)
+  output:
+    touch("{prefix}/selection_runs.txt")
+
+
+rule campaign:
+  input:
+    expand("{{prefix}}/test/{seed}/{strategy}/verified.txt", seed=SEEDS_TEST, strategy=STRATEGIES)
+  output:
+    touch("{prefix}/campaign.txt")
+
+
+rule select_run:
+  output:
+    touch("{prefix}/select/{seed}/{strategy}/{regime}/done.txt")
+  threads: 2
+  resources:
+    local_gpu=1, mem_mb=8000, runtime=1440
+  shell:
+    ENV + " python scripts/bo.py =extremes"
+    " strategy=extremes-{wildcards.strategy}-{wildcards.regime}"
+    " output={wildcards.prefix}/select/{wildcards.seed}/{wildcards.strategy}/{wildcards.regime}"
+    " seed={wildcards.seed}"
+
+
+rule verify_select_run:
+  """Re-score each search run's designs on data it never saw, so the regimes are ranked on a HELD-OUT
+    number rather than on the loss each run reported for its own designs."""
+  input:
+    "{prefix}/select/{seed}/{strategy}/{regime}/done.txt"
+  output:
+    touch("{prefix}/select/{seed}/{strategy}/{regime}/verified.txt")
+  threads: 2
+  resources:
+    local_gpu=1, mem_mb=6000, runtime=720
+  shell:
+    ENV + " python scripts/verify_trajectory.py =extremes"
+    " trajectory={wildcards.prefix}/select/{wildcards.seed}/{wildcards.strategy}/{wildcards.regime}/results.json"
+    " seed={wildcards.seed} progress=plain"
+
+
+rule select:
+  input:
+    "{prefix}/selection_runs.txt"
+  output:
+    marker=touch("{prefix}/selected.txt"),
+    report="{prefix}/selection.txt"
+  threads: 2
+  resources:
+    local_gpu=0, mem_mb=2000, runtime=20
+  shell:
+    PREAMBLE + "python scripts/select_retention.py --task extremes"
+    " --runs {wildcards.prefix}/select --verified --write --report {output.report}"
+
+
+rule test_bo:
+  input:
+    "{prefix}/selected.txt"
+  output:
+    touch("{prefix}/test/{seed}/{strategy}/done.txt")
+  threads: 2
+  resources:
+    local_gpu=1, mem_mb=8000, runtime=1440
+  shell:
+    ENV + " python scripts/bo.py =extremes"
+    " strategy=extremes-{wildcards.strategy}-optimal"
+    " output={wildcards.prefix}/test/{wildcards.seed}/{wildcards.strategy}"
+    " seed={wildcards.seed}"
+
+
+rule verify:
+  input:
+    "{prefix}/test/{seed}/{strategy}/done.txt"
+  output:
+    touch("{prefix}/test/{seed}/{strategy}/verified.txt")
+  threads: 2
+  resources:
+    local_gpu=1, mem_mb=8000, runtime=720
+  shell:
+    ENV + " python scripts/verify_trajectory.py =extremes"
+    " trajectory={wildcards.prefix}/test/{wildcards.seed}/{wildcards.strategy}/results.json"
+    " seed={wildcards.seed} progress=plain"

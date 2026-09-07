@@ -1,9 +1,10 @@
 # WINDOWS 2026-09-06: `training.n0` 4096 and `training.n_increment` 2048 on EVERY rung, regressor activation `celu`,
-# `iteration_limit` 131072. The paragraphs below that argue for 512/256 or 1024/512 describe the adamaxw era and are
+# `iteration_limit` 262144, `budget` 524288, `warmup_epochs` 16 (user, 2026-09-06: no exit test before the 16-epoch
+# cosine has reached its floor). The paragraphs below that argue for 512/256 or 1024/512 describe the adamaxw era and are
 # SUPERSEDED: under adamw + cosine a window grown from a few hundred rows accumulates training optimism
 # (2 sigma^2 p_eff / N over thousands of epochs) and never meets the 0.02 bar before ~140k rows, while a 4096 first
 # window converges designs at 8k-47k rows with the reported loss on the closed-form Bayes risk. Measured on d2n3 /
-# seed 160541601; probes and figure in output/probe-linear-ladder-2026-09-05/, record in docs/handoff-2026-09-04b.md §9.
+# seed 160541601; probes and figure in output/archive/probe-linear-ladder-2026-09-05/, record in docs/handoff-2026-09-04b.md §9.
 #
 # THE ARM AND ITS TRAINING REGIME ARE NOT IN THIS FILE. They live in `config/strategy/`, shared
 # across the whole ladder (one selection, not one per rung), and named on the command line:
@@ -59,7 +60,7 @@ training:
   n_increment: 2048
   batch: 128
   eval_batch: 4096
-  warmup_epochs: 2
+  warmup_epochs: 16
   patience: 16
   budget: 524288
   iteration_limit: 262144

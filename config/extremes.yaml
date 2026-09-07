@@ -1,0 +1,101 @@
+# EXTREMES campaign under the CURRENT protocol -- the one `docs/final.md` set for SHiP and `linear.snake` runs for the
+# ladder. The arm and its training regime are NOT in this file: they live in `config/strategy/extremes-<strategy>-
+# <regime>.yaml`, named on the command line by `extremes.snake` (selection over 3 seeds x 3 strategies x 5 regimes,
+# then 10 test seeds x 3 strategies with the selected regime):
+#
+#     python scripts/bo.py =extremes strategy=extremes-meta-rewind-01 output=... seed=...
+#
+# Supersedes `config/extremes_p1e2.yaml` (adamaxw, no schedule, `rewind` inside the task config), which `scripts/bo.py`
+# now refuses: a task config may not set a retention knob once a strategy is in use.
+#
+# WHAT CHANGED against `extremes_p1e2.yaml`, and why (user, 2026-09-06: "the biggest difference in the current batch of
+# experiments: hyper-parameter optimization + adamax -> adamw"):
+#   optimizer       adamaxw -> adamw; lr 2.5e-4, b1 0.9, b2 0.999, eps 1e-8, weight_decay 1e-3 as before
+#   schedule        cosine floor 4x -> 1x over 16 epochs, re-phased at every data addition (`cosine_epochs` 0 = off)
+#   warmup_epochs   2 -> 16, matching the cosine horizon: no exit test before the schedule has reached its floor
+#   activation      leaky-tanh (the learnable default) -> celu, as the SHiP and linear regressors
+#   rewind          REMOVED here; it is a regime and the selection stage chooses it
+#   verify          the settle-test verification of `scripts/verify_trajectory.py`: 128 epochs, warmup 16
+# UNCHANGED: detector, regressor width [[24,16],[16,24]] (measured in docs/prereg-extremes-p1e2-campaign.md), n_models 4,
+# dropconnect 0.05, batch 256, eval_batch 2048, val_fraction 0.25, loss_precision 1e-2, patience 16, and the BO block
+# (invariant kernel, `exchangeable` 4 = n_experiments).
+#
+# LADDER, 2026-09-06 22:15 (autonomous operator, inside the user's mandate; user: "bad n0 / n_increment numbers?"):
+# `n0` 4096 -> 16384 and `n_increment` 2048 -> 8192. MEASURED on the 527 designs of the first 8.5 h at CERN under
+# adamw: a design spends a median 95584 calls = 71688 training rows, so from 4096 in steps of 2048 it takes a median
+# 34 growth rounds (p90 84, max 144), and under warmup 16 a round is at least 17 epochs x 2048 steps -- 24 s per round,
+# 16.5 min per design (53 min at p90), the network itself being tiny. That ladder was the adamaxw era's, derived when
+# a design cost 76460 calls and rounds were 3 epochs. The new ladder is SHiP's proportion (n0 ~ 1/4 of the median
+# training rows, increment n0/2): rounds median 8 (p90 20), total training steps x0.23, and its first window (21845
+# calls) censors 1.5% of the observed designs (2% in the sp regimes, 0% in rewind/norewind); 32768/16384 would censor
+# 16%, 8192/4096 would only halve the cost. `n0` is part of the procedure, so the selection stage restarted from
+# scratch; the first attempt is archived at CERN in output/archive/extremes-ladder4096-2026-09-06/.
+#
+# LIMIT AND BUDGET, 2026-09-06 14:30 (autonomous operator, inside the user's mandate): `iteration_limit` 262144 ->
+# 524288 and `budget` 1310720 -> 2097152. In the first hour of the CERN selection stage under adamw the rewind and
+# norewind regimes converged designs at 109-311k calls (up to 233k training rows, 89% of the old cap) and cell
+# 160541601/continue/norewind DIED on its third design at the 262144-row limit ("did not reach precision"); a capped
+# cell is a failure, never a result, and one such failure stalls the campaign at the selection rule. The new limit
+# puts the worst observed design at 45% of the cap. `iteration_limit` is also the epoch: steps_per_epoch is now
+# 524288 / 256 = 2048, the SAME epoch as the SHiP (524288 / 256) and linear (262144 / 128) campaigns, and
+# `warmup_epochs` 16 / `patience` 16 / `cosine_epochs` 16 keep their meaning. The budget follows the settled
+# `budget = 4 x iteration_limit` (2^21, back on a power of two); at the old budget a rewind cell finished with 6
+# designs, one more than `n_init`, so BO had proposed a single design. The hour of results under the old values is
+# archived at CERN in output/archive/extremes-il262144-budget1310720-2026-09-06/; the selection stage restarted from
+# scratch because the epoch length is part of the procedure.
+#
+# ⚠️ THE WINDOWS ARE UNVERIFIED UNDER adamw. On the linear ladder the same optimizer change made windows grown from a
+# few hundred rows degenerate -- training optimism never met the bar -- and the windows had to grow 8x. 4096/2048 here
+# are the adamaxw-era values; the first cells decide whether they stand, and `n0` / `n_increment` / `iteration_limit` /
+# `budget` are the knobs the operator may move (user, 2026-09-06). Decisions are logged in
+# docs/autonomous-log-2026-09-06.md.
+strategy: extremes-from_scratch-norewind
+detector: enzyme_extremes
+regressor:
+  set-regressor:
+    features: [[24, 16], [16, 24]]
+    n_models: 4
+    dropconnect: 0.05
+    activation: celu
+device: cuda
+plot_per_epoch: 8
+training:
+  n0: 16384
+  n_increment: 8192
+  batch: 256
+  eval_batch: 2048
+  warmup_epochs: 16
+  patience: 16
+  budget: 2097152
+  iteration_limit: 524288
+  val_fraction: 0.25
+  loss_precision: 1.0e-2
+  cosine_epochs: 16
+  cosine_peak: 4.0
+  optimizer:
+    adamw:
+      learning_rate: 2.5e-4
+      b1: 0.9
+      b2: 0.999
+      eps: 1.0e-8
+      weight_decay: 1.0e-3
+bo:
+  n_init: 5
+  gp:
+    n_folds: 5
+    n_restarts: 5
+    n_steps: 40
+    log_lengthscale_prior_bounds: [-2.0, 1.0]
+    log_amplitude_prior_bounds: [-6.0, 1.5]
+    kernel:
+      normalised-invariant-rbf:
+        exchangeable: 4
+  ei:
+    n_restarts: 32
+    n_steps: 100
+verify:
+  epochs: 128
+  warmup_epochs: 16
+  val_every_epochs: 10
+  budget: null
+  batch: null

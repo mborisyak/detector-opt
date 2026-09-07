@@ -1,0 +1,24 @@
+# STRATEGY: continue on the EXTREMES campaign, training regime `sp-l03-s1e2`: shrink-and-perturb with an
+# INDEPENDENT noise scale, lambda 0.3 at sigma 1.0e-2.
+#
+# ONE TASK, ONE SELECTION. `extremes.snake` runs every regime of every strategy over the three validation seeds,
+# ranks the VERIFIED best-so-far curves, and `scripts/select_retention.py --task extremes` copies the winner to
+# `extremes-<strategy>-optimal.yaml`, which the test stage names.
+#
+# A strategy is the ARM (behaviour BETWEEN designs); a training regime is behaviour WITHIN a design, at each data
+# addition. Ladder, budget, optimiser and detector stay in `config/extremes.yaml` so they are held FIXED across the
+# comparison; `scripts/bo.py` refuses a task config that also sets a retention knob, so there is never a second
+# source of truth.
+#
+#   shrink   params <- shrink * params + param_noise * fresh_draw
+#            Shrink-and-perturb (Ash & Adams, arXiv:1910.08475): partially RESAMPLES toward a fresh
+#            initialisation of the whole network. `shrink` and `param_noise` are separate knobs, as
+#            the paper sweeps them, and BOTH must be given.
+#
+# Sigma is held at 0.01 across every lambda so the arms differ in one thing. `rewind` and `shrink`
+# are mutually exclusive: the trainer raises if `rewind` is non-zero alongside a `shrink` below 1.
+
+nn_init_strategy: continue
+rewind: 0.0
+shrink: 0.3
+param_noise: 0.01

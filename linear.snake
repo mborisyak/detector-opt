@@ -15,9 +15,9 @@
 # SHiP. To select on a single rung instead, cut SELECT_RUNGS to one entry.
 #
 # THE THREE STAGES:
-#   1. select_run   every regime over the SAME 5-design Sobol sequence, per rung/strategy/seed:
-#                   4 x 3 x 3 x 5 = 180 runs. `bo.n_designs=5` with `n_init=5` means the GP is never
-#                   fitted, so every regime sees identical designs and the comparison is PAIRED.
+#   1. select_run   every regime under the task config, per rung/strategy/seed: 4 x 3 x 3 x 5 = 180 runs.
+#                   The `n_init=5` Sobol block is shared, so the first five designs are PAIRED across
+#                   regimes; the paragraph below says where the pairing ends.
 #   2. select       integral rank of the best-so-far curves, pooled over rungs and seeds
 #                   -> config/strategy/linear-<strategy>-optimal.yaml
 #   3. test         10 test seeds x 3 strategies on EVERY rung, then a 10-point verification.
@@ -70,34 +70,13 @@ REGIMES = ["norewind", "rewind-01", "rewind-025", "sp-l03-s1e2", "sp-l06-s1e2"]
 # count is a CEILING: it verifies every best-so-far INCUMBENT, and across 59 archived cells the number
 # of incumbents ran 2-8, so the cap never bound.
 
-# ⛔️ THE SELECTION RUNS NEED A LARGER PER-DESIGN LIMIT THAN THE TASK CONFIG, and the banked ladder does
-# NOT calibrate it. Over 8073 banked designs the largest train window ever needed was 58056, so the
-# task's `iteration_limit=65536` looks generous -- but those designs came from BO, which proposes near
-# where it has already learned. These runs use SOBOL: space-filling by construction, so it reaches hard
-# corners of the design box BO never proposes. One such design capped at 65536, missing the bar by
-# 0.001 (diff+err 0.02109 against precision 0.02).
-#
-# A CAP HERE IS NOT MERELY A LOST CELL, IT IS A BIASED COMPARISON. All five regimes score the SAME
-# Sobol design, so a hard design caps some regimes and not others -- reintroducing exactly the
-# arm-dependent censoring that raising `iteration_limit` removed from the SHiP campaign. 131072 is 2.3x
-# the largest window ever observed. This argument is STRONGER now than when it was written: the search
-# no longer stops after five designs, so with `n_init` above what the budget can buy EVERY design it
-# scores is a Sobol draw, and it draws many more of them.
-#
-# The TEST stage keeps the task config's own limit: it runs BO-proposed designs, which the banked
-# corpus does calibrate.
-SELECT_IL = 131072
-# ⛔️ `iteration_limit` SETS THE EPOCH, so raising it WITHOUT halving these is a silent 2x tax.
-# `steps_per_epoch = iteration_limit // batch`, and `patience` / `warmup_epochs` are counted in EPOCHS.
-# Doubling the limit (65536 -> 131072, i.e. 512 -> 1024 steps per epoch) doubles the optimisation an
-# epoch contains, so the same epoch counts silently demand twice the work. Halving them restores the
-# intended horizon. This is the project's settled rule and exactly what the SHiP campaign did when its
-# limit doubled (patience 32 -> 16, warmup 4 -> 2).
-#
-# MEASURED on the same cell and seed, three designs: 729/833/158 s at patience 16 against 339/557/94 s
-# at patience 8 -- 1.7x overall, ~30 h across this stage.
-SELECT_PATIENCE = 8
-SELECT_WARMUP = 1
+# THE SELECTION RUNS USE THE TASK CONFIG EXACTLY -- the same `iteration_limit`, `patience`, `warmup_epochs`,
+# budget and windows as the test stage -- and differ from it ONLY in the regime under selection (user,
+# 2026-09-06: "exactly the same config except for the optimized values"). The per-stage overrides that used
+# to live here (`iteration_limit` 131072, `patience` 8, `warmup_epochs` 1) were calibrated against a task
+# limit of 65536 and were left INVERTED by the 2026-09-06 re-size to 262144: a regime selected under a
+# shorter horizon and a smaller per-design cap than the stage it is used in is not a selection of the real
+# procedure.
 PREAMBLE = config.get("preamble", "")
 ENV = PREAMBLE + "XLA_PYTHON_CLIENT_PREALLOCATE=false PYTHONUNBUFFERED=1"
 
@@ -143,15 +122,13 @@ rule select_run:
     ENV + " python scripts/bo.py =linear_{wildcards.rung}"
     " strategy=linear-{wildcards.strategy}-{wildcards.regime}"
     " output={wildcards.prefix}/select/{wildcards.rung}/{wildcards.seed}/{wildcards.strategy}/{wildcards.regime}"
-    f" seed={{wildcards.seed}}"
-    f" training.iteration_limit={SELECT_IL}"
-    f" training.patience={SELECT_PATIENCE} training.warmup_epochs={SELECT_WARMUP}"
+    " seed={wildcards.seed}"
 
 
 rule verify_select_run:
   """Re-score each search run's incumbents on data it never saw, so the regimes are ranked on a
     HELD-OUT number rather than on the loss each run reported for its own designs. The verification
-    inherits the run's own settings, including the raised `iteration_limit` above."""
+    inherits the run's own settings."""
   input:
     "{prefix}/select/{rung}/{seed}/{strategy}/{regime}/done.txt"
   output:

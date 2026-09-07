@@ -1,0 +1,18 @@
+# STRATEGY: continue on the EXTREMES campaign, training regime `rewind-01`.
+#
+# ONE TASK, ONE SELECTION. `extremes.snake` runs every regime of every strategy over the three validation seeds,
+# ranks the VERIFIED best-so-far curves, and `scripts/select_retention.py --task extremes` copies the winner to
+# `extremes-<strategy>-optimal.yaml`, which the test stage names.
+#
+# A strategy is the ARM (behaviour BETWEEN designs); a training regime is behaviour WITHIN a design, at each data
+# addition. Ladder, budget, optimiser and detector stay in `config/extremes.yaml` so they are held FIXED across the
+# comparison; `scripts/bo.py` refuses a task config that also sets a retention knob, so there is never a second
+# source of truth.
+#
+#   rewind   params <- initial + (1 - rewind) * (params - initial)
+#   shrink   params <- shrink * params + param_noise * fresh_draw
+#            `shrink` and `param_noise` are separate knobs and BOTH must be given.
+
+nn_init_strategy: continue
+rewind: 0.1
+shrink: 1.0
