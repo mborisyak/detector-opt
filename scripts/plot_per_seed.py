@@ -1,130 +1,86 @@
-#!/usr/bin/env python3
-"""Per-seed best-so-far curves: one panel per SEED, one line per arm.
+"""Per-seed read-out: one subplot per (tree, seed), one best-so-far curve per arm, plus every banked design.
 
-    python scripts/plot_per_seed.py output/ship-addr-prec1e2 --out output/render --name ship_seeds.png
+    python scripts/plot_per_seed.py output/plots/extremes-2026-09-07/trees/select-optimal \
+        output/plots/extremes-2026-09-07/trees/test-reported --out output/plots/extremes-2026-09-07 --name per-seed
 
-The median and mean plots in `scripts/plot_median.py` aggregate ACROSS seeds and therefore hide the
-quantity that decides whether an arm separates: the seed-to-seed spread. This shows every seed
-separately, so a single adverse seed is visible as itself rather than as inflated error bars.
-
-Complete cells only by default; `--partial` includes running cells, whose best-so-far is an upper
-bound that will keep falling. Colour follows the ARM, matching `plot_median.py`, and each panel is
-titled with the seed and the final ordering, because two of the four arm colours sit below 3:1
-contrast against the chart surface and identity must not rest on colour alone.
+The companion of `plot_median.py` for the question it cannot answer: WHICH seeds carry an aggregate. A
+tree is the same ``<seed>/<arm>/results.json`` layout, cells are complete trajectories only, and the
+curve is the same best-so-far against cumulative detector calls, carried to the configured budget.
+Each subplot is titled ``<tree name> <seed>``; faint dots are the individual designs' reported losses,
+so a cell that found a low design once and never again reads differently from one that kept
+improving. Colours, palette and the budget check are imported from `plot_median.py`, so an arm has
+the same colour in both figures. The y axis is shared across subplots.
 """
-
 import argparse
 import glob
 import json
 import os
 
-import matplotlib
-
-matplotlib.use("AGG")
-import matplotlib.pyplot as plt
 import numpy as np
+import matplotlib.pyplot as plt
 
-SURFACE, INK, INK_2, INK_3 = '#fcfcfb', '#0b0b0b', '#52514e', '#8a8880'
-SERIES = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#8e58c9']
-ARMS = ('from_scratch', 'continue', 'closest', 'meta', 'meta_reinit')
-# `zip` TRUNCATES SILENTLY. A four-colour SERIES against five ARMS left `meta_reinit` with no entry
-# and the plot died on a KeyError only when a tree actually contained that arm. Assert instead.
-assert len(SERIES) >= len(ARMS), f'{len(ARMS)} arms need at least that many colours, got {len(SERIES)}'
-ARM_COLOUR = dict(zip(ARMS, SERIES))
-
-plt.rcParams.update({
-  'figure.facecolor': SURFACE,
-  'axes.facecolor': SURFACE,
-  'savefig.facecolor': SURFACE,
-  'axes.edgecolor': INK_3,
-  'axes.linewidth': 0.8,
-  'axes.labelcolor': INK_2,
-  'text.color': INK,
-  'xtick.color': INK_2,
-  'ytick.color': INK_2,
-  'xtick.labelsize': 7,
-  'ytick.labelsize': 7,
-  'axes.labelsize': 8,
-  'axes.titlesize': 8,
-  'legend.fontsize': 8,
-  'legend.frameon': False,
-  'grid.color': '#e8e6e1',
-  'axes.grid': True,
-  'grid.linewidth': 0.6,
-})
+from plot_median import load, budget_of, colour_of, INK_2
 
 
-def load(tree, partial, exclude=()):
-  cells = {}
-  for path in glob.glob(os.path.join(tree, '*', '*', 'results.json')):
-    parts = path.split(os.sep)
-    seed, arm = parts[-3], parts[-2]
-    if arm not in ARMS:
-      continue
-    with open(path) as handle:
-      payload = json.load(handle)
-    rows = payload['results']
-    if f'{seed}/{arm}' in exclude:
-      continue
-    if len(rows) == 0 or not (payload.get('completed') or partial):
-      continue
-    calls = np.cumsum([row['spent'] for row in rows])
-    best = np.minimum.accumulate([row['loss'] for row in rows])
-    cells[(seed, arm)] = (calls, best)
-  return cells
+def designs_of(tree, seed, arm):
+  """``(cumulative calls, loss)`` of every banked design of one cell."""
+  with open(os.path.join(tree, seed, arm, 'results.json')) as handle:
+    rows = json.load(handle)['results']
+  return np.cumsum([row['spent'] for row in rows]), np.asarray([row['loss'] for row in rows])
 
 
 def main():
-  parser = argparse.ArgumentParser()
-  parser.add_argument('tree')
-  parser.add_argument('--out', default=None)
-  parser.add_argument('--name', default='per_seed.png')
-  parser.add_argument('--partial', action='store_true')
-  parser.add_argument(
-    '--exclude', nargs='*', default=(),
-    help='cells to drop outright, as seed/arm; a CAPPED cell carries completed: false and would otherwise be '
-    'plotted by --partial as though it were still running'
-  )
-  parser.add_argument('--paired', action='store_true', help='only seeds complete in EVERY arm')
-  arguments = parser.parse_args()
+  parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+  parser.add_argument('trees', nargs='+')
+  parser.add_argument('--out', default=None, help='directory for the png; defaults beside the first tree')
+  parser.add_argument('--name', default='per-seed')
+  parser.add_argument('--cols', type=int, default=5)
+  args = parser.parse_args()
 
-  cells = load(arguments.tree, arguments.partial, exclude=set(arguments.exclude))
-  seeds = sorted({seed for seed, _ in cells}, key=int)
-  if arguments.paired:
-    seeds = [s for s in seeds if all((s, a) in cells for a in ARMS)]
-  if len(seeds) == 0:
-    raise SystemExit('no seeds to plot')
+  panels = []
+  for tree in args.trees:
+    label = os.path.basename(os.path.normpath(tree))
+    budget = budget_of(tree)
+    arms = load(tree)
+    for seed in sorted({seed for cells in arms.values() for seed in cells}, key=int):
+      panels.append((tree, label, seed, budget, {arm: cells[seed] for arm, cells in arms.items() if seed in cells}))
+  if len(panels) == 0:
+    raise SystemExit('no complete cells in ' + ', '.join(args.trees))
 
-  columns = min(4, len(seeds))
-  rows_n = (len(seeds) + columns - 1) // columns
-  figure, axes = plt.subplots(rows_n, columns, figsize=(4.0 * columns, 3.2 * rows_n), squeeze=False)
-  for index, seed in enumerate(seeds):
-    axis = axes[index // columns][index % columns]
-    finals = {}
-    for arm in ARMS:
-      if (seed, arm) not in cells:
+  cols = min(args.cols, len(panels))
+  rows = int(np.ceil(len(panels) / cols))
+  figure, axes = plt.subplots(rows, cols, figsize=(3.6 * cols, 2.9 * rows), sharey=True, squeeze=False)
+  ordered_arms = sorted({arm for *_, cells in panels for arm in cells})
+  for axis, (tree, label, seed, budget, cells) in zip(axes.flat, panels):
+    for slot, arm in enumerate(ordered_arms):
+      if arm not in cells:
         continue
-      calls, best = cells[(seed, arm)]
-      axis.step(calls, best, where='post', color=ARM_COLOUR[arm], linewidth=1.8, label=arm)
-      finals[arm] = best[-1]
-    order = sorted(finals, key=finals.get)
-    axis.set_title(f'{seed}   ' + ' < '.join(a[:4] for a in order), color=INK, loc='left')
-    axis.set_xlabel('cumulative detector calls')
-    axis.set_ylabel('best loss so far')
-  for index in range(len(seeds), rows_n * columns):
-    axes[index // columns][index % columns].axis('off')
-  handles = [plt.Line2D([], [], color=ARM_COLOUR[a], linewidth=2, label=a) for a in ARMS]
-  figure.legend(handles=handles, loc='upper right', ncol=4)
+      x, y = cells[arm]
+      colour = colour_of(arm, slot)
+      if budget is not None and x[-1] < budget:
+        x, y = np.append(x, budget), np.append(y, y[-1])
+      axis.step(x, y, where='post', color=colour, linewidth=1.6, label=f'{arm} ({y[-1]:.3f})')
+      dx, dy = designs_of(tree, seed, arm)
+      axis.plot(dx, dy, linestyle='none', marker='o', markersize=2.4, color=colour, alpha=0.35)
+    axis.set_title(f'{label}  {seed}', fontsize=9, loc='left')
+    axis.legend(fontsize=6.5, frameon=False, loc='upper right')
+    axis.grid(True, linewidth=0.4)
+    axis.tick_params(labelsize=7)
+  for axis in axes.flat[len(panels):]:
+    axis.set_visible(False)
+  for axis in axes[-1]:
+    axis.set_xlabel('cumulative detector calls', fontsize=8, color=INK_2)
+  for axis in axes[:, 0]:
+    axis.set_ylabel('loss (line: best so far; dots: designs)', fontsize=8, color=INK_2)
   figure.suptitle(
-    f'{os.path.basename(arguments.tree.rstrip("/"))} — best-so-far per seed '
-    f'({len(seeds)} seeds)', x=0.01, ha='left', fontsize=10, color=INK
+    'Per-seed trajectories, one subplot per seed; legend holds the best loss at the budget', fontsize=10, x=0.01, ha='left'
   )
-  figure.tight_layout(rect=(0, 0, 1, 0.95))
-  out = arguments.out or arguments.tree
-  os.makedirs(out, exist_ok=True)
-  target = os.path.join(out, arguments.name)
-  figure.savefig(target, dpi=140)
-  print(f'wrote {target}')
+  figure.tight_layout(rect=(0, 0, 1, 0.97))
+  out_dir = args.out if args.out is not None else os.path.dirname(os.path.normpath(args.trees[0]))
+  os.makedirs(out_dir, exist_ok=True)
+  path = os.path.join(out_dir, f'{args.name}.png')
+  figure.savefig(path, dpi=160)
+  print(f'wrote {path} ({len(panels)} panels)')
 
 
 if __name__ == '__main__':

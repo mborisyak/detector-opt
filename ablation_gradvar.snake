@@ -1,0 +1,66 @@
+# ABLATION: gradient variance of the STRUCTURED minibatch (half current design, half replay) against a UNIFORM draw
+# from the whole pool, at fixed designs of the main run's `meta` trajectories, under the verification protocol.
+#
+#   setsid nohup scripts/cern/ablation/run_gradvar.sh > logs/ablation-gradvar.log 2>&1 < /dev/null &   # at CERN
+#   snakemake -s ablation_gradvar.snake -n                                                             # dry run
+#   snakemake -s ablation_gradvar.snake -n --config trajectories=output/ship-cern-fresh   # dry run on the local mirror
+#
+# THE CONSTRUCTION (user, 2026-09-08: "take some meta checkpoint, sample context, sample whole recorded budget, train
+# (using verify protocol), record gradient variance. Do that for 3rd, 5th and 7th designs. Both SHiP tasks, 3 seeds"):
+# `scripts/probe_gradient_variance.py` restores the run's own state at the design (pools re-simulated from the
+# committed designs, carried network from the checkpoint of the design before), samples the design's data at the
+# size the trajectory recorded, and trains it TWICE from that checkpoint under the verification schedule -- once
+# with the campaign's structured batch, once with every row a uniform draw -- recording at every epoch, for both
+# compositions at the parameters of that moment, the gradient's trace and average per-parameter variance, the
+# first moment relative to its std (the optimizer's figure of merit), the Adam form of that ratio, the signal, the
+# minibatch loss and the cosine between the two compositions' mean gradients. The user's "3rd, 5th and 7th" are
+# 0-based indices 2, 4, 6. 2 tasks x 3 seeds x 3 designs = 18 jobs; each job holds both arms.
+# `trajectories` (default `output`) is the root holding `<task>/test/<seed>/meta/` WITH checkpoints.
+#
+# ⛔️ THIS FILE NAMES NO MACHINE (see linear.snake). At CERN the launcher runs it with `--nolock` because other
+# orchestrators hold the working directory's lock; the DAGs share no output path.
+DEFAULT_PREFIX = config.get("prefix", "output/ablation-gradvar")
+TRAJECTORIES = config.get("trajectories", "output")
+
+TASKS = ["angle", "intersect"]
+REGIME = {"angle": "rewind-01", "intersect": "norewind"}
+SEEDS = [1244111331, 126382657, 750143450]
+DESIGNS = [2, 4, 6]
+DRAWS = int(config.get("draws", 16))
+PREAMBLE = config.get("preamble", "")
+ENV = PREAMBLE + "XLA_PYTHON_CLIENT_PREALLOCATE=false PYTHONUNBUFFERED=1"
+
+
+wildcard_constraints:
+  prefix=".+",
+  task="|".join(TASKS),
+  seed="|".join(str(s) for s in SEEDS),
+  design="|".join(str(k) for k in DESIGNS),
+
+
+localrules: all
+
+
+rule all:
+  input:
+    expand(f"{DEFAULT_PREFIX}/{{task}}/{{seed}}/design-{{design}}.json", task=TASKS, seed=SEEDS, design=DESIGNS)
+
+
+rule probe:
+  input:
+    f"{TRAJECTORIES}/{{task}}/test/{{seed}}/meta/results.json"
+  output:
+    "{prefix}/{task}/{seed}/design-{design}.json"
+  params:
+    regime=lambda w: REGIME[w.task],
+  threads: 2
+  resources:
+    local_gpu=1, mem_mb=6000, runtime=720
+  shell:
+    ENV + " python scripts/probe_gradient_variance.py ={wildcards.task}"
+    " strategy={wildcards.task}-meta-{params.regime}"
+    " trajectory={input}"
+    " seed={wildcards.seed}"
+    " design_index={wildcards.design}"
+    f" draws={DRAWS}"
+    " output={output}"

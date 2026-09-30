@@ -1,0 +1,71 @@
+# ABLATION: the weight of the CONTEXT (replay) batch in the `meta` arm, on the SHiP tasks.
+#
+#   setsid nohup scripts/cern/ablation/run_ablation.sh > logs/ablation.log 2>&1 < /dev/null &   # at CERN
+#   snakemake -s ablation_lambda.snake -n                                                       # dry run
+#
+# `meta` trains on batches that are half current design and half replay from earlier designs -- that 1:1
+# BATCH COMPOSITION IS FIXED in every cell here (user, 2026-09-07); what varies is `training.replay_weight`,
+# the weight of a replay row against a current-design row in the gradient (detopt/nn/trainer/continual.py).
+# The SHiP campaigns ran 0.25 (config/angle.yaml, config/intersect.yaml),
+# so that point exists already in the test stage of `output/<task>/test/<seed>/meta/` -- this file adds
+# 0.5 and 0.125 and nothing else moves: same task config, the meta regime each task's selection stage
+# chose (angle: rewind-01, intersect: norewind), the three SELECTION seeds, the full 2^21 budget, the same
+# verification. A cell is `output/ablation-lambda/<task>/lambda-<weight>/<seed>/meta/`, so the 0.25
+# reference is the test-stage cell of the same seed. 2 tasks x 2 weights x 3 seeds = 12 cells.
+#
+# ⛔️ THIS FILE NAMES NO MACHINE (see linear.snake). At CERN the launcher runs it with `--nolock`: the
+# extremes orchestrator holds the working directory's snakemake lock and the two DAGs share no output.
+DEFAULT_PREFIX = config.get("prefix", "output/ablation-lambda")
+
+TASKS = ["angle", "intersect"]
+REGIME = {"angle": "rewind-01", "intersect": "norewind"}
+LAMBDAS = {"lambda-0.5": 0.5, "lambda-0.125": 0.125}
+SEEDS = [282522616, 2036255796, 160541601]
+PREAMBLE = config.get("preamble", "")
+ENV = PREAMBLE + "XLA_PYTHON_CLIENT_PREALLOCATE=false PYTHONUNBUFFERED=1"
+
+
+wildcard_constraints:
+  prefix=".+",
+  task="|".join(TASKS),
+  lam="|".join(k.replace(".", r"\.") for k in LAMBDAS),
+  seed="|".join(str(s) for s in SEEDS),
+
+
+localrules: all
+
+
+rule all:
+  input:
+    expand(f"{DEFAULT_PREFIX}/{{task}}/{{lam}}/{{seed}}/meta/verified.txt", task=TASKS, lam=LAMBDAS, seed=SEEDS)
+
+
+rule ablation_bo:
+  output:
+    touch("{prefix}/{task}/{lam}/{seed}/meta/done.txt")
+  params:
+    regime=lambda w: REGIME[w.task],
+    weight=lambda w: LAMBDAS[w.lam],
+  threads: 2
+  resources:
+    local_gpu=1, mem_mb=6000, runtime=2880
+  shell:
+    ENV + " python scripts/bo.py ={wildcards.task}"
+    " strategy={wildcards.task}-meta-{params.regime}"
+    " training.replay_weight={params.weight}"
+    " output={wildcards.prefix}/{wildcards.task}/{wildcards.lam}/{wildcards.seed}/meta"
+    " seed={wildcards.seed}"
+
+
+rule ablation_verify:
+  input:
+    "{prefix}/{task}/{lam}/{seed}/meta/done.txt"
+  output:
+    touch("{prefix}/{task}/{lam}/{seed}/meta/verified.txt")
+  threads: 2
+  resources:
+    local_gpu=1, mem_mb=6000, runtime=2880
+  shell:
+    ENV + " python scripts/verify_trajectory.py ={wildcards.task}"
+    " trajectory={wildcards.prefix}/{wildcards.task}/{wildcards.lam}/{wildcards.seed}/meta/results.json"
+    " seed={wildcards.seed} progress=plain"

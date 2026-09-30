@@ -72,7 +72,7 @@ import detopt.utils.io
 from detopt.bo import BayesianOptimizer
 from detopt.nn.trainer import (
   ContinualRandomFrozenTrainer, ContinualRandomOnlineTrainer, ContinualRatioTrainer, ContinualReinitTrainer, ContinualTrainer,
-  DesignTrainer
+  ContinualUniformTrainer, DesignTrainer
 )
 from detopt.utils.viz.bo import plot_iteration, plot_convergence
 
@@ -81,7 +81,9 @@ from detopt.utils.viz.bo import plot_iteration, plot_convergence
 # "meta" is the ContinualTrainer: one persistent network trained with current+history
 # replay. "meta_ratio" is the same continual strategy with the current:replay batch
 # composition as a knob (`training.current_replay_ratio`), of which "meta"'s 50/50
-# batch is the 1:1 case.
+# batch is the 1:1 case. "meta_uniform" is the same continual strategy with NO batch
+# composition: every minibatch row is a uniform draw from the whole pool, and every row
+# weighs 1 (the 2026-09-07 ablation).
 #
 # WHICH ARMS SEE THE DESIGN, and why it is not the same for all of them. Each trainer answers
 # `Trainer.reveals_design()` and the training procedure combines accordingly. The two continual arms
@@ -97,7 +99,8 @@ from detopt.utils.viz.bo import plot_iteration, plot_convergence
 # visible window, the sampling blur) still applies it, and drops only what would announce which
 # design produced the reading.
 VALID_INIT_STRATEGIES = (
-  "from_scratch", "continue", "closest", "meta", "meta_reinit", "meta_ratio", "meta_random_frozen", "meta_random_online"
+  "from_scratch", "continue", "closest", "meta", "meta_reinit", "meta_ratio", "meta_uniform", "meta_random_frozen",
+  "meta_random_online"
 )
 
 # THE TRAINER CLASSES THIS DRIVER USES, KEYED BY STRATEGY. "per_design" backs from_scratch /
@@ -108,6 +111,7 @@ TRAINERS = {
   "meta": ContinualTrainer,
   "meta_reinit": ContinualReinitTrainer,
   "meta_ratio": ContinualRatioTrainer,
+  "meta_uniform": ContinualUniformTrainer,
   "meta_random_frozen": ContinualRandomFrozenTrainer,
   "meta_random_online": ContinualRandomOnlineTrainer
 }

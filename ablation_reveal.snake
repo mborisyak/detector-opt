@@ -1,0 +1,81 @@
+# ABLATION: the `continue` arm with the design REVEALED to the network, on the SHiP tasks.
+#
+#   setsid nohup scripts/cern/ablation/run_reveal.sh > logs/ablation-reveal.log 2>&1 < /dev/null &              # at CERN
+#   STAGE=test setsid nohup scripts/cern/ablation/run_reveal.sh > logs/ablation-reveal-test.log 2>&1 < /dev/null &
+#   snakemake -s ablation_reveal.snake -n [--config stage=test]                                                  # dry run
+#
+# The per-design arms withhold the design by default (`Trainer.default_reveal`, detopt/nn/trainer/common.py):
+# within one design the design is constant across the batch and carries nothing the network could use for that
+# design -- but a network denied it has to INFER the measurement geometry from the readings, which costs data.
+# This ablation sets `training.reveal=design` for `continue` (user, 2026-09-07) and nothing else moves: same task
+# config, the same verification. continue + reveal is `meta` WITHOUT the replay buffer (user, 2026-09-08): the
+# design-conditioned network is carried design to design and must keep what it learned about earlier designs
+# without ever seeing them again, so its pair is `meta` on the same seeds.
+#
+# TWO STAGES, chosen with `--config stage=select|test` (default select):
+#   select  the three SELECTION seeds under `output/ablation-reveal/<task>/<seed>/continue/`; the campaign's
+#           `continue` and `meta` selection cells of the same seeds are the pairs. 6 cells + 6 verifications.
+#   test    the ten TEST seeds under `output/ablation-reveal-test/<task>/<seed>/continue/` (user, 2026-09-08:
+#           "Launch 10 seeds of continue-reveal on test sequence with the same regime as meta. Both tasks"); the
+#           campaign's test-stage `meta` cells are the pairs. 20 cells + 20 verifications.
+# The regime is the one the selection stage chose for `meta` on each task -- angle rewind-01, intersect norewind --
+# which is also what it chose for `continue`, so the strategy file is `<task>-continue-<regime>.yaml` either way.
+#
+# ⛔️ THIS FILE NAMES NO MACHINE (see linear.snake). At CERN the launcher runs it with `--nolock` because other
+# orchestrators hold the working directory's lock; the DAGs share no output path.
+STAGE = config.get("stage", "select")
+if STAGE not in ("select", "test"):
+  raise ValueError(f"stage must be select or test, got {STAGE!r}")
+DEFAULT_PREFIX = config.get("prefix", "output/ablation-reveal" if STAGE == "select" else "output/ablation-reveal-test")
+
+TASKS = ["angle", "intersect"]
+REGIME = {"angle": "rewind-01", "intersect": "norewind"}
+SEEDS_SELECT = [282522616, 2036255796, 160541601]
+SEEDS_TEST = [1244111331, 126382657, 750143450, 9577242, 330924253, 219094734, 1153299222, 122012491, 499913522, 983655707]
+SEEDS = SEEDS_SELECT if STAGE == "select" else SEEDS_TEST
+PREAMBLE = config.get("preamble", "")
+ENV = PREAMBLE + "XLA_PYTHON_CLIENT_PREALLOCATE=false PYTHONUNBUFFERED=1"
+
+
+wildcard_constraints:
+  prefix=".+",
+  task="|".join(TASKS),
+  seed="|".join(str(s) for s in SEEDS_SELECT + SEEDS_TEST),
+
+
+localrules: all
+
+
+rule all:
+  input:
+    expand(f"{DEFAULT_PREFIX}/{{task}}/{{seed}}/continue/verified.txt", task=TASKS, seed=SEEDS)
+
+
+rule reveal_bo:
+  output:
+    touch("{prefix}/{task}/{seed}/continue/done.txt")
+  params:
+    regime=lambda w: REGIME[w.task],
+  threads: 2
+  resources:
+    local_gpu=1, mem_mb=6000, runtime=2880
+  shell:
+    ENV + " python scripts/bo.py ={wildcards.task}"
+    " strategy={wildcards.task}-continue-{params.regime}"
+    " training.reveal=design"
+    " output={wildcards.prefix}/{wildcards.task}/{wildcards.seed}/continue"
+    " seed={wildcards.seed}"
+
+
+rule reveal_verify:
+  input:
+    "{prefix}/{task}/{seed}/continue/done.txt"
+  output:
+    touch("{prefix}/{task}/{seed}/continue/verified.txt")
+  threads: 2
+  resources:
+    local_gpu=1, mem_mb=6000, runtime=2880
+  shell:
+    ENV + " python scripts/verify_trajectory.py ={wildcards.task}"
+    " trajectory={wildcards.prefix}/{wildcards.task}/{wildcards.seed}/continue/results.json"
+    " seed={wildcards.seed} progress=plain"

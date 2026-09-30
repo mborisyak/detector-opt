@@ -1,0 +1,67 @@
+# ABLATION: the `continue` arm with the design REVEALED to the network, on the LINEAR ladder (the SHiP twin is
+# ablation_reveal.snake).
+#
+#   setsid nohup scripts/run_reveal_linear.sh > logs/ablation-reveal-linear.log 2>&1 < /dev/null &   # workstation
+#   scripts/run_reveal_linear.sh -n                                                                  # dry run
+#
+# continue + reveal=design is `meta` WITHOUT the replay buffer (user, 2026-09-08): the design-conditioned network is
+# carried design to design and must keep what it learned about earlier designs without seeing them again. Its pairs
+# are the campaign's test-stage `meta` and withheld `continue` cells of the SAME rung and seed
+# (`output/linear/<rung>/test/<seed>/{meta,continue}/`), so this runs the first FIVE test seeds on EVERY rung (user,
+# 2026-09-08: "Prepare reveal ablation on linear, 5 seeds each dimension"), with the regime the pooled selection
+# chose for `continue` -- sp-l03-s1e2, the same file `linear-continue-optimal.yaml` copies -- and nothing else
+# moved: same task configs (`config/linear_<rung>.yaml`, d1n2's halved windows included), full budget, the same
+# verification. 4 rungs x 5 seeds = 20 cells + 20 verifications, under `output/ablation-reveal-linear/`.
+#
+# ⛔️ THIS FILE NAMES NO MACHINE (see linear.snake); the workstation profile supplies the SLURM resources and the
+# launcher the lock and the MPS check. It shares no output path with linear.snake, so it can run beside the
+# campaign's orchestrator (`--nolock` in the launcher).
+DEFAULT_PREFIX = config.get("prefix", "output/ablation-reveal-linear")
+
+RUNGS = ["d1n2", "d2n3", "d3n4", "d4n5"]
+REGIME = "sp-l03-s1e2"
+SEEDS = [1244111331, 126382657, 750143450, 9577242, 330924253]
+PREAMBLE = config.get("preamble", "")
+ENV = PREAMBLE + "XLA_PYTHON_CLIENT_PREALLOCATE=false PYTHONUNBUFFERED=1"
+
+
+wildcard_constraints:
+  prefix=".+",
+  rung="|".join(RUNGS),
+  seed="|".join(str(s) for s in SEEDS),
+
+
+localrules: all
+
+
+rule all:
+  input:
+    expand(f"{DEFAULT_PREFIX}/{{rung}}/{{seed}}/continue/verified.txt", rung=RUNGS, seed=SEEDS)
+
+
+rule reveal_bo:
+  output:
+    touch("{prefix}/{rung}/{seed}/continue/done.txt")
+  threads: 2
+  resources:
+    local_gpu=1, mem_mb=5500, runtime=480
+  shell:
+    ENV + " python scripts/bo.py =linear_{wildcards.rung}"
+    f" strategy=linear-continue-{REGIME}"
+    " training.reveal=design"
+    " output={wildcards.prefix}/{wildcards.rung}/{wildcards.seed}/continue"
+    " seed={wildcards.seed}"
+
+
+rule reveal_verify:
+  input:
+    "{prefix}/{rung}/{seed}/continue/done.txt"
+  output:
+    touch("{prefix}/{rung}/{seed}/continue/verified.txt")
+  threads: 2
+  resources:
+    local_gpu=1, mem_mb=5500, runtime=480
+  shell:
+    ENV + " python scripts/verify_trajectory.py =linear_{wildcards.rung}"
+    " trajectory={wildcards.prefix}/{wildcards.rung}/{wildcards.seed}/continue/results.json"
+    " seed={wildcards.seed} progress=plain"

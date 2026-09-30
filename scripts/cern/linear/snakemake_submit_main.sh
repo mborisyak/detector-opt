@@ -1,9 +1,7 @@
 #!/bin/bash
-# snakemake `cluster-generic` submit command for the EXTREMES campaign on CERN HTCondor -- the twin of
-# scripts/cern/snakemake_submit.sh (SHiP) with two differences: the batch name `extremes-<rule>`, which is what
-# scripts/cern/extremes/run_extremes.sh scopes its orphan reap by, and a GPU memory floor of 8000 MB instead of
-# 10000: an extremes cell holds 1310720 events of 4 x 32 floats in its pools (~0.7 GB) plus a small set regressor,
-# nowhere near a SHiP search cell's 6.1 GiB, so the smaller slices are admitted.
+# snakemake `cluster-generic` submit command for the linear ladder run from the MAIN tree on CERN HTCondor: batch
+# name `linear-<rule>` (what run_linear_main.sh scopes its orphan reap by), SnakeCell from the cell path, GPU memory
+# floor 4000 MB (a linear cell was measured at 310-500 MiB of VRAM; the floor only keeps it off the smallest cards).
 #
 # cluster-generic appends the jobscript path as the last argument and reads the job id from stdout, so this prints
 # the ClusterId and NOTHING else. `runtime` is snakemake's MINUTES; +MaxRuntime is condor's SECONDS.
@@ -24,12 +22,12 @@ SUB=$(mktemp /tmp/snakemake-condor.XXXXXX.sub)
   echo "request_cpus   = 1"
   echo "request_memory = $MEM"
   echo "+MaxRuntime    = $((RUNTIME * 60))"
-  echo "+JobBatchName  = \"extremes-$RULE\""
-  CELL=$(grep -oE "output/[A-Za-z0-9_./-]+/(select|test)/[A-Za-z0-9_/-]+" "$JOBSCRIPT" 2>/dev/null | head -1)
+  echo "+JobBatchName  = \"linear-$RULE\""
+  CELL=$(grep -oE "output/linear/[A-Za-z0-9_./-]+/(select|test)/[A-Za-z0-9_/-]+" "$JOBSCRIPT" 2>/dev/null | head -1)
   echo "+SnakeCell     = \"${CELL:-unknown}\""
   if [ "$GPU" -gt 0 ]; then
     echo "request_gpus   = 1"
-    echo "requirements   = TARGET.GPUs_GlobalMemoryMb >= 8000"
+    echo "requirements   = TARGET.GPUs_GlobalMemoryMb >= 4000"
   fi
   echo "queue"
 } > "$SUB"

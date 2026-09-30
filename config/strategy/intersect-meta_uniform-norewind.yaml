@@ -1,0 +1,13 @@
+# STRATEGY: meta_uniform on `intersect`, training regime `norewind` -- the 2026-09-07 batch-composition ABLATION.
+#
+# `meta_uniform` is the continual arm with NO batch composition: every minibatch row is a uniform draw from
+# the whole pool (current window and all earlier designs together) and every row weighs 1, against `meta`'s
+# 1:1 batch with `replay_weight` 0.25 (detopt/nn/trainer/continual_uniform.py). The regime is the one the
+# intersect selection stage chose for `meta` (norewind), so a probe branching off a `meta` trajectory changes
+# the batch draw and nothing else. `training.replay_weight` is dropped for this arm by `scripts/bo.py`.
+#
+#   rewind   params <- initial + (1 - rewind) * (params - initial)
+
+nn_init_strategy: meta_uniform
+rewind: 0.0
+shrink: 1.0

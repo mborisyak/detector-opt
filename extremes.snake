@@ -13,7 +13,11 @@
 #                   designs are PAIRED across regimes; past it each regime's own GP proposes and the pairing ends.
 #   2. select       integral rank of the VERIFIED best-so-far curves over the three seeds
 #                   -> config/strategy/extremes-<strategy>-optimal.yaml
-#   3. test         10 test seeds x 3 strategies with the selected regime, each verified; `campaign.txt` marks the end.
+#   3. test         20 test seeds x 3 strategies with the selected regime, each verified; `campaign.txt` marks the end.
+#                   The first 10 seeds are draws 1-10 of `random.Random(123456).randint(0, 2**31 - 1)` (docs/final.md);
+#                   the second 10 are draws 11-20 of the SAME generator, added 2026-09-08 (user: "Put 10 more seeds of
+#                   extremes. same test sequence, just generate the next 10 seeds") after the first batch had run.
+#                   `scripts/cern/extremes/run_extremes_more.sh` builds the second batch beside a running first one.
 #
 # THE SELECTION RUNS USE THE TASK CONFIG EXACTLY -- the same `iteration_limit`, `patience`, `warmup_epochs`, budget
 # and windows as the test stage -- and differ from it ONLY in the regime under selection (user, 2026-09-06: "exactly
@@ -49,6 +53,8 @@ SEEDS_VAL = [282522616, 2036255796, 160541601]
 SEEDS_TEST = [
   1244111331, 126382657, 750143450, 9577242, 330924253,
   219094734, 1153299222, 122012491, 499913522, 983655707,
+  2093442589, 799314451, 104246563, 553867472, 1620698205,
+  1588951686, 183442464, 774926522, 261261008, 1890636464,
 ]
 STRATEGIES = ["from_scratch", "continue", "meta"]
 REGIMES = ["norewind", "rewind-01", "rewind-025", "sp-l03-s1e2", "sp-l06-s1e2"]

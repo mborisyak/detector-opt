@@ -18,11 +18,13 @@ from .common import REVEAL, TrainResult, Trainer
 from .continual import ContinualReinitTrainer, ContinualTrainer
 from .continual_random import ContinualRandomFrozenTrainer, ContinualRandomOnlineTrainer
 from .continual_ratio import ContinualRatioTrainer
+from .continual_uniform import ContinualUniformTrainer
 from .design import DesignTrainer
 from .fixed_window import FixedWindowTrainer
 from .full_budget import FullBudgetTrainer
 
 __all__ = [
   'REVEAL', "Trainer", "DesignTrainer", "ContinualTrainer", "ContinualReinitTrainer", "ContinualRatioTrainer",
-  "ContinualRandomFrozenTrainer", "ContinualRandomOnlineTrainer", "FullBudgetTrainer", "FixedWindowTrainer", "TrainResult"
+  "ContinualUniformTrainer", "ContinualRandomFrozenTrainer", "ContinualRandomOnlineTrainer", "FullBudgetTrainer",
+  "FixedWindowTrainer", "TrainResult"
 ]

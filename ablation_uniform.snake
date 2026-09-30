@@ -1,0 +1,64 @@
+# ABLATION: batch composition of the `meta` arm -- 1:1 current:replay (the campaign) against a UNIFORM draw
+# from the whole pool (`meta_uniform`, detopt/nn/trainer/continual_uniform.py) -- as a ONE-STEP BRANCH off the
+# main run's meta trajectories on the SHiP tasks.
+#
+#   setsid nohup scripts/cern/ablation/run_uniform.sh > logs/ablation-uniform.log 2>&1 < /dev/null &   # at CERN
+#   snakemake -s ablation_uniform.snake -n                                                             # dry run
+#   snakemake -s ablation_uniform.snake -n --config trajectories=output/ship-cern-fresh   # dry run on the local mirror
+#
+# THE CONSTRUCTION (user, 2026-09-07): no campaign. For each of the first three TEST seeds' `meta` cells of the
+# main run, `scripts/probe_retention.py` restores the run's own state at the trajectory's MIDDLE design --
+# the pools re-simulated from the committed designs, the carried network read from the checkpoint written at
+# the previous design -- and trains that one design, no BO step. Two arms score the SAME design from the SAME
+# checkpoint on the SAME iteration seed: `meta` (the control: 1:1 batch, replay_weight 0.25, i.e. the run's
+# own procedure re-run) and `meta_uniform` (every row a uniform draw from the whole pool, unit weights).
+# Readout: loss and spend per cell in `output/ablation-uniform/<task>/<seed>/<arm>.json` (`reference_loss` is
+# the trajectory's own recorded loss at that design). The regime is the one each task's selection stage chose
+# for `meta` (angle rewind-01, intersect norewind), so the batch draw is the only difference between the arms.
+# 2 tasks x 3 seeds x 2 arms = 12 single-design jobs. `trajectories` (default `output`) is the root that holds the
+# main run's `<task>/test/<seed>/meta/` cells WITH their checkpoints; the local mirror has none, so it only dry-runs.
+#
+# ⛔️ THIS FILE NAMES NO MACHINE (see linear.snake). At CERN the launcher runs it with `--nolock` because other
+# orchestrators hold the working directory's lock; the DAGs share no output path.
+DEFAULT_PREFIX = config.get("prefix", "output/ablation-uniform")
+TRAJECTORIES = config.get("trajectories", "output")
+
+TASKS = ["angle", "intersect"]
+REGIME = {"angle": "rewind-01", "intersect": "norewind"}
+ARMS = ["meta", "meta_uniform"]
+SEEDS = [1244111331, 126382657, 750143450]
+PREAMBLE = config.get("preamble", "")
+ENV = PREAMBLE + "XLA_PYTHON_CLIENT_PREALLOCATE=false PYTHONUNBUFFERED=1"
+
+
+wildcard_constraints:
+  prefix=".+",
+  task="|".join(TASKS),
+  arm="|".join(ARMS),
+  seed="|".join(str(s) for s in SEEDS),
+
+
+localrules: all
+
+
+rule all:
+  input:
+    expand(f"{DEFAULT_PREFIX}/{{task}}/{{seed}}/{{arm}}.json", task=TASKS, seed=SEEDS, arm=ARMS)
+
+
+rule probe:
+  input:
+    f"{TRAJECTORIES}/{{task}}/test/{{seed}}/meta/results.json"
+  output:
+    "{prefix}/{task}/{seed}/{arm}.json"
+  params:
+    regime=lambda w: REGIME[w.task],
+  threads: 2
+  resources:
+    local_gpu=1, mem_mb=6000, runtime=720
+  shell:
+    ENV + " python scripts/probe_retention.py ={wildcards.task}"
+    " strategy={wildcards.task}-{wildcards.arm}-{params.regime}"
+    " trajectory={input}"
+    " seed={wildcards.seed}"
+    " output={output}"

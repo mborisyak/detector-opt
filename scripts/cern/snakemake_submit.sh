@@ -7,6 +7,8 @@
 #
 # cluster-generic appends the jobscript path as the last argument and reads the job id from stdout,
 # so this prints the ClusterId and NOTHING else.
+# ONE CPU per job (user, 2026-09-09: \"1 CPU for us is enough\"): the snakefile's `threads` is not forwarded; CERN's
+# schedd added one more on top of it, and a 3-CPU request could not use GPU slots whose cores other jobs hold.
 set -eu
 RULE=$1; THREADS=$2; MEM=$3; RUNTIME=$4; GPU=$5; JOBSCRIPT=$6
 D=/afs/cern.ch/work/m/maborisy/detector-opt
@@ -19,7 +21,7 @@ SUB=$(mktemp /tmp/snakemake-condor.XXXXXX.sub)
   echo "output         = $D/logs/condor/\$(ClusterId).out"
   echo "error          = $D/logs/condor/\$(ClusterId).err"
   echo "log            = $D/logs/condor/\$(ClusterId).log"
-  echo "request_cpus   = $THREADS"
+  echo "request_cpus   = 1"
   echo "request_memory = $MEM"
   # `runtime` is snakemake's MINUTES; +MaxRuntime is condor's SECONDS. Passing one as the other is
   # how a job silently gets 40 minutes instead of 48 hours.
